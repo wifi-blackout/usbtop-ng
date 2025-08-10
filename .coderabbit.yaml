@@ -1,0 +1,58 @@
+# CodeRabbit configuration for usbtop-ng
+reviews:
+  # Request changes for issues that should be addressed before merging
+  request_changes: "auto"
+  # Enable high-level summary
+  high_level_summary: true
+  # Enable poem (fun summaries)
+  poem: true
+  # Enable review status in PR description  
+  review_status: true
+  # Auto-approve minor changes
+  auto_approve: false
+
+# Language-specific settings
+language_settings:
+  rust:
+    # Enable Rust-specific lints and suggestions
+    enabled: true
+    # Focus on performance, safety, and idiomatic code
+    focus_areas:
+      - "performance"
+      - "safety" 
+      - "idioms"
+      - "error_handling"
+    # Custom rules for Rust
+    rules:
+      - "prefer_unwrap_or_else_over_unwrap_or"
+      - "avoid_unwrap_in_main"
+      - "prefer_expect_over_unwrap"
+      - "use_clippy_lints"
+
+# File patterns to include/exclude
+path_filters:
+  include:
+    - "src/**/*.rs"
+    - "Cargo.toml"
+    - "README.md"
+    - "CHANGELOG.md"
+  exclude:
+    - "target/**"
+    - "*.lock"
+    - ".git/**"
+
+# Review focus areas
+focus_areas:
+  - "security"
+  - "performance" 
+  - "maintainability"
+  - "error_handling"
+  - "documentation"
+
+# Enable suggestions for specific areas
+suggestions:
+  rust_best_practices: true
+  performance_optimization: true
+  security_improvements: true
+  code_organization: true
+  documentation: true
