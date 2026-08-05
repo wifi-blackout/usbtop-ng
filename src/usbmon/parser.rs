@@ -39,6 +39,53 @@ impl UsbSpeed {
             UsbSpeed::Unknown => 0.0,
         }
     }
+
+    /// Returns theoretical maximum bandwidth in bytes per second
+    /// Note: These are raw theoretical maximums, actual usable bandwidth is lower
+    /// due to protocol overhead, frame structure, etc.
+    ///
+    /// `cfg(test)`-only for now: nothing in production code reads it yet, but
+    /// the %busy / speed-mismatch indicators land on top of it, so it (and
+    /// [`to_practical_bytes_per_second`](Self::to_practical_bytes_per_second))
+    /// stay in place, verified, ready for that wiring.
+    #[cfg(test)]
+    pub fn to_bytes_per_second(&self) -> f64 {
+        match self {
+            UsbSpeed::Low => 1_500_000.0 / 8.0,    // 1.5 Mbps = ~187.5 KB/s
+            UsbSpeed::Full => 12_000_000.0 / 8.0,  // 12 Mbps = 1.5 MB/s
+            UsbSpeed::High => 480_000_000.0 / 8.0, // 480 Mbps = 60 MB/s
+            UsbSpeed::SuperSpeed => 5_000_000_000.0 / 8.0, // 5 Gbps = 625 MB/s
+            UsbSpeed::SuperSpeedPlus => 10_000_000_000.0 / 8.0, // 10 Gbps = 1.25 GB/s
+            UsbSpeed::Unknown => 0.0,
+        }
+    }
+
+    /// Returns practical maximum bandwidth in bytes per second
+    /// Takes into account typical protocol overhead (~80% efficiency for most speeds)
+    ///
+    /// `cfg(test)`-only for now; see [`to_bytes_per_second`](Self::to_bytes_per_second).
+    #[cfg(test)]
+    pub fn to_practical_bytes_per_second(&self) -> f64 {
+        match self {
+            UsbSpeed::Low => self.to_bytes_per_second() * 0.7, // ~70% for low speed
+            UsbSpeed::Full => self.to_bytes_per_second() * 0.8, // ~80% for full speed
+            UsbSpeed::High => self.to_bytes_per_second() * 0.8, // ~80% for high speed
+            UsbSpeed::SuperSpeed => self.to_bytes_per_second() * 0.85, // ~85% for super speed
+            UsbSpeed::SuperSpeedPlus => self.to_bytes_per_second() * 0.85, // ~85% for super speed+
+            UsbSpeed::Unknown => 0.0,
+        }
+    }
+
+    pub fn color_code(&self) -> (u8, u8, u8) {
+        match self {
+            UsbSpeed::Low => (255, 100, 100),          // Light red
+            UsbSpeed::Full => (255, 165, 0),           // Orange
+            UsbSpeed::High => (255, 255, 0),           // Yellow
+            UsbSpeed::SuperSpeed => (0, 255, 0),       // Green
+            UsbSpeed::SuperSpeedPlus => (0, 255, 255), // Cyan
+            UsbSpeed::Unknown => (128, 128, 128),      // Gray
+        }
+    }
 }
 
 /// A single parsed usbmon URB event.
@@ -388,5 +435,23 @@ mod tests {
     fn test_usb_speed_from_str_and_mbps() {
         assert_eq!(UsbSpeed::from_speed_str("480"), UsbSpeed::High);
         assert_eq!(UsbSpeed::SuperSpeed.to_mbps(), 5000.0);
+    }
+
+    #[test]
+    fn practical_bandwidth_applies_overhead_factors() {
+        assert_eq!(UsbSpeed::High.to_bytes_per_second(), 60_000_000.0);
+        assert_eq!(UsbSpeed::High.to_practical_bytes_per_second(), 48_000_000.0);
+        assert_eq!(
+            UsbSpeed::SuperSpeed.to_practical_bytes_per_second(),
+            531_250_000.0
+        );
+        assert_eq!(UsbSpeed::Unknown.to_practical_bytes_per_second(), 0.0);
+    }
+
+    #[test]
+    fn speed_colors_are_stable() {
+        assert_eq!(UsbSpeed::Low.color_code(), (255, 100, 100));
+        assert_eq!(UsbSpeed::SuperSpeed.color_code(), (0, 255, 0));
+        assert_eq!(UsbSpeed::Unknown.color_code(), (128, 128, 128));
     }
 }
