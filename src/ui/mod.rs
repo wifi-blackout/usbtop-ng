@@ -65,6 +65,10 @@ pub struct UsbTopApp {
     pub refresh_rate: Duration,
     pub total_bandwidth: f64,
     pub peak_bandwidth: f64,
+    /// Vertical scroll offset for the device list, in lines. Follows the
+    /// selected device's row so `select_next_device`/`select_previous_device`
+    /// can't walk the selection off-screen; see `follow_selection_in_list`.
+    pub list_scroll: u16,
 }
 
 impl UsbTopApp {
@@ -79,6 +83,7 @@ impl UsbTopApp {
             refresh_rate,
             total_bandwidth: 0.0,
             peak_bandwidth: 0.0,
+            list_scroll: 0,
         }
     }
 
@@ -203,6 +208,36 @@ impl UsbTopApp {
         let selected = self.selected_device.as_ref()?;
         device_keys.iter().position(|key| key == selected)
     }
+
+    /// Keep `list_scroll` following the selected device's line: scroll up if
+    /// the selection is above the visible window, down if it's below, and
+    /// leave it untouched otherwise (so it doesn't chase when nothing is
+    /// selected). Always clamped to the current content length afterwards,
+    /// so a shrunk list or a stale offset can't scroll past its end.
+    ///
+    /// `total_lines`/`selected_line` come from `device_list_lines_with_selection`
+    /// (headings count toward both); `visible_height` is the render area's
+    /// height minus its block's borders, computed by the caller since only it
+    /// knows the area.
+    fn follow_selection_in_list(
+        &mut self,
+        total_lines: usize,
+        selected_line: Option<usize>,
+        visible_height: u16,
+    ) {
+        if let Some(index) = selected_line {
+            let index = index as u16;
+            if index < self.list_scroll {
+                self.list_scroll = index;
+            } else if visible_height > 0 && index >= self.list_scroll.saturating_add(visible_height)
+            {
+                self.list_scroll = index.saturating_sub(visible_height.saturating_sub(1));
+            }
+        }
+
+        let max_scroll = (total_lines as u16).saturating_sub(visible_height);
+        self.list_scroll = self.list_scroll.min(max_scroll);
+    }
 }
 
 /// Snapshot one bus: its devices in physical port order.
@@ -305,7 +340,7 @@ fn run_app(
     Ok(())
 }
 
-fn draw_ui(f: &mut Frame, app: &UsbTopApp) {
+fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
     if app.show_help {
         draw_help_overlay(f);
         return;
@@ -324,8 +359,12 @@ fn draw_ui(f: &mut Frame, app: &UsbTopApp) {
         ])
         .split(size);
 
+    let chart_chunks = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+
     draw_header(f, chunks[0], app);
-    draw_bandwidth_graph(f, chunks[1], app);
+    draw_bandwidth_graph(f, chart_chunks[0], app);
+    draw_device_chart(f, chart_chunks[1], app);
     draw_device_list(f, chunks[2], app);
     draw_color_reference(f, chunks[3]);
 }
@@ -422,6 +461,93 @@ fn draw_bandwidth_graph(f: &mut Frame, area: Rect, app: &UsbTopApp) {
     f.render_widget(chart, area);
 }
 
+/// Find the currently selected device's row (plus its bus id, since
+/// `DeviceRow` doesn't carry one) by matching `app.selected_device` against
+/// the same "bus:dev" key used to build it in `device_keys`.
+fn find_selected_device(app: &UsbTopApp) -> Option<(u8, &DeviceRow)> {
+    let selected = app.selected_device.as_ref()?;
+    app.controllers
+        .iter()
+        .flat_map(|controller| controller.buses.iter())
+        .find_map(|bus| {
+            bus.devices
+                .iter()
+                .find(|row| format!("{}:{}", bus.bus_id, row.device.device_id) == *selected)
+                .map(|row| (bus.bus_id, row))
+        })
+}
+
+/// Right-hand chart of the strip: the selected device's rx/tx rate history
+/// over the last 60 seconds, or a placeholder when nothing is selected (or
+/// the selection vanished, e.g. the device was unplugged).
+fn draw_device_chart(f: &mut Frame, area: Rect, app: &UsbTopApp) {
+    let Some((bus_id, row)) = find_selected_device(app) else {
+        let placeholder = Paragraph::new("Select a device with ↑/↓").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Device rx/tx "),
+        );
+        f.render_widget(placeholder, area);
+        return;
+    };
+
+    let now = Instant::now();
+    // rate_history carries raw bytes/s against sample instants; plot MB/s
+    // against seconds-ago (0 = now, -60 = a minute back), matching the
+    // aggregate chart's units but anchored to "now" instead of session time.
+    let to_series = |pick: fn(&(Instant, f64, f64)) -> f64| -> Vec<(f64, f64)> {
+        row.device
+            .bandwidth_stats
+            .rate_history
+            .iter()
+            .map(|sample| (-(now - sample.0).as_secs_f64(), pick(sample) / 1_000_000.0))
+            .collect()
+    };
+    let rx_data = to_series(|(_, rx, _)| *rx);
+    let tx_data = to_series(|(_, _, tx)| *tx);
+
+    let max_mbps = rx_data
+        .iter()
+        .chain(tx_data.iter())
+        .map(|(_, mbps)| *mbps)
+        .fold(0.0, f64::max)
+        .max(0.001);
+
+    let datasets = vec![
+        Dataset::default()
+            .name("rx")
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(PRIMARY_COLOR))
+            .data(&rx_data),
+        Dataset::default()
+            .name("tx")
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(SECONDARY_COLOR))
+            .data(&tx_data),
+    ];
+
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {}:{} rx/tx ", bus_id, row.device.device_id)),
+        )
+        .x_axis(
+            Axis::default()
+                .title("Time (s)")
+                .style(Style::default().fg(TEXT_COLOR))
+                .bounds([-60.0, 0.0]),
+        )
+        .y_axis(
+            Axis::default()
+                .title("MB/s")
+                .style(Style::default().fg(TEXT_COLOR))
+                .bounds([0.0, max_mbps]),
+        );
+
+    f.render_widget(chart, area);
+}
+
 /// Column widths, in terminal cells, for the device rows: Port, Device, Speed,
 /// Vendor, Product, Bw↓, Bw↑, %busy, !. Controller and bus headings span the
 /// whole line, which a `Table` cannot do, so the list is laid out as lines of
@@ -491,19 +617,31 @@ fn port_label(port_chain: Option<&Vec<u32>>) -> String {
     }
 }
 
-fn draw_device_list(f: &mut Frame, area: Rect, app: &UsbTopApp) {
-    let list = Paragraph::new(device_list_lines(app)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" USB Devices "),
-    );
+/// Rendered lines minus the block's top and bottom border rows.
+fn inner_height(area: Rect) -> u16 {
+    area.height.saturating_sub(2)
+}
+
+fn draw_device_list(f: &mut Frame, area: Rect, app: &mut UsbTopApp) {
+    let (lines, selected_line) = device_list_lines_with_selection(app);
+    app.follow_selection_in_list(lines.len(), selected_line, inner_height(area));
+
+    let list = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" USB Devices "),
+        )
+        .scroll((app.list_scroll, 0));
 
     f.render_widget(list, area);
 }
 
-/// The device list as rendered: a column header, then per controller a heading,
-/// per bus a header, and one line per device in port order.
-fn device_list_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
+/// The device list as rendered: a column header, then per controller a
+/// heading, per bus a header, and one line per device in port order. Also
+/// returns the line index of the selected device's row (headings count
+/// toward it), so the caller can keep it inside the visible scroll window.
+fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Option<usize>) {
     let heading_style = Style::default()
         .fg(ACCENT_COLOR)
         .add_modifier(Modifier::BOLD);
@@ -512,6 +650,7 @@ fn device_list_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
         "Port", "Device", "Speed", "Vendor", "Product", "Bw↓", "Bw↑", "%busy", "!",
     ]))
     .style(heading_style)];
+    let mut selected_line = None;
 
     for controller in &app.controllers {
         lines.push(Line::styled(
@@ -537,6 +676,9 @@ fn device_list_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
                 let device = &row.device;
                 let device_key = format!("{}:{}", bus.bus_id, device.device_id);
                 let is_selected = app.selected_device.as_ref() == Some(&device_key);
+                if is_selected {
+                    selected_line = Some(lines.len());
+                }
                 let indicator = device.get_speed_indicator(&bus.speed);
 
                 let status_style = if device.is_disconnected {
@@ -577,7 +719,7 @@ fn device_list_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
         }
     }
 
-    lines
+    (lines, selected_line)
 }
 
 fn draw_color_reference(f: &mut Frame, area: Rect) {
@@ -1000,7 +1142,7 @@ mod tests {
         let mut app = UsbTopApp::new(Duration::from_millis(100));
         app.sync_from(&mgr);
 
-        let lines = device_list_lines(&app);
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
         let widths: Vec<usize> = lines.iter().map(Line::width).collect();
         // Column header plus all three device rows occupy exactly the same
         // cells; the controller heading and bus header are free-form.
@@ -1039,7 +1181,8 @@ mod tests {
         let mut app = UsbTopApp::new(Duration::from_millis(100));
         app.sync_from(&mgr);
 
-        let text: String = device_list_lines(&app)
+        let text: String = device_list_lines_with_selection(&app)
+            .0
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>()
@@ -1060,9 +1203,10 @@ mod tests {
         app.sync_from(&mgr);
         app.selected_device = Some("1:4".to_string());
 
-        let lines = device_list_lines(&app);
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
         // [0] column header, [1] controller heading, [2] bus header,
         // [3] device 3 (unselected), [4] device 4 (selected).
+        assert_eq!(selected_line, Some(4), "selected row's line index");
         let unselected_speed = &lines[3].spans[SPEED_SPAN_INDEX];
         assert_eq!(
             unselected_speed.style.fg,
@@ -1098,7 +1242,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                draw_device_list(f, area, &app);
+                draw_device_list(f, area, &mut app);
             })
             .unwrap();
         let screen = terminal.backend().to_string();
@@ -1116,5 +1260,150 @@ mod tests {
             .filter(|cell| ["-", "1.4.1", "2", "?"].contains(cell))
             .collect();
         assert_eq!(ports, vec!["-", "1.4.1", "2", "?"], "{screen}");
+    }
+
+    /// A single bus with `count` devices (no sysfs, so every port chain is
+    /// `None` and rows sort by device id ascending), used to build a device
+    /// list longer than a small `TestBackend` can show at once.
+    fn manager_with_n_devices(count: u8) -> (tempfile::TempDir, DeviceManager) {
+        let entries: Vec<(u8, u8, f64)> = (1..=count).map(|dev| (1u8, dev, 0.0)).collect();
+        manager_with_rates(&entries)
+    }
+
+    #[test]
+    fn selecting_last_device_scrolls_it_into_view() {
+        let (_t, mgr) = manager_with_n_devices(8);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = app.device_keys().last().cloned();
+
+        // 8 visible rows would need height 10+; this backend only shows 6.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 8)).unwrap();
+        terminal
+            .draw(|f| draw_device_list(f, f.area(), &mut app))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(
+            screen.contains("001:008"),
+            "selected (last) device's row must be visible: {screen}"
+        );
+        assert!(
+            !screen.contains("═ unknown ═"),
+            "first controller heading must have scrolled out: {screen}"
+        );
+    }
+
+    #[test]
+    fn scroll_stays_put_when_nothing_is_selected() {
+        let (_t, mgr) = manager_with_n_devices(8);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.list_scroll = 2; // as if a prior selection had scrolled the list
+        assert_eq!(app.selected_device, None);
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 8)).unwrap();
+        terminal
+            .draw(|f| draw_device_list(f, f.area(), &mut app))
+            .unwrap();
+
+        assert_eq!(
+            app.list_scroll, 2,
+            "offset must not chase a selection when there isn't one"
+        );
+    }
+
+    #[test]
+    fn scroll_clamps_to_content_length_when_list_shrinks() {
+        let (_t, mgr) = manager_with_n_devices(8);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.list_scroll = 50; // stale offset from a much longer list
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 8)).unwrap();
+        terminal
+            .draw(|f| draw_device_list(f, f.area(), &mut app))
+            .unwrap();
+
+        // 11 total lines (header + heading + bus header + 8 devices), 6 visible.
+        assert_eq!(app.list_scroll, 5, "clamped to the last full page");
+    }
+
+    #[test]
+    fn wraparound_selection_pulls_scroll_back_toward_top() {
+        let (_t, mgr) = manager_with_n_devices(8);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = app.device_keys().last().cloned(); // start at the last device
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 8)).unwrap();
+        terminal
+            .draw(|f| draw_device_list(f, f.area(), &mut app))
+            .unwrap();
+        assert_eq!(
+            app.list_scroll, 5,
+            "scrolled down to reveal the last device"
+        );
+
+        app.select_next_device(); // wraps from the last device back to the first
+        assert_eq!(app.selected_device.as_deref(), Some("1:1"));
+        terminal
+            .draw(|f| draw_device_list(f, f.area(), &mut app))
+            .unwrap();
+
+        assert!(
+            app.list_scroll < 5,
+            "scroll must move back toward the top after the wrap, was {}",
+            app.list_scroll
+        );
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("001:001"), "{screen}");
+    }
+
+    #[test]
+    fn device_chart_shows_placeholder_when_nothing_selected() {
+        let app = UsbTopApp::new(Duration::from_millis(100));
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|f| draw_device_chart(f, f.area(), &app))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(screen.contains("Select a device with"), "{screen}");
+        assert!(screen.contains("Device rx/tx"), "{screen}");
+    }
+
+    #[test]
+    fn device_chart_shows_placeholder_when_selection_vanishes() {
+        let (_t, mgr) = manager_with_rates(&[(1, 3, 0.0)]);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("9:9".to_string()); // no such device
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|f| draw_device_chart(f, f.area(), &app))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(screen.contains("Select a device with"), "{screen}");
+    }
+
+    #[test]
+    fn device_chart_titles_the_selected_device_when_present() {
+        let (_t, mgr) = manager_with_rates(&[(1, 3, 0.0)]);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|f| draw_device_chart(f, f.area(), &app))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(screen.contains(" 1:3 rx/tx "), "{screen}");
+        assert!(!screen.contains("Select a device with"), "{screen}");
     }
 }

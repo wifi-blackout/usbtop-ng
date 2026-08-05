@@ -12,7 +12,14 @@ pub struct BandwidthStats {
     pub rx_history: VecDeque<(Instant, u64)>,
     pub tx_history: VecDeque<(Instant, u64)>,
     pub history_window: Duration,
+    /// One `(sampled_at, rx_bps, tx_bps)` reading per `refresh()` call, most
+    /// recent last, capped at 60 samples so a per-device chart can plot the
+    /// last minute of rates without unbounded growth.
+    pub rate_history: VecDeque<(Instant, f64, f64)>,
 }
+
+/// `rate_history` retains at most this many samples (see `refresh`).
+const RATE_HISTORY_CAP: usize = 60;
 
 impl BandwidthStats {
     pub fn new() -> Self {
@@ -26,6 +33,7 @@ impl BandwidthStats {
             rx_history: VecDeque::new(),
             tx_history: VecDeque::new(),
             history_window: Duration::from_secs(10), // 10-second window
+            rate_history: VecDeque::new(),
         }
     }
 
@@ -87,9 +95,17 @@ impl BandwidthStats {
 
     /// Re-evaluate rates against the sliding window without new traffic,
     /// so idle devices decay to zero instead of freezing at their last rate.
+    /// Also samples the freshly recalculated rates into `rate_history` for
+    /// the per-device rate chart.
     pub fn refresh(&mut self) {
         self.cleanup_old_entries();
         self.recalculate_rates();
+
+        self.rate_history
+            .push_back((Instant::now(), self.rx_bps, self.tx_bps));
+        while self.rate_history.len() > RATE_HISTORY_CAP {
+            self.rate_history.pop_front();
+        }
     }
 
     /// Current bandwidth as a percentage of `max_speed_bps`, clamped to 100%.
@@ -167,5 +183,19 @@ mod tests {
         let mut stats = BandwidthStats::new();
         stats.current_bps = 500.0;
         assert_eq!(stats.get_utilization_percentage(0.0), 0.0);
+    }
+
+    #[test]
+    fn refresh_samples_rate_history() {
+        let mut stats = BandwidthStats::new();
+        stats.update_rx(1000);
+        stats.refresh();
+        stats.refresh();
+        assert_eq!(stats.rate_history.len(), 2);
+        assert!(stats.rate_history[0].1 > 0.0); // rx_bps sampled
+        for _ in 0..100 {
+            stats.refresh();
+        }
+        assert_eq!(stats.rate_history.len(), 60, "capped at 60 samples");
     }
 }
