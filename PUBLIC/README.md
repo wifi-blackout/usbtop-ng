@@ -18,7 +18,7 @@ usbtop-ng builds, runs its setup checks, and opens the terminal UI with live pac
 - Managed usbmon load/unload, with the choice remembered in preferences
 - Lightweight, terminal-friendly interface
 - Rust-powered performance and safety
-- Linux usbmon support; BSD/macOS support is currently limited to device enumeration
+- Linux usbmon support; live monitoring is Linux-only — on BSD/macOS the UI can open (with `--force` where needed) but shows no devices
 - Low resource footprint
 
 ## 📦 Installation

@@ -58,7 +58,7 @@ usbtop-ng is designed as a modular USB monitoring tool with clear separation of 
 - **Purpose**: USB device discovery and metadata management
 - **Components**:
   - `mod.rs`: Device structure and lifecycle
-  - `manager.rs`: Platform-specific device enumeration
+  - `manager.rs`: Routes usbmon packets into per-device bandwidth stats and resolves device metadata from sysfs (Linux only)
 
 #### 3. Statistics Engine (`stats/`)
 - **Purpose**: Real-time bandwidth calculation and history
@@ -127,7 +127,7 @@ pub struct UsbDevice {
 - Automatic device discovery via sysfs/udev
 - Metadata extraction (vendor, product, speed)
 - Disconnect detection and tracking
-- Cross-platform device enumeration
+- Device discovery is Linux-only, driven by incoming usbmon packets (metadata resolved from sysfs); no enumeration fallback on BSD/macOS
 
 ### Statistics Engine
 
@@ -239,35 +239,21 @@ mod linux {
 
 ### BSD Implementation
 
-```rust
-#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
-mod bsd {
-    fn enumerate_devices() -> Vec<UsbDevice> {
-        // usbconfig/usbdevs integration
-    }
-}
-```
+BSD builds only have stub platform checks: `is_usbmon_module_loaded` looks at `kldstat` output and `check_usbmon_debugfs_exists` just checks that `/dev` exists, so the startup checks may pass without confirming a real usbmon-equivalent interface. There is no live-monitoring reader and no device-enumeration fallback wired up — devices are only ever created from usbmon packets, so with no packet source the device list stays empty even if the UI opens.
 
-**Features:**
-- Native USB device enumeration
-- Platform-specific monitoring interfaces
-- Device permission handling
+**Status:**
+- No live monitoring implemented
+- No device enumeration implemented; sysfs-metadata population is a no-op stub
+- The UI can open (with `--force` if the startup checks fail) but shows no devices
 
 ### macOS Implementation
 
-```rust
-#[cfg(target_os = "macos")]
-mod macos {
-    fn enumerate_devices() -> Vec<UsbDevice> {
-        // IOKit/system_profiler integration
-    }
-}
-```
+macOS has no usbmon equivalent, so `is_usbmon_module_loaded` always returns `false` and usbtop-ng exits at startup unless run with `--force`. There is also no device-enumeration fallback: devices are only ever created from usbmon packets, and macOS has no packet source.
 
 **Limitations:**
 - No real-time monitoring (no usbmon equivalent)
-- Static device information only
-- Limited bandwidth detection
+- No device enumeration — the device list stays empty
+- The UI opens only with `--force`, and shows no devices even then
 
 ## Performance Considerations
 
@@ -311,7 +297,7 @@ usbtop-ng requires elevated privileges for USB monitoring:
 - Alternative: `plugdev` group membership (distribution-specific)
 
 **BSD:**
-- Root access for USB device enumeration
+- Root access would be required for USB device access, but no live monitoring or device enumeration is currently implemented on BSD
 - Some BSDs allow user access to USB devices
 
 **macOS:**

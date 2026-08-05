@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Full parser for usbmon's `Nu` text interface format
 - Device metadata (vendor, product, speed) resolved from sysfs by busnum/devnum topology
 - Interactive terminal UI with ratatui
-- Cross-platform support: Linux is the primary target for live monitoring; BSD/macOS currently get device enumeration only
+- Cross-platform support: live monitoring via usbmon is Linux-only; on BSD/macOS the UI can open (with `--force` where needed) but shows no devices
 - Device disconnection tracking with a 5-second grace period before removal from the UI
 - Bandwidth history visualization with a 60-second sliding window
 - Clear usbmon detection with explicit prompts before running sudo
@@ -66,10 +66,10 @@ This is the initial release of usbtop-ng, a next-generation USB monitoring tool 
 - **Historical data**: Bandwidth graphs with configurable time windows
 
 #### System Requirements
-- Rust 1.78 or later (for building from source)
+- Rust 1.88 or later (for building from source)
 - Linux: usbmon kernel module and debugfs
 - BSD: Native USB monitoring interfaces
-- macOS: Limited functionality (device enumeration only)
+- macOS: No live monitoring (no usbmon equivalent); the UI opens with `--force` but shows no devices
 
 #### Installation
 ```bash
