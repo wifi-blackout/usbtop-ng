@@ -11,13 +11,15 @@ usbtop-ng builds, runs its setup checks, and opens the terminal UI with live pac
 
 ## ✨ Features
 
-- Real-time USB traffic statistics with **%busy** calculations for devices and buses
-- **Speed capability mismatch detection** - shows when devices could run faster  
+- Live per-device USB bandwidth (RX/TX), plus running totals and peak bandwidth across all devices
+- Bandwidth history graph over a 60-second sliding window
+- Device metadata (vendor, product, speed) resolved from sysfs
+- Disconnect detection: devices are shown greyed out for 5 seconds after disconnecting, then removed
+- Managed usbmon load/unload, with the choice remembered in preferences
 - Lightweight, terminal-friendly interface
 - Rust-powered performance and safety
-- Cross-platform support (Linux, *BSD, macOS — Windows WIP)
+- Cross-platform support (Linux, *BSD, macOS — Windows WIP); live monitoring via usbmon is Linux-only, other platforms get device enumeration only
 - Low resource footprint
-- **Visual indicators** for high utilization and speed limitations
 
 ## 📦 Installation
 
@@ -94,14 +96,6 @@ Options:
   -h, --help               Print help
   -V, --version            Print version
 ```
-
-### %busy Display Features
-
-- **Device %busy**: Shows bandwidth utilization percentage for each USB device
-- **Bus %busy**: Shows total bandwidth utilization for each USB bus  
-- **Speed indicators**: Visual symbols for devices that could run faster
-  - ⚡ High utilization (>80% bandwidth usage)
-  - 🔺 Limited by bus speed (device capable of faster speed)
 
 ## 🛠 Development
 

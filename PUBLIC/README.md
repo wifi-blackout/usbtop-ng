@@ -11,13 +11,15 @@ usbtop-ng builds, runs its setup checks, and opens the terminal UI with live pac
 
 ## ✨ Features
 
-- USB traffic statistics with **%busy** calculations for devices and buses
-- **Speed capability mismatch detection** - shows when devices could run faster
+- Live per-device USB bandwidth (RX/TX), plus running totals and peak bandwidth across all devices
+- Bandwidth history graph over a 60-second sliding window
+- Device metadata (vendor, product, speed) resolved from sysfs
+- Disconnect detection: devices are shown greyed out for 5 seconds after disconnecting, then removed
+- Managed usbmon load/unload, with the choice remembered in preferences
 - Lightweight, terminal-friendly interface
 - Rust-powered performance and safety
-- Linux usbmon support; BSD/macOS support is currently limited
+- Linux usbmon support; BSD/macOS support is currently limited to device enumeration
 - Low resource footprint
-- **Visual indicators** for high utilization and speed limitations
 
 ## 📦 Installation
 
