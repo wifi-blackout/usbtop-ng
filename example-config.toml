@@ -1,102 +1,16 @@
-# ng-usbtop Example Configuration File
-# Copy this to ~/.config/ng-usbtop/config.toml and customize as needed
+# usbtop-ng preferences example
+#
+# usbtop-ng creates its default preference file at:
+#   ~/.usbtop-ng/preferences.toml
+#
+# You can copy this file there, or pass a custom path with:
+#   usbtop-ng --config /path/to/preferences.toml
 
-[display]
-# Refresh rate in milliseconds (default: 1000)
-refresh_rate = 1000
+# If false, usbtop-ng asks before running `sudo modprobe usbmon` when usbmon is missing.
+# If true, usbtop-ng automatically tries to load usbmon when live monitoring needs it.
+auto_load_usbmon = false
 
-# How long to show disconnected devices in seconds (default: 5)
-show_disconnected_time = 5
-
-# Show help on startup (default: false)
-show_help_on_startup = false
-
-[monitoring]
-# History window for bandwidth calculations in seconds (default: 60)
-history_window = 60
-
-# Prefer binary usbmon format over text (default: true)
-binary_mode = true
-
-# Maximum number of devices to track (default: 1000)
-max_devices = 1000
-
-# Packet buffer size for usbmon reading (default: 4096)
-packet_buffer_size = 4096
-
-[colors]
-# Color scheme (hex colors)
-# Primary color for main UI elements
-primary = "#00BFFF"
-
-# Secondary color for accents
-secondary = "#FF8C00"
-
-# Accent color for highlights
-accent = "#32CD32"
-
-# Success color for positive indicators
-success = "#00FF00"
-
-# Warning color for caution indicators
-warning = "#FFFF00"
-
-# Error color for problems
-error = "#FF4500"
-
-# Text color for normal text
-text = "#FFFFFF"
-
-# Background color (terminal dependent)
-background = "#2C2C2C"
-
-# USB speed specific colors (override defaults)
-[colors.usb_speeds]
-low_speed = "#FF6464"        # 1.5 Mbps - Light red
-full_speed = "#FFA500"       # 12 Mbps - Orange
-high_speed = "#FFFF00"       # 480 Mbps - Yellow
-super_speed = "#00FF00"      # 5 Gbps - Green
-super_speed_plus = "#00FFFF" # 10+ Gbps - Cyan
-unknown = "#808080"          # Unknown - Gray
-
-[ui]
-# Show bandwidth graphs (default: true)
-show_graphs = true
-
-# Show device metadata (vendor, product) (default: true)
-show_device_info = true
-
-# Compact mode - less spacing (default: false)
-compact_mode = false
-
-# Show packet counts in addition to bandwidth (default: false)
-show_packet_counts = false
-
-[advanced]
-# Enable debug logging (default: false)
-debug_logging = false
-
-# Log file path (default: stderr)
-log_file = "/tmp/ng-usbtop.log"
-
-# Force specific platform detection
-# Options: "linux", "freebsd", "openbsd", "netbsd", "macos", "auto"
-force_platform = "auto"
-
-# Custom usbmon path (Linux only)
-# usbmon_path = "/sys/kernel/debug/usb/usbmon"
-
-# Custom sysfs path for device info (Linux only)
-# sysfs_path = "/sys/bus/usb/devices"
-
-[keybindings]
-# Customize keyboard shortcuts
-quit = ["q", "Esc"]
-help = ["h", "F1"]
-up = ["Up", "k"]
-down = ["Down", "j"]
-refresh = ["r", "F5"]
-
-# Note: Some settings require restart to take effect
-# Colors and UI settings are applied immediately
-# Monitoring settings may require reconnection to USB monitoring interface
+# If false, usbtop-ng asks on quit whether to unload usbmon when usbtop-ng loaded it.
+# If true, usbtop-ng automatically runs `sudo modprobe -r usbmon` on exit, but only
+# when usbtop-ng loaded usbmon for this session.
+unload_usbmon_on_exit = false

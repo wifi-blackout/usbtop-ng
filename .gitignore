@@ -1,6 +1,5 @@
 # Rust
 /target/
-Cargo.lock
 **/*.rs.bk
 *.pdb
 
@@ -22,17 +21,18 @@ Thumbs.db
 
 # Logs
 *.log
-ng-usbtop.log*
+usbtop-ng.log*
 
-# Config files (except examples)
+# Config files (except examples and Cargo manifest)
 config.toml
 *.toml
+!Cargo.toml
 !example-config.toml
 
 # Build artifacts
 dist/
 build/
-debian/ng-usbtop/
+debian/usbtop-ng/
 *.deb
 *.rpm
 *.pkg

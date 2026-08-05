@@ -1,6 +1,6 @@
-# Contributing to ng-usbtop
+# Contributing to usbtop-ng
 
-Thank you for your interest in contributing to ng-usbtop! This document provides guidelines and information for contributors.
+Thank you for your interest in contributing to usbtop-ng! This document provides guidelines and information for contributors.
 
 ## Table of Contents
 
@@ -26,12 +26,12 @@ Thank you for your interest in contributing to ng-usbtop! This document provides
 1. Fork the repository on GitHub
 2. Clone your fork locally:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/ng-usbtop.git
-   cd ng-usbtop
+   git clone https://github.com/wifi-blackout/usbtop-ng.git
+   cd usbtop-ng
    ```
 3. Add the upstream repository:
    ```bash
-   git remote add upstream https://github.com/original-repo/ng-usbtop.git
+   git remote add upstream https://github.com/wifi-blackout/usbtop-ng.git
    ```
 
 ## Development Environment
@@ -104,8 +104,8 @@ src/
 │   ├── mod.rs        # Main UI logic
 │   ├── colors.rs     # Color definitions
 │   └── widgets.rs    # UI components
-└── config/           # Configuration
-    └── mod.rs        # Config file handling
+└── config/           # Preferences
+    └── mod.rs        # ~/.usbtop-ng/preferences.toml handling
 ```
 
 ### Commit Messages
@@ -250,7 +250,7 @@ Brief description of changes
 
 Use the bug report template and include:
 
-- **Environment**: OS, Rust version, ng-usbtop version
+- **Environment**: OS, Rust version, usbtop-ng version
 - **Steps to reproduce** the bug
 - **Expected vs actual behavior**
 - **Log output** with `RUST_LOG=debug`
@@ -350,4 +350,4 @@ Please follow our [Code of Conduct](CODE_OF_CONDUCT.md) in all interactions.
 
 ---
 
-Thank you for contributing to ng-usbtop! 🚀
+Thank you for contributing to usbtop-ng! 🚀

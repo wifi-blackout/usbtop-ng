@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to ng-usbtop will be documented in this file.
+All notable changes to usbtop-ng will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -8,16 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Initial implementation of ng-usbtop
+- Initial implementation of usbtop-ng
 - Real-time USB bandwidth monitoring using usbmon interface
 - Interactive terminal UI with ratatui
 - Cross-platform support (Linux, BSD, macOS)
 - USB speed color coding system
 - Device disconnection tracking with 5-second grey display
 - Bandwidth history visualization with 60-second sliding window
-- Automatic usbmon kernel module detection and loading
-- Device metadata extraction from sysfs
-- Configuration file support (TOML format)
+- Clear usbmon detection with explicit prompts before running sudo
+- Preferences in `~/.usbtop-ng/preferences.toml` for automatic usbmon load and unload behavior
 - Comprehensive help system and keyboard navigation
 - Command-line interface with multiple options
 - Platform-specific setup instructions
@@ -34,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2024-07-30
 
 ### Added
-- Initial release of ng-usbtop
+- Initial release of usbtop-ng
 - Core USB monitoring functionality
 - Terminal user interface
 - Cross-platform compatibility layer
@@ -46,13 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Version 0.1.0
 
-This is the initial release of ng-usbtop, a next-generation USB monitoring tool designed to replace and enhance the original usbtop utility.
+This is the initial release of usbtop-ng, a next-generation USB monitoring tool designed to replace and enhance the original usbtop utility.
 
 #### Key Features
 - **Real-time monitoring**: Live USB bandwidth tracking with sub-second updates
 - **Rich terminal UI**: Colorful, interactive interface inspired by modern system monitors
 - **Cross-platform**: Native support for Linux, BSD variants, and macOS
-- **Smart detection**: Automatic usbmon module detection and setup assistance
+- **Smart detection**: usbmon module detection, clear setup assistance, and optional saved load/unload preferences
 - **Visual feedback**: Color-coded USB speeds and device status indicators
 - **Historical data**: Bandwidth graphs with configurable time windows
 
@@ -64,7 +63,7 @@ This is the initial release of ng-usbtop, a next-generation USB monitoring tool 
 
 #### Installation
 ```bash
-cargo install ng-usbtop
+cargo install usbtop-ng
 ```
 
 Or download pre-built binaries from the releases page.
@@ -72,13 +71,13 @@ Or download pre-built binaries from the releases page.
 #### Usage
 ```bash
 # Basic usage (will prompt for usbmon setup if needed)
-ng-usbtop
+usbtop-ng
 
 # Show help
-ng-usbtop --help
+usbtop-ng --help
 
 # Platform-specific setup instructions
-ng-usbtop --setup
+usbtop-ng --setup
 ```
 
 #### Known Limitations
@@ -88,7 +87,6 @@ ng-usbtop --setup
 - Binary usbmon format parsing is still being refined
 
 #### Roadmap
-- Configuration file support improvements
 - Additional platform-specific optimizations  
 - Enhanced device filtering and search
 - Export functionality for bandwidth data
@@ -99,4 +97,4 @@ ng-usbtop --setup
 
 For detailed technical information, see the [README.md](README.md) and [documentation](docs/).
 
-Report issues and feature requests on [GitHub Issues](https://github.com/your-repo/ng-usbtop/issues).
+Report issues and feature requests on [GitHub Issues](https://github.com/wifi-blackout/usbtop-ng/issues).
