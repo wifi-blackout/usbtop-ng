@@ -14,7 +14,7 @@ This document provides a detailed overview of usbtop-ng's architecture, design d
 
 ## Overview
 
-usbtop-ng is designed as a modular USB monitoring tool with clear separation of concerns. Live monitoring is built on dedicated blocking reader threads (one per usbmon interface, or a single reader for the aggregate `0u` interface) that feed parsed packets to the main thread over an `mpsc` channel; there is no async runtime involved.
+usbtop-ng is designed as a modular USB monitoring tool with clear separation of concerns. Live monitoring is built on dedicated blocking reader threads (one per usbmon interface, or a single reader for the aggregate `0u`/`/dev/usbmon0` interface) that feed parsed packets to the main thread over an `mpsc` channel; there is no async runtime involved. `usbmon::monitor::start_monitoring` probes once per process whether the binary `/dev/usbmonN` interface can be opened and, if so, uses it for every target bus; otherwise it falls back to the debugfs `Nu` text interface. Both readers produce the same `UsbPacket` type, so everything downstream of the channel is interface-agnostic.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -25,7 +25,7 @@ usbtop-ng is designed as a modular USB monitoring tool with clear separation of 
 │  Application Logic (UsbTopApp)                                 │
 ├─────────────────┬─────────────────┬─────────────────────────────┤
 │  USB Monitor    │  Device Manager │  Statistics Engine          │
-│  (usbmon)       │  (sysfs/udev)   │  (bandwidth calc)           │
+│  (usbmon)       │  (sysfs)        │  (bandwidth calc)           │
 ├─────────────────┼─────────────────┼─────────────────────────────┤
 │  Platform Abstraction Layer                                    │
 ├─────────────────────────────────────────────────────────────────┤
@@ -50,15 +50,16 @@ usbtop-ng is designed as a modular USB monitoring tool with clear separation of 
 - **Purpose**: Interface with kernel USB monitoring facilities
 - **Components**:
   - `mod.rs`: Module detection, load/unload, and setup instructions
-  - `monitor.rs`: Spawns one blocking reader thread per bus (or a single thread for the aggregate `0u` interface), owns the shutdown handle, and exposes the `mpsc` receiver the UI reads from
+  - `monitor.rs`: Probes for the binary interface, spawns one blocking reader thread per bus (or a single thread for the aggregate interface), owns the shutdown handle, and exposes the `mpsc` receiver the UI reads from
   - `reader.rs`: Blocking read loop over the usbmon `Nu` text interface, opened `O_NONBLOCK` and polled so it can be shut down promptly
-  - `parser.rs`: Parses the usbmon `Nu` text-format lines into `UsbPacket`s
+  - `binary.rs`: Blocking read loop over the usbmon binary `/dev/usbmonN` character-device interface: fixed 48-byte native-endian headers (`Documentation/usb/usbmon.rst`) followed by `len_cap` bytes of captured payload drained (not kept) per event; same `O_NONBLOCK`/poll/shutdown contract as `reader.rs`
+  - `parser.rs`: Parses the usbmon `Nu` text-format lines into `UsbPacket`s (also home to `UsbSpeed`'s practical-bandwidth and color-code tables)
 
 #### 2. Device Manager (`device/`)
 - **Purpose**: USB device discovery and metadata management
 - **Components**:
-  - `mod.rs`: Device structure and lifecycle
-  - `manager.rs`: Routes usbmon packets into per-device bandwidth stats and resolves device metadata from sysfs (Linux only)
+  - `mod.rs`: Device structure and lifecycle; `UsbDevice::get_busy_percentage`, `check_speed_mismatch`/`get_speed_indicator`, and the `bcdDevice`/`bMaxPacketSize0` max-capability heuristic
+  - `manager.rs`: Routes usbmon packets into per-device bandwidth stats, resolves device metadata from sysfs (Linux only), and groups devices into `UsbBus`es that resolve their host controller and aggregate %busy
 
 #### 3. Statistics Engine (`stats/`)
 - **Purpose**: Real-time bandwidth calculation and history
@@ -85,7 +86,7 @@ usbtop-ng is designed as a modular USB monitoring tool with clear separation of 
 ### USB Monitor Module
 
 ```rust
-// High-level interface (see src/usbmon/reader.rs)
+// Text interface (see src/usbmon/reader.rs)
 pub struct UsbmonReader {
     pub bus_id: u8,
     pub path: PathBuf,
@@ -96,18 +97,32 @@ impl UsbmonReader {
     pub fn read_packets<F>(&self, shutdown: &AtomicBool, callback: F) -> Result<()>
     where F: FnMut(UsbPacket) -> Result<()>;
 }
+
+// Binary interface (see src/usbmon/binary.rs) — same shape, same contract
+pub struct BinaryReader {
+    pub bus_id: u8,
+    pub path: PathBuf,
+    follow: bool,
+}
+
+impl BinaryReader {
+    pub fn read_packets<F>(&self, shutdown: &AtomicBool, callback: F) -> Result<()>
+    where F: FnMut(UsbPacket) -> Result<()>;
+}
 ```
 
 **Design Decisions:**
 - Each reader runs to completion on its own dedicated thread (spawned by `usbmon::monitor`), so a blocked or idle interface never blocks the UI thread
 - Callback-based interface for flexible packet processing; the callback used in production forwards each `UsbPacket` over an `mpsc` channel
-- Only the usbmon **text** interface (`Nu` files under `/sys/kernel/debug/usb/usbmon/`) is supported; the binary `/dev/usbmonN` character-device interface is not opened
-- The file is opened `O_NONBLOCK` on Linux and polled every 50ms so `shutdown` can be observed promptly, instead of parking indefinitely inside `read()`
+- Both usbmon interfaces are supported and produce the same `UsbPacket` type. `monitor::start_monitoring` probes once per process by trying to open `/dev/usbmon<bus>` for the first target bus: success means every target bus is read through `BinaryReader` (48-byte native-endian headers per `Documentation/usb/usbmon.rst`, with each event's `len_cap` payload bytes drained rather than kept); failure (missing node, permissions, older kernel) falls back to `UsbmonReader` over the debugfs `Nu` text interface for every target bus. One `info!` log line states which interface was chosen.
+- The file/device is opened `O_NONBLOCK` on Linux and polled every 50ms so `shutdown` can be observed promptly, instead of parking indefinitely inside `read()` — the same contract for both readers
 - Platform-specific path resolution
 
 **Packet Flow:**
 ```
-usbmon Nu file → Reader thread → Parser → UsbPacket → mpsc channel → DeviceManager
+/dev/usbmonN (binary, preferred) ─┐
+                                   ├─→ Reader thread → UsbPacket → mpsc channel → DeviceManager
+usbmon Nu file (text, fallback)  ─┘
 ```
 
 ### Device Manager Module
@@ -119,15 +134,26 @@ pub struct UsbDevice {
     pub speed: UsbSpeed,
     pub bandwidth_stats: BandwidthStats,
     pub is_disconnected: bool,
+    pub sysfs_path: Option<PathBuf>,
+    pub max_capability: Option<UsbSpeed>, // cached bcdDevice/bMaxPacketSize0 heuristic
     // ... metadata fields
+}
+
+pub struct UsbBus {
+    pub bus_id: u8,
+    pub speed: UsbSpeed,
+    pub devices: HashMap<u8, UsbDevice>,
+    pub controller: Option<String>, // e.g. "0000:00:14.0"; resolved once
 }
 ```
 
 **Features:**
-- Automatic device discovery via sysfs/udev
-- Metadata extraction (vendor, product, speed)
+- Automatic device discovery via sysfs, driven by incoming usbmon packets (busnum/devnum topology scan, not udev)
+- Metadata extraction (vendor, product, speed, plus the cached max-capability heuristic)
+- `UsbDevice::get_busy_percentage()` — %busy against the device's practical (overhead-adjusted) bandwidth; `UsbBus::busy_percentage()` — the bus's aggregate %busy, `None` when bus speed is unknown
+- `UsbDevice::get_speed_indicator()` — `SpeedIndicator::HighUtilization` (⚡, >80% busy) or `LimitedByBus` (🔺, cached capability exceeds both the bus speed and current link speed), `LimitedByBus` taking precedence
 - Disconnect detection and tracking
-- Device discovery is Linux-only, driven by incoming usbmon packets (metadata resolved from sysfs); no enumeration fallback on BSD/macOS
+- Device discovery is Linux-only; no enumeration fallback on BSD/macOS
 
 ### Statistics Engine
 
@@ -137,23 +163,25 @@ pub struct BandwidthStats {
     pub tx_bps: f64,
     pub current_bps: f64,
     pub peak_bps: f64,
+    pub rate_history: VecDeque<(Instant, f64, f64)>, // per-device chart samples
     // ... historical data
 }
 ```
 
 **Algorithm:**
-- Sliding window bandwidth calculation
-- Exponential moving averages for smoothing
-- Efficient circular buffer for history
-- Real-time rate limiting
+- Sliding window bandwidth calculation (10-second window), re-evaluated every `refresh()` call so idle devices decay to zero instead of freezing at their last rate
+- `get_utilization_percentage(max_bps)` — `current_bps / max_bps`, clamped to 100%, the shared building block behind per-device and per-bus %busy
+- One `(Instant, rx_bps, tx_bps)` sample appended to `rate_history` per `refresh()` tick, capped at 60 samples, feeding the per-device rx/tx chart
+- Bounded VecDeque-backed history buffers
 
 ### User Interface
 
 ```rust
 pub struct UsbTopApp {
-    devices: HashMap<String, UsbDevice>,
-    bandwidth_history: Vec<(f64, f64)>,
-    selected_device: Option<String>,
+    pub controllers: Vec<ControllerView>, // rebuilt from DeviceManager each tick
+    pub bandwidth_history: Vec<(f64, f64)>,
+    pub selected_device: Option<String>, // "bus:devnum"
+    pub list_scroll: u16,                // follows the selection
     // ... UI state
 }
 ```
@@ -161,21 +189,64 @@ pub struct UsbTopApp {
 **Architecture:**
 - Event-driven UI updates
 - Hierarchical layout system
-- Color-coded device status
+- Color-coded device status, link speeds, and utilization/capability indicators
 - Keyboard-based navigation
+
+### Snapshot Model and Topology Resolution
+
+`UsbTopApp` holds no live device map of its own. Every tick, `sync_from(&DeviceManager)`
+rebuilds a render snapshot from scratch:
+
+```rust
+pub struct ControllerView { pub id: String, pub buses: Vec<BusView> }
+pub struct BusView {
+    pub bus_id: u8,
+    pub speed: UsbSpeed,
+    pub side_label: &'static str,      // "USB2 side" / "USB3 side" / ""
+    pub devices: Vec<DeviceRow>,       // in physical port order
+    pub busy_percentage: Option<f64>,
+}
+pub struct DeviceRow { pub port_chain: Option<Vec<u32>>, pub device: UsbDevice }
+```
+
+Rebuilding from scratch each tick (rather than patching an incremental map) is what
+keeps totals, peak bandwidth, and the port-ordered layout consistent with whatever
+`DeviceManager` currently holds — see `sync_from` in `src/ui/mod.rs`.
+
+**Controller pairing:** for each bus, `UsbBus::update_bus_speed` canonicalizes
+`/sys/bus/usb/devices/usb<N>` (the root hub) and takes the *parent* directory's
+basename as the controller id — real sysfs symlinks each root hub into its PCI
+host controller's directory, so the canonical parent names the controller. Buses
+sharing a controller id render under one `═ <controller id> ═` heading, sorted by
+bus id; a controller that can't be resolved falls into an `unknown` group that
+always sorts last. The side label comes from the bus's own speed: ≤480 Mbps is
+"USB2 side", ≥5 Gbps is "USB3 side" — this is how a shared xHCI controller's two
+root hubs (one USB2, one USB3) end up listed as adjacent sibling buses.
+
+**Port ordering:** `UsbDevice::port_chain()` parses the resolved sysfs directory
+basename — `3-1.4.2` → `[1, 4, 2]`, a root hub (`usb3`) → `[]` (sorts first),
+unresolved → `None` (sorts last, Port column shows `?`). Devices within a bus sort
+by this chain, numerically level by level, which lists hub children in physical
+connector order.
 
 ## Data Flow
 
 ### Primary Data Flow
 
 ```
-1. USB Activity → usbmon kernel interface (debugfs `Nu` text file)
-2. Reader thread → UsbmonReader::read_packets() (blocking, non-blocking-poll loop)
-3. Raw text lines → UsbPacket parsing (usbmon/parser.rs)
+1. USB Activity → usbmon kernel interface: /dev/usbmonN (binary, preferred)
+   or the debugfs `Nu` text file (fallback) — chosen once by
+   monitor::start_monitoring's open probe
+2. Reader thread → BinaryReader::read_packets() or UsbmonReader::read_packets()
+   (blocking, non-blocking-poll loop; same shutdown contract either way)
+3. Raw bytes/text → UsbPacket parsing (usbmon/binary.rs or usbmon/parser.rs)
 4. UsbPacket → sent over an mpsc channel to the UI thread
 5. UI thread → DeviceManager::apply_packet() aggregates into BandwidthStats,
    resolving new devices' metadata from sysfs by busnum/devnum
-6. Per-tick refresh → UI rendering
+6. Per-tick refresh → DeviceManager::refresh() (decay rates, drop stale
+   devices, recompute bus speeds/controllers) → UsbTopApp::sync_from()
+   rebuilds the controller/bus/device snapshot (including %busy and speed
+   indicators) → UI rendering
 ```
 
 ### Event Processing
@@ -193,10 +264,9 @@ loop {
     }
 
     if app.last_update.elapsed() >= app.refresh_rate {
-        for (bus_id, device_id) in manager.refresh() {
-            app.remove_device(bus_id, device_id);
-        }
-        // ...sync manager's devices into app state, update history...
+        let _ = manager.refresh();     // decay rates, drop stale devices
+        app.sync_from(manager);        // rebuild the render snapshot
+        app.update_bandwidth_history();
     }
 
     terminal.draw(|f| draw_ui(f, app))?;

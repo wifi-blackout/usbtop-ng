@@ -3,10 +3,46 @@ use log::{debug, info, warn};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
+pub mod binary;
 pub mod monitor;
 pub mod parser;
 pub mod reader;
+
+/// Generic Linux value of `O_NONBLOCK`. Hardcoded because usbtop-ng has no
+/// libc dependency; the value differs only on mips/alpha/sparc, which this
+/// tool does not target.
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0o4000;
+
+/// How long a reader parks between polls when the interface has nothing to
+/// give (EAGAIN or EOF). Also the worst-case latency of a shutdown request.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Open a usbmon interface non-blocking on Linux so an idle bus cannot pin the
+/// reader thread inside `read`: without `O_NONBLOCK` a thread parked on a
+/// silent `Nu` file or `/dev/usbmonN` device keeps it (and therefore the usbmon
+/// module) open indefinitely. Regular files never report `WouldBlock`, so
+/// fixture-backed tests behave exactly as they would with a plain open.
+///
+/// Shared by the text ([`reader`]) and binary ([`binary`]) readers, and used by
+/// [`monitor::start_monitoring`] to probe whether the binary interface exists.
+pub(crate) fn open_nonblocking(path: &Path) -> std::io::Result<fs::File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(path)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        fs::File::open(path)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct UsbmonStatus {
@@ -328,5 +364,36 @@ mod tests {
         assert_eq!(unload_mode(&auto), UnloadMode::Automatic);
         let ask = crate::config::Preferences::default();
         assert_eq!(unload_mode(&ask), UnloadMode::Ask);
+    }
+}
+
+#[cfg(all(test, feature = "integration", target_os = "linux"))]
+mod integration_tests {
+    use super::*;
+
+    /// Requires: Linux, usbmon loaded, read access (typically root).
+    /// Run: cargo test --features integration
+    #[test]
+    fn live_usbmon_status_and_interfaces() {
+        let status = check_usbmon_status().expect("status check must run");
+        if !status.usbmon_available {
+            eprintln!("usbmon not available; live checks skipped");
+            return;
+        }
+        let bus = status.available_buses.first().copied().unwrap_or(0);
+        let text = crate::usbmon::reader::UsbmonReader::new(bus);
+        assert!(
+            text.is_available(),
+            "text interface file missing: {}",
+            text.path.display()
+        );
+        let binary = std::path::Path::new("/dev/usbmon0");
+        if binary.exists() {
+            eprintln!("binary node present: {}", binary.display());
+            match crate::usbmon::open_nonblocking(binary) {
+                Ok(_) => eprintln!("binary node opened ok: {}", binary.display()),
+                Err(e) => eprintln!("binary node open failed: {}: {}", binary.display(), e),
+            }
+        }
     }
 }

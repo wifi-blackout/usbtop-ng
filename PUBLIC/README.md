@@ -7,18 +7,18 @@ It does **not** share code with the original project and is **not affiliated wit
 
 ## Current Status
 
-usbtop-ng builds, runs its setup checks, and opens the terminal UI with live packet-to-device monitoring wired end-to-end: usbmon reader thread(s) parse the `Nu` text interface, hand packets to the UI thread over an `mpsc` channel, and `DeviceManager` aggregates them into per-device bandwidth stats on every refresh tick.
+usbtop-ng builds, runs its setup checks, and opens the terminal UI with live packet-to-device monitoring wired end-to-end: usbmon reader thread(s) read the binary `/dev/usbmonN` interface when it's available, falling back automatically to the debugfs `Nu` text interface otherwise, hand packets to the UI thread over an `mpsc` channel, and `DeviceManager` aggregates them into per-device bandwidth stats, physical topology, and %busy on every refresh tick.
 
 ## ✨ Features
 
+- Controller-grouped, physically port-ordered device list, with the USB2-side and USB3-side buses of a shared xHCI controller shown as adjacent sibling buses
 - Live per-device USB bandwidth (RX/TX), plus running totals and peak bandwidth across all devices
-- Bandwidth history graph over a 60-second sliding window
+- Per-device and per-bus %busy against each USB speed's practical bandwidth, plus ⚡ high-utilization and 🔺 capability-exceeds-bus indicators
+- Color-coded USB link speeds, and a split chart pane (aggregate total plus the selected device's rx/tx history)
 - Device metadata (vendor, product, speed) resolved from sysfs
 - Disconnect detection: devices are shown greyed out for 5 seconds after disconnecting, then removed
 - Managed usbmon load/unload, with the choice remembered in preferences
-- Lightweight, terminal-friendly interface
-- Rust-powered performance and safety
-- Linux usbmon support; live monitoring is Linux-only — on BSD/macOS the UI can open (with `--force` where needed) but shows no devices
+- Linux usbmon support (binary `/dev/usbmonN` interface with automatic text fallback); live monitoring is Linux-only — on BSD/macOS the UI can open (with `--force` where needed) but shows no devices
 - Low resource footprint
 
 ## 📦 Installation

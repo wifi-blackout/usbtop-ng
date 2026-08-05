@@ -93,12 +93,13 @@ src/
 ├── main.rs           # Entry point and CLI
 ├── usbmon/           # USB monitoring core
 │   ├── mod.rs        # Module detection, load/unload, setup instructions
-│   ├── monitor.rs    # Reader thread spawning, shutdown handle, mpsc channel
+│   ├── monitor.rs    # Binary/text interface probe, reader thread spawning, mpsc channel
 │   ├── reader.rs     # Blocking read loop over the usbmon Nu text interface
-│   └── parser.rs     # Nu text-format parsing
+│   ├── binary.rs     # Blocking read loop over the usbmon /dev/usbmonN binary interface
+│   └── parser.rs     # Nu text-format parsing; UsbSpeed bandwidth/color tables
 ├── device/           # Device management
-│   ├── mod.rs        # Device structure and sysfs metadata resolution
-│   └── manager.rs    # Bus/device aggregation, packet routing, disconnect handling
+│   ├── mod.rs        # Device structure, sysfs metadata resolution, %busy/indicators
+│   └── manager.rs    # Bus/device aggregation, controller resolution, packet routing, disconnect handling
 ├── stats/            # Statistics engine
 │   └── mod.rs        # Bandwidth calculations
 ├── ui/               # Terminal interface
@@ -154,6 +155,29 @@ cargo test -- --nocapture
 cargo test --all-targets
 ```
 
+`cargo test` (and `cargo test --all-targets`) run the default, hermetic suite
+only: everything is exercised against fixture files, FIFOs, and `tempfile`
+paths, so it passes on any OS with no `/dev` or debugfs access required. CI
+runs this default suite only.
+
+### Live System Tests (`integration` feature)
+
+The opt-in `integration` cargo feature adds tests that talk to the real
+usbmon interfaces instead of fixtures:
+
+```bash
+# Requires Linux, the usbmon kernel module loaded, and read access to
+# /sys/kernel/debug/usb/usbmon (typically root)
+cargo test --features integration
+```
+
+These tests are gated behind `target_os = "linux"` as well as the feature, so
+they compile to nothing (and are skipped) on non-Linux hosts and on default
+builds. On Linux, if usbmon itself is unavailable the test prints a skip
+message and returns rather than failing, since not every Linux dev box has
+usbmon loaded. CI intentionally does not run this feature — it is meant for
+manual verification on a real machine with real USB traffic.
+
 ### Writing Tests
 
 ```rust
@@ -171,6 +195,8 @@ mod tests {
         // Reader tests point UsbmonReader at a fixture file via
         // UsbmonReader::with_path(bus_id, path, follow) instead of the real
         // debugfs path — see src/usbmon/reader.rs for examples.
+        // BinaryReader::with_path(bus_id, path, follow) is the equivalent
+        // seam for the binary interface — see src/usbmon/binary.rs.
     }
 }
 ```
@@ -285,16 +311,17 @@ Include:
 ### Data Flow
 
 ```
-usbmon Nu file → Reader thread → Parser → UsbPacket → mpsc channel
-                                                            ↓
-                              UI thread ← DeviceManager (sysfs metadata, bandwidth stats)
+/dev/usbmonN (binary, preferred) ─┐
+                                   ├─→ Reader thread → Parser → UsbPacket → mpsc channel
+usbmon Nu file (text, fallback)  ─┘                                            ↓
+               UI thread ← DeviceManager (sysfs metadata, bandwidth stats, %busy, controller/port grouping)
 ```
 
 ### Adding New Features
 
 1. **Platform Support**: Add new OS in platform-specific modules
 2. **UI Components**: Extend rendering in `ui/mod.rs` (and `ui/colors.rs` for the color scheme)
-3. **Monitoring**: Add new packet analysis in `usbmon/parser.rs`
+3. **Monitoring**: Add new packet analysis in `usbmon/parser.rs` (text interface) or `usbmon/binary.rs` (binary interface)
 4. **Statistics**: Enhance calculations in `stats/mod.rs`
 
 ### Dependencies
@@ -311,7 +338,7 @@ Key external dependencies:
 ### Linux
 
 - Test with different kernel versions
-- Verify usbmon `Nu` text-format parsing (the binary `/dev/usbmonN` interface is not supported)
+- Verify usbmon parsing on both interfaces: the binary `/dev/usbmonN` device (preferred when it can be opened) and the debugfs `Nu` text fallback
 - Check debugfs mount requirements
 - Test permission scenarios
 
