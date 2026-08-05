@@ -148,10 +148,20 @@ impl BinaryReader {
 
     /// Discard `len_cap` bytes of captured payload in bounded chunks, so an
     /// event claiming a large capture cannot make the reader allocate for it.
+    ///
+    /// Shutdown is checked explicitly at the top of each chunk rather than
+    /// relying solely on `fill`'s park path: `fill` only consults `shutdown`
+    /// when a `read` comes up short (`WouldBlock` or a follow-mode EOF). A
+    /// source that keeps a large `len_cap` fully supplied — hostile or just
+    /// unlucky framing — would otherwise let every chunk return `Filled`
+    /// without ever parking, deferring shutdown for the whole drain.
     fn drain(&self, file: &mut File, len_cap: u32, shutdown: &AtomicBool) -> Fill {
         let mut scratch = [0u8; DRAIN_CHUNK];
         let mut remaining = len_cap as usize;
         while remaining > 0 {
+            if shutdown.load(Ordering::Relaxed) {
+                return Fill::Stopped;
+            }
             let chunk = remaining.min(DRAIN_CHUNK);
             if let Fill::Stopped = self.fill(file, &mut scratch[..chunk], shutdown) {
                 return Fill::Stopped;
