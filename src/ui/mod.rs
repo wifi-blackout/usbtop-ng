@@ -9,11 +9,8 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
-    text::{Line, Span, Text},
-    widgets::{
-        Axis, Block, Borders, Chart, Clear, Dataset, Gauge, List, ListItem, Paragraph, Row, Table,
-        Wrap,
-    },
+    text::{Line, Span},
+    widgets::{Axis, Block, Borders, Chart, Clear, Dataset, Paragraph, Row, Table, Wrap},
     Frame, Terminal,
 };
 use std::{
@@ -25,14 +22,11 @@ use std::{
 
 use crate::device::manager::DeviceManager;
 use crate::device::UsbDevice;
-use crate::stats::BandwidthStats;
-use crate::usbmon::parser::{UsbPacket, UsbSpeed};
+use crate::usbmon::parser::UsbPacket;
 
 pub mod colors;
-pub mod widgets;
 
 use colors::*;
-use widgets::*;
 
 pub struct UsbTopApp {
     pub devices: HashMap<String, UsbDevice>,
@@ -357,16 +351,9 @@ fn draw_device_list(f: &mut Frame, area: Rect, app: &UsbTopApp) {
 
     let rows: Vec<Row> = devices
         .iter()
-        .enumerate()
-        .map(|(i, device)| {
+        .map(|device| {
             let device_key = format!("{}:{}", device.bus_id, device.device_id);
             let is_selected = app.selected_device.as_ref() == Some(&device_key);
-
-            let speed_color = Color::Rgb(
-                device.speed.color_code().0,
-                device.speed.color_code().1,
-                device.speed.color_code().2,
-            );
 
             let status_style = if device.is_disconnected {
                 Style::default().bg(Color::Gray).fg(Color::White)

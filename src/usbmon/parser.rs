@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UrbType {
@@ -40,73 +39,35 @@ impl UsbSpeed {
             UsbSpeed::Unknown => 0.0,
         }
     }
-
-    /// Returns theoretical maximum bandwidth in bytes per second
-    /// Note: These are raw theoretical maximums, actual usable bandwidth is lower
-    /// due to protocol overhead, frame structure, etc.
-    pub fn to_bytes_per_second(&self) -> f64 {
-        match self {
-            UsbSpeed::Low => 1_500_000.0 / 8.0,    // 1.5 Mbps = ~187.5 KB/s
-            UsbSpeed::Full => 12_000_000.0 / 8.0,  // 12 Mbps = 1.5 MB/s
-            UsbSpeed::High => 480_000_000.0 / 8.0, // 480 Mbps = 60 MB/s
-            UsbSpeed::SuperSpeed => 5_000_000_000.0 / 8.0, // 5 Gbps = 625 MB/s
-            UsbSpeed::SuperSpeedPlus => 10_000_000_000.0 / 8.0, // 10 Gbps = 1.25 GB/s
-            UsbSpeed::Unknown => 0.0,
-        }
-    }
-
-    /// Returns practical maximum bandwidth in bytes per second
-    /// Takes into account typical protocol overhead (~80% efficiency for most speeds)
-    pub fn to_practical_bytes_per_second(&self) -> f64 {
-        match self {
-            UsbSpeed::Low => self.to_bytes_per_second() * 0.7, // ~70% for low speed
-            UsbSpeed::Full => self.to_bytes_per_second() * 0.8, // ~80% for full speed
-            UsbSpeed::High => self.to_bytes_per_second() * 0.8, // ~80% for high speed
-            UsbSpeed::SuperSpeed => self.to_bytes_per_second() * 0.85, // ~85% for super speed
-            UsbSpeed::SuperSpeedPlus => self.to_bytes_per_second() * 0.85, // ~85% for super speed+
-            UsbSpeed::Unknown => 0.0,
-        }
-    }
-
-    pub fn color_code(&self) -> (u8, u8, u8) {
-        match self {
-            UsbSpeed::Low => (255, 100, 100),          // Light red
-            UsbSpeed::Full => (255, 165, 0),           // Orange
-            UsbSpeed::High => (255, 255, 0),           // Yellow
-            UsbSpeed::SuperSpeed => (0, 255, 0),       // Green
-            UsbSpeed::SuperSpeedPlus => (0, 255, 255), // Cyan
-            UsbSpeed::Unknown => (128, 128, 128),      // Gray
-        }
-    }
 }
 
+/// A single parsed usbmon URB event.
+///
+/// Only the fields the bandwidth aggregator consumes (`urb_type`, `bus_id`,
+/// `device_id`, `direction`, `data_length`) are compiled into production
+/// builds. The remaining fields (`urb_tag`, `endpoint`, `status`,
+/// `setup_packet`, `data`) are still fully parsed and validated by
+/// [`parse_usbmon_text_line`] on every build — they are `cfg(test)`-only
+/// because nothing downstream reads them yet, but the parser test suite
+/// relies on them to verify the full usbmon `Nu` text format is decoded
+/// correctly (see Documentation/usb/usbmon.rst).
 #[derive(Debug, Clone)]
 pub struct UsbPacket {
-    pub timestamp: DateTime<Utc>,
-    pub urb_tag: String,
     pub urb_type: UrbType,
     pub bus_id: u8,
     pub device_id: u8,
-    pub endpoint: u8,
     pub direction: bool, // true = IN (device->host), false = OUT (host->device)
     pub data_length: u32,
+    #[cfg(test)]
+    pub urb_tag: String,
+    #[cfg(test)]
+    pub endpoint: u8,
+    #[cfg(test)]
     pub status: i32,
+    #[cfg(test)]
     pub setup_packet: Option<Vec<u8>>,
+    #[cfg(test)]
     pub data: Option<Vec<u8>>,
-}
-
-impl UsbPacket {
-    pub fn is_data_packet(&self) -> bool {
-        self.data_length > 0 && matches!(self.urb_type, UrbType::Submission | UrbType::Callback)
-    }
-
-    pub fn bandwidth_bytes(&self) -> u32 {
-        if self.is_data_packet() {
-            self.data_length
-        } else {
-            0
-        }
-    }
 }
 
 /// Parses a single line of usbmon's `Nu` text output.
@@ -123,22 +84,23 @@ impl UsbPacket {
 pub fn parse_usbmon_text_line(line: &str) -> Result<UsbPacket> {
     let mut tokens = line.split_whitespace().peekable();
 
-    // Word 1: URB tag.
-    let urb_tag = tokens
+    // Word 1: URB tag. Kept only for `cfg(test)` verification (see
+    // `UsbPacket` docs), so the parsed value is bound with a leading
+    // underscore to stay warning-free in non-test builds.
+    let _urb_tag = tokens
         .next()
         .ok_or_else(|| anyhow!("Invalid usbmon text line format: empty line"))?
         .to_string();
 
     // Word 2: timestamp in microseconds. We don't yet reconstruct wall-clock
-    // time from usbmon's boot-relative clock, so just validate the field and
-    // stamp the packet with the current time.
+    // time from usbmon's boot-relative clock, so just validate the field;
+    // nothing downstream needs it.
     let timestamp_token = tokens
         .next()
         .ok_or_else(|| anyhow!("Invalid usbmon text line format: missing timestamp"))?;
     let _timestamp_us: u64 = timestamp_token
         .parse()
         .map_err(|_| anyhow!("Invalid timestamp: {}", timestamp_token))?;
-    let timestamp = Utc::now();
 
     // Word 3: event type.
     let event_token = tokens
@@ -184,7 +146,8 @@ pub fn parse_usbmon_text_line(line: &str) -> Result<UsbPacket> {
     let device_id: u8 = addr_parts[2]
         .parse()
         .map_err(|_| anyhow!("Invalid device ID: {}", addr_parts[2]))?;
-    let endpoint: u8 = addr_parts[3]
+    // cfg(test)-only field (see `UsbPacket` docs); still validated on every build.
+    let _endpoint: u8 = addr_parts[3]
         .parse()
         .map_err(|_| anyhow!("Invalid endpoint: {}", addr_parts[3]))?;
 
@@ -195,7 +158,10 @@ pub fn parse_usbmon_text_line(line: &str) -> Result<UsbPacket> {
         .ok_or_else(|| anyhow!("Invalid usbmon text line format: missing status/setup word"))?;
     let is_setup = status_token == "s";
 
-    let (status, setup_packet) = if is_setup {
+    // `status`/`setup_packet` are cfg(test)-only fields (see `UsbPacket`
+    // docs); the parsing and validation below always run so malformed lines
+    // are rejected identically in every build.
+    let (_status, _setup_packet) = if is_setup {
         let mut setup_bytes = Vec::with_capacity(8);
         let bm_request_type = next_hex_u8(&mut tokens, "bmRequestType")?;
         let b_request = next_hex_u8(&mut tokens, "bRequest")?;
@@ -248,24 +214,29 @@ pub fn parse_usbmon_text_line(line: &str) -> Result<UsbPacket> {
         }
     };
 
-    // Word 8: data tag (`=` for captured data, `<`/`>` for none) plus data words.
-    let data = match tokens.next() {
+    // Word 8: data tag (`=` for captured data, `<`/`>` for none) plus data
+    // words. cfg(test)-only field (see `UsbPacket` docs).
+    let _data = match tokens.next() {
         Some("=") => Some(parse_hex_data(&tokens.collect::<Vec<_>>()).unwrap_or_default()),
         _ => None,
     };
 
     Ok(UsbPacket {
-        timestamp,
-        urb_tag,
         urb_type,
         bus_id,
         device_id,
-        endpoint,
         direction,
         data_length,
-        status,
-        setup_packet,
-        data,
+        #[cfg(test)]
+        urb_tag: _urb_tag,
+        #[cfg(test)]
+        endpoint: _endpoint,
+        #[cfg(test)]
+        status: _status,
+        #[cfg(test)]
+        setup_packet: _setup_packet,
+        #[cfg(test)]
+        data: _data,
     })
 }
 
@@ -414,22 +385,8 @@ mod tests {
     }
 
     #[test]
-    fn test_usb_speed_color_codes() {
-        assert_eq!(UsbSpeed::SuperSpeed.color_code(), (0, 255, 0));
-        assert_eq!(UsbSpeed::High.color_code(), (255, 255, 0));
+    fn test_usb_speed_from_str_and_mbps() {
         assert_eq!(UsbSpeed::from_speed_str("480"), UsbSpeed::High);
         assert_eq!(UsbSpeed::SuperSpeed.to_mbps(), 5000.0);
-    }
-
-    #[test]
-    fn test_bandwidth_calculations() {
-        // Test theoretical bandwidth
-        assert_eq!(UsbSpeed::High.to_bytes_per_second(), 60_000_000.0);
-        assert_eq!(UsbSpeed::SuperSpeed.to_bytes_per_second(), 625_000_000.0);
-
-        // Test practical bandwidth (with overhead)
-        let high_practical = UsbSpeed::High.to_practical_bytes_per_second();
-        assert!(high_practical < UsbSpeed::High.to_bytes_per_second());
-        assert_eq!(high_practical, 48_000_000.0); // 80% of 60MB/s
     }
 }

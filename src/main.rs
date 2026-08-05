@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_imports, unused_mut, unused_variables)]
-
 use anyhow::Result;
 use clap::Parser;
 use log::{error, info, warn};
@@ -20,8 +18,8 @@ use std::time::Duration;
 use config::{load_or_create_default_at, Preferences};
 use ui::{run_ui, UsbTopApp};
 use usbmon::{
-    attempt_load_usbmon, attempt_unload_usbmon, check_usbmon_status, print_platform_instructions,
-    prompt_user_to_load_module, prompt_user_to_unload_module,
+    attempt_load_usbmon, check_usbmon_status, print_platform_instructions,
+    prompt_user_to_load_module,
 };
 
 #[derive(Parser)]
