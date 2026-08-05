@@ -9,18 +9,16 @@ repository = "https://github.com/wifi-blackout/usbtop-ng"
 readme = "README.md"
 keywords = ["usb", "monitoring", "usbmon", "tui"]
 categories = ["command-line-utilities"]
-rust-version = "1.78"
+rust-version = "1.88"
 
 [dependencies]
 anyhow = "1.0"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
 env_logger = "0.11"
 log = "0.4"
 ratatui = "0.30"
 serde = { version = "1.0", features = ["derive"] }
-tokio = { version = "1.40", features = ["fs", "io-util", "macros", "rt-multi-thread", "time"] }
 toml = "1.1"
 
 [dev-dependencies]

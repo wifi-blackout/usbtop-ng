@@ -85,71 +85,11 @@ impl BandwidthStats {
         }
     }
 
-    pub fn get_utilization_percentage(&self, max_speed_bps: f64) -> f64 {
-        if max_speed_bps > 0.0 {
-            (self.current_bps / max_speed_bps * 100.0).min(100.0)
-        } else {
-            0.0
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.rx_bps = 0.0;
-        self.tx_bps = 0.0;
-        self.current_bps = 0.0;
-        self.peak_bps = 0.0;
-        self.total_rx_bytes = 0;
-        self.total_tx_bytes = 0;
-        self.rx_history.clear();
-        self.tx_history.clear();
-    }
-
-    pub fn get_history_data(&self, max_points: usize) -> Vec<(f64, f64, f64)> {
-        // Returns (timestamp_offset, rx_rate, tx_rate) tuples
-        let mut combined_history = Vec::new();
-        let now = Instant::now();
-
-        // Combine RX and TX history by timestamp
-        let mut rx_iter = self.rx_history.iter();
-        let mut tx_iter = self.tx_history.iter();
-
-        let mut current_rx = rx_iter.next();
-        let mut current_tx = tx_iter.next();
-
-        while current_rx.is_some() || current_tx.is_some() {
-            match (current_rx, current_tx) {
-                (Some((rx_time, rx_bytes)), Some((tx_time, tx_bytes))) => {
-                    if rx_time <= tx_time {
-                        let offset = now.duration_since(*rx_time).as_secs_f64();
-                        combined_history.push((offset, *rx_bytes as f64, 0.0));
-                        current_rx = rx_iter.next();
-                    } else {
-                        let offset = now.duration_since(*tx_time).as_secs_f64();
-                        combined_history.push((offset, 0.0, *tx_bytes as f64));
-                        current_tx = tx_iter.next();
-                    }
-                }
-                (Some((rx_time, rx_bytes)), None) => {
-                    let offset = now.duration_since(*rx_time).as_secs_f64();
-                    combined_history.push((offset, *rx_bytes as f64, 0.0));
-                    current_rx = rx_iter.next();
-                }
-                (None, Some((tx_time, tx_bytes))) => {
-                    let offset = now.duration_since(*tx_time).as_secs_f64();
-                    combined_history.push((offset, 0.0, *tx_bytes as f64));
-                    current_tx = tx_iter.next();
-                }
-                (None, None) => break,
-            }
-        }
-
-        // Limit to max_points
-        if combined_history.len() > max_points {
-            let skip = combined_history.len() - max_points;
-            combined_history.drain(0..skip);
-        }
-
-        combined_history
+    /// Re-evaluate rates against the sliding window without new traffic,
+    /// so idle devices decay to zero instead of freezing at their last rate.
+    pub fn refresh(&mut self) {
+        self.cleanup_old_entries();
+        self.recalculate_rates();
     }
 }
 
@@ -170,6 +110,19 @@ mod tests {
         assert_eq!(stats.total_tx_bytes, 500);
         assert!(stats.current_bps > 0.0);
         assert_eq!(stats.peak_bps, stats.current_bps);
+    }
+
+    #[test]
+    fn refresh_decays_rates_to_zero_after_window() {
+        let mut stats = BandwidthStats::new();
+        stats.history_window = Duration::from_millis(50);
+        stats.update_rx(1000);
+        assert!(stats.rx_bps > 0.0);
+        sleep(Duration::from_millis(80));
+        stats.refresh();
+        assert_eq!(stats.rx_bps, 0.0);
+        assert_eq!(stats.current_bps, 0.0);
+        assert_eq!(stats.total_rx_bytes, 1000); // totals are cumulative
     }
 
     #[test]

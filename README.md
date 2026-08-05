@@ -7,17 +7,19 @@ It does **not** share code with the original project and is **not affiliated wit
 
 ## Current Status
 
-usbtop-ng builds, runs its setup checks, and opens the terminal UI. Live packet-to-device monitoring is still being wired into the UI, so expect limited runtime functionality until the monitoring loop is connected.
+usbtop-ng builds, runs its setup checks, and opens the terminal UI with live packet-to-device monitoring wired end-to-end: usbmon reader thread(s) parse the `Nu` text interface, hand packets to the UI thread over an `mpsc` channel, and `DeviceManager` aggregates them into per-device bandwidth stats on every refresh tick.
 
 ## ✨ Features
 
-- Real-time USB traffic statistics with **%busy** calculations for devices and buses
-- **Speed capability mismatch detection** - shows when devices could run faster  
+- Live per-device USB bandwidth (RX/TX), plus running totals and peak bandwidth across all devices
+- Bandwidth history graph over a 60-second sliding window
+- Device metadata (vendor, product, speed) resolved from sysfs
+- Disconnect detection: devices are shown greyed out for 5 seconds after disconnecting, then removed
+- Managed usbmon load/unload, with the choice remembered in preferences
 - Lightweight, terminal-friendly interface
 - Rust-powered performance and safety
-- Cross-platform support (Linux, *BSD, macOS — Windows WIP)
+- Cross-platform support (Linux, *BSD, macOS — Windows WIP); live monitoring via usbmon is Linux-only — on BSD/macOS the UI can open (with `--force` where needed) but shows no devices
 - Low resource footprint
-- **Visual indicators** for high utilization and speed limitations
 
 ## 📦 Installation
 
@@ -95,14 +97,6 @@ Options:
   -V, --version            Print version
 ```
 
-### %busy Display Features
-
-- **Device %busy**: Shows bandwidth utilization percentage for each USB device
-- **Bus %busy**: Shows total bandwidth utilization for each USB bus  
-- **Speed indicators**: Visual symbols for devices that could run faster
-  - ⚡ High utilization (>80% bandwidth usage)
-  - 🔺 Limited by bus speed (device capable of faster speed)
-
 ## 🛠 Development
 
 Requirements:
@@ -127,5 +121,5 @@ See [LICENSE](LICENSE) for full details.
 
 ## 🙏 Acknowledgments
 
-- Inspired by the original [usbtop](https://github.com/aguinet/usbtop) by Antoine Guinet.
+- Inspired by the original [usbtop](https://github.com/aguinet/usbtop) by Adrien Guinet.
 - Thanks to the Rust community for making systems programming safer and fun.
