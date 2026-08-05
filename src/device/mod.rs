@@ -19,6 +19,7 @@ pub struct UsbDevice {
     pub is_disconnected: bool,
     pub disconnect_time: Option<Instant>,
     pub last_seen: Instant,
+    pub sysfs_path: Option<std::path::PathBuf>,
 }
 
 impl UsbDevice {
@@ -36,6 +37,7 @@ impl UsbDevice {
             is_disconnected: false,
             disconnect_time: None,
             last_seen: Instant::now(),
+            sysfs_path: None,
         }
     }
 
@@ -83,6 +85,7 @@ impl UsbDevice {
         let Some(sysfs_path) = self.find_linux_sysfs_path(base) else {
             return Ok(());
         };
+        self.sysfs_path = Some(sysfs_path.clone());
 
         // Read device attributes
         if let Ok(speed_str) = std::fs::read_to_string(sysfs_path.join("speed")) {
@@ -116,18 +119,46 @@ impl UsbDevice {
         Ok(())
     }
 
+    /// Scan `base` for the sysfs entry whose `busnum`/`devnum` files match
+    /// this device. Real sysfs USB device directories are named by port
+    /// topology (e.g. `3-1.4`), not by bus/device number, so a name guess
+    /// doesn't work; we have to read the attribute files instead.
     #[cfg(target_os = "linux")]
     fn find_linux_sysfs_path(&self, base: &std::path::Path) -> Option<std::path::PathBuf> {
-        [
-            base.join(format!("{}-{}", self.bus_id, self.device_id)),
-            base.join(format!(
-                "usb{}/{}-{}",
-                self.bus_id, self.bus_id, self.device_id
-            )),
-            base.join(self.device_id.to_string()),
-        ]
-        .into_iter()
-        .find(|path| path.exists())
+        let entries = std::fs::read_dir(base).ok()?;
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let is_interface = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.contains(':'));
+            if is_interface {
+                continue;
+            }
+
+            let Ok(busnum_str) = std::fs::read_to_string(path.join("busnum")) else {
+                continue;
+            };
+            let Ok(busnum) = busnum_str.trim().parse::<u8>() else {
+                continue;
+            };
+            if busnum != self.bus_id {
+                continue;
+            }
+
+            let Ok(devnum_str) = std::fs::read_to_string(path.join("devnum")) else {
+                continue;
+            };
+            let Ok(devnum) = devnum_str.trim().parse::<u8>() else {
+                continue;
+            };
+            if devnum != self.device_id {
+                continue;
+            }
+
+            return Some(path);
+        }
+        None
     }
 
     #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
@@ -331,22 +362,38 @@ pub fn format_bandwidth(bps: f64) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn update_from_sysfs_uses_alternative_device_path() {
-        let temp = tempfile::tempdir().unwrap();
-        let device_dir = temp.path().join("usb1/1-2");
-        std::fs::create_dir_all(&device_dir).unwrap();
-        std::fs::write(device_dir.join("speed"), "480\n").unwrap();
-        std::fs::write(device_dir.join("idVendor"), "1d6b\n").unwrap();
-        std::fs::write(device_dir.join("idProduct"), "0002\n").unwrap();
-        std::fs::write(device_dir.join("manufacturer"), "Linux Foundation\n").unwrap();
-        std::fs::write(device_dir.join("product"), "Root Hub\n").unwrap();
-        std::fs::write(device_dir.join("serial"), "test-serial\n").unwrap();
+    fn write_device(dir: &std::path::Path, busnum: u8, devnum: u8, extra: &[(&str, &str)]) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("busnum"), format!("{busnum}\n")).unwrap();
+        std::fs::write(dir.join("devnum"), format!("{devnum}\n")).unwrap();
+        for (name, value) in extra {
+            std::fs::write(dir.join(name), format!("{value}\n")).unwrap();
+        }
+    }
 
-        let mut device = UsbDevice::new(1, 2);
-        device
-            .update_linux_device_info_from_base(temp.path())
-            .unwrap();
+    #[test]
+    fn resolves_device_by_busnum_devnum_topology() {
+        let temp = tempfile::tempdir().unwrap();
+        // Root hub: usb1 (busnum 1, devnum 1); device at port path 1-2.4
+        write_device(&temp.path().join("usb1"), 1, 1, &[("speed", "480")]);
+        write_device(
+            &temp.path().join("1-2.4"),
+            1,
+            5,
+            &[
+                ("speed", "480"),
+                ("idVendor", "1d6b"),
+                ("idProduct", "0002"),
+                ("manufacturer", "Linux Foundation"),
+                ("product", "Root Hub"),
+                ("serial", "test-serial"),
+            ],
+        );
+        // Interface directory must be skipped, not matched
+        std::fs::create_dir_all(temp.path().join("1-2.4:1.0")).unwrap();
+
+        let mut device = UsbDevice::new(1, 5);
+        device.populate_from_sysfs(Some(temp.path()));
 
         assert_eq!(device.speed, UsbSpeed::High);
         assert_eq!(device.vendor_id, Some(0x1d6b));
@@ -354,5 +401,18 @@ mod tests {
         assert_eq!(device.vendor.as_deref(), Some("Linux Foundation"));
         assert_eq!(device.product.as_deref(), Some("Root Hub"));
         assert_eq!(device.serial.as_deref(), Some("test-serial"));
+        assert_eq!(device.sysfs_path, Some(temp.path().join("1-2.4")));
+    }
+
+    #[test]
+    fn unmatched_device_resolves_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        write_device(&temp.path().join("usb1"), 1, 1, &[("speed", "480")]);
+
+        let mut device = UsbDevice::new(1, 9);
+        device.populate_from_sysfs(Some(temp.path()));
+
+        assert_eq!(device.sysfs_path, None);
+        assert_eq!(device.vendor, None);
     }
 }
