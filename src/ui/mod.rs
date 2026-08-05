@@ -19,12 +19,14 @@ use ratatui::{
 use std::{
     collections::HashMap,
     io,
+    sync::mpsc::Receiver,
     time::{Duration, Instant},
 };
 
+use crate::device::manager::DeviceManager;
 use crate::device::UsbDevice;
 use crate::stats::BandwidthStats;
-use crate::usbmon::parser::UsbSpeed;
+use crate::usbmon::parser::{UsbPacket, UsbSpeed};
 
 pub mod colors;
 pub mod widgets;
@@ -38,6 +40,7 @@ pub struct UsbTopApp {
     pub selected_device: Option<String>,
     pub show_help: bool,
     pub last_update: Instant,
+    pub start_time: Instant,
     pub refresh_rate: Duration,
     pub total_bandwidth: f64,
     pub peak_bandwidth: f64,
@@ -51,6 +54,7 @@ impl UsbTopApp {
             selected_device: None,
             show_help: false,
             last_update: Instant::now(),
+            start_time: Instant::now(),
             refresh_rate,
             total_bandwidth: 0.0,
             peak_bandwidth: 0.0,
@@ -59,29 +63,29 @@ impl UsbTopApp {
 
     pub fn update_device(&mut self, device: UsbDevice) {
         let device_key = format!("{}:{}", device.bus_id, device.device_id);
-
-        // Update total bandwidth
-        if let Some(existing_device) = self.devices.get(&device_key) {
-            self.total_bandwidth -= existing_device.bandwidth_stats.current_bps;
-        }
-
-        self.total_bandwidth += device.bandwidth_stats.current_bps;
-        if self.total_bandwidth > self.peak_bandwidth {
-            self.peak_bandwidth = self.total_bandwidth;
-        }
-
         self.devices.insert(device_key, device);
+        self.recompute_totals();
     }
 
     pub fn remove_device(&mut self, bus_id: u8, device_id: u8) {
         let device_key = format!("{}:{}", bus_id, device_id);
-        if let Some(device) = self.devices.remove(&device_key) {
-            self.total_bandwidth -= device.bandwidth_stats.current_bps;
+        self.devices.remove(&device_key);
+        self.recompute_totals();
+    }
+
+    fn recompute_totals(&mut self) {
+        self.total_bandwidth = self
+            .devices
+            .values()
+            .map(|d| d.bandwidth_stats.current_bps)
+            .sum();
+        if self.total_bandwidth > self.peak_bandwidth {
+            self.peak_bandwidth = self.total_bandwidth;
         }
     }
 
     pub fn update_bandwidth_history(&mut self) {
-        let now = self.last_update.elapsed().as_secs_f64();
+        let now = self.start_time.elapsed().as_secs_f64();
         self.bandwidth_history.push((now, self.total_bandwidth));
 
         // Keep only last 60 seconds of data
@@ -148,7 +152,11 @@ impl UsbTopApp {
     }
 }
 
-pub fn run_ui(mut app: UsbTopApp) -> Result<()> {
+pub fn run_ui(
+    mut app: UsbTopApp,
+    mut manager: DeviceManager,
+    packets: Receiver<UsbPacket>,
+) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -156,7 +164,7 @@ pub fn run_ui(mut app: UsbTopApp) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, &mut app);
+    let result = run_app(&mut terminal, &mut app, &mut manager, &packets);
 
     // Restore terminal
     disable_raw_mode()?;
@@ -173,17 +181,33 @@ pub fn run_ui(mut app: UsbTopApp) -> Result<()> {
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut UsbTopApp,
+    manager: &mut DeviceManager,
+    packets: &Receiver<UsbPacket>,
 ) -> Result<()> {
     loop {
+        // Drain everything the reader threads produced since the last pass.
+        // Any `try_recv` error (empty or disconnected) means "nothing to drain",
+        // which keeps the UI alive in --force mode with no usbmon readers.
+        while let Ok(packet) = packets.try_recv() {
+            manager.apply_packet(&packet);
+        }
+
+        if app.last_update.elapsed() >= app.refresh_rate {
+            for (bus_id, device_id) in manager.refresh() {
+                app.remove_device(bus_id, device_id);
+            }
+            for bus in manager.buses.values() {
+                for device in bus.devices.values() {
+                    app.update_device(device.clone());
+                }
+            }
+            app.update_bandwidth_history();
+        }
+
         terminal.draw(|f| draw_ui(f, app))?;
 
         if app.handle_input()? {
             break;
-        }
-
-        // Update bandwidth history periodically
-        if app.last_update.elapsed() >= app.refresh_rate {
-            app.update_bandwidth_history();
         }
     }
     Ok(())
@@ -267,14 +291,17 @@ fn draw_bandwidth_graph(f: &mut Frame, area: Rect, app: &UsbTopApp) {
         return;
     }
 
-    let max_bandwidth = app
+    // History carries raw bytes/s against session seconds; the chart is drawn in
+    // MB/s over a 60-second sliding window, so convert once here.
+    let data: Vec<(f64, f64)> = app
         .bandwidth_history
         .iter()
-        .map(|(_, bw)| *bw)
-        .fold(0.0, f64::max)
-        .max(1.0); // Minimum scale
-
-    let data: Vec<(f64, f64)> = app.bandwidth_history.clone();
+        .map(|(t, bps)| (*t, bps / 1_000_000.0))
+        .collect();
+    let latest_t = data.last().map(|(t, _)| *t).unwrap_or(0.0);
+    let x_min = (latest_t - 60.0).max(0.0);
+    let x_max = latest_t.max(60.0);
+    let max_mbps = data.iter().map(|(_, m)| *m).fold(0.0, f64::max).max(1.0);
 
     let datasets = vec![Dataset::default()
         .marker(symbols::Marker::Braille)
@@ -291,13 +318,13 @@ fn draw_bandwidth_graph(f: &mut Frame, area: Rect, app: &UsbTopApp) {
             Axis::default()
                 .title("Time (s)")
                 .style(Style::default().fg(TEXT_COLOR))
-                .bounds([0.0, 60.0]),
+                .bounds([x_min, x_max]),
         )
         .y_axis(
             Axis::default()
                 .title("MB/s")
                 .style(Style::default().fg(TEXT_COLOR))
-                .bounds([0.0, max_bandwidth / 1_000_000.0]),
+                .bounds([0.0, max_mbps]),
         );
 
     f.render_widget(chart, area);
@@ -542,4 +569,74 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::manager::DeviceManager;
+    use crate::usbmon::parser::parse_usbmon_text_line;
+
+    #[test]
+    fn packets_flow_from_parser_through_manager_into_app_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        for line in [
+            "ffff0000eeee0001 100 C Bi:1:003:1 0 4096 <",
+            "ffff0000eeee0002 200 C Bi:1:003:1 0 4096 <",
+            "ffff0000eeee0003 300 C Bo:1:003:2 0 1024 >",
+        ] {
+            manager.apply_packet(&parse_usbmon_text_line(line).unwrap());
+        }
+        manager.refresh();
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        for bus in manager.buses.values() {
+            for device in bus.devices.values() {
+                app.update_device(device.clone());
+            }
+        }
+
+        let device = app.devices.get("1:3").expect("device visible in app state");
+        assert_eq!(device.bandwidth_stats.total_rx_bytes, 8192);
+        assert_eq!(device.bandwidth_stats.total_tx_bytes, 1024);
+        assert!(app.total_bandwidth > 0.0);
+        assert_eq!(app.total_bandwidth, device.bandwidth_stats.current_bps);
+    }
+
+    #[test]
+    fn update_device_recomputes_totals_instead_of_drifting() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        let mut device = crate::device::UsbDevice::new(1, 3);
+        device.bandwidth_stats.current_bps = 1000.0;
+        app.update_device(device.clone());
+        assert_eq!(app.total_bandwidth, 1000.0);
+
+        device.bandwidth_stats.current_bps = 400.0;
+        app.update_device(device.clone());
+        assert_eq!(app.total_bandwidth, 400.0);
+        assert_eq!(app.peak_bandwidth, 1000.0);
+
+        app.remove_device(1, 3);
+        assert_eq!(app.total_bandwidth, 0.0);
+    }
+
+    #[test]
+    fn totals_do_not_accumulate_float_error_across_updates() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+
+        let mut first = crate::device::UsbDevice::new(1, 3);
+        first.bandwidth_stats.current_bps = 0.1;
+        app.update_device(first);
+
+        let mut second = crate::device::UsbDevice::new(1, 4);
+        second.bandwidth_stats.current_bps = 0.2;
+        app.update_device(second);
+
+        app.remove_device(1, 4);
+        assert_eq!(
+            app.total_bandwidth, 0.1,
+            "total must be recomputed from the device map, not patched incrementally"
+        );
+    }
 }

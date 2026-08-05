@@ -54,8 +54,7 @@ struct Cli {
     create_alias: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging
@@ -160,8 +159,10 @@ async fn main() -> Result<()> {
         warn!("No USB buses detected");
     }
 
+    let packets = usbmon::monitor::start_monitoring(&usbmon_status.available_buses);
+    let manager = device::manager::DeviceManager::new();
     let app = UsbTopApp::new(Duration::from_millis(cli.refresh));
-    let run_result = run_ui(app);
+    let run_result = run_ui(app, manager, packets);
 
     if loaded_usbmon_for_this_run {
         let should_unload = if preferences.unload_usbmon_on_exit {
