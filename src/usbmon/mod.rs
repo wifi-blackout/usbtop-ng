@@ -234,6 +234,38 @@ pub fn attempt_unload_usbmon() -> Result<()> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum UnloadMode {
+    Automatic,
+    Ask,
+}
+
+pub fn unload_mode(preferences: &crate::config::Preferences) -> UnloadMode {
+    if preferences.unload_usbmon_on_exit {
+        UnloadMode::Automatic
+    } else {
+        UnloadMode::Ask
+    }
+}
+
+/// Offer to unload usbmon after a session in which usbtop-ng loaded it.
+/// Called on every exit path that follows a successful load — including
+/// startup failures after the module was loaded.
+pub fn offer_unload_after_session(preferences: &crate::config::Preferences) {
+    let should_unload = match unload_mode(preferences) {
+        UnloadMode::Automatic => {
+            println!("unload_usbmon_on_exit=true, so usbtop-ng will try to unload usbmon now.");
+            true
+        }
+        UnloadMode::Ask => prompt_user_to_unload_module().unwrap_or(false),
+    };
+    if should_unload {
+        if let Err(e) = attempt_unload_usbmon() {
+            log::warn!("Failed to unload usbmon: {}", e);
+        }
+    }
+}
+
 pub fn print_platform_instructions() {
     #[cfg(target_os = "linux")]
     {
@@ -271,6 +303,7 @@ pub fn print_platform_instructions() {
 #[cfg(test)]
 mod tests {
     use super::is_yes_response;
+    use super::{unload_mode, UnloadMode};
 
     #[test]
     fn yes_response_accepts_y_and_yes_case_insensitively() {
@@ -284,5 +317,16 @@ mod tests {
         assert!(!is_yes_response(""));
         assert!(!is_yes_response("n"));
         assert!(!is_yes_response("sure"));
+    }
+
+    #[test]
+    fn unload_mode_follows_preferences() {
+        let auto = crate::config::Preferences {
+            auto_load_usbmon: false,
+            unload_usbmon_on_exit: true,
+        };
+        assert_eq!(unload_mode(&auto), UnloadMode::Automatic);
+        let ask = crate::config::Preferences::default();
+        assert_eq!(unload_mode(&ask), UnloadMode::Ask);
     }
 }
