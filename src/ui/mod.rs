@@ -44,6 +44,9 @@ pub struct BusView {
     pub speed: UsbSpeed,
     pub side_label: &'static str,
     pub devices: Vec<DeviceRow>,
+    /// Aggregate %busy across the bus's devices; `None` when the bus speed
+    /// is unknown (see `UsbBus::busy_percentage`).
+    pub busy_percentage: Option<f64>,
 }
 
 /// One host controller and its buses in bus-number order.
@@ -227,6 +230,7 @@ fn bus_view(bus: &UsbBus) -> BusView {
         speed: bus.speed.clone(),
         side_label: side_label(&bus.speed),
         devices,
+        busy_percentage: bus.busy_percentage(),
     }
 }
 
@@ -419,16 +423,16 @@ fn draw_bandwidth_graph(f: &mut Frame, area: Rect, app: &UsbTopApp) {
 }
 
 /// Column widths, in terminal cells, for the device rows: Port, Device, Speed,
-/// Vendor, Product, Bw↓, Bw↑, Status. Controller and bus headings span the
+/// Vendor, Product, Bw↓, Bw↑, %busy, !. Controller and bus headings span the
 /// whole line, which a `Table` cannot do, so the list is laid out as lines of
 /// pre-padded per-cell spans instead.
-const DEVICE_COLUMNS: [usize; 8] = [8, 8, 10, 14, 18, 10, 10, 12];
+const DEVICE_COLUMNS: [usize; 9] = [8, 8, 10, 14, 18, 10, 10, 7, 3];
 
 /// One padded cell per column, separated by single-space spans. Columns are
 /// measured in terminal cells, not chars: a CJK vendor string is twice as wide
 /// as its char count, and padding by chars would shove every later column
 /// rightwards on that row only.
-fn device_columns(cells: [&str; 8]) -> Vec<Span<'static>> {
+fn device_columns(cells: [&str; 9]) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(DEVICE_COLUMNS.len() * 2 - 1);
     for (index, (cell, width)) in cells.iter().zip(DEVICE_COLUMNS).enumerate() {
         if index > 0 {
@@ -458,10 +462,12 @@ fn fit_to_display_width(text: &str, width: usize) -> String {
     fitted
 }
 
-/// Speed is the 3rd column (index 2) of `DEVICE_COLUMNS`. `device_columns`
-/// emits one separator span before every column after the first, so a cell
-/// at column index `i` lands at span index `2 * i` in its output.
+/// Speed is the 3rd column (index 2) of `DEVICE_COLUMNS`; the `!` indicator is
+/// the last (index 8). `device_columns` emits one separator span before every
+/// column after the first, so a cell at column index `i` lands at span index
+/// `2 * i` in its output.
 const SPEED_SPAN_INDEX: usize = 2 * 2;
+const INDICATOR_SPAN_INDEX: usize = 2 * 8;
 
 /// Style that paints text in a speed's reference color (see
 /// `UsbSpeed::color_code`), used for both the bus header's Mbps figure and
@@ -503,7 +509,7 @@ fn device_list_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
         .add_modifier(Modifier::BOLD);
 
     let mut lines = vec![Line::from(device_columns([
-        "Port", "Device", "Speed", "Vendor", "Product", "Bw↓", "Bw↑", "Status",
+        "Port", "Device", "Speed", "Vendor", "Product", "Bw↓", "Bw↑", "%busy", "!",
     ]))
     .style(heading_style)];
 
@@ -514,18 +520,24 @@ fn device_list_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
         ));
 
         for bus in &controller.buses {
+            let busy_suffix = match bus.busy_percentage {
+                Some(pct) => format!(" · {pct:.1}% busy"),
+                None => " · -- busy".to_string(),
+            };
             lines.push(Line::from(vec![
                 Span::raw(format!("▶ Bus {:02} ({})  ", bus.bus_id, bus.side_label)),
                 Span::styled(
                     format!("{:.1} Mbps", bus.speed.to_mbps()),
                     speed_style(&bus.speed),
                 ),
+                Span::raw(busy_suffix),
             ]));
 
             for row in &bus.devices {
                 let device = &row.device;
                 let device_key = format!("{}:{}", bus.bus_id, device.device_id);
                 let is_selected = app.selected_device.as_ref() == Some(&device_key);
+                let indicator = device.get_speed_indicator(&bus.speed);
 
                 let status_style = if device.is_disconnected {
                     Style::default().bg(Color::Gray).fg(Color::White)
@@ -543,20 +555,21 @@ fn device_list_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
                     device.product.as_deref().unwrap_or("Unknown"),
                     &format!("{:.1} KB/s", device.bandwidth_stats.rx_bps / 1000.0),
                     &format!("{:.1} KB/s", device.bandwidth_stats.tx_bps / 1000.0),
-                    if device.is_disconnected {
-                        "Disconnected"
-                    } else {
-                        "Connected"
-                    },
+                    &format!("{:5.1}", device.get_busy_percentage()),
+                    indicator.get_symbol(),
                 ]);
 
                 // Selected/disconnected rows stay uniformly styled for
                 // readability; only a plain, connected row gets its Speed
-                // cell tinted by the bus speed's reference color.
+                // and indicator cells tinted by their reference colors.
                 if !is_selected && !device.is_disconnected {
                     spans[SPEED_SPAN_INDEX] = spans[SPEED_SPAN_INDEX]
                         .clone()
                         .style(speed_style(&device.speed));
+                    let (r, g, b) = indicator.get_color();
+                    spans[INDICATOR_SPAN_INDEX] = spans[INDICATOR_SPAN_INDEX]
+                        .clone()
+                        .style(Style::default().fg(Color::Rgb(r, g, b)));
                 }
 
                 lines.push(Line::from(spans).style(status_style));
@@ -935,7 +948,9 @@ mod tests {
     #[test]
     fn device_columns_pad_and_truncate_by_display_width() {
         // "東京デバイス" is 6 chars but 12 terminal cells, so the 14-cell Vendor
-        // column takes 2 spaces of padding, not 8.
+        // column takes 2 spaces of padding, not 8. The "⚡" indicator is a
+        // 2-cell glyph inside the 3-cell `!` column, exercising the same
+        // display-width padding there.
         let wide = Line::from(device_columns([
             "?",
             "001:004",
@@ -944,11 +959,13 @@ mod tests {
             "プローブ",
             "0.0 KB/s",
             "0.0 KB/s",
-            "Connected",
+            " 91.6",
+            "⚡",
         ]));
         assert_eq!(wide.width(), device_row_width());
 
         // Over-long cells are clipped to their column, again by display width.
+        // "🔺" is likewise a 2-cell glyph.
         let clipped = Line::from(device_columns([
             "?",
             "001:004",
@@ -957,14 +974,15 @@ mod tests {
             "Product",
             "0.0 KB/s",
             "0.0 KB/s",
-            "Connected",
+            "100.0",
+            "🔺",
         ]));
         assert_eq!(clipped.width(), device_row_width());
     }
 
     #[test]
     fn device_rows_stay_aligned_with_wide_characters() {
-        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0), (1, 4, 0.0)]);
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0), (1, 4, 0.0), (1, 5, 1_100_000.0)]);
         {
             let bus = mgr.get_or_create_bus(1);
             let ascii = bus.devices.get_mut(&3).unwrap();
@@ -973,14 +991,19 @@ mod tests {
             let wide = bus.devices.get_mut(&4).unwrap();
             wide.vendor = Some("東京デバイス".to_string());
             wide.product = Some("プローブ".to_string());
+            // Device 5: practical max for Full speed is 1.2 MB/s, so
+            // 1.1 MB/s crosses the 80% HighUtilization threshold and renders
+            // the 2-cell "⚡" glyph in the `!` column.
+            let indicator = bus.devices.get_mut(&5).unwrap();
+            indicator.speed = UsbSpeed::Full;
         }
         let mut app = UsbTopApp::new(Duration::from_millis(100));
         app.sync_from(&mgr);
 
         let lines = device_list_lines(&app);
         let widths: Vec<usize> = lines.iter().map(Line::width).collect();
-        // Column header plus both device rows occupy exactly the same cells;
-        // the controller heading and bus header are free-form.
+        // Column header plus all three device rows occupy exactly the same
+        // cells; the controller heading and bus header are free-form.
         assert_eq!(
             widths,
             vec![
@@ -988,15 +1011,41 @@ mod tests {
                 widths[1],
                 widths[2],
                 device_row_width(),
-                device_row_width()
+                device_row_width(),
+                device_row_width(),
             ]
         );
 
         // Lock the ASCII geometry so column offsets cannot drift silently.
         assert_eq!(
             lines[3].to_string(),
-            "?        001:003  0.0 Mbps   Acme           Widget             0.0 KB/s   0.0 KB/s   Connected   "
+            "?        001:003  0.0 Mbps   Acme           Widget             0.0 KB/s   0.0 KB/s     0.0      "
         );
+
+        // The wide (2-cell) "⚡" indicator glyph must not push the row's
+        // total width off alignment with the others.
+        assert!(lines[5].to_string().contains('⚡'), "{}", lines[5]);
+    }
+
+    #[test]
+    fn bus_header_shows_busy_percentage_or_dashes() {
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0), (2, 4, 600_000.0)]);
+        {
+            // Bus 1 keeps the default UsbSpeed::Unknown -> no meaningful
+            // denominator, so its header shows "-- busy".
+            let bus2 = mgr.get_or_create_bus(2);
+            bus2.speed = UsbSpeed::Full; // practical max 1_200_000 bytes/s
+        }
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let text: String = device_list_lines(&app)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("· -- busy"), "{text}");
+        assert!(text.contains("· 50.0% busy"), "{text}");
     }
 
     #[test]

@@ -44,11 +44,9 @@ impl UsbSpeed {
     /// Note: These are raw theoretical maximums, actual usable bandwidth is lower
     /// due to protocol overhead, frame structure, etc.
     ///
-    /// `cfg(test)`-only for now: nothing in production code reads it yet, but
-    /// the %busy / speed-mismatch indicators land on top of it, so it (and
-    /// [`to_practical_bytes_per_second`](Self::to_practical_bytes_per_second))
-    /// stay in place, verified, ready for that wiring.
-    #[cfg(test)]
+    /// Feeds [`to_practical_bytes_per_second`](Self::to_practical_bytes_per_second),
+    /// which the %busy / speed-mismatch indicators (`UsbDevice::get_busy_percentage`,
+    /// `UsbBus::busy_percentage`) read as their denominator.
     pub fn to_bytes_per_second(&self) -> f64 {
         match self {
             UsbSpeed::Low => 1_500_000.0 / 8.0,    // 1.5 Mbps = ~187.5 KB/s
@@ -63,8 +61,8 @@ impl UsbSpeed {
     /// Returns practical maximum bandwidth in bytes per second
     /// Takes into account typical protocol overhead (~80% efficiency for most speeds)
     ///
-    /// `cfg(test)`-only for now; see [`to_bytes_per_second`](Self::to_bytes_per_second).
-    #[cfg(test)]
+    /// Denominator for `UsbDevice::get_busy_percentage` and
+    /// `UsbBus::busy_percentage`; see [`to_bytes_per_second`](Self::to_bytes_per_second).
     pub fn to_practical_bytes_per_second(&self) -> f64 {
         match self {
             UsbSpeed::Low => self.to_bytes_per_second() * 0.7, // ~70% for low speed

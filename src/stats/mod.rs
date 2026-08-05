@@ -91,6 +91,16 @@ impl BandwidthStats {
         self.cleanup_old_entries();
         self.recalculate_rates();
     }
+
+    /// Current bandwidth as a percentage of `max_speed_bps`, clamped to 100%.
+    /// `0.0` when `max_speed_bps` is non-positive (e.g. an unknown speed).
+    pub fn get_utilization_percentage(&self, max_speed_bps: f64) -> f64 {
+        if max_speed_bps > 0.0 {
+            (self.current_bps / max_speed_bps * 100.0).min(100.0)
+        } else {
+            0.0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -136,5 +146,26 @@ mod tests {
 
         // First entry should be cleaned up
         assert_eq!(stats.rx_history.len(), 1);
+    }
+
+    #[test]
+    fn utilization_percentage_50_percent_case() {
+        let mut stats = BandwidthStats::new();
+        stats.current_bps = 500.0;
+        assert_eq!(stats.get_utilization_percentage(1000.0), 50.0);
+    }
+
+    #[test]
+    fn utilization_percentage_clamps_at_100() {
+        let mut stats = BandwidthStats::new();
+        stats.current_bps = 5000.0;
+        assert_eq!(stats.get_utilization_percentage(1000.0), 100.0);
+    }
+
+    #[test]
+    fn utilization_percentage_zero_when_max_is_zero() {
+        let mut stats = BandwidthStats::new();
+        stats.current_bps = 500.0;
+        assert_eq!(stats.get_utilization_percentage(0.0), 0.0);
     }
 }
