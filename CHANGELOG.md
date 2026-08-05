@@ -8,25 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Initial implementation of usbtop-ng
-- Real-time USB bandwidth monitoring using usbmon interface
+- Live USB bandwidth monitoring pipeline wired end-to-end: usbmon reader thread(s) → mpsc channel → DeviceManager aggregation → per-tick UI refresh
+- Full parser for usbmon's `Nu` text interface format
+- Device metadata (vendor, product, speed) resolved from sysfs by busnum/devnum topology
 - Interactive terminal UI with ratatui
-- Cross-platform support (Linux, BSD, macOS)
-- USB speed color coding system
-- Device disconnection tracking with 5-second grey display
-- Bandwidth history visualization with 60-second sliding window
+- Cross-platform support: Linux is the primary target for live monitoring; BSD/macOS currently get device enumeration only
+- Device disconnection tracking with a 5-second grace period before removal from the UI
+- Bandwidth history visualization with a 60-second sliding window
 - Clear usbmon detection with explicit prompts before running sudo
-- Preferences in `~/.usbtop-ng/preferences.toml` for automatic usbmon load and unload behavior
+- Preferences in `~/.usbtop-ng/preferences.toml` for automatic usbmon load and unload behavior, now honored on exit paths that follow a post-load failure as well
 - Comprehensive help system and keyboard navigation
 - Command-line interface with multiple options
 - Platform-specific setup instructions
-- Integration tests and unit test coverage
+- Unit test coverage across parsing, aggregation, config, and UI state
+
+### Changed
+- Preferences-directory permission hardening (0700) now applies only when usbtop-ng creates the default `~/.usbtop-ng` directory; existing or custom-path directories are left untouched
+- `PUBLIC/LICENSE` now matches the root `LICENSE` verbatim (BSD-3-Clause, copyright usbtop-ng contributors)
+- Documentation (README, CONTRIBUTING, ARCHITECTURE) reconciled with the implemented thread + mpsc + text-interface design
+
+### Removed
+- Tokio and chrono dependencies
+- The broken binary-mode usbmon reader; only the debugfs `Nu` text interface is read
+- Per-speed row coloring from the UI legend and help overlay (the feature was never actually implemented)
 
 ### Technical Details
 - Built with Rust 2021 edition
-- Async I/O using Tokio runtime
-- Terminal UI powered by ratatui and crossterm
-- USB packet parsing for both binary and text usbmon formats
+- Dedicated blocking reader thread(s), opened `O_NONBLOCK` with a shutdown handle, feeding an `mpsc` channel read by the UI thread
+- Terminal UI powered by ratatui and crossterm, redrawn on a per-tick refresh
+- USB packet parsing for the usbmon `Nu` text format only (binary `/dev/usbmonN` is not supported)
 - Multi-threaded architecture with proper error handling
 - Modular codebase with clear separation of concerns
 
@@ -52,21 +62,23 @@ This is the initial release of usbtop-ng, a next-generation USB monitoring tool 
 - **Rich terminal UI**: Colorful, interactive interface inspired by modern system monitors
 - **Cross-platform**: Native support for Linux, BSD variants, and macOS
 - **Smart detection**: usbmon module detection, clear setup assistance, and optional saved load/unload preferences
-- **Visual feedback**: Color-coded USB speeds and device status indicators
+- **Visual feedback**: Device status indicators (connected/disconnected)
 - **Historical data**: Bandwidth graphs with configurable time windows
 
 #### System Requirements
-- Rust 1.70 or later (for building from source)
+- Rust 1.78 or later (for building from source)
 - Linux: usbmon kernel module and debugfs
 - BSD: Native USB monitoring interfaces
 - macOS: Limited functionality (device enumeration only)
 
 #### Installation
 ```bash
-cargo install usbtop-ng
+git clone https://github.com/wifi-blackout/usbtop-ng.git
+cd usbtop-ng
+cargo install --path .
 ```
 
-Or download pre-built binaries from the releases page.
+The crate is not currently published on crates.io; `cargo install usbtop-ng` will work once it is. Pre-built binaries may also be available from the releases page.
 
 #### Usage
 ```bash
@@ -84,7 +96,7 @@ usbtop-ng --setup
 - Requires root privileges on most systems
 - macOS support is limited due to lack of usbmon equivalent
 - Some USB controllers may not be fully supported
-- Binary usbmon format parsing is still being refined
+- Only the usbmon text (`Nu`) interface is supported; the binary `/dev/usbmonN` interface is not used
 
 #### Roadmap
 - Additional platform-specific optimizations  
