@@ -366,3 +366,34 @@ mod tests {
         assert_eq!(unload_mode(&ask), UnloadMode::Ask);
     }
 }
+
+#[cfg(all(test, feature = "integration", target_os = "linux"))]
+mod integration_tests {
+    use super::*;
+
+    /// Requires: Linux, usbmon loaded, read access (typically root).
+    /// Run: cargo test --features integration
+    #[test]
+    fn live_usbmon_status_and_interfaces() {
+        let status = check_usbmon_status().expect("status check must run");
+        if !status.usbmon_available {
+            eprintln!("usbmon not available; live checks skipped");
+            return;
+        }
+        let bus = status.available_buses.first().copied().unwrap_or(0);
+        let text = crate::usbmon::reader::UsbmonReader::new(bus);
+        assert!(
+            text.is_available(),
+            "text interface file missing: {}",
+            text.path.display()
+        );
+        let binary = std::path::Path::new("/dev/usbmon0");
+        if binary.exists() {
+            eprintln!("binary node present: {}", binary.display());
+            match crate::usbmon::open_nonblocking(binary) {
+                Ok(_) => eprintln!("binary node opened ok: {}", binary.display()),
+                Err(e) => eprintln!("binary node open failed: {}: {}", binary.display(), e),
+            }
+        }
+    }
+}
