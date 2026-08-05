@@ -209,10 +209,19 @@ impl DeviceManager {
     /// Once-per-tick maintenance: decay rates, drop devices disconnected
     /// long enough, refresh bus speeds. Returns removed (bus_id, device_id).
     pub fn refresh(&mut self) -> Vec<(u8, u8)> {
+        let sysfs_base = self.sysfs_base.clone();
         let mut removed = Vec::new();
         for bus in self.buses.values_mut() {
             for device in bus.devices.values_mut() {
                 device.bandwidth_stats.refresh();
+                if let Some(path) = &device.sysfs_path {
+                    if !path.exists() {
+                        device.mark_disconnected();
+                    }
+                } else if !device.is_disconnected {
+                    // metadata may become readable later (e.g. permissions, race at first sight)
+                    device.populate_from_sysfs(sysfs_base.as_deref());
+                }
             }
             let stale: Vec<u8> = bus
                 .devices
@@ -323,5 +332,23 @@ mod tests {
         let removed = mgr.refresh();
         assert_eq!(removed, vec![(1, 5)]);
         assert!(!mgr.buses.contains_key(&1), "empty buses are dropped");
+    }
+
+    #[test]
+    fn refresh_marks_devices_disconnected_when_sysfs_path_vanishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let dev_dir = temp.path().join("1-2");
+        std::fs::create_dir_all(&dev_dir).unwrap();
+        std::fs::write(dev_dir.join("busnum"), "1\n").unwrap();
+        std::fs::write(dev_dir.join("devnum"), "3\n").unwrap();
+
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let callback = parse_usbmon_text_line("ffff0000ffff0001 100 C Bi:1:003:1 0 64 <").unwrap();
+        mgr.apply_packet(&callback);
+        assert!(!mgr.buses[&1].devices[&3].is_disconnected);
+
+        std::fs::remove_dir_all(&dev_dir).unwrap();
+        mgr.refresh();
+        assert!(mgr.buses[&1].devices[&3].is_disconnected);
     }
 }
