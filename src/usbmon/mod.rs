@@ -1,11 +1,11 @@
+use anyhow::{anyhow, Result};
+use log::{debug, info, warn};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use anyhow::{Result, anyhow};
-use log::{info, warn, debug};
 
-pub mod reader;
 pub mod parser;
+pub mod reader;
 
 #[derive(Debug, Clone)]
 pub struct UsbmonStatus {
@@ -17,7 +17,7 @@ pub struct UsbmonStatus {
 
 pub fn check_usbmon_status() -> Result<UsbmonStatus> {
     debug!("Checking usbmon kernel module status");
-    
+
     let module_loaded = is_usbmon_module_loaded()?;
     let debugfs_mounted = is_debugfs_mounted()?;
     let usbmon_available = debugfs_mounted && check_usbmon_debugfs_exists()?;
@@ -41,7 +41,7 @@ fn is_usbmon_module_loaded() -> Result<bool> {
         let modules = fs::read_to_string("/proc/modules")?;
         Ok(modules.lines().any(|line| line.starts_with("usbmon ")))
     }
-    
+
     #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
     {
         // BSD systems may have USB monitoring built-in or use different mechanisms
@@ -51,7 +51,7 @@ fn is_usbmon_module_loaded() -> Result<bool> {
         let stdout = String::from_utf8_lossy(&output.stdout);
         Ok(stdout.contains("usb") || stdout.contains("ugen"))
     }
-    
+
     #[cfg(target_os = "macos")]
     {
         // macOS doesn't have usbmon, but we can still detect USB via system_profiler
@@ -64,11 +64,11 @@ fn is_debugfs_mounted() -> Result<bool> {
     #[cfg(target_os = "linux")]
     {
         let mounts = fs::read_to_string("/proc/mounts")?;
-        Ok(mounts.lines().any(|line| {
-            line.contains("debugfs") && line.contains("/sys/kernel/debug")
-        }))
+        Ok(mounts
+            .lines()
+            .any(|line| line.contains("debugfs") && line.contains("/sys/kernel/debug")))
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         // Non-Linux systems use different paths
@@ -81,13 +81,13 @@ fn check_usbmon_debugfs_exists() -> Result<bool> {
     {
         Ok(Path::new("/sys/kernel/debug/usb/usbmon").exists())
     }
-    
+
     #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
     {
         // BSD systems may use /dev/ugen* or similar
         Ok(Path::new("/dev").exists())
     }
-    
+
     #[cfg(target_os = "macos")]
     {
         Ok(false)
@@ -98,27 +98,25 @@ fn get_available_buses() -> Result<Vec<u8>> {
     #[cfg(target_os = "linux")]
     {
         let mut buses = Vec::new();
-        
+
         if let Ok(entries) = fs::read_dir("/sys/kernel/debug/usb/usbmon") {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let filename = entry.file_name();
-                    let filename_str = filename.to_string_lossy();
-                    
-                    // Look for files like "0u", "1u", "2u", etc.
-                    if filename_str.ends_with('u') && filename_str.len() >= 2 {
-                        if let Ok(bus_num) = filename_str[0..filename_str.len()-1].parse::<u8>() {
-                            buses.push(bus_num);
-                        }
+            for entry in entries.flatten() {
+                let filename = entry.file_name();
+                let filename_str = filename.to_string_lossy();
+
+                // Look for files like "0u", "1u", "2u", etc.
+                if filename_str.ends_with('u') && filename_str.len() >= 2 {
+                    if let Ok(bus_num) = filename_str[0..filename_str.len() - 1].parse::<u8>() {
+                        buses.push(bus_num);
                     }
                 }
             }
         }
-        
+
         buses.sort();
         Ok(buses)
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         // For non-Linux systems, we'll implement bus discovery differently
@@ -126,80 +124,130 @@ fn get_available_buses() -> Result<Vec<u8>> {
     }
 }
 
+fn is_yes_response(input: &str) -> bool {
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
 pub fn prompt_user_to_load_module() -> Result<bool> {
     use std::io::{self, Write};
-    
-    println!("❌ usbmon kernel module is not loaded!");
-    println!();
-    println!("usbtop-ng requires the usbmon kernel module to monitor USB traffic.");
-    println!("This module is safe and provides read-only access to USB bus activity.");
-    println!();
-    println!("To load the module, run:");
-    println!("  sudo modprobe usbmon");
-    println!();
-    println!("You may also need to mount debugfs if not already mounted:");
+
+    println!("usbmon is not loaded, so usbtop-ng cannot read live USB traffic yet.");
+    println!("usbtop-ng can run 'sudo modprobe usbmon' for you now.");
+    println!("If debugfs is not mounted, it can also run:");
     println!("  sudo mount -t debugfs none /sys/kernel/debug");
     println!();
-    print!("Would you like usbtop-ng to attempt loading the module? (y/N): ");
+    println!("This may ask for your sudo password. Answer 'n' to leave the system unchanged.");
+    print!("Load usbmon now? (y/N): ");
     io::stdout().flush()?;
-    
+
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
-    
-    let response = input.trim().to_lowercase();
-    Ok(response == "y" || response == "yes")
+
+    Ok(is_yes_response(&input))
+}
+
+pub fn prompt_user_to_unload_module() -> Result<bool> {
+    use std::io::{self, Write};
+
+    println!("usbtop-ng loaded usbmon for this session.");
+    println!("You can leave it loaded for future USB monitoring, or unload it now with:");
+    println!("  sudo modprobe -r usbmon");
+    println!();
+    println!("This may ask for your sudo password. Answer 'n' to leave usbmon loaded.");
+    print!("Unload usbmon now? (y/N): ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    Ok(is_yes_response(&input))
 }
 
 pub fn attempt_load_usbmon() -> Result<()> {
     info!("Attempting to load usbmon kernel module");
-    
+
     #[cfg(target_os = "linux")]
     {
         // Try to load usbmon module
         let output = Command::new("sudo")
-            .args(&["modprobe", "usbmon"])
+            .args(["modprobe", "usbmon"])
             .output()
             .map_err(|e| anyhow!("Failed to run modprobe: {}", e))?;
-        
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!("Failed to load usbmon module: {}", stderr));
         }
-        
+
         // Try to mount debugfs if needed
         if !is_debugfs_mounted()? {
             info!("Attempting to mount debugfs");
             let output = Command::new("sudo")
-                .args(&["mount", "-t", "debugfs", "none", "/sys/kernel/debug"])
+                .args(["mount", "-t", "debugfs", "none", "/sys/kernel/debug"])
                 .output()
                 .map_err(|e| anyhow!("Failed to mount debugfs: {}", e))?;
-            
+
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!("Failed to mount debugfs (may already be mounted): {}", stderr);
+                warn!(
+                    "Failed to mount debugfs (may already be mounted): {}",
+                    stderr
+                );
             }
         }
-        
+
         Ok(())
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
-        Err(anyhow!("Automatic module loading not supported on this platform"))
+        Err(anyhow!(
+            "Automatic module loading is only supported on Linux"
+        ))
+    }
+}
+
+pub fn attempt_unload_usbmon() -> Result<()> {
+    info!("Attempting to unload usbmon kernel module");
+
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("sudo")
+            .args(["modprobe", "-r", "usbmon"])
+            .output()
+            .map_err(|e| anyhow!("Failed to run modprobe -r: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("Failed to unload usbmon module: {}", stderr));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(anyhow!(
+            "Automatic module unloading is only supported on Linux"
+        ))
     }
 }
 
 pub fn print_platform_instructions() {
     #[cfg(target_os = "linux")]
     {
-        println!("📋 Linux Setup Instructions:");
-        println!("1. Load the usbmon kernel module:");
+        println!("Linux setup for live USB monitoring:");
+        println!("1. Make the usbmon kernel module available:");
         println!("   sudo modprobe usbmon");
-        println!("2. Ensure debugfs is mounted:");
+        println!("2. Make the usbmon debugfs files available:");
         println!("   sudo mount -t debugfs none /sys/kernel/debug");
-        println!("3. Run usbtop-ng as root or add your user to the appropriate group");
+        println!("3. Run usbtop-ng with permission to read /sys/kernel/debug/usb/usbmon");
+        println!("   The simplest test is: sudo usbtop-ng");
+        println!(
+            "usbtop-ng can prompt for step 1 at startup and can optionally unload usbmon on quit."
+        );
     }
-    
+
     #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
     {
         println!("📋 BSD Setup Instructions:");
@@ -207,7 +255,7 @@ pub fn print_platform_instructions() {
         println!("2. Check available USB devices with: usbconfig");
         println!("3. Run usbtop-ng with appropriate permissions");
     }
-    
+
     #[cfg(target_os = "macos")]
     {
         println!("📋 macOS Setup Instructions:");
@@ -216,5 +264,24 @@ pub fn print_platform_instructions() {
         println!("- USB Prober (part of Additional Tools for Xcode)");
         println!("- system_profiler SPUSBDataType");
         println!("- ioreg -p IOUSB");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_yes_response;
+
+    #[test]
+    fn yes_response_accepts_y_and_yes_case_insensitively() {
+        assert!(is_yes_response("y"));
+        assert!(is_yes_response("YES"));
+        assert!(is_yes_response(" yes \n"));
+    }
+
+    #[test]
+    fn yes_response_rejects_other_answers() {
+        assert!(!is_yes_response(""));
+        assert!(!is_yes_response("n"));
+        assert!(!is_yes_response("sure"));
     }
 }

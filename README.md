@@ -5,6 +5,10 @@ usbtop-ng is a next-generation USB traffic monitoring tool, reimagined in Rust f
 Inspired by the original [usbtop](https://github.com/aguinet/usbtop), usbtop-ng is an **independent reimplementation**.  
 It does **not** share code with the original project and is **not affiliated with or endorsed by** its authors.
 
+## Current Status
+
+usbtop-ng builds, runs its setup checks, and opens the terminal UI. Live packet-to-device monitoring is still being wired into the UI, so expect limited runtime functionality until the monitoring loop is connected.
+
 ## ✨ Features
 
 - Real-time USB traffic statistics with **%busy** calculations for devices and buses
@@ -19,7 +23,7 @@ It does **not** share code with the original project and is **not affiliated wit
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/usbtop-ng.git
+git clone https://github.com/wifi-blackout/usbtop-ng.git
 cd usbtop-ng
 
 # Build and install
@@ -50,6 +54,31 @@ usbtop
 Press `q` to quit.  
 Run with `--help` to see all options.
 
+### usbmon loading and unloading
+
+On Linux, live monitoring uses the `usbmon` kernel module and the debugfs interface at `/sys/kernel/debug/usb/usbmon`.
+
+If usbmon is missing, usbtop-ng explains the exact command it wants to run and asks before running:
+
+```bash
+sudo modprobe usbmon
+```
+
+If usbtop-ng loaded usbmon for the current session, it asks on quit whether to unload it again with:
+
+```bash
+sudo modprobe -r usbmon
+```
+
+Preferences are stored in `~/.usbtop-ng/preferences.toml` and are created automatically on first run:
+
+```toml
+auto_load_usbmon = false
+unload_usbmon_on_exit = false
+```
+
+Set `auto_load_usbmon = true` to skip the startup prompt and load usbmon automatically when needed. Set `unload_usbmon_on_exit = true` to unload usbmon automatically on exit, but only when usbtop-ng loaded it for that session.
+
 ### Command Line Options
 
 ```
@@ -57,7 +86,7 @@ usbtop-ng [OPTIONS]
 
 Options:
   -v, --verbose            Enable verbose logging
-  -c, --config <CONFIG>    Configuration file path
+  -c, --config <CONFIG>    Preferences file path (default: ~/.usbtop-ng/preferences.toml)
   -r, --refresh <REFRESH>  Refresh rate in milliseconds [default: 1000]
       --force              Force run without usbmon (limited functionality)
       --setup              Show platform-specific setup instructions
@@ -78,7 +107,6 @@ Options:
 
 Requirements:
 - Rust (latest stable)
-- libusb (development headers)
 
 Build:
 ```bash
@@ -92,7 +120,7 @@ cargo test
 
 ## 📄 License
 
-This project is licensed under the **BSD 3-Clause License**.  
+This project is licensed under the **BSD 3-Clause License**, matching the original usbtop package's license family.  
 You are free to use, modify, and distribute this code, provided you include the original copyright and license notice in any copies or substantial portions.
 
 See [LICENSE](LICENSE) for full details.

@@ -1,6 +1,6 @@
-# ng-usbtop Architecture
+# usbtop-ng Architecture
 
-This document provides a detailed overview of ng-usbtop's architecture, design decisions, and implementation details.
+This document provides a detailed overview of usbtop-ng's architecture, design decisions, and implementation details.
 
 ## Table of Contents
 
@@ -14,11 +14,11 @@ This document provides a detailed overview of ng-usbtop's architecture, design d
 
 ## Overview
 
-ng-usbtop is designed as a modular, async-first USB monitoring tool with clear separation of concerns:
+usbtop-ng is designed as a modular, async-first USB monitoring tool with clear separation of concerns:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        ng-usbtop                                │
+│                        usbtop-ng                                │
 ├─────────────────────────────────────────────────────────────────┤
 │  Terminal UI (ratatui + crossterm)                             │
 ├─────────────────────────────────────────────────────────────────┤
@@ -298,7 +298,7 @@ mod macos {
 
 ### Privilege Requirements
 
-ng-usbtop requires elevated privileges for USB monitoring:
+usbtop-ng requires elevated privileges for USB monitoring:
 
 **Linux:**
 - Root access for `/sys/kernel/debug/usb/usbmon/` access
@@ -314,7 +314,7 @@ ng-usbtop requires elevated privileges for USB monitoring:
 ### Security Measures
 
 1. **Minimal Privileges**: Drop privileges after initialization where possible
-2. **Input Validation**: All user input and configuration files validated
+2. **Input Validation**: All user input and preference files validated
 3. **Safe Parsing**: Robust packet parsing with bounds checking
 4. **Error Handling**: Graceful degradation on permission errors
 5. **No Network**: Local-only operation, no network communication
@@ -380,7 +380,7 @@ match usbmon_reader.read_packets().await {
 
 ---
 
-This architecture enables ng-usbtop to be:
+This architecture enables usbtop-ng to be:
 - **Performant**: Minimal overhead USB monitoring
 - **Reliable**: Robust error handling and recovery
 - **Maintainable**: Clear module boundaries and interfaces
