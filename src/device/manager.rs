@@ -82,6 +82,22 @@ impl UsbBus {
     pub fn remove_device(&mut self, device_id: u8) {
         self.devices.remove(&device_id);
     }
+
+    /// Aggregate %busy across every device on this bus, against the bus's
+    /// practical maximum bandwidth. `None` when the bus speed is unknown (no
+    /// meaningful denominator) rather than a misleading `0.0`.
+    pub fn busy_percentage(&self) -> Option<f64> {
+        let max_bandwidth = self.speed.to_practical_bytes_per_second();
+        if max_bandwidth <= 0.0 {
+            return None;
+        }
+        let total_usage: f64 = self
+            .devices
+            .values()
+            .map(|device| device.bandwidth_stats.current_bps)
+            .sum();
+        Some((total_usage / max_bandwidth * 100.0).min(100.0))
+    }
 }
 
 #[derive(Debug)]
@@ -239,6 +255,41 @@ mod tests {
         let removed = mgr.refresh();
         assert_eq!(removed, vec![(1, 5)]);
         assert!(!mgr.buses.contains_key(&1), "empty buses are dropped");
+    }
+
+    #[test]
+    fn busy_percentage_none_for_unknown_bus_speed() {
+        let (_t, mut mgr) = manager_with_empty_sysfs();
+        let bus = mgr.get_or_create_bus(1);
+        assert_eq!(bus.speed, UsbSpeed::Unknown);
+        assert_eq!(bus.busy_percentage(), None);
+    }
+
+    #[test]
+    fn busy_percentage_sums_devices_against_bus_practical_max() {
+        let (_t, mut mgr) = manager_with_empty_sysfs();
+        let bus = mgr.get_or_create_bus(1);
+        bus.speed = UsbSpeed::Full; // practical max = 1_200_000 bytes/s
+        let mut d1 = UsbDevice::new(1, 3);
+        d1.bandwidth_stats.current_bps = 600_000.0;
+        let mut d2 = UsbDevice::new(1, 4);
+        d2.bandwidth_stats.current_bps = 300_000.0;
+        bus.devices.insert(3, d1);
+        bus.devices.insert(4, d2);
+
+        assert_eq!(bus.busy_percentage(), Some(75.0));
+    }
+
+    #[test]
+    fn busy_percentage_clamps_at_100() {
+        let (_t, mut mgr) = manager_with_empty_sysfs();
+        let bus = mgr.get_or_create_bus(1);
+        bus.speed = UsbSpeed::Full;
+        let mut d1 = UsbDevice::new(1, 3);
+        d1.bandwidth_stats.current_bps = 10_000_000.0;
+        bus.devices.insert(3, d1);
+
+        assert_eq!(bus.busy_percentage(), Some(100.0));
     }
 
     #[cfg(target_os = "linux")]
