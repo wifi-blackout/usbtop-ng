@@ -418,18 +418,44 @@ fn draw_bandwidth_graph(f: &mut Frame, area: Rect, app: &UsbTopApp) {
     f.render_widget(chart, area);
 }
 
-/// Column widths for the device rows: Port, Device, Speed, Vendor, Product,
-/// Bw↓, Bw↑, Status. Controller and bus headings span the whole line, which a
-/// `Table` cannot do, so the list is laid out as pre-padded text lines.
+/// Column widths, in terminal cells, for the device rows: Port, Device, Speed,
+/// Vendor, Product, Bw↓, Bw↑, Status. Controller and bus headings span the
+/// whole line, which a `Table` cannot do, so the list is laid out as lines of
+/// pre-padded per-cell spans instead.
 const DEVICE_COLUMNS: [usize; 8] = [8, 8, 10, 14, 18, 10, 10, 12];
 
-fn device_columns(cells: [&str; 8]) -> String {
-    cells
-        .iter()
-        .zip(DEVICE_COLUMNS)
-        .map(|(cell, width)| format!("{cell:<width$.width$}"))
-        .collect::<Vec<_>>()
-        .join(" ")
+/// One padded cell per column, separated by single-space spans. Columns are
+/// measured in terminal cells, not chars: a CJK vendor string is twice as wide
+/// as its char count, and padding by chars would shove every later column
+/// rightwards on that row only.
+fn device_columns(cells: [&str; 8]) -> Vec<Span<'static>> {
+    let mut spans = Vec::with_capacity(DEVICE_COLUMNS.len() * 2 - 1);
+    for (index, (cell, width)) in cells.iter().zip(DEVICE_COLUMNS).enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::raw(fit_to_display_width(cell, width)));
+    }
+    spans
+}
+
+/// Clip `text` to at most `width` terminal cells, then pad it to exactly that
+/// many. A wide character that would straddle the edge is dropped in favour of
+/// a padding space, so the column always ends where it should.
+fn fit_to_display_width(text: &str, width: usize) -> String {
+    let mut fitted = String::with_capacity(width);
+    let mut used = 0;
+    let mut buffer = [0u8; 4];
+    for character in text.chars() {
+        let cells = Span::raw(&*character.encode_utf8(&mut buffer)).width();
+        if used + cells > width {
+            break;
+        }
+        fitted.push(character);
+        used += cells;
+    }
+    fitted.push_str(&" ".repeat(width - used));
+    fitted
 }
 
 /// Port column text: "1.4.2" for a hub chain, "-" for a root hub, "?" when the
@@ -447,16 +473,26 @@ fn port_label(port_chain: Option<&Vec<u32>>) -> String {
 }
 
 fn draw_device_list(f: &mut Frame, area: Rect, app: &UsbTopApp) {
+    let list = Paragraph::new(device_list_lines(app)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" USB Devices "),
+    );
+
+    f.render_widget(list, area);
+}
+
+/// The device list as rendered: a column header, then per controller a heading,
+/// per bus a header, and one line per device in port order.
+fn device_list_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
     let heading_style = Style::default()
         .fg(ACCENT_COLOR)
         .add_modifier(Modifier::BOLD);
 
-    let mut lines = vec![Line::styled(
-        device_columns([
-            "Port", "Device", "Speed", "Vendor", "Product", "Bw↓", "Bw↑", "Status",
-        ]),
-        heading_style,
-    )];
+    let mut lines = vec![Line::from(device_columns([
+        "Port", "Device", "Speed", "Vendor", "Product", "Bw↓", "Bw↑", "Status",
+    ]))
+    .style(heading_style)];
 
     for controller in &app.controllers {
         lines.push(Line::styled(
@@ -485,8 +521,8 @@ fn draw_device_list(f: &mut Frame, area: Rect, app: &UsbTopApp) {
                     Style::default().fg(TEXT_COLOR)
                 };
 
-                lines.push(Line::styled(
-                    device_columns([
+                lines.push(
+                    Line::from(device_columns([
                         &port_label(row.port_chain.as_ref()),
                         &format!("{:03}:{:03}", device.bus_id, device.device_id),
                         &format!("{:.1} Mbps", device.speed.to_mbps()),
@@ -499,20 +535,14 @@ fn draw_device_list(f: &mut Frame, area: Rect, app: &UsbTopApp) {
                         } else {
                             "Connected"
                         },
-                    ]),
-                    status_style,
-                ));
+                    ]))
+                    .style(status_style),
+                );
             }
         }
     }
 
-    let list = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" USB Devices "),
-    );
-
-    f.render_widget(list, area);
+    lines
 }
 
 fn draw_color_reference(f: &mut Frame, area: Rect) {
@@ -856,6 +886,78 @@ mod tests {
         assert_eq!(app.selected_device.as_deref(), Some("3:6"));
         app.select_previous_device(); // wraps
         assert_eq!(app.selected_device.as_deref(), Some("4:2"));
+    }
+
+    /// Total display width of a device row: every column plus one space between.
+    fn device_row_width() -> usize {
+        DEVICE_COLUMNS.iter().sum::<usize>() + DEVICE_COLUMNS.len() - 1
+    }
+
+    #[test]
+    fn device_columns_pad_and_truncate_by_display_width() {
+        // "東京デバイス" is 6 chars but 12 terminal cells, so the 14-cell Vendor
+        // column takes 2 spaces of padding, not 8.
+        let wide = Line::from(device_columns([
+            "?",
+            "001:004",
+            "0.0 Mbps",
+            "東京デバイス",
+            "プローブ",
+            "0.0 KB/s",
+            "0.0 KB/s",
+            "Connected",
+        ]));
+        assert_eq!(wide.width(), device_row_width());
+
+        // Over-long cells are clipped to their column, again by display width.
+        let clipped = Line::from(device_columns([
+            "?",
+            "001:004",
+            "0.0 Mbps",
+            "東京デバイスカンパニー",
+            "Product",
+            "0.0 KB/s",
+            "0.0 KB/s",
+            "Connected",
+        ]));
+        assert_eq!(clipped.width(), device_row_width());
+    }
+
+    #[test]
+    fn device_rows_stay_aligned_with_wide_characters() {
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0), (1, 4, 0.0)]);
+        {
+            let bus = mgr.get_or_create_bus(1);
+            let ascii = bus.devices.get_mut(&3).unwrap();
+            ascii.vendor = Some("Acme".to_string());
+            ascii.product = Some("Widget".to_string());
+            let wide = bus.devices.get_mut(&4).unwrap();
+            wide.vendor = Some("東京デバイス".to_string());
+            wide.product = Some("プローブ".to_string());
+        }
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let lines = device_list_lines(&app);
+        let widths: Vec<usize> = lines.iter().map(Line::width).collect();
+        // Column header plus both device rows occupy exactly the same cells;
+        // the controller heading and bus header are free-form.
+        assert_eq!(
+            widths,
+            vec![
+                device_row_width(),
+                widths[1],
+                widths[2],
+                device_row_width(),
+                device_row_width()
+            ]
+        );
+
+        // Lock the ASCII geometry so column offsets cannot drift silently.
+        assert_eq!(
+            lines[3].to_string(),
+            "?        001:003  0.0 Mbps   Acme           Widget             0.0 KB/s   0.0 KB/s   Connected   "
+        );
     }
 
     #[cfg(target_os = "linux")]
