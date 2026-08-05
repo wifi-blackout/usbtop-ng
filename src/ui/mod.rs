@@ -316,7 +316,7 @@ fn draw_ui(f: &mut Frame, app: &UsbTopApp) {
             Constraint::Length(3), // Header
             Constraint::Length(8), // Bandwidth graph
             Constraint::Min(10),   // Device list
-            Constraint::Length(3), // Controls
+            Constraint::Length(4), // Controls
         ])
         .split(size);
 
@@ -458,6 +458,19 @@ fn fit_to_display_width(text: &str, width: usize) -> String {
     fitted
 }
 
+/// Speed is the 3rd column (index 2) of `DEVICE_COLUMNS`. `device_columns`
+/// emits one separator span before every column after the first, so a cell
+/// at column index `i` lands at span index `2 * i` in its output.
+const SPEED_SPAN_INDEX: usize = 2 * 2;
+
+/// Style that paints text in a speed's reference color (see
+/// `UsbSpeed::color_code`), used for both the bus header's Mbps figure and
+/// the device row's Speed cell.
+fn speed_style(speed: &UsbSpeed) -> Style {
+    let (r, g, b) = speed.color_code();
+    Style::default().fg(Color::Rgb(r, g, b))
+}
+
 /// Port column text: "1.4.2" for a hub chain, "-" for a root hub, "?" when the
 /// device could not be located in sysfs.
 fn port_label(port_chain: Option<&Vec<u32>>) -> String {
@@ -501,12 +514,13 @@ fn device_list_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
         ));
 
         for bus in &controller.buses {
-            lines.push(Line::raw(format!(
-                "▶ Bus {:02} ({})  {:.1} Mbps",
-                bus.bus_id,
-                bus.side_label,
-                bus.speed.to_mbps()
-            )));
+            lines.push(Line::from(vec![
+                Span::raw(format!("▶ Bus {:02} ({})  ", bus.bus_id, bus.side_label)),
+                Span::styled(
+                    format!("{:.1} Mbps", bus.speed.to_mbps()),
+                    speed_style(&bus.speed),
+                ),
+            ]));
 
             for row in &bus.devices {
                 let device = &row.device;
@@ -521,23 +535,31 @@ fn device_list_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
                     Style::default().fg(TEXT_COLOR)
                 };
 
-                lines.push(
-                    Line::from(device_columns([
-                        &port_label(row.port_chain.as_ref()),
-                        &format!("{:03}:{:03}", device.bus_id, device.device_id),
-                        &format!("{:.1} Mbps", device.speed.to_mbps()),
-                        device.vendor.as_deref().unwrap_or("Unknown"),
-                        device.product.as_deref().unwrap_or("Unknown"),
-                        &format!("{:.1} KB/s", device.bandwidth_stats.rx_bps / 1000.0),
-                        &format!("{:.1} KB/s", device.bandwidth_stats.tx_bps / 1000.0),
-                        if device.is_disconnected {
-                            "Disconnected"
-                        } else {
-                            "Connected"
-                        },
-                    ]))
-                    .style(status_style),
-                );
+                let mut spans = device_columns([
+                    &port_label(row.port_chain.as_ref()),
+                    &format!("{:03}:{:03}", device.bus_id, device.device_id),
+                    &format!("{:.1} Mbps", device.speed.to_mbps()),
+                    device.vendor.as_deref().unwrap_or("Unknown"),
+                    device.product.as_deref().unwrap_or("Unknown"),
+                    &format!("{:.1} KB/s", device.bandwidth_stats.rx_bps / 1000.0),
+                    &format!("{:.1} KB/s", device.bandwidth_stats.tx_bps / 1000.0),
+                    if device.is_disconnected {
+                        "Disconnected"
+                    } else {
+                        "Connected"
+                    },
+                ]);
+
+                // Selected/disconnected rows stay uniformly styled for
+                // readability; only a plain, connected row gets its Speed
+                // cell tinted by the bus speed's reference color.
+                if !is_selected && !device.is_disconnected {
+                    spans[SPEED_SPAN_INDEX] = spans[SPEED_SPAN_INDEX]
+                        .clone()
+                        .style(speed_style(&device.speed));
+                }
+
+                lines.push(Line::from(spans).style(status_style));
             }
         }
     }
@@ -546,30 +568,47 @@ fn device_list_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
 }
 
 fn draw_color_reference(f: &mut Frame, area: Rect) {
-    let reference_text = vec![Line::from(vec![
-        Span::raw("Controls: "),
-        Span::styled(
-            "↑↓",
-            Style::default()
-                .fg(ACCENT_COLOR)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" Navigate  "),
-        Span::styled(
-            "h",
-            Style::default()
-                .fg(ACCENT_COLOR)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" Help  "),
-        Span::styled(
-            "q/Esc",
-            Style::default()
-                .fg(ACCENT_COLOR)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" Quit"),
-    ])];
+    let reference_text = vec![
+        Line::from(vec![
+            Span::raw("Legend: "),
+            Span::styled("●", speed_style(&UsbSpeed::Low)),
+            Span::raw(" 1.5M  "),
+            Span::styled("●", speed_style(&UsbSpeed::Full)),
+            Span::raw(" 12M  "),
+            Span::styled("●", speed_style(&UsbSpeed::High)),
+            Span::raw(" 480M  "),
+            Span::styled("●", speed_style(&UsbSpeed::SuperSpeed)),
+            Span::raw(" 5G  "),
+            Span::styled("●", speed_style(&UsbSpeed::SuperSpeedPlus)),
+            Span::raw(" 10G+  "),
+            Span::styled("●", speed_style(&UsbSpeed::Unknown)),
+            Span::raw(" ?"),
+        ]),
+        Line::from(vec![
+            Span::raw("Controls: "),
+            Span::styled(
+                "↑↓",
+                Style::default()
+                    .fg(ACCENT_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Navigate  "),
+            Span::styled(
+                "h",
+                Style::default()
+                    .fg(ACCENT_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Help  "),
+            Span::styled(
+                "q/Esc",
+                Style::default()
+                    .fg(ACCENT_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Quit"),
+        ]),
+    ];
 
     let reference = Paragraph::new(reference_text)
         .block(Block::default().borders(Borders::ALL).title(" Controls "));
@@ -957,6 +996,36 @@ mod tests {
         assert_eq!(
             lines[3].to_string(),
             "?        001:003  0.0 Mbps   Acme           Widget             0.0 KB/s   0.0 KB/s   Connected   "
+        );
+    }
+
+    #[test]
+    fn speed_span_is_colored_unless_the_row_is_selected() {
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0), (1, 4, 0.0)]);
+        {
+            let bus = mgr.get_or_create_bus(1);
+            bus.devices.get_mut(&3).unwrap().speed = UsbSpeed::High;
+            bus.devices.get_mut(&4).unwrap().speed = UsbSpeed::SuperSpeed;
+        }
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:4".to_string());
+
+        let lines = device_list_lines(&app);
+        // [0] column header, [1] controller heading, [2] bus header,
+        // [3] device 3 (unselected), [4] device 4 (selected).
+        let unselected_speed = &lines[3].spans[SPEED_SPAN_INDEX];
+        assert_eq!(
+            unselected_speed.style.fg,
+            Some(Color::Rgb(255, 255, 0)), // UsbSpeed::High
+            "unselected row's Speed span carries its speed color"
+        );
+
+        let selected_speed = &lines[4].spans[SPEED_SPAN_INDEX];
+        assert_ne!(
+            selected_speed.style.fg,
+            Some(Color::Rgb(0, 255, 0)), // UsbSpeed::SuperSpeed
+            "selected row keeps the uniform highlight instead of the speed color"
         );
     }
 
