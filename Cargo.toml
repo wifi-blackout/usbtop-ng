@@ -11,6 +11,9 @@ keywords = ["usb", "monitoring", "usbmon", "tui"]
 categories = ["command-line-utilities"]
 rust-version = "1.88"
 
+[features]
+integration = []
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
