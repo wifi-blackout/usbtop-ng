@@ -7,15 +7,20 @@ It does **not** share code with the original project and is **not affiliated wit
 
 ## Current Status
 
-usbtop-ng builds, runs its setup checks, and opens the terminal UI with live packet-to-device monitoring wired end-to-end: usbmon reader thread(s) parse the `Nu` text interface, hand packets to the UI thread over an `mpsc` channel, and `DeviceManager` aggregates them into per-device bandwidth stats on every refresh tick.
+usbtop-ng builds, runs its setup checks, and opens the terminal UI with live packet-to-device monitoring wired end-to-end: usbmon reader thread(s) read the binary `/dev/usbmonN` interface when it's available, falling back automatically to the debugfs `Nu` text interface otherwise, hand packets to the UI thread over an `mpsc` channel, and `DeviceManager` aggregates them into per-device bandwidth stats, physical topology, and %busy on every refresh tick.
 
 ## ✨ Features
 
+- Controller-grouped, physically port-ordered device list: devices are listed under their host controller and USB bus in physical port order, with the USB2-side and USB3-side buses of a shared xHCI controller shown as adjacent sibling buses
 - Live per-device USB bandwidth (RX/TX), plus running totals and peak bandwidth across all devices
-- Bandwidth history graph over a 60-second sliding window
+- Per-device and per-bus %busy, measured against each USB speed's practical (protocol-overhead-adjusted) bandwidth and shown in the device list and bus headers
+- ⚡ high-utilization (>80% busy) and 🔺 capability-exceeds-bus indicators — the latter from a cached `bcdDevice`/`bMaxPacketSize0` heuristic read via the device's resolved sysfs path
+- Color-coded USB link speeds in the device list, bus headers, and a legend in the controls bar
+- Split bandwidth chart pane: aggregate total on the left, the selected device's rx/tx history on the right
 - Device metadata (vendor, product, speed) resolved from sysfs
 - Disconnect detection: devices are shown greyed out for 5 seconds after disconnecting, then removed
 - Managed usbmon load/unload, with the choice remembered in preferences
+- Binary usbmon interface (`/dev/usbmonN`) used when available, with automatic fallback to the debugfs `Nu` text interface
 - Lightweight, terminal-friendly interface
 - Rust-powered performance and safety
 - Cross-platform support (Linux, *BSD, macOS — Windows WIP); live monitoring via usbmon is Linux-only — on BSD/macOS the UI can open (with `--force` where needed) but shows no devices

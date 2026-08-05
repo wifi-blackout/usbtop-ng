@@ -9,7 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Live USB bandwidth monitoring pipeline wired end-to-end: usbmon reader thread(s) → mpsc channel → DeviceManager aggregation → per-tick UI refresh
+- Real binary usbmon interface (`/dev/usbmonN`): reads the kernel's 48-byte native-endian event headers directly and drains each event's captured payload, used automatically when the device can be opened, with transparent fallback to the debugfs `Nu` text interface otherwise (one `info!` log line states which interface was chosen)
 - Full parser for usbmon's `Nu` text interface format
+- Controller-grouped, physically port-ordered device list: devices are listed under a `═ controller ═` heading and `▶ Bus NN (USB2 side/USB3 side)` bus headers, in physical port order (parsed from the resolved sysfs directory name), with the USB2-side and USB3-side buses of a shared xHCI controller listed as adjacent sibling buses; the list's vertical scroll follows the selected device so it can't be walked off-screen
+- Per-device and per-bus %busy, measured against each USB speed's practical (protocol-overhead-adjusted) bandwidth and rendered in the device list and bus headers (`-- busy` when the bus speed is unknown)
+- ⚡ high-utilization (>80% busy) and 🔺 capability-exceeds-bus indicators in the device list's `!` column, the latter driven by a cached `bcdDevice`/`bMaxPacketSize0` capability heuristic read once via the device's resolved sysfs path
+- Color-coded USB link speeds: the Speed cell of every device row, the speed figure in every bus header, and a color legend in the controls block
+- Split bandwidth chart pane: the aggregate total chart on the left, the selected device's rx/tx rate history on the right ([-60, 0]s window), with a placeholder when no device is selected or the selection disappears
+- `integration` cargo feature: opt-in tests that exercise the real usbmon interfaces on a live Linux system (`cargo test --features integration`), skipping gracefully when usbmon isn't available; the default `cargo test`/`cargo test --all-targets` suite and CI are unaffected
 - Device metadata (vendor, product, speed) resolved from sysfs by busnum/devnum topology
 - Interactive terminal UI with ratatui
 - Cross-platform support: live monitoring via usbmon is Linux-only; on BSD/macOS the UI can open (with `--force` where needed) but shows no devices
@@ -25,18 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Preferences-directory permission hardening (0700) now applies only when usbtop-ng creates the default `~/.usbtop-ng` directory; existing or custom-path directories are left untouched
 - `PUBLIC/LICENSE` now matches the root `LICENSE` verbatim (BSD-3-Clause, copyright usbtop-ng contributors)
-- Documentation (README, CONTRIBUTING, ARCHITECTURE) reconciled with the implemented thread + mpsc + text-interface design
+- Documentation (README, CONTRIBUTING, ARCHITECTURE) reconciled with the implemented thread + mpsc + dual-interface (binary preferred, text fallback) design
+- `UsbTopApp`'s flat device map replaced with a per-tick `sync_from(&DeviceManager)` snapshot (`ControllerView`/`BusView`/`DeviceRow`) that also drives the new controller/bus grouping and port ordering
 
 ### Removed
 - Tokio and chrono dependencies
-- The broken binary-mode usbmon reader; only the debugfs `Nu` text interface is read
-- Per-speed row coloring from the UI legend and help overlay (the feature was never actually implemented)
 
 ### Technical Details
 - Built with Rust 2021 edition
 - Dedicated blocking reader thread(s), opened `O_NONBLOCK` with a shutdown handle, feeding an `mpsc` channel read by the UI thread
 - Terminal UI powered by ratatui and crossterm, redrawn on a per-tick refresh
-- USB packet parsing for the usbmon `Nu` text format only (binary `/dev/usbmonN` is not supported)
+- USB packet parsing for both the binary (`/dev/usbmonN`) and text (`Nu`) usbmon interfaces, selected automatically at startup
 - Multi-threaded architecture with proper error handling
 - Modular codebase with clear separation of concerns
 
@@ -96,7 +102,7 @@ usbtop-ng --setup
 - Requires root privileges on most systems
 - macOS support is limited due to lack of usbmon equivalent
 - Some USB controllers may not be fully supported
-- Only the usbmon text (`Nu`) interface is supported; the binary `/dev/usbmonN` interface is not used
+- Both usbmon interfaces (binary `/dev/usbmonN`, text `Nu`) are supported, but only on Linux; there is no live-monitoring equivalent on BSD/macOS
 
 #### Roadmap
 - Additional platform-specific optimizations  

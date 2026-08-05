@@ -785,7 +785,7 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from("Controls:"),
         Line::from(vec![
             Span::styled("  ↑/↓", Style::default().fg(ACCENT_COLOR)),
-            Span::raw("      Navigate device list"),
+            Span::raw("      Select a device (list scrolls to keep it visible)"),
         ]),
         Line::from(vec![
             Span::styled("  h", Style::default().fg(ACCENT_COLOR)),
@@ -797,9 +797,12 @@ fn draw_help_overlay(f: &mut Frame) {
         ]),
         Line::from(""),
         Line::from("Features:"),
-        Line::from("  • Real-time USB bandwidth monitoring"),
+        Line::from("  • Controller-grouped, port-ordered device list (USB2/USB3 sibling buses)"),
+        Line::from("  • Per-device and per-bus %busy"),
+        Line::from("  • ⚡ high-utilization / 🔺 limited-by-bus indicators"),
+        Line::from("  • Color-coded USB link speeds"),
+        Line::from("  • Split charts: aggregate total, plus the selected device's rx/tx"),
         Line::from("  • Device disconnect detection"),
-        Line::from("  • Bandwidth history graphs"),
         Line::from("  • Multi-platform support (Linux/BSD/macOS)"),
         Line::from(""),
         Line::from("Press 'h' to close this help"),
