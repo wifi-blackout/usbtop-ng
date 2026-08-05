@@ -154,6 +154,29 @@ cargo test -- --nocapture
 cargo test --all-targets
 ```
 
+`cargo test` (and `cargo test --all-targets`) run the default, hermetic suite
+only: everything is exercised against fixture files, FIFOs, and `tempfile`
+paths, so it passes on any OS with no `/dev` or debugfs access required. CI
+runs this default suite only.
+
+### Live System Tests (`integration` feature)
+
+The opt-in `integration` cargo feature adds tests that talk to the real
+usbmon interfaces instead of fixtures:
+
+```bash
+# Requires Linux, the usbmon kernel module loaded, and read access to
+# /sys/kernel/debug/usb/usbmon (typically root)
+cargo test --features integration
+```
+
+These tests are gated behind `target_os = "linux"` as well as the feature, so
+they compile to nothing (and are skipped) on non-Linux hosts and on default
+builds. On Linux, if usbmon itself is unavailable the test prints a skip
+message and returns rather than failing, since not every Linux dev box has
+usbmon loaded. CI intentionally does not run this feature — it is meant for
+manual verification on a real machine with real USB traffic.
+
 ### Writing Tests
 
 ```rust
