@@ -3,24 +3,17 @@ use log::{debug, error};
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use super::parser::{parse_usbmon_text_line, UsbPacket};
-
-/// Generic Linux value of `O_NONBLOCK`. Hardcoded because usbtop-ng has no
-/// libc dependency; the value differs only on mips/alpha/sparc, which this
-/// tool does not target.
-#[cfg(target_os = "linux")]
-const O_NONBLOCK: i32 = 0o4000;
-
-/// How long a reader parks between polls when the interface has nothing to
-/// give (EAGAIN or EOF). Also the worst-case latency of a shutdown request.
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+use super::{open_nonblocking, POLL_INTERVAL};
 
 /// Reads usbmon's `Nu` text interface (`/sys/kernel/debug/usb/usbmon/{bus}u`
 /// on Linux). debugfs's `Nu` files ARE the text interface described in
-/// Documentation/usb/usbmon.rst — the real binary API is the separate
-/// `/dev/usbmonN` character devices, which this codebase does not open.
+/// Documentation/usb/usbmon.rst; the binary API is the separate
+/// `/dev/usbmonN` character devices, read by
+/// [`BinaryReader`](super::binary::BinaryReader). This reader is the fallback
+/// [`start_monitoring`](super::monitor::start_monitoring) picks when those
+/// devices cannot be opened.
 ///
 /// On Linux the file is opened non-blocking and polled every
 /// [`POLL_INTERVAL`], so a silent bus never parks the reader thread inside a
@@ -76,27 +69,6 @@ impl UsbmonReader {
         self.path.exists()
     }
 
-    /// Open the interface non-blocking on Linux so an idle bus cannot pin the
-    /// reader thread inside `read`: without `O_NONBLOCK` a thread parked on a
-    /// silent `Nu` file keeps the debugfs file (and therefore the usbmon
-    /// module) open indefinitely. Regular files never report `WouldBlock`, so
-    /// fixture-backed tests behave exactly as before.
-    fn open(&self) -> std::io::Result<std::fs::File> {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(O_NONBLOCK)
-                .open(&self.path)
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            std::fs::File::open(&self.path)
-        }
-    }
-
     /// Read loop over the usbmon text interface. Runs to completion on the
     /// calling thread; callers that want this alongside other work (e.g. a TUI
     /// event loop) should spawn it on a dedicated thread.
@@ -120,8 +92,7 @@ impl UsbmonReader {
 
         debug!("Starting packet capture from {}", self.path.display());
 
-        let file = self
-            .open()
+        let file = open_nonblocking(&self.path)
             .map_err(|e| anyhow!("Failed to open {}: {}", self.path.display(), e))?;
         let mut reader = BufReader::new(file);
         // Held across iterations on purpose: a `WouldBlock` can land mid-line,
@@ -184,6 +155,7 @@ mod tests {
     use super::*;
     use crate::usbmon::parser::UrbType;
     use std::io::Write;
+    use std::time::Duration;
 
     #[test]
     fn reads_packets_from_fixture_file_skipping_garbage() {
