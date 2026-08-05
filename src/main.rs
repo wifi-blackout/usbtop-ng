@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_imports, unused_mut, unused_variables)]
-
 use anyhow::Result;
 use clap::Parser;
 use log::{error, info, warn};
@@ -20,8 +18,8 @@ use std::time::Duration;
 use config::{load_or_create_default_at, Preferences};
 use ui::{run_ui, UsbTopApp};
 use usbmon::{
-    attempt_load_usbmon, attempt_unload_usbmon, check_usbmon_status, print_platform_instructions,
-    prompt_user_to_load_module, prompt_user_to_unload_module,
+    attempt_load_usbmon, check_usbmon_status, print_platform_instructions,
+    prompt_user_to_load_module,
 };
 
 #[derive(Parser)]
@@ -54,8 +52,7 @@ struct Cli {
     create_alias: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging
@@ -133,6 +130,7 @@ async fn main() -> Result<()> {
                         "usbmon was loaded, but the usbmon debugfs interface is still unavailable"
                     );
                     print_platform_instructions();
+                    usbmon::offer_unload_after_session(&preferences);
                     process::exit(1);
                 }
 
@@ -160,22 +158,17 @@ async fn main() -> Result<()> {
         warn!("No USB buses detected");
     }
 
+    let (packets, monitor) = usbmon::monitor::start_monitoring(&usbmon_status.available_buses);
+    let manager = device::manager::DeviceManager::new();
     let app = UsbTopApp::new(Duration::from_millis(cli.refresh));
-    let run_result = run_ui(app);
+    let run_result = run_ui(app, manager, packets);
+
+    // Close the usbmon files before anything tries to unload the module: an
+    // open debugfs `Nu` file pins usbmon, so `modprobe -r` would fail EBUSY.
+    monitor.stop();
 
     if loaded_usbmon_for_this_run {
-        let should_unload = if preferences.unload_usbmon_on_exit {
-            println!("unload_usbmon_on_exit=true, so usbtop-ng will try to unload usbmon now.");
-            true
-        } else {
-            prompt_user_to_unload_module()?
-        };
-
-        if should_unload {
-            if let Err(e) = attempt_unload_usbmon() {
-                warn!("Failed to unload usbmon: {}", e);
-            }
-        }
+        usbmon::offer_unload_after_session(&preferences);
     }
 
     run_result?;
