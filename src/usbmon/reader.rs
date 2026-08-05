@@ -1,128 +1,105 @@
 use anyhow::{anyhow, Result};
-use log::{debug, error, warn};
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
-use std::path::Path;
-use tokio::fs::File as TokioFile;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader as TokioBufReader};
+use log::{debug, error};
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::time::Duration;
 
-use super::parser::{parse_usbmon_binary_packet, parse_usbmon_text_line, UsbPacket};
+use super::parser::{parse_usbmon_text_line, UsbPacket};
 
+/// Reads usbmon's `Nu` text interface (`/sys/kernel/debug/usb/usbmon/{bus}u`
+/// on Linux) with blocking I/O. debugfs's `Nu` files ARE the text interface
+/// described in Documentation/usb/usbmon.rst — the real binary API is the
+/// separate `/dev/usbmonN` character devices, which this codebase does not
+/// open.
 #[derive(Debug, Clone)]
 pub struct UsbmonReader {
     pub bus_id: u8,
-    pub use_binary: bool,
-    pub path: String,
+    pub path: PathBuf,
+    follow: bool,
 }
 
 impl UsbmonReader {
-    pub fn new(bus_id: u8, use_binary: bool) -> Self {
-        let path = Self::get_usbmon_path(bus_id, use_binary);
+    pub fn new(bus_id: u8) -> Self {
         Self {
             bus_id,
-            use_binary,
-            path,
+            path: Self::get_usbmon_path(bus_id),
+            follow: true,
         }
     }
 
-    fn get_usbmon_path(bus_id: u8, use_binary: bool) -> String {
+    /// Test seam: point the reader at an arbitrary file instead of the real
+    /// debugfs path, and optionally disable follow-on-EOF so tests over a
+    /// fixed fixture file terminate.
+    pub fn with_path(bus_id: u8, path: PathBuf, follow: bool) -> Self {
+        Self {
+            bus_id,
+            path,
+            follow,
+        }
+    }
+
+    fn get_usbmon_path(bus_id: u8) -> PathBuf {
         #[cfg(target_os = "linux")]
         {
-            let suffix = if use_binary { "u" } else { "t" };
-            format!("/sys/kernel/debug/usb/usbmon/{}{}", bus_id, suffix)
+            PathBuf::from(format!("/sys/kernel/debug/usb/usbmon/{}u", bus_id))
         }
 
         #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
         {
             // BSD systems might use different paths
-            format!("/dev/ugen{}.{}", bus_id, if use_binary { "1" } else { "0" })
+            PathBuf::from(format!("/dev/ugen{}.0", bus_id))
         }
 
         #[cfg(target_os = "macos")]
         {
             // macOS doesn't have usbmon, return a placeholder
-            format!("/dev/null")
+            PathBuf::from("/dev/null")
         }
     }
 
     pub fn is_available(&self) -> bool {
-        Path::new(&self.path).exists()
+        self.path.exists()
     }
 
-    pub async fn read_packets<F>(&self, mut callback: F) -> Result<()>
+    /// Blocking read loop over the usbmon text interface. Runs to completion
+    /// on the calling thread; callers that want this alongside other work
+    /// (e.g. a TUI event loop) should spawn it on a dedicated thread.
+    ///
+    /// Lines that fail to parse are skipped (logged at debug level). A
+    /// callback `Err` stops the loop early and still returns `Ok(())`.
+    pub fn read_packets<F>(&self, mut callback: F) -> Result<()>
     where
         F: FnMut(UsbPacket) -> Result<()>,
     {
         if !self.is_available() {
-            return Err(anyhow!("usbmon interface not available: {}", self.path));
+            return Err(anyhow!(
+                "usbmon interface not available: {}",
+                self.path.display()
+            ));
         }
 
-        debug!("Starting packet capture from {}", self.path);
+        debug!("Starting packet capture from {}", self.path.display());
 
-        if self.use_binary {
-            self.read_binary_packets(callback).await
-        } else {
-            self.read_text_packets(callback).await
-        }
-    }
-
-    async fn read_binary_packets<F>(&self, mut callback: F) -> Result<()>
-    where
-        F: FnMut(UsbPacket) -> Result<()>,
-    {
-        let mut file = TokioFile::open(&self.path)
-            .await
-            .map_err(|e| anyhow!("Failed to open {}: {}", self.path, e))?;
-
-        let mut buffer = vec![0u8; 64]; // usbmon binary packets are 64 bytes
-
-        loop {
-            match file.read_exact(&mut buffer).await {
-                Ok(_) => match parse_usbmon_binary_packet(&buffer) {
-                    Ok(packet) => {
-                        if let Err(e) = callback(packet) {
-                            error!("Packet callback error: {}", e);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to parse binary packet: {}", e);
-                        continue;
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to read from {}: {}", self.path, e);
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn read_text_packets<F>(&self, mut callback: F) -> Result<()>
-    where
-        F: FnMut(UsbPacket) -> Result<()>,
-    {
-        let file = TokioFile::open(&self.path)
-            .await
-            .map_err(|e| anyhow!("Failed to open {}: {}", self.path, e))?;
-
-        let mut reader = TokioBufReader::new(file);
+        let file = std::fs::File::open(&self.path)
+            .map_err(|e| anyhow!("Failed to open {}: {}", self.path.display(), e))?;
+        let mut reader = BufReader::new(file);
         let mut line = String::new();
 
         loop {
             line.clear();
-            match reader.read_line(&mut line).await {
+            match reader.read_line(&mut line) {
                 Ok(0) => {
-                    // EOF reached, continue monitoring
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    continue;
+                    // EOF reached.
+                    if self.follow {
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                    break;
                 }
                 Ok(_) => match parse_usbmon_text_line(line.trim()) {
                     Ok(packet) => {
                         if let Err(e) = callback(packet) {
-                            error!("Packet callback error: {}", e);
+                            debug!("Packet callback error: {}", e);
                             break;
                         }
                     }
@@ -132,12 +109,66 @@ impl UsbmonReader {
                     }
                 },
                 Err(e) => {
-                    error!("Failed to read line from {}: {}", self.path, e);
+                    error!("Failed to read line from {}: {}", self.path.display(), e);
                     break;
                 }
             }
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::usbmon::parser::UrbType;
+    use std::io::Write;
+
+    #[test]
+    fn reads_packets_from_fixture_file_skipping_garbage() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("2u");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            "ffff880067b00300 373151059 S Ci:2:001:0 s a3 00 0000 0003 0004 4 <"
+        )
+        .unwrap();
+        writeln!(f, "this line is garbage and must be skipped").unwrap();
+        writeln!(f, "ffff880067b00300 373151577 C Ci:2:001:0 0 4 = 01050000").unwrap();
+
+        let reader = UsbmonReader::with_path(2, path, false);
+        let mut packets = Vec::new();
+        reader
+            .read_packets(|p| {
+                packets.push(p);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].urb_type, UrbType::Submission);
+        assert_eq!(packets[1].urb_type, UrbType::Callback);
+        assert_eq!(packets[1].data_length, 4);
+    }
+
+    #[test]
+    fn callback_error_stops_reading() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("1u");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "ffff880067b00300 373151577 C Ci:1:001:0 0 4 = 01050000").unwrap();
+        writeln!(f, "ffff880067b00301 373151578 C Ci:1:002:0 0 4 = 01050000").unwrap();
+
+        let reader = UsbmonReader::with_path(1, path, false);
+        let mut count = 0;
+        reader
+            .read_packets(|_| {
+                count += 1;
+                Err(anyhow::anyhow!("stop"))
+            })
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }
