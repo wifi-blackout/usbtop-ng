@@ -16,7 +16,7 @@ Thank you for your interest in contributing to usbtop-ng! This document provides
 
 ### Prerequisites
 
-- **Rust 1.78+** - Install from [rustup.rs](https://rustup.rs/)
+- **Rust 1.88+** - Install from [rustup.rs](https://rustup.rs/)
 - **Git** for version control
 - **Linux system** for full testing (usbmon support)
 - Basic understanding of USB protocols and system monitoring
@@ -317,15 +317,15 @@ Key external dependencies:
 
 ### BSD Systems
 
-- Use `usbconfig` for device enumeration
+- No live monitoring or device enumeration is implemented yet; `usbconfig`/`usbdevs` can be used manually to compare against what the (currently empty) device list shows
 - Test on FreeBSD, OpenBSD, NetBSD
 - Handle different device path formats
 
 ### macOS
 
-- Limited functionality due to no usbmon
-- Use system_profiler integration
-- Test device enumeration only
+- No usbmon equivalent, so live monitoring is not implemented
+- No device-enumeration fallback exists either; verify usbtop-ng exits without `--force` and opens with an empty device list when `--force` is passed
+- `system_profiler`/`ioreg` are only referenced in the printed setup instructions as manual alternatives for the user, not integrated into the app
 
 ## Release Process
 
