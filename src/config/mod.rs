@@ -17,6 +17,9 @@ pub struct Preferences {
 impl Preferences {
     pub fn load_or_create_default() -> Result<Self> {
         let path = preferences_path()?;
+        if let Some(parent) = path.parent() {
+            ensure_private_config_dir(parent)?;
+        }
         load_or_create_default_at(&path)
     }
 }
@@ -49,12 +52,24 @@ pub fn write_preferences_at(path: &Path, prefs: &Preferences) -> Result<()> {
                 parent.display()
             )
         })?;
-        set_private_dir_permissions(parent)?;
     }
 
     let content = toml::to_string_pretty(prefs).context("failed to serialize preferences")?;
     fs::write(path, content)
         .with_context(|| format!("failed to write preferences to {}", path.display()))?;
+    Ok(())
+}
+
+/// Create the default config directory with private (0700) permissions.
+/// Only chmods when this call creates the directory; an existing directory
+/// (or a user-supplied custom path) is never re-chmodded.
+pub fn ensure_private_config_dir(dir: &Path) -> Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create config directory {}", dir.display()))?;
+    set_private_dir_permissions(dir)?;
     Ok(())
 }
 
@@ -106,5 +121,52 @@ mod tests {
 
         assert!(prefs.auto_load_usbmon);
         assert!(prefs.unload_usbmon_on_exit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_path_write_does_not_change_parent_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("custom");
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = parent.join("prefs.toml");
+        load_or_create_default_at(&path).unwrap();
+
+        let mode = fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "custom parent dir permissions must be untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_config_dir_creates_with_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join(".usbtop-ng");
+
+        ensure_private_config_dir(&dir).unwrap();
+
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_config_dir_leaves_existing_dir_permissions_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join(".usbtop-ng");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_private_config_dir(&dir).unwrap();
+
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "existing dir must not be re-chmodded");
     }
 }
