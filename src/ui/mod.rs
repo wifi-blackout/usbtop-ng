@@ -603,6 +603,20 @@ fn speed_style(speed: &UsbSpeed) -> Style {
     Style::default().fg(Color::Rgb(r, g, b))
 }
 
+/// %busy cell text for a device row: a numeric percentage normally, or a
+/// width-matched "--" when the device's speed is unknown and therefore has
+/// no meaningful bandwidth denominator. Mirrors `BusView::busy_percentage`'s
+/// `None` case (see `UsbBus::busy_percentage`) — without this, an
+/// Unknown-speed device with real traffic renders a misleading "0.0" instead
+/// of the bus row's honest "--".
+fn busy_cell(device: &UsbDevice) -> String {
+    if device.speed == UsbSpeed::Unknown {
+        format!("{:>5}", "--")
+    } else {
+        format!("{:5.1}", device.get_busy_percentage())
+    }
+}
+
 /// Port column text: "1.4.2" for a hub chain, "-" for a root hub, "?" when the
 /// device could not be located in sysfs.
 fn port_label(port_chain: Option<&Vec<u32>>) -> String {
@@ -697,7 +711,7 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
                     device.product.as_deref().unwrap_or("Unknown"),
                     &format!("{:.1} KB/s", device.bandwidth_stats.rx_bps / 1000.0),
                     &format!("{:.1} KB/s", device.bandwidth_stats.tx_bps / 1000.0),
-                    &format!("{:5.1}", device.get_busy_percentage()),
+                    &busy_cell(device),
                     indicator.get_symbol(),
                 ]);
 
@@ -1162,9 +1176,11 @@ mod tests {
         );
 
         // Lock the ASCII geometry so column offsets cannot drift silently.
+        // Device 3 keeps the default UsbSpeed::Unknown (never overridden
+        // above), so its %busy cell is the width-7 "--" fallback, not "0.0".
         assert_eq!(
             lines[3].to_string(),
-            "?        001:003  0.0 Mbps   Acme           Widget             0.0 KB/s   0.0 KB/s     0.0      "
+            "?        001:003  0.0 Mbps   Acme           Widget             0.0 KB/s   0.0 KB/s      --      "
         );
 
         // The wide (2-cell) "⚡" indicator glyph must not push the row's
@@ -1192,6 +1208,31 @@ mod tests {
             .join("\n");
         assert!(text.contains("· -- busy"), "{text}");
         assert!(text.contains("· 50.0% busy"), "{text}");
+    }
+
+    #[test]
+    fn device_row_shows_dashes_when_device_speed_is_unknown() {
+        // %busy is device-row column index 7; device_columns emits one
+        // separator span before every column after the first, so its content
+        // lands at span index 2 * 7 (see SPEED_SPAN_INDEX/INDICATOR_SPAN_INDEX
+        // above for the same pattern).
+        const BUSY_SPAN_INDEX: usize = 2 * 7;
+
+        // The device keeps UsbDevice::new's default UsbSpeed::Unknown, but
+        // has real traffic (nonzero current_bps): without the fix this
+        // renders a misleading "0.0" instead of the bus header's honest "--".
+        let (_t, mgr) = manager_with_rates(&[(1, 3, 600_000.0)]);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        // [0] column header, [1] controller heading, [2] bus header, [3] device row.
+        let busy_span = &lines[3].spans[BUSY_SPAN_INDEX];
+        assert_eq!(
+            busy_span.content, "   --  ",
+            "unknown-speed device's %busy cell must be a width-7 '--', not '{}'",
+            lines[3]
+        );
     }
 
     #[test]

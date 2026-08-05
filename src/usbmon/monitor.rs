@@ -75,6 +75,13 @@ pub fn start_monitoring(buses: &[u8]) -> (Receiver<UsbPacket>, MonitorHandle) {
         buses.to_vec()
     };
 
+    // No buses to monitor (e.g. `--force` with none detected): skip the
+    // interface probe and its `info!` entirely rather than announcing a
+    // choice of interface for zero readers that are about to spawn.
+    if targets.is_empty() {
+        return start_sources(vec![]);
+    }
+
     // Probing the first target is enough: the binary devices are created by the
     // same module for the same set of buses. The probe handle is dropped right
     // away so it cannot pin usbmon.
@@ -218,6 +225,24 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "stop() must wake and join a parked binary reader promptly"
         );
+    }
+
+    #[test]
+    fn start_monitoring_with_no_buses_spawns_no_readers() {
+        // The `--force` path can call this with an empty bus list when no
+        // buses were detected. No sources means no reader threads, and the
+        // channel's sender side drops as soon as `start_monitoring` returns,
+        // so the receiver must already read as disconnected.
+        let (rx, handle) = start_monitoring(&[]);
+        assert!(
+            handle.threads.is_empty(),
+            "no targets must spawn no reader threads"
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+        handle.stop(); // no threads to join; must still return promptly
     }
 
     #[test]
