@@ -159,10 +159,14 @@ fn main() -> Result<()> {
         warn!("No USB buses detected");
     }
 
-    let packets = usbmon::monitor::start_monitoring(&usbmon_status.available_buses);
+    let (packets, monitor) = usbmon::monitor::start_monitoring(&usbmon_status.available_buses);
     let manager = device::manager::DeviceManager::new();
     let app = UsbTopApp::new(Duration::from_millis(cli.refresh));
     let run_result = run_ui(app, manager, packets);
+
+    // Close the usbmon files before anything tries to unload the module: an
+    // open debugfs `Nu` file pins usbmon, so `modprobe -r` would fail EBUSY.
+    monitor.stop();
 
     if loaded_usbmon_for_this_run {
         let should_unload = if preferences.unload_usbmon_on_exit {
