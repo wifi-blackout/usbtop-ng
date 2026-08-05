@@ -7,7 +7,7 @@ It does **not** share code with the original project and is **not affiliated wit
 
 ## Current Status
 
-usbtop-ng builds, runs its setup checks, and opens the terminal UI. Live packet-to-device monitoring is still being wired into the UI, so expect limited runtime functionality until the monitoring loop is connected.
+usbtop-ng builds, runs its setup checks, and opens the terminal UI with live packet-to-device monitoring wired end-to-end: usbmon reader thread(s) parse the `Nu` text interface, hand packets to the UI thread over an `mpsc` channel, and `DeviceManager` aggregates them into per-device bandwidth stats on every refresh tick.
 
 ## ✨ Features
 

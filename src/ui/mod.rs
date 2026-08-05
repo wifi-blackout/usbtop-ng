@@ -222,7 +222,7 @@ fn draw_ui(f: &mut Frame, app: &UsbTopApp) {
             Constraint::Length(3), // Header
             Constraint::Length(8), // Bandwidth graph
             Constraint::Min(10),   // Device list
-            Constraint::Length(6), // Color reference
+            Constraint::Length(3), // Controls
         ])
         .split(size);
 
@@ -420,54 +420,33 @@ fn draw_device_list(f: &mut Frame, area: Rect, app: &UsbTopApp) {
 }
 
 fn draw_color_reference(f: &mut Frame, area: Rect) {
-    let reference_text = vec![
-        Line::from(vec![
-            Span::styled("●", Style::default().fg(Color::Rgb(255, 100, 100))),
-            Span::raw(" Low Speed (1.5 Mbps)  "),
-            Span::styled("●", Style::default().fg(Color::Rgb(255, 165, 0))),
-            Span::raw(" Full Speed (12 Mbps)  "),
-            Span::styled("●", Style::default().fg(Color::Rgb(255, 255, 0))),
-            Span::raw(" High Speed (480 Mbps)"),
-        ]),
-        Line::from(vec![
-            Span::styled("●", Style::default().fg(Color::Rgb(0, 255, 0))),
-            Span::raw(" SuperSpeed (5 Gbps)  "),
-            Span::styled("●", Style::default().fg(Color::Rgb(0, 255, 255))),
-            Span::raw(" SuperSpeed+ (10+ Gbps)  "),
-            Span::styled("●", Style::default().fg(Color::Gray)),
-            Span::raw(" Unknown/Disconnected"),
-        ]),
-        Line::from(vec![
-            Span::raw("Controls: "),
-            Span::styled(
-                "↑↓",
-                Style::default()
-                    .fg(ACCENT_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Navigate  "),
-            Span::styled(
-                "h",
-                Style::default()
-                    .fg(ACCENT_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Help  "),
-            Span::styled(
-                "q/Esc",
-                Style::default()
-                    .fg(ACCENT_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Quit"),
-        ]),
-    ];
+    let reference_text = vec![Line::from(vec![
+        Span::raw("Controls: "),
+        Span::styled(
+            "↑↓",
+            Style::default()
+                .fg(ACCENT_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" Navigate  "),
+        Span::styled(
+            "h",
+            Style::default()
+                .fg(ACCENT_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" Help  "),
+        Span::styled(
+            "q/Esc",
+            Style::default()
+                .fg(ACCENT_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" Quit"),
+    ])];
 
-    let reference = Paragraph::new(reference_text).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Legend & Controls "),
-    );
+    let reference = Paragraph::new(reference_text)
+        .block(Block::default().borders(Borders::ALL).title(" Controls "));
 
     f.render_widget(reference, area);
 }
@@ -499,32 +478,9 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from(""),
         Line::from("Features:"),
         Line::from("  • Real-time USB bandwidth monitoring"),
-        Line::from("  • Color-coded USB speeds"),
         Line::from("  • Device disconnect detection"),
         Line::from("  • Bandwidth history graphs"),
         Line::from("  • Multi-platform support (Linux/BSD/macOS)"),
-        Line::from(""),
-        Line::from("Speed Colors:"),
-        Line::from(vec![
-            Span::styled("  Red", Style::default().fg(Color::Rgb(255, 100, 100))),
-            Span::raw("     Low Speed (1.5 Mbps)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Orange", Style::default().fg(Color::Rgb(255, 165, 0))),
-            Span::raw("  Full Speed (12 Mbps)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Yellow", Style::default().fg(Color::Rgb(255, 255, 0))),
-            Span::raw("  High Speed (480 Mbps)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Green", Style::default().fg(Color::Rgb(0, 255, 0))),
-            Span::raw("   SuperSpeed (5 Gbps)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Cyan", Style::default().fg(Color::Rgb(0, 255, 255))),
-            Span::raw("    SuperSpeed+ (10+ Gbps)"),
-        ]),
         Line::from(""),
         Line::from("Press 'h' to close this help"),
     ];

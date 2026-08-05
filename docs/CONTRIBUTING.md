@@ -16,7 +16,7 @@ Thank you for your interest in contributing to usbtop-ng! This document provides
 
 ### Prerequisites
 
-- **Rust 1.70+** - Install from [rustup.rs](https://rustup.rs/)
+- **Rust 1.78+** - Install from [rustup.rs](https://rustup.rs/)
 - **Git** for version control
 - **Linux system** for full testing (usbmon support)
 - Basic understanding of USB protocols and system monitoring
@@ -92,18 +92,18 @@ We follow the official Rust style guidelines:
 src/
 ├── main.rs           # Entry point and CLI
 ├── usbmon/           # USB monitoring core
-│   ├── mod.rs        # Module detection and setup
-│   ├── reader.rs     # Packet capture
-│   └── parser.rs     # Packet parsing
+│   ├── mod.rs        # Module detection, load/unload, setup instructions
+│   ├── monitor.rs    # Reader thread spawning, shutdown handle, mpsc channel
+│   ├── reader.rs     # Blocking read loop over the usbmon Nu text interface
+│   └── parser.rs     # Nu text-format parsing
 ├── device/           # Device management
-│   ├── mod.rs        # Device structure and methods
-│   └── manager.rs    # Device discovery
+│   ├── mod.rs        # Device structure and sysfs metadata resolution
+│   └── manager.rs    # Bus/device aggregation, packet routing, disconnect handling
 ├── stats/            # Statistics engine
 │   └── mod.rs        # Bandwidth calculations
 ├── ui/               # Terminal interface
-│   ├── mod.rs        # Main UI logic
-│   ├── colors.rs     # Color definitions
-│   └── widgets.rs    # UI components
+│   ├── mod.rs        # App state, event loop, and rendering
+│   └── colors.rs     # Color definitions
 └── config/           # Preferences
     └── mod.rs        # ~/.usbtop-ng/preferences.toml handling
 ```
@@ -126,7 +126,7 @@ Longer description if needed
 **Examples:**
 ```
 feat(ui): add device search functionality
-fix(usbmon): handle binary packet parsing edge case
+fix(usbmon): handle malformed text-line parsing edge case
 docs: update installation instructions
 ```
 
@@ -150,11 +150,8 @@ cargo test usbmon::parser
 # Run tests with output
 cargo test -- --nocapture
 
-# Run integration tests (requires usbmon)
-cargo test --features integration
-
-# Test with specific platform features
-cargo test --features linux
+# Run all test targets (unit tests plus any integration test binaries)
+cargo test --all-targets
 ```
 
 ### Writing Tests
@@ -163,15 +160,17 @@ cargo test --features linux
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_usb_speed_parsing() {
         assert_eq!(UsbSpeed::from_speed_str("480"), UsbSpeed::High);
     }
-    
-    #[tokio::test]
-    async fn test_packet_reading() {
-        // Async test example
+
+    #[test]
+    fn test_packet_reading() {
+        // Reader tests point UsbmonReader at a fixture file via
+        // UsbmonReader::with_path(bus_id, path, follow) instead of the real
+        // debugfs path — see src/usbmon/reader.rs for examples.
     }
 }
 ```
@@ -286,15 +285,15 @@ Include:
 ### Data Flow
 
 ```
-USB Hardware → usbmon → Reader → Parser → Stats Engine → UI
-                ↓              ↓           ↓
-            Device Manager ← sysfs ← Platform Layer
+usbmon Nu file → Reader thread → Parser → UsbPacket → mpsc channel
+                                                            ↓
+                              UI thread ← DeviceManager (sysfs metadata, bandwidth stats)
 ```
 
 ### Adding New Features
 
 1. **Platform Support**: Add new OS in platform-specific modules
-2. **UI Components**: Extend widgets in `ui/widgets.rs`
+2. **UI Components**: Extend rendering in `ui/mod.rs` (and `ui/colors.rs` for the color scheme)
 3. **Monitoring**: Add new packet analysis in `usbmon/parser.rs`
 4. **Statistics**: Enhance calculations in `stats/mod.rs`
 
@@ -303,17 +302,16 @@ USB Hardware → usbmon → Reader → Parser → Stats Engine → UI
 Key external dependencies:
 - `ratatui`: Terminal UI framework
 - `crossterm`: Cross-platform terminal manipulation
-- `tokio`: Async runtime
 - `clap`: Command-line parsing
-- `serde`: Serialization (config files)
-- `chrono`: Date/time handling
+- `serde` / `toml`: Preferences serialization (`~/.usbtop-ng/preferences.toml`)
+- `anyhow` / `log` / `env_logger`: Error handling and logging
 
 ## Platform-Specific Development
 
 ### Linux
 
 - Test with different kernel versions
-- Verify usbmon binary/text format parsing
+- Verify usbmon `Nu` text-format parsing (the binary `/dev/usbmonN` interface is not supported)
 - Check debugfs mount requirements
 - Test permission scenarios
 

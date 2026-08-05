@@ -14,7 +14,7 @@ This document provides a detailed overview of usbtop-ng's architecture, design d
 
 ## Overview
 
-usbtop-ng is designed as a modular, async-first USB monitoring tool with clear separation of concerns:
+usbtop-ng is designed as a modular USB monitoring tool with clear separation of concerns. Live monitoring is built on dedicated blocking reader threads (one per usbmon interface, or a single reader for the aggregate `0u` interface) that feed parsed packets to the main thread over an `mpsc` channel; there is no async runtime involved.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -37,7 +37,7 @@ usbtop-ng is designed as a modular, async-first USB monitoring tool with clear s
 
 ### Core Principles
 
-1. **Async-First**: Built on Tokio for non-blocking I/O
+1. **Thread-Based I/O**: Dedicated blocking reader threads read usbmon and hand packets to the UI thread over an `mpsc` channel, so a stalled or idle interface never blocks rendering
 2. **Modular Design**: Clear module boundaries with defined interfaces
 3. **Cross-Platform**: Abstracted platform-specific code
 4. **Memory Safe**: Rust's ownership system prevents common errors
@@ -49,9 +49,10 @@ usbtop-ng is designed as a modular, async-first USB monitoring tool with clear s
 #### 1. USB Monitor (`usbmon/`)
 - **Purpose**: Interface with kernel USB monitoring facilities
 - **Components**:
-  - `mod.rs`: Module detection and setup
-  - `reader.rs`: Async packet capture from usbmon
-  - `parser.rs`: Binary/text format parsing
+  - `mod.rs`: Module detection, load/unload, and setup instructions
+  - `monitor.rs`: Spawns one blocking reader thread per bus (or a single thread for the aggregate `0u` interface), owns the shutdown handle, and exposes the `mpsc` receiver the UI reads from
+  - `reader.rs`: Blocking read loop over the usbmon `Nu` text interface, opened `O_NONBLOCK` and polled so it can be shut down promptly
+  - `parser.rs`: Parses the usbmon `Nu` text-format lines into `UsbPacket`s
 
 #### 2. Device Manager (`device/`)
 - **Purpose**: USB device discovery and metadata management
@@ -69,9 +70,8 @@ usbtop-ng is designed as a modular, async-first USB monitoring tool with clear s
 #### 4. User Interface (`ui/`)
 - **Purpose**: Terminal-based user interface
 - **Components**:
-  - `mod.rs`: Main UI logic and event handling
+  - `mod.rs`: App state, the packet-drain/refresh/draw event loop, and all widget rendering
   - `colors.rs`: Color scheme definitions
-  - `widgets.rs`: Reusable UI components
 
 #### 5. Configuration (`config/`)
 - **Purpose**: Settings management and persistence
@@ -85,28 +85,29 @@ usbtop-ng is designed as a modular, async-first USB monitoring tool with clear s
 ### USB Monitor Module
 
 ```rust
-// High-level interface
+// High-level interface (see src/usbmon/reader.rs)
 pub struct UsbmonReader {
-    bus_id: u8,
-    use_binary: bool,
-    path: String,
+    pub bus_id: u8,
+    pub path: PathBuf,
+    follow: bool, // false only in tests, to make fixture reads terminate
 }
 
 impl UsbmonReader {
-    pub async fn read_packets<F>(&self, callback: F) -> Result<()>
+    pub fn read_packets<F>(&self, shutdown: &AtomicBool, callback: F) -> Result<()>
     where F: FnMut(UsbPacket) -> Result<()>;
 }
 ```
 
 **Design Decisions:**
-- Async packet reading to avoid blocking the UI
-- Callback-based interface for flexible packet processing
-- Support for both binary and text usbmon formats
+- Each reader runs to completion on its own dedicated thread (spawned by `usbmon::monitor`), so a blocked or idle interface never blocks the UI thread
+- Callback-based interface for flexible packet processing; the callback used in production forwards each `UsbPacket` over an `mpsc` channel
+- Only the usbmon **text** interface (`Nu` files under `/sys/kernel/debug/usb/usbmon/`) is supported; the binary `/dev/usbmonN` character-device interface is not opened
+- The file is opened `O_NONBLOCK` on Linux and polled every 50ms so `shutdown` can be observed promptly, instead of parking indefinitely inside `read()`
 - Platform-specific path resolution
 
 **Packet Flow:**
 ```
-usbmon device → Reader → Parser → UsbPacket → Callback
+usbmon Nu file → Reader thread → Parser → UsbPacket → mpsc channel → DeviceManager
 ```
 
 ### Device Manager Module
@@ -168,35 +169,40 @@ pub struct UsbTopApp {
 ### Primary Data Flow
 
 ```
-1. USB Activity → usbmon kernel interface
-2. usbmon → UsbmonReader::read_packets()
-3. Raw packets → UsbPacket parsing
-4. UsbPacket → Device identification
-5. Device stats → BandwidthStats update
-6. Updated stats → UI rendering
+1. USB Activity → usbmon kernel interface (debugfs `Nu` text file)
+2. Reader thread → UsbmonReader::read_packets() (blocking, non-blocking-poll loop)
+3. Raw text lines → UsbPacket parsing (usbmon/parser.rs)
+4. UsbPacket → sent over an mpsc channel to the UI thread
+5. UI thread → DeviceManager::apply_packet() aggregates into BandwidthStats,
+   resolving new devices' metadata from sysfs by busnum/devnum
+6. Per-tick refresh → UI rendering
 ```
 
 ### Event Processing
 
+The UI thread owns a single loop (see `run_app` in `src/ui/mod.rs`): it drains
+whatever the reader threads produced since the last pass, refreshes state on
+a fixed tick, redraws, and polls for input — no async runtime is involved.
+
 ```rust
 // Simplified event loop
 loop {
-    tokio::select! {
-        packet = reader.read_packets() => {
-            // Process USB packet
-            let device = device_manager.get_or_create(packet.device_id);
-            device.update_stats(packet);
+    // Drain everything the reader threads produced since the last pass.
+    while let Ok(packet) = packets.try_recv() {
+        manager.apply_packet(&packet);
+    }
+
+    if app.last_update.elapsed() >= app.refresh_rate {
+        for (bus_id, device_id) in manager.refresh() {
+            app.remove_device(bus_id, device_id);
         }
-        
-        input = terminal.read_input() => {
-            // Handle user input
-            app.handle_input(input)?;
-        }
-        
-        _ = refresh_timer.tick() => {
-            // Update UI
-            terminal.draw(|f| ui::draw(f, &app))?;
-        }
+        // ...sync manager's devices into app state, update history...
+    }
+
+    terminal.draw(|f| draw_ui(f, app))?;
+
+    if app.handle_input()? {
+        break; // 'q' or Esc
     }
 }
 ```
@@ -267,7 +273,7 @@ mod macos {
 
 ### Optimization Strategies
 
-1. **Async I/O**: Non-blocking packet reading and UI updates
+1. **Threaded I/O**: Dedicated blocking reader threads, decoupled from the UI thread via an `mpsc` channel
 2. **Efficient Parsing**: Zero-copy packet parsing where possible
 3. **Bounded Collections**: Prevent unbounded memory growth
 4. **Lazy Evaluation**: Device metadata loaded on-demand
@@ -338,12 +344,14 @@ usbtop-ng requires elevated privileges for USB monitoring:
 ### Error Recovery
 
 ```rust
-// Example error handling pattern
-match usbmon_reader.read_packets().await {
-    Ok(packet) => process_packet(packet),
-    Err(PermissionError) => show_permission_help(),
-    Err(ParseError(data)) => log_and_skip(data),
-    Err(FatalError) => graceful_shutdown(),
+// Example error handling pattern: read_packets() runs the whole read loop on
+// its thread. Per-line parse errors are logged and skipped inside the loop;
+// only a fatal condition (interface gone, callback error) ends the loop.
+match reader.read_packets(&shutdown, |packet| {
+    tx.send(packet).map_err(|_| anyhow!("packet channel closed"))
+}) {
+    Ok(()) => debug!("usbmon reader for bus {bus} finished"),
+    Err(e) => warn!("usbmon reader for bus {bus} stopped: {e}"),
 }
 ```
 
