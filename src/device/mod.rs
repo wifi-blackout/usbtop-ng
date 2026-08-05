@@ -41,6 +41,17 @@ impl UsbDevice {
         }
     }
 
+    /// Physical port chain from the resolved sysfs name: "3-1.4.2" -> [1,4,2];
+    /// a root hub ("usbN") -> empty chain (sorts first); unresolved -> None.
+    pub fn port_chain(&self) -> Option<Vec<u32>> {
+        let name = self.sysfs_path.as_ref()?.file_name()?.to_str()?;
+        if let Some(rest) = name.strip_prefix("usb") {
+            return rest.parse::<u8>().ok().map(|_| Vec::new());
+        }
+        let (_bus, ports) = name.split_once('-')?;
+        ports.split('.').map(|p| p.parse::<u32>().ok()).collect()
+    }
+
     /// Populate metadata from sysfs; `base` overrides /sys/bus/usb/devices for tests.
     pub fn populate_from_sysfs(&mut self, base: Option<&std::path::Path>) {
         #[cfg(target_os = "linux")]
@@ -238,6 +249,21 @@ mod tests {
         assert_eq!(device.product.as_deref(), Some("Root Hub"));
         assert_eq!(device.serial.as_deref(), Some("test-serial"));
         assert_eq!(device.sysfs_path, Some(temp.path().join("1-2.4")));
+    }
+
+    #[test]
+    fn port_chain_parses_topology_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let mk = |name: &str| {
+            let mut d = UsbDevice::new(3, 2);
+            d.sysfs_path = Some(temp.path().join(name));
+            d
+        };
+        assert_eq!(mk("3-1.4.2").port_chain(), Some(vec![1, 4, 2]));
+        assert_eq!(mk("3-2").port_chain(), Some(vec![2]));
+        assert_eq!(mk("usb3").port_chain(), Some(vec![]));
+        assert_eq!(mk("garbage").port_chain(), None);
+        assert_eq!(UsbDevice::new(3, 9).port_chain(), None); // no sysfs_path
     }
 
     #[test]

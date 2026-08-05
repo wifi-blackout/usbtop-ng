@@ -10,6 +10,9 @@ pub struct UsbBus {
     pub bus_id: u8,
     pub speed: UsbSpeed,
     pub devices: HashMap<u8, UsbDevice>,
+    /// Host controller this bus hangs off, e.g. `0000:00:14.0`; `None` until
+    /// the root hub's sysfs parent can be resolved.
+    pub controller: Option<String>,
 }
 
 impl UsbBus {
@@ -18,19 +21,27 @@ impl UsbBus {
             bus_id,
             speed: UsbSpeed::Unknown,
             devices: HashMap::new(),
+            controller: None,
         }
     }
 
-    /// Update bus speed by detecting the root hub speed.
-    /// `base` overrides `/sys/bus/usb/devices` for tests.
+    /// Update bus speed by detecting the root hub speed, and resolve the host
+    /// controller once. `base` overrides `/sys/bus/usb/devices` for tests.
     pub fn update_bus_speed(&mut self, base: Option<&Path>) -> Result<(), std::io::Error> {
+        let default_base = Path::new("/sys/bus/usb/devices");
+        let base_path = base.unwrap_or(default_base);
+        if self.controller.is_none() {
+            // The flat devices directory symlinks each root hub into its
+            // controller's directory, so the canonical parent names the controller.
+            self.controller = fs::canonicalize(base_path.join(format!("usb{}", self.bus_id)))
+                .ok()
+                .and_then(|real| Some(real.parent()?.file_name()?.to_string_lossy().into_owned()));
+        }
+
         #[cfg(target_os = "linux")]
         {
             // Try to read the root hub speed (usually device 1 on the bus)
-            let root_hub_path = base
-                .unwrap_or(Path::new("/sys/bus/usb/devices"))
-                .join(format!("usb{}", self.bus_id))
-                .join("speed");
+            let root_hub_path = base_path.join(format!("usb{}", self.bus_id)).join("speed");
             if root_hub_path.exists() {
                 if let Ok(speed_str) = fs::read_to_string(&root_hub_path) {
                     self.speed = UsbSpeed::from_speed_str(speed_str.trim());
@@ -53,7 +64,6 @@ impl UsbBus {
         #[cfg(not(target_os = "linux"))]
         {
             // For non-Linux systems, estimate bus speed from devices
-            let _ = base;
             let highest_speed = self
                 .devices
                 .values()
