@@ -85,6 +85,13 @@ impl BandwidthStats {
         }
     }
 
+    /// Re-evaluate rates against the sliding window without new traffic,
+    /// so idle devices decay to zero instead of freezing at their last rate.
+    pub fn refresh(&mut self) {
+        self.cleanup_old_entries();
+        self.recalculate_rates();
+    }
+
     pub fn get_utilization_percentage(&self, max_speed_bps: f64) -> f64 {
         if max_speed_bps > 0.0 {
             (self.current_bps / max_speed_bps * 100.0).min(100.0)
@@ -170,6 +177,19 @@ mod tests {
         assert_eq!(stats.total_tx_bytes, 500);
         assert!(stats.current_bps > 0.0);
         assert_eq!(stats.peak_bps, stats.current_bps);
+    }
+
+    #[test]
+    fn refresh_decays_rates_to_zero_after_window() {
+        let mut stats = BandwidthStats::new();
+        stats.history_window = Duration::from_millis(50);
+        stats.update_rx(1000);
+        assert!(stats.rx_bps > 0.0);
+        sleep(Duration::from_millis(80));
+        stats.refresh();
+        assert_eq!(stats.rx_bps, 0.0);
+        assert_eq!(stats.current_bps, 0.0);
+        assert_eq!(stats.total_rx_bytes, 1000); // totals are cumulative
     }
 
     #[test]

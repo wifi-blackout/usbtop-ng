@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+pub mod monitor;
 pub mod parser;
 pub mod reader;
 
