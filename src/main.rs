@@ -132,6 +132,7 @@ fn main() -> Result<()> {
                         "usbmon was loaded, but the usbmon debugfs interface is still unavailable"
                     );
                     print_platform_instructions();
+                    usbmon::offer_unload_after_session(&preferences);
                     process::exit(1);
                 }
 
@@ -169,18 +170,7 @@ fn main() -> Result<()> {
     monitor.stop();
 
     if loaded_usbmon_for_this_run {
-        let should_unload = if preferences.unload_usbmon_on_exit {
-            println!("unload_usbmon_on_exit=true, so usbtop-ng will try to unload usbmon now.");
-            true
-        } else {
-            prompt_user_to_unload_module()?
-        };
-
-        if should_unload {
-            if let Err(e) = attempt_unload_usbmon() {
-                warn!("Failed to unload usbmon: {}", e);
-            }
-        }
+        usbmon::offer_unload_after_session(&preferences);
     }
 
     run_result?;
