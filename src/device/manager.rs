@@ -334,6 +334,7 @@ mod tests {
         assert!(!mgr.buses.contains_key(&1), "empty buses are dropped");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn refresh_marks_devices_disconnected_when_sysfs_path_vanishes() {
         let temp = tempfile::tempdir().unwrap();
