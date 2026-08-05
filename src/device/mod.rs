@@ -39,6 +39,20 @@ impl UsbDevice {
         }
     }
 
+    /// Populate metadata from sysfs; `base` overrides /sys/bus/usb/devices for tests.
+    pub fn populate_from_sysfs(&mut self, base: Option<&std::path::Path>) {
+        #[cfg(target_os = "linux")]
+        {
+            let default = std::path::Path::new("/sys/bus/usb/devices");
+            let _ = self.update_linux_device_info_from_base(base.unwrap_or(default));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = base;
+            let _ = self.update_from_sysfs();
+        }
+    }
+
     pub fn update_from_sysfs(&mut self) -> Result<(), std::io::Error> {
         #[cfg(target_os = "linux")]
         {

@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::device::UsbDevice;
 use crate::stats::BandwidthStats;
-use crate::usbmon::parser::UsbSpeed;
+use crate::usbmon::parser::{UrbType, UsbPacket, UsbSpeed};
 
 #[derive(Debug, Clone)]
 pub struct UsbBus {
@@ -24,13 +24,17 @@ impl UsbBus {
         }
     }
 
-    /// Update bus speed by detecting the root hub speed
-    pub fn update_bus_speed(&mut self) -> Result<(), std::io::Error> {
+    /// Update bus speed by detecting the root hub speed.
+    /// `base` overrides `/sys/bus/usb/devices` for tests.
+    pub fn update_bus_speed(&mut self, base: Option<&Path>) -> Result<(), std::io::Error> {
         #[cfg(target_os = "linux")]
         {
             // Try to read the root hub speed (usually device 1 on the bus)
-            let root_hub_path = format!("/sys/bus/usb/devices/usb{}/speed", self.bus_id);
-            if Path::new(&root_hub_path).exists() {
+            let root_hub_path = base
+                .unwrap_or(Path::new("/sys/bus/usb/devices"))
+                .join(format!("usb{}", self.bus_id))
+                .join("speed");
+            if root_hub_path.exists() {
                 if let Ok(speed_str) = fs::read_to_string(&root_hub_path) {
                     self.speed = UsbSpeed::from_speed_str(speed_str.trim());
                     return Ok(());
@@ -52,6 +56,7 @@ impl UsbBus {
         #[cfg(not(target_os = "linux"))]
         {
             // For non-Linux systems, estimate bus speed from devices
+            let _ = base;
             let highest_speed = self
                 .devices
                 .values()
@@ -141,12 +146,23 @@ impl UsbBus {
 #[derive(Debug)]
 pub struct DeviceManager {
     pub buses: HashMap<u8, UsbBus>,
+    sysfs_base: Option<PathBuf>,
 }
 
 impl DeviceManager {
     pub fn new() -> Self {
         Self {
             buses: HashMap::new(),
+            sysfs_base: None,
+        }
+    }
+
+    /// Test seam: point sysfs lookups (device metadata, bus speed) at a
+    /// fixture directory instead of the real `/sys/bus/usb/devices`.
+    pub fn with_sysfs_base(base: PathBuf) -> Self {
+        Self {
+            buses: HashMap::new(),
+            sysfs_base: Some(base),
         }
     }
 
@@ -159,9 +175,59 @@ impl DeviceManager {
 
     /// Update all bus speeds
     pub fn update_bus_speeds(&mut self) {
+        let sysfs_base = self.sysfs_base.clone();
         for bus in self.buses.values_mut() {
-            let _ = bus.update_bus_speed(); // Ignore errors for now
+            let _ = bus.update_bus_speed(sysfs_base.as_deref()); // Ignore errors for now
         }
+    }
+
+    /// Route one parsed usbmon event into per-device stats.
+    /// Only callbacks carry the actual transferred length; submissions would
+    /// double-count every URB.
+    pub fn apply_packet(&mut self, packet: &UsbPacket) {
+        let sysfs_base = self.sysfs_base.clone();
+        let bus = self.get_or_create_bus(packet.bus_id);
+        let device = bus.devices.entry(packet.device_id).or_insert_with(|| {
+            let mut d = UsbDevice::new(packet.bus_id, packet.device_id);
+            d.populate_from_sysfs(sysfs_base.as_deref());
+            d
+        });
+        device.update_activity();
+        if packet.urb_type == UrbType::Callback && packet.data_length > 0 {
+            if packet.direction {
+                device
+                    .bandwidth_stats
+                    .update_rx(u64::from(packet.data_length));
+            } else {
+                device
+                    .bandwidth_stats
+                    .update_tx(u64::from(packet.data_length));
+            }
+        }
+    }
+
+    /// Once-per-tick maintenance: decay rates, drop devices disconnected
+    /// long enough, refresh bus speeds. Returns removed (bus_id, device_id).
+    pub fn refresh(&mut self) -> Vec<(u8, u8)> {
+        let mut removed = Vec::new();
+        for bus in self.buses.values_mut() {
+            for device in bus.devices.values_mut() {
+                device.bandwidth_stats.refresh();
+            }
+            let stale: Vec<u8> = bus
+                .devices
+                .values()
+                .filter(|d| d.should_remove())
+                .map(|d| d.device_id)
+                .collect();
+            for device_id in stale {
+                bus.remove_device(device_id);
+                removed.push((bus.bus_id, device_id));
+            }
+        }
+        self.buses.retain(|_, bus| !bus.devices.is_empty());
+        self.update_bus_speeds();
+        removed
     }
 
     /// Add or update a device
@@ -197,5 +263,65 @@ impl DeviceManager {
     /// Get total bandwidth usage across all buses
     pub fn get_total_bandwidth(&self) -> f64 {
         self.buses.values().map(|bus| bus.get_total_bps()).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::usbmon::parser::parse_usbmon_text_line;
+    use std::time::Duration;
+
+    fn manager_with_empty_sysfs() -> (tempfile::TempDir, DeviceManager) {
+        let temp = tempfile::tempdir().unwrap();
+        let mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        (temp, mgr)
+    }
+
+    #[test]
+    fn apply_packet_counts_only_callback_data() {
+        let (_t, mut mgr) = manager_with_empty_sysfs();
+        let submission =
+            parse_usbmon_text_line("ffff0000aaaa0001 100 S Bi:1:003:1 -115 512 <").unwrap();
+        let callback =
+            parse_usbmon_text_line("ffff0000aaaa0001 200 C Bi:1:003:1 0 512 = 00").unwrap();
+
+        mgr.apply_packet(&submission);
+        let dev = &mgr.buses[&1].devices[&3];
+        assert_eq!(
+            dev.bandwidth_stats.total_rx_bytes, 0,
+            "submissions must not count"
+        );
+
+        mgr.apply_packet(&callback);
+        let dev = &mgr.buses[&1].devices[&3];
+        assert_eq!(dev.bandwidth_stats.total_rx_bytes, 512);
+        assert_eq!(dev.bandwidth_stats.total_tx_bytes, 0);
+    }
+
+    #[test]
+    fn apply_packet_routes_out_transfers_to_tx() {
+        let (_t, mut mgr) = manager_with_empty_sysfs();
+        let callback = parse_usbmon_text_line("ffff0000bbbb0001 300 C Bo:2:004:2 0 128 >").unwrap();
+        mgr.apply_packet(&callback);
+        let dev = &mgr.buses[&2].devices[&4];
+        assert_eq!(dev.bandwidth_stats.total_tx_bytes, 128);
+        assert_eq!(dev.bandwidth_stats.total_rx_bytes, 0);
+    }
+
+    #[test]
+    fn refresh_reports_removed_devices() {
+        let (_t, mut mgr) = manager_with_empty_sysfs();
+        let callback = parse_usbmon_text_line("ffff0000cccc0001 400 C Bi:1:005:1 0 64 <").unwrap();
+        mgr.apply_packet(&callback);
+        // Force the disconnect path directly (sysfs-based detection arrives in Task 6).
+        {
+            let dev = mgr.buses.get_mut(&1).unwrap().devices.get_mut(&5).unwrap();
+            dev.mark_disconnected();
+            dev.disconnect_time = Some(std::time::Instant::now() - Duration::from_secs(10));
+        }
+        let removed = mgr.refresh();
+        assert_eq!(removed, vec![(1, 5)]);
+        assert!(!mgr.buses.contains_key(&1), "empty buses are dropped");
     }
 }
