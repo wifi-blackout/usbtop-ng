@@ -1,6 +1,6 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -12,6 +12,14 @@ use super::open_nonblocking;
 use super::parser::UsbPacket;
 use super::reader::UsbmonReader;
 
+/// How many packets may sit unread on the channel before readers start
+/// discarding. A busy bus can outrun a slow consumer (a redraw over SSH, say)
+/// indefinitely, and an unbounded queue would turn that into unbounded memory;
+/// this caps the backlog at a fixed few hundred kilobytes instead — over a
+/// second of traffic at the packet rates this tool targets, far more slack
+/// than the UI's ~50ms pass needs.
+const CHANNEL_BOUND: usize = 16_384;
+
 /// Ownership of the spawned reader threads.
 ///
 /// Callers must `stop()` this before doing anything that requires the usbmon
@@ -20,6 +28,10 @@ use super::reader::UsbmonReader;
 pub struct MonitorHandle {
     shutdown: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+    /// Packets discarded because the channel was full, across every reader.
+    /// Clone the `Arc` before `stop()` to keep reading it (the UI surfaces the
+    /// count in its header so a lossy session is never silently lossy).
+    pub dropped: Arc<AtomicU64>,
 }
 
 impl MonitorHandle {
@@ -111,34 +123,101 @@ pub fn start_monitoring(buses: &[u8]) -> (Receiver<UsbPacket>, MonitorHandle) {
 /// Split out from [`start_monitoring`] so tests can drive the spawn/shutdown
 /// path with fixture-backed readers instead of real usbmon interfaces.
 pub fn start_sources(sources: Vec<PacketSource>) -> (Receiver<UsbPacket>, MonitorHandle) {
-    let (tx, rx) = channel();
+    start_sources_with_bound(sources, CHANNEL_BOUND)
+}
+
+/// [`start_sources`] with an explicit channel bound, so tests can fill the
+/// channel without producing 16k packets.
+fn start_sources_with_bound(
+    sources: Vec<PacketSource>,
+    bound: usize,
+) -> (Receiver<UsbPacket>, MonitorHandle) {
+    let (tx, rx) = sync_channel(bound);
     let shutdown = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicU64::new(0));
     let mut threads = Vec::new();
     for source in sources {
         let tx = tx.clone();
         let shutdown = Arc::clone(&shutdown);
+        let dropped = Arc::clone(&dropped);
         let bus = source.bus_id();
         match thread::Builder::new()
             .name(format!("usbmon-bus-{bus}"))
-            .spawn(move || {
-                let send = |packet| {
-                    tx.send(packet)
-                        .map_err(|_| anyhow!("packet channel closed"))
-                };
-                let result = match source {
-                    PacketSource::Text(reader) => reader.read_packets(&shutdown, send),
-                    PacketSource::Binary(reader) => reader.read_packets(&shutdown, send),
-                };
-                match result {
-                    Ok(()) => debug!("usbmon reader for bus {bus} finished"),
-                    Err(e) => warn!("usbmon reader for bus {bus} stopped: {e}"),
-                }
-            }) {
+            .spawn(move || run_source(source, &shutdown, &tx, &dropped))
+        {
             Ok(handle) => threads.push(handle),
             Err(e) => warn!("failed to spawn usbmon reader for bus {bus}: {e}"),
         }
     }
-    (rx, MonitorHandle { shutdown, threads })
+    (
+        rx,
+        MonitorHandle {
+            shutdown,
+            threads,
+            dropped,
+        },
+    )
+}
+
+/// Read one source to completion on the calling thread, funnelling its packets
+/// onto `tx`, with this bus's text interface standing by if a binary source
+/// turns out to be unusable.
+fn run_source(
+    source: PacketSource,
+    shutdown: &AtomicBool,
+    tx: &SyncSender<UsbPacket>,
+    dropped: &AtomicU64,
+) {
+    let fallback = UsbmonReader::new(source.bus_id());
+    run_source_with_fallback(source, fallback, shutdown, tx, dropped);
+}
+
+/// [`run_source`] with the fallback reader supplied by the caller, so tests can
+/// point it at a fixture instead of the real debugfs path.
+fn run_source_with_fallback(
+    source: PacketSource,
+    fallback: UsbmonReader,
+    shutdown: &AtomicBool,
+    tx: &SyncSender<UsbPacket>,
+    dropped: &AtomicU64,
+) {
+    let bus = source.bus_id();
+    // `start_monitoring`'s probe only tried the first target bus, and a
+    // per-bus `/dev/usbmonN` can still be missing or unreadable. Check this
+    // bus's device before committing to it: without this, that one bus's
+    // reader would exit with a warning and the bus would silently go dark,
+    // even though its text interface is right there. The probe handle is
+    // dropped immediately so it cannot pin usbmon.
+    let source = match source {
+        PacketSource::Binary(reader) if open_nonblocking(&reader.path).is_err() => {
+            warn!(
+                "cannot open {} for bus {bus}; falling back to the usbmon text interface",
+                reader.path.display()
+            );
+            PacketSource::Text(fallback)
+        }
+        source => source,
+    };
+    let send = |packet| match tx.try_send(packet) {
+        Ok(()) => Ok(()),
+        // The channel is bounded on purpose (see CHANNEL_BOUND) and a reader
+        // must never park on it: a parked reader holds the usbmon file open,
+        // which is exactly what `MonitorHandle::stop` exists to prevent. Losing
+        // the packet is the lesser evil, and the count makes the loss visible.
+        Err(TrySendError::Full(_)) => {
+            dropped.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(TrySendError::Disconnected(_)) => Err(anyhow!("packet channel closed")),
+    };
+    let result = match source {
+        PacketSource::Text(reader) => reader.read_packets(shutdown, send),
+        PacketSource::Binary(reader) => reader.read_packets(shutdown, send),
+    };
+    match result {
+        Ok(()) => debug!("usbmon reader for bus {bus} finished"),
+        Err(e) => warn!("usbmon reader for bus {bus} stopped: {e}"),
+    }
 }
 
 #[cfg(test)]
@@ -225,6 +304,111 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "stop() must wake and join a parked binary reader promptly"
         );
+    }
+
+    /// A reader must never park waiting for room on the channel — that would
+    /// hold the usbmon file open past `stop()` if the UI ever stalled. Once the
+    /// bound is reached the surplus is counted and discarded instead.
+    #[test]
+    fn full_channel_drops_packets_instead_of_blocking_the_reader() {
+        const BOUND: usize = 3;
+        const EVENTS: usize = 10;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("1u");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for _ in 0..EVENTS {
+            writeln!(f, "ffff0000dddd0001 500 C Bi:1:003:1 0 32 <").unwrap();
+        }
+
+        // Nothing drains `rx` until the reader thread has finished, so every
+        // event past the bound has to go somewhere other than a blocked send.
+        let (rx, handle) = start_sources_with_bound(
+            vec![PacketSource::Text(UsbmonReader::with_path(1, path, false))],
+            BOUND,
+        );
+        let dropped = Arc::clone(&handle.dropped);
+
+        // A blocking send would park here forever instead of counting: the
+        // channel is full from the fourth event on and nobody is draining it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while dropped.load(Ordering::Relaxed) < (EVENTS - BOUND) as u64 {
+            assert!(
+                Instant::now() < deadline,
+                "reader parked on the full channel instead of dropping"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let started = Instant::now();
+        handle.stop();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stop() must join a reader that filled the channel"
+        );
+
+        let received: Vec<_> = rx.try_iter().collect();
+        assert_eq!(received.len(), BOUND, "the channel holds exactly its bound");
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            (EVENTS - BOUND) as u64,
+            "every packet that did not fit is counted as dropped"
+        );
+    }
+
+    /// The global probe can succeed while one bus's `/dev/usbmonN` is missing
+    /// or unreadable. That bus must not simply go dark: the reader falls back
+    /// to its own text interface instead of dying with a warning.
+    #[test]
+    fn binary_source_that_cannot_be_opened_falls_back_to_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let text_path = temp.path().join("7u");
+        let mut f = std::fs::File::create(&text_path).unwrap();
+        writeln!(f, "ffff0000dddd0007 500 C Bi:7:003:1 0 32 <").unwrap();
+        let missing_device = temp.path().join("usbmon7"); // never created
+
+        let (tx, rx) = sync_channel(4);
+        run_source_with_fallback(
+            PacketSource::Binary(BinaryReader::with_path(7, missing_device, false)),
+            UsbmonReader::with_path(7, text_path, false),
+            &AtomicBool::new(false),
+            &tx,
+            &AtomicU64::new(0),
+        );
+
+        let packets: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            packets.len(),
+            1,
+            "the fallback reader's packets must arrive"
+        );
+        assert_eq!(packets[0].bus_id, 7);
+        assert_eq!(packets[0].data_length, 32);
+    }
+
+    /// The fallback is only for a binary source that cannot be opened; a
+    /// working one is read as-is and the text reader stays untouched.
+    #[test]
+    fn openable_binary_source_is_not_replaced_by_the_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary_path = temp.path().join("usbmon8");
+        std::fs::write(&binary_path, binary_event(8, 3, 64)).unwrap();
+        let unused_text = temp.path().join("8u");
+        std::fs::write(&unused_text, "ffff0000dddd0008 500 C Bi:8:009:1 0 32 <\n").unwrap();
+
+        let (tx, rx) = sync_channel(4);
+        run_source_with_fallback(
+            PacketSource::Binary(BinaryReader::with_path(8, binary_path, false)),
+            UsbmonReader::with_path(8, unused_text, false),
+            &AtomicBool::new(false),
+            &tx,
+            &AtomicU64::new(0),
+        );
+
+        let packets: Vec<_> = rx.try_iter().collect();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].device_id, 3, "read from the binary source");
+        assert_eq!(packets[0].data_length, 64);
     }
 
     #[test]
