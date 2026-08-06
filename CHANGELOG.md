@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Full parser for usbmon's `Nu` text interface format
 - Controller-grouped, physically port-ordered device list: devices are listed under a `═ controller ═` heading and `▶ Bus NN (USB2 side/USB3 side)` bus headers, in physical port order (parsed from the resolved sysfs directory name), with the USB2-side and USB3-side buses of a shared xHCI controller listed as adjacent sibling buses; the list's vertical scroll follows the selected device so it can't be walked off-screen
 - Per-device and per-bus %busy, measured against each USB speed's practical (protocol-overhead-adjusted) bandwidth and rendered in the device list and bus headers (`-- busy` when the bus speed is unknown)
-- ⚡ high-utilization (>80% busy) and 🔺 capability-exceeds-bus indicators in the device list's `!` column, the latter driven by a cached `bcdDevice`/`bMaxPacketSize0` capability heuristic read once via the device's resolved sysfs path
+- ⚡ high-utilization (>80% busy) and 🔺 capability-exceeds-bus indicators in the device list's `!` column, the latter driven by a best-effort capability signal (sysfs `version`, i.e. bcdUSB >= 3.00) read once via the device's resolved sysfs path
 - Color-coded USB link speeds: the Speed cell of every device row, the speed figure in every bus header, and a color legend in the controls block
 - Split bandwidth chart pane: the aggregate total chart on the left, the selected device's rx/tx rate history on the right ([-60, 0]s window), with a placeholder when no device is selected or the selection disappears
 - `integration` cargo feature: opt-in tests that exercise the real usbmon interfaces on a live Linux system (`cargo test --features integration`), skipping gracefully when usbmon isn't available; the default `cargo test`/`cargo test --all-targets` suite and CI are unaffected
@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `PUBLIC/LICENSE` now matches the root `LICENSE` verbatim (BSD-3-Clause, copyright usbtop-ng contributors)
 - Documentation (README, CONTRIBUTING, ARCHITECTURE) reconciled with the implemented thread + mpsc + dual-interface (binary preferred, text fallback) design
 - `UsbTopApp`'s flat device map replaced with a per-tick `sync_from(&DeviceManager)` snapshot (`ControllerView`/`BusView`/`DeviceRow`) that also drives the new controller/bus grouping and port ordering
+
+### Fixed
+- Per-packet bandwidth accounting is now O(1): `BandwidthStats` keeps the 10-second window as fixed 250ms buckets with a running sum instead of one entry per packet plus a full-window rescan on every URB, so sustained traffic no longer costs work proportional to the packets already in the window
+- The reader→UI packet channel is bounded (`sync_channel`, 16384 packets) and readers hand packets over with `try_send`: a consumer that cannot keep up (busy bus, slow terminal over SSH) can no longer grow memory without bound. Packets that do not fit are counted, not waited on — readers never park, so `MonitorHandle::stop()` still joins promptly — and the UI header shows `dropped: N` whenever the count is above zero. The UI also applies at most 8192 packets per event-loop pass, so a burst cannot stall a frame
+- A bus whose `/dev/usbmonN` cannot be opened now falls back to that bus's debugfs `Nu` text interface instead of leaving the bus dark: the interface probe at startup only tried the first target bus, and a per-bus open failure used to kill just that reader thread with a warning
+- The 🔺 indicator no longer guesses: the old `bcdDevice`/`bMaxPacketSize0` heuristic flagged ordinary full-speed devices (a `bcdDevice` of 0x0300+ is a vendor firmware revision, and `bMaxPacketSize0 == 64` is legal at full speed). It is now a best-effort signal from the device's declared bcdUSB version (sysfs `version` >= 3.00) and simply stays silent when there is no signal
+- Both 60-second histories are now trimmed by age instead of by sample count, so `bandwidth_history` and `rate_history` really cover 60 seconds at any `--refresh` rate (a 60-sample cap meant 15s at `--refresh 250` and 120s at `--refresh 2000`, while the charts kept claiming a minute)
 
 ### Removed
 - Tokio and chrono dependencies

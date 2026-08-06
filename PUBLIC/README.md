@@ -13,8 +13,9 @@ usbtop-ng builds, runs its setup checks, and opens the terminal UI with live pac
 
 - Controller-grouped, physically port-ordered device list, with the USB2-side and USB3-side buses of a shared xHCI controller shown as adjacent sibling buses
 - Live per-device USB bandwidth (RX/TX), plus running totals and peak bandwidth across all devices
-- Per-device and per-bus %busy against each USB speed's practical bandwidth, plus ⚡ high-utilization and 🔺 capability-exceeds-bus indicators
+- Per-device and per-bus %busy against each USB speed's practical bandwidth, plus ⚡ high-utilization and 🔺 capability-exceeds-bus indicators (🔺 is best-effort: it fires when a device's sysfs `version` declares bcdUSB 3.x but it is linked slower)
 - Color-coded USB link speeds, and a split chart pane (aggregate total plus the selected device's rx/tx history)
+- Bounded packet queue with drop accounting: readers never block on a slow UI, and the header shows `dropped: N` if anything was lost
 - Device metadata (vendor, product, speed) resolved from sysfs
 - Disconnect detection: devices are shown greyed out for 5 seconds after disconnecting, then removed
 - Managed usbmon load/unload, with the choice remembered in preferences
