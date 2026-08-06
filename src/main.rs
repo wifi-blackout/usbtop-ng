@@ -6,6 +6,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process;
+use std::sync::Arc;
 
 mod config;
 mod device;
@@ -160,7 +161,10 @@ fn main() -> Result<()> {
 
     let (packets, monitor) = usbmon::monitor::start_monitoring(&usbmon_status.available_buses);
     let manager = device::manager::DeviceManager::new();
-    let app = UsbTopApp::new(Duration::from_millis(cli.refresh));
+    // The readers discard packets rather than block when the channel fills, so
+    // the UI needs the count to say so in its header.
+    let app = UsbTopApp::new(Duration::from_millis(cli.refresh))
+        .with_dropped_counter(Arc::clone(&monitor.dropped));
     let run_result = run_ui(app, manager, packets);
 
     // Close the usbmon files before anything tries to unload the module: an

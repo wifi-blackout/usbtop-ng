@@ -16,7 +16,11 @@ use ratatui::{
 use std::{
     collections::BTreeMap,
     io,
-    sync::mpsc::Receiver,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::Receiver,
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -30,6 +34,17 @@ use colors::*;
 
 /// Group name for buses whose host controller could not be resolved.
 const UNKNOWN_CONTROLLER: &str = "unknown";
+
+/// How much of `bandwidth_history` is kept and plotted, in seconds. Eviction
+/// and the chart's x-axis read the same number so the window the chart claims
+/// is the window the data actually covers.
+const HISTORY_WINDOW_SECS: f64 = 60.0;
+
+/// Most packets applied in one pass of the event loop. The channel's bound is
+/// what caps memory; this caps how long a single frame can spend catching up,
+/// so a burst can never stall input handling or the redraw. Anything left over
+/// is still queued for the next pass, one poll interval (~50ms) later.
+const DRAIN_BATCH: usize = 8_192;
 
 /// One device as rendered: its physical port chain plus a snapshot of the
 /// device itself, taken once per tick from the `DeviceManager`.
@@ -69,6 +84,11 @@ pub struct UsbTopApp {
     /// selected device's row so `select_next_device`/`select_previous_device`
     /// can't walk the selection off-screen; see `follow_selection_in_list`.
     pub list_scroll: u16,
+    /// Shared count of packets the reader threads had to discard because the
+    /// channel was full (see `usbmon::monitor`). `None` when no monitor is
+    /// attached; the header surfaces it once it goes above zero, so a lossy
+    /// session never reads like a complete one.
+    pub dropped_counter: Option<Arc<AtomicU64>>,
 }
 
 impl UsbTopApp {
@@ -84,7 +104,22 @@ impl UsbTopApp {
             total_bandwidth: 0.0,
             peak_bandwidth: 0.0,
             list_scroll: 0,
+            dropped_counter: None,
         }
+    }
+
+    /// Attach the monitor's dropped-packet counter (see
+    /// [`Self::dropped_counter`]).
+    pub fn with_dropped_counter(mut self, dropped: Arc<AtomicU64>) -> Self {
+        self.dropped_counter = Some(dropped);
+        self
+    }
+
+    /// Packets discarded so far, or 0 when no counter is attached.
+    fn dropped_packets(&self) -> u64 {
+        self.dropped_counter
+            .as_ref()
+            .map_or(0, |counter| counter.load(Ordering::Relaxed))
     }
 
     /// Rebuild the whole render snapshot from the manager: controller ->
@@ -148,11 +183,14 @@ impl UsbTopApp {
         let now = self.start_time.elapsed().as_secs_f64();
         self.bandwidth_history.push((now, self.total_bandwidth));
 
-        // Keep only last 60 seconds of data
-        if self.bandwidth_history.len() > 60 {
-            self.bandwidth_history
-                .drain(0..self.bandwidth_history.len() - 60);
-        }
+        // Keep the last 60 seconds of data, by age rather than by sample
+        // count: the tick rate is the user's `--refresh` choice, so a fixed
+        // count would mean 15s at 250ms and 120s at 2000ms while the chart
+        // keeps claiming a 60-second window. Samples are appended in time
+        // order, so the expired ones are exactly the leading run.
+        let cutoff = now - HISTORY_WINDOW_SECS;
+        let expired = self.bandwidth_history.partition_point(|(t, _)| *t < cutoff);
+        self.bandwidth_history.drain(0..expired);
 
         self.last_update = Instant::now();
     }
@@ -316,12 +354,7 @@ fn run_app(
     packets: &Receiver<UsbPacket>,
 ) -> Result<()> {
     loop {
-        // Drain everything the reader threads produced since the last pass.
-        // Any `try_recv` error (empty or disconnected) means "nothing to drain",
-        // which keeps the UI alive in --force mode with no usbmon readers.
-        while let Ok(packet) = packets.try_recv() {
-            manager.apply_packet(&packet);
-        }
+        drain_packets(manager, packets, DRAIN_BATCH);
 
         if app.last_update.elapsed() >= app.refresh_rate {
             // `sync_from` rebuilds the whole snapshot, so the list of devices
@@ -338,6 +371,27 @@ fn run_app(
         }
     }
     Ok(())
+}
+
+/// Apply up to `batch` queued packets to the manager and report how many were
+/// applied. Any `try_recv` error (empty or disconnected) means "nothing to
+/// drain", which keeps the UI alive in --force mode with no usbmon readers.
+fn drain_packets(
+    manager: &mut DeviceManager,
+    packets: &Receiver<UsbPacket>,
+    batch: usize,
+) -> usize {
+    let mut applied = 0;
+    while applied < batch {
+        match packets.try_recv() {
+            Ok(packet) => {
+                manager.apply_packet(&packet);
+                applied += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    applied
 }
 
 fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
@@ -370,6 +424,43 @@ fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &UsbTopApp) {
+    let mut stats_line = vec![
+        Span::raw("Total: "),
+        Span::styled(
+            format!("{:.1} MB/s", app.total_bandwidth / 1_000_000.0),
+            Style::default()
+                .fg(PRIMARY_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" | Peak: "),
+        Span::styled(
+            format!("{:.1} MB/s", app.peak_bandwidth / 1_000_000.0),
+            Style::default()
+                .fg(SECONDARY_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" | Devices: "),
+        Span::styled(
+            app.device_keys().len().to_string(),
+            Style::default()
+                .fg(SUCCESS_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    // Only shown once something was actually lost: the figures above are then
+    // an undercount, and silence about that would be the real bug.
+    let dropped = app.dropped_packets();
+    if dropped > 0 {
+        stats_line.push(Span::raw(" | dropped: "));
+        stats_line.push(Span::styled(
+            dropped.to_string(),
+            Style::default()
+                .fg(SECONDARY_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     let header_text = vec![
         Line::from(vec![
             Span::styled(
@@ -380,29 +471,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &UsbTopApp) {
             ),
             Span::raw(" - Next-Gen USB Traffic Monitor"),
         ]),
-        Line::from(vec![
-            Span::raw("Total: "),
-            Span::styled(
-                format!("{:.1} MB/s", app.total_bandwidth / 1_000_000.0),
-                Style::default()
-                    .fg(PRIMARY_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" | Peak: "),
-            Span::styled(
-                format!("{:.1} MB/s", app.peak_bandwidth / 1_000_000.0),
-                Style::default()
-                    .fg(SECONDARY_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" | Devices: "),
-            Span::styled(
-                app.device_keys().len().to_string(),
-                Style::default()
-                    .fg(SUCCESS_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
+        Line::from(stats_line),
     ];
 
     let header = Paragraph::new(header_text)
@@ -430,8 +499,8 @@ fn draw_bandwidth_graph(f: &mut Frame, area: Rect, app: &UsbTopApp) {
         .map(|(t, bps)| (*t, bps / 1_000_000.0))
         .collect();
     let latest_t = data.last().map(|(t, _)| *t).unwrap_or(0.0);
-    let x_min = (latest_t - 60.0).max(0.0);
-    let x_max = latest_t.max(60.0);
+    let x_min = (latest_t - HISTORY_WINDOW_SECS).max(0.0);
+    let x_max = latest_t.max(HISTORY_WINDOW_SECS);
     let max_mbps = data.iter().map(|(_, m)| *m).fold(0.0, f64::max).max(1.0);
 
     let datasets = vec![Dataset::default()
@@ -813,7 +882,9 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from("Features:"),
         Line::from("  • Controller-grouped, port-ordered device list (USB2/USB3 sibling buses)"),
         Line::from("  • Per-device and per-bus %busy"),
-        Line::from("  • ⚡ high-utilization / 🔺 limited-by-bus indicators"),
+        Line::from("  • ⚡ high-utilization indicator (>80% of practical bandwidth)"),
+        Line::from("  • 🔺 device declares USB 3.x support but linked slower — best-effort signal"),
+        Line::from("  • Header shows 'dropped: N' if packets were lost to a full queue"),
         Line::from("  • Color-coded USB link speeds"),
         Line::from("  • Split charts: aggregate total, plus the selected device's rx/tx"),
         Line::from("  • Device disconnect detection"),
@@ -1402,6 +1473,88 @@ mod tests {
         );
         let screen = terminal.backend().to_string();
         assert!(screen.contains("001:001"), "{screen}");
+    }
+
+    /// One pass may not stall the frame behind an unbounded backlog: whatever
+    /// is left over stays queued for the next pass, ~50ms later.
+    #[test]
+    fn drain_stops_at_the_batch_limit_and_leaves_the_rest_queued() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        for device_id in 1..=5u8 {
+            tx.send(
+                parse_usbmon_text_line(&format!(
+                    "ffff0000eeee000{device_id} 100 C Bi:1:00{device_id}:1 0 4096 <"
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(drain_packets(&mut manager, &rx, 2), 2);
+        assert_eq!(manager.buses[&1].devices.len(), 2);
+
+        // The leftovers are still there for the following pass.
+        assert_eq!(drain_packets(&mut manager, &rx, 8), 3);
+        assert_eq!(manager.buses[&1].devices.len(), 5);
+        assert_eq!(drain_packets(&mut manager, &rx, 8), 0, "empty channel");
+    }
+
+    /// A lossy session must never look like a clean one, but a clean session
+    /// must not carry a permanent "dropped: 0" either.
+    #[test]
+    fn header_reports_dropped_packets_only_once_some_were_dropped() {
+        let render = |app: &UsbTopApp| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(90, 4)).unwrap();
+            terminal.draw(|f| draw_header(f, f.area(), app)).unwrap();
+            terminal.backend().to_string()
+        };
+
+        let plain = UsbTopApp::new(Duration::from_millis(100));
+        assert!(!render(&plain).contains("dropped"), "no counter wired up");
+
+        let counter = Arc::new(AtomicU64::new(0));
+        let app =
+            UsbTopApp::new(Duration::from_millis(100)).with_dropped_counter(Arc::clone(&counter));
+        let screen = render(&app);
+        assert!(!screen.contains("dropped"), "nothing dropped yet: {screen}");
+
+        counter.store(42, Ordering::Relaxed);
+        let screen = render(&app);
+        assert!(screen.contains("dropped: 42"), "{screen}");
+    }
+
+    /// The chart's x-axis is 60 seconds wide, so the history it plots is
+    /// trimmed by age. A 60-sample cap would mean 15s at `--refresh 250`.
+    #[test]
+    fn bandwidth_history_keeps_sixty_seconds_not_sixty_samples() {
+        let mut app = UsbTopApp::new(Duration::from_millis(250));
+        app.start_time = Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .expect("monotonic clock has at least 120s of history");
+        app.bandwidth_history.push((0.0, 1.0)); // ~120s before now
+        app.bandwidth_history.push((100.0, 2.0)); // ~20s before now
+
+        app.update_bandwidth_history();
+
+        let times: Vec<f64> = app.bandwidth_history.iter().map(|(t, _)| *t).collect();
+        assert_eq!(times.len(), 2, "only the out-of-window sample is dropped");
+        assert_eq!(times[0], 100.0);
+        assert!(times[1] >= 119.0, "this tick's sample, at ~120s: {times:?}");
+    }
+
+    #[test]
+    fn bandwidth_history_retains_more_than_sixty_recent_samples() {
+        let mut app = UsbTopApp::new(Duration::from_millis(250));
+        for _ in 0..100 {
+            app.update_bandwidth_history();
+        }
+        assert_eq!(
+            app.bandwidth_history.len(),
+            100,
+            "samples inside the 60s window are all kept, however fast the tick"
+        );
     }
 
     #[test]
