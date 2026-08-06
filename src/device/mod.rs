@@ -247,24 +247,15 @@ impl UsbDevice {
     }
 }
 
-/// Heuristic max speed capability from USB descriptors: a `bcdDevice`
-/// (device release number) of 0x0300 or higher signals a SuperSpeed-era
-/// device; otherwise `bMaxPacketSize0` (the control endpoint's max packet
-/// size) narrows it to High/Full/Low. Neither is authoritative, but it's
-/// what sysfs exposes without a live USB descriptor read.
+/// Best-effort capability signal: a device that declares bcdUSB >= 3.00 in
+/// its descriptor (sysfs `version`) is SuperSpeed-capable. Devices linked
+/// below their capability usually report bcdUSB 2.10 on the USB2 bus, so the
+/// absence of this signal proves nothing — 🔺 is best-effort by design.
 #[cfg(target_os = "linux")]
 fn read_max_capability(dir: &std::path::Path) -> Option<UsbSpeed> {
-    if let Ok(bcd) = std::fs::read_to_string(dir.join("bcdDevice")) {
-        if u16::from_str_radix(bcd.trim(), 16).is_ok_and(|v| v >= 0x0300) {
-            return Some(UsbSpeed::SuperSpeed);
-        }
-    }
-    let raw = std::fs::read_to_string(dir.join("bMaxPacketSize0")).ok()?;
-    match raw.trim().parse::<u16>().ok()? {
-        n if n >= 64 => Some(UsbSpeed::High),
-        8 => Some(UsbSpeed::Low),
-        _ => Some(UsbSpeed::Full),
-    }
+    let raw = std::fs::read_to_string(dir.join("version")).ok()?;
+    let major: u32 = raw.trim().split('.').next()?.parse().ok()?;
+    (major >= 3).then_some(UsbSpeed::SuperSpeed)
 }
 
 /// Visual indicator for a device's speed-capability status, surfaced as the
@@ -405,14 +396,14 @@ mod tests {
     }
 
     #[test]
-    fn max_capability_reads_bcd_and_packet_size() {
+    fn max_capability_reads_declared_bcd_usb_version() {
         let temp = tempfile::tempdir().unwrap();
-        // device with bcdDevice >= 0x0300 -> SuperSpeed capability
+        // device declaring bcdUSB 3.20 -> SuperSpeed-capable
         write_device(
             &temp.path().join("1-2"),
             1,
             5,
-            &[("speed", "480"), ("bcdDevice", "0310")],
+            &[("speed", "480"), ("version", "3.20")],
         );
         let mut d = UsbDevice::new(1, 5);
         d.populate_from_sysfs(Some(temp.path()));
@@ -447,7 +438,7 @@ mod tests {
             &temp.path().join("1-2"),
             1,
             7,
-            &[("speed", "480"), ("bcdDevice", "0310")],
+            &[("speed", "480"), ("version", "3.20")],
         );
         let mut d = UsbDevice::new(1, 7);
         d.populate_from_sysfs(Some(temp.path()));
@@ -472,22 +463,55 @@ mod tests {
     }
 
     #[test]
-    fn read_max_capability_falls_back_to_max_packet_size() {
+    fn read_max_capability_signals_only_on_declared_usb_3() {
         let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("bMaxPacketSize0"), "64\n").unwrap();
-        assert_eq!(read_max_capability(temp.path()), Some(UsbSpeed::High));
+        std::fs::write(temp.path().join("version"), "3.20\n").unwrap();
+        assert_eq!(read_max_capability(temp.path()), Some(UsbSpeed::SuperSpeed));
 
-        std::fs::write(temp.path().join("bMaxPacketSize0"), "8\n").unwrap();
-        assert_eq!(read_max_capability(temp.path()), Some(UsbSpeed::Low));
+        // Real sysfs pads the field; 2.x says nothing about SuperSpeed support.
+        std::fs::write(temp.path().join("version"), " 2.10\n").unwrap();
+        assert_eq!(read_max_capability(temp.path()), None);
 
-        std::fs::write(temp.path().join("bMaxPacketSize0"), "32\n").unwrap();
-        assert_eq!(read_max_capability(temp.path()), Some(UsbSpeed::Full));
+        std::fs::write(temp.path().join("version"), " 1.10\n").unwrap();
+        assert_eq!(read_max_capability(temp.path()), None);
     }
 
     #[test]
-    fn read_max_capability_none_when_no_attributes() {
+    fn read_max_capability_none_when_version_is_missing_or_unparsable() {
         let temp = tempfile::tempdir().unwrap();
+        assert_eq!(read_max_capability(temp.path()), None, "no version file");
+
+        std::fs::write(temp.path().join("version"), "not-a-version\n").unwrap();
         assert_eq!(read_max_capability(temp.path()), None);
+    }
+
+    /// Without the bcdUSB signal there is no 🔺 to show, so the indicator
+    /// falls through to the utilization rules — the point of dropping the old
+    /// heuristic was that a plain USB 2 device must not be flagged.
+    #[test]
+    fn no_capability_signal_falls_through_to_utilization_indicators() {
+        let temp = tempfile::tempdir().unwrap();
+        write_device(
+            &temp.path().join("1-3"),
+            1,
+            4,
+            &[("speed", "12"), ("version", " 2.00")],
+        );
+        let mut d = UsbDevice::new(1, 4);
+        d.populate_from_sysfs(Some(temp.path()));
+        assert_eq!(d.max_capability, None);
+        assert_eq!(d.check_speed_mismatch(&UsbSpeed::High), None);
+        assert_eq!(
+            d.get_speed_indicator(&UsbSpeed::High),
+            SpeedIndicator::Normal
+        );
+
+        // Full speed practical max is 1.2 MB/s, so this crosses 80% busy.
+        d.bandwidth_stats.current_bps = 1_100_000.0;
+        assert_eq!(
+            d.get_speed_indicator(&UsbSpeed::High),
+            SpeedIndicator::HighUtilization
+        );
     }
 
     #[test]
