@@ -50,7 +50,7 @@ usbtop-ng is designed as a modular USB monitoring tool with clear separation of 
 - **Purpose**: Interface with kernel USB monitoring facilities
 - **Components**:
   - `mod.rs`: Module detection, load/unload, and setup instructions
-  - `monitor.rs`: Probes for the binary interface, spawns one blocking reader thread per bus (or a single thread for the aggregate interface), owns the shutdown handle, and exposes the `mpsc` receiver the UI reads from
+  - `monitor.rs`: Probes for the binary interface, spawns one blocking reader thread per bus (or a single thread for the aggregate interface), owns the shutdown handle, and exposes the bounded `mpsc` receiver the UI reads from plus the shared dropped-packet counter; each thread's `run_source` also re-checks its own binary device and falls back to that bus's text interface if it cannot be opened
   - `reader.rs`: Blocking read loop over the usbmon `Nu` text interface, opened `O_NONBLOCK` and polled so it can be shut down promptly
   - `binary.rs`: Blocking read loop over the usbmon binary `/dev/usbmonN` character-device interface: fixed 48-byte native-endian headers (`Documentation/usb/usbmon.rst`) followed by `len_cap` bytes of captured payload drained (not kept) per event; same `O_NONBLOCK`/poll/shutdown contract as `reader.rs`
   - `parser.rs`: Parses the usbmon `Nu` text-format lines into `UsbPacket`s (also home to `UsbSpeed`'s practical-bandwidth and color-code tables)
@@ -58,15 +58,15 @@ usbtop-ng is designed as a modular USB monitoring tool with clear separation of 
 #### 2. Device Manager (`device/`)
 - **Purpose**: USB device discovery and metadata management
 - **Components**:
-  - `mod.rs`: Device structure and lifecycle; `UsbDevice::get_busy_percentage`, `check_speed_mismatch`/`get_speed_indicator`, and the `bcdDevice`/`bMaxPacketSize0` max-capability heuristic
+  - `mod.rs`: Device structure and lifecycle; `UsbDevice::get_busy_percentage`, `check_speed_mismatch`/`get_speed_indicator`, and the best-effort max-capability signal read from sysfs `version` (bcdUSB)
   - `manager.rs`: Routes usbmon packets into per-device bandwidth stats, resolves device metadata from sysfs (Linux only), and groups devices into `UsbBus`es that resolve their host controller and aggregate %busy
 
 #### 3. Statistics Engine (`stats/`)
 - **Purpose**: Real-time bandwidth calculation and history
 - **Features**:
-  - Sliding window calculations
+  - Sliding window calculations over fixed 250ms buckets, so accounting a packet is O(1) rather than a rescan of the window
   - Peak tracking
-  - Historical data management
+  - Historical data management, evicted by age rather than sample count
 
 #### 4. User Interface (`ui/`)
 - **Purpose**: Terminal-based user interface
@@ -115,15 +115,24 @@ impl BinaryReader {
 - Each reader runs to completion on its own dedicated thread (spawned by `usbmon::monitor`), so a blocked or idle interface never blocks the UI thread
 - Callback-based interface for flexible packet processing; the callback used in production forwards each `UsbPacket` over an `mpsc` channel
 - Both usbmon interfaces are supported and produce the same `UsbPacket` type. `monitor::start_monitoring` probes once per process by trying to open `/dev/usbmon<bus>` for the first target bus: success means every target bus is read through `BinaryReader` (48-byte native-endian headers per `Documentation/usb/usbmon.rst`, with each event's `len_cap` payload bytes drained rather than kept); failure (missing node, permissions, older kernel) falls back to `UsbmonReader` over the debugfs `Nu` text interface for every target bus. One `info!` log line states which interface was chosen.
+- That global choice is a starting point, not a promise: each reader thread (`run_source`) re-opens its own `/dev/usbmon<bus>` before entering the read loop and, if that fails, warns and reads this bus's debugfs `Nu` text interface instead. One bus with a missing or unreadable binary node therefore degrades to text rather than going dark.
 - The file/device is opened `O_NONBLOCK` on Linux and polled every 50ms so `shutdown` can be observed promptly, instead of parking indefinitely inside `read()` — the same contract for both readers
 - Platform-specific path resolution
 
 **Packet Flow:**
 ```
 /dev/usbmonN (binary, preferred) ─┐
-                                   ├─→ Reader thread → UsbPacket → mpsc channel → DeviceManager
+                                   ├─→ Reader thread → UsbPacket → bounded channel → DeviceManager
 usbmon Nu file (text, fallback)  ─┘
 ```
+
+**Backpressure:** the channel is a `sync_channel(16_384)`, and readers hand packets
+over with `try_send`. A reader must never park on a full channel — a parked reader
+still holds its usbmon file open, which is precisely what `MonitorHandle::stop()`
+exists to prevent before `modprobe -r usbmon` — so a packet that does not fit is
+discarded and counted in the `Arc<AtomicU64>` the handle exposes as `dropped`. The
+UI reads that counter and appends `dropped: N` to its header once it is non-zero,
+so lost samples are always visible rather than silently missing.
 
 ### Device Manager Module
 
@@ -135,7 +144,7 @@ pub struct UsbDevice {
     pub bandwidth_stats: BandwidthStats,
     pub is_disconnected: bool,
     pub sysfs_path: Option<PathBuf>,
-    pub max_capability: Option<UsbSpeed>, // cached bcdDevice/bMaxPacketSize0 heuristic
+    pub max_capability: Option<UsbSpeed>, // cached bcdUSB (sysfs `version`) signal
     // ... metadata fields
 }
 
@@ -149,9 +158,10 @@ pub struct UsbBus {
 
 **Features:**
 - Automatic device discovery via sysfs, driven by incoming usbmon packets (busnum/devnum topology scan, not udev)
-- Metadata extraction (vendor, product, speed, plus the cached max-capability heuristic)
+- Metadata extraction (vendor, product, speed, plus the cached max-capability signal)
 - `UsbDevice::get_busy_percentage()` — %busy against the device's practical (overhead-adjusted) bandwidth; `UsbBus::busy_percentage()` — the bus's aggregate %busy, `None` when bus speed is unknown
 - `UsbDevice::get_speed_indicator()` — `SpeedIndicator::HighUtilization` (⚡, >80% busy) or `LimitedByBus` (🔺, cached capability exceeds both the bus speed and current link speed), `LimitedByBus` taking precedence
+- The capability behind 🔺 is deliberately a *best-effort* signal, read once from the device's sysfs `version` (bcdUSB): `>= 3.00` means SuperSpeed-capable, anything else means "no signal", not "not capable". A device linked below its capability usually reports bcdUSB 2.10 on the USB2 bus, so its absence proves nothing — which is why no descriptor guesswork (`bcdDevice`, `bMaxPacketSize0`) is used to manufacture one
 - Disconnect detection and tracking
 - Device discovery is Linux-only; no enumeration fallback on BSD/macOS
 
@@ -163,6 +173,10 @@ pub struct BandwidthStats {
     pub tx_bps: f64,
     pub current_bps: f64,
     pub peak_bps: f64,
+    pub rx_buckets: VecDeque<(Instant, u64)>,        // 250ms slots, oldest first
+    pub tx_buckets: VecDeque<(Instant, u64)>,
+    pub rx_window_sum: u64,                          // running sum of rx_buckets
+    pub tx_window_sum: u64,
     pub rate_history: VecDeque<(Instant, f64, f64)>, // per-device chart samples
     // ... historical data
 }
@@ -170,8 +184,9 @@ pub struct BandwidthStats {
 
 **Algorithm:**
 - Sliding window bandwidth calculation (10-second window), re-evaluated every `refresh()` call so idle devices decay to zero instead of freezing at their last rate
+- The window is stored as fixed 250ms buckets with a running sum, not one entry per packet: `update_rx`/`update_tx` evict expired buckets from the front (subtracting them from the sum), add the bytes to the newest bucket, and divide the sum by the window — all O(1) amortized. Nothing on the packet path rescans the window, so a saturated bus costs constant work per URB instead of work proportional to the packets already in the window
 - `get_utilization_percentage(max_bps)` — `current_bps / max_bps`, clamped to 100%, the shared building block behind per-device and per-bus %busy
-- One `(Instant, rx_bps, tx_bps)` sample appended to `rate_history` per `refresh()` tick, capped at 60 samples, feeding the per-device rx/tx chart
+- One `(Instant, rx_bps, tx_bps)` sample appended to `rate_history` per `refresh()` tick, retained for 60 seconds by age (not by sample count, which would mean 15s at `--refresh 250` and 120s at `--refresh 2000`), feeding the per-device rx/tx chart
 - Bounded VecDeque-backed history buffers
 
 ### User Interface
@@ -179,9 +194,10 @@ pub struct BandwidthStats {
 ```rust
 pub struct UsbTopApp {
     pub controllers: Vec<ControllerView>, // rebuilt from DeviceManager each tick
-    pub bandwidth_history: Vec<(f64, f64)>,
+    pub bandwidth_history: Vec<(f64, f64)>, // (session seconds, bytes/s), last 60s
     pub selected_device: Option<String>, // "bus:devnum"
     pub list_scroll: u16,                // follows the selection
+    pub dropped_counter: Option<Arc<AtomicU64>>, // shared with the reader threads
     // ... UI state
 }
 ```
@@ -252,16 +268,16 @@ connector order.
 ### Event Processing
 
 The UI thread owns a single loop (see `run_app` in `src/ui/mod.rs`): it drains
-whatever the reader threads produced since the last pass, refreshes state on
-a fixed tick, redraws, and polls for input — no async runtime is involved.
+what the reader threads produced since the last pass (at most `DRAIN_BATCH`
+packets, so one burst cannot stall a frame — the leftovers are picked up on the
+next pass ~50ms later), refreshes state on a fixed tick, redraws, and polls for
+input — no async runtime is involved.
 
 ```rust
 // Simplified event loop
 loop {
-    // Drain everything the reader threads produced since the last pass.
-    while let Ok(packet) = packets.try_recv() {
-        manager.apply_packet(&packet);
-    }
+    // Apply up to DRAIN_BATCH (8192) packets; the rest wait for the next pass.
+    drain_packets(manager, packets, DRAIN_BATCH);
 
     if app.last_update.elapsed() >= app.refresh_rate {
         let _ = manager.refresh();     // decay rates, drop stale devices
@@ -279,7 +295,8 @@ loop {
 
 ### Memory Management
 
-- **Bounded buffers**: Historical data limited to prevent memory growth
+- **Bounded buffers**: Historical data limited to prevent memory growth — bandwidth history by wall-clock age (60s), the sliding rate window by 250ms buckets
+- **Bounded channel**: The reader→UI channel holds at most `CHANNEL_BOUND` (16384) packets; a consumer that cannot keep up costs dropped (counted) packets, never growing memory
 - **Device cleanup**: Automatic removal of stale devices
 - **Packet pooling**: Reuse packet structures to reduce allocations
 - **String interning**: Common strings (vendor names) are deduplicated
@@ -402,9 +419,16 @@ usbtop-ng requires elevated privileges for USB monitoring:
 ```rust
 // Example error handling pattern: read_packets() runs the whole read loop on
 // its thread. Per-line parse errors are logged and skipped inside the loop;
-// only a fatal condition (interface gone, callback error) ends the loop.
-match reader.read_packets(&shutdown, |packet| {
-    tx.send(packet).map_err(|_| anyhow!("packet channel closed"))
+// only a fatal condition (interface gone, callback error) ends the loop. A
+// full channel is not fatal — the packet is counted and dropped, because a
+// reader that parks would keep the usbmon file open past stop().
+match reader.read_packets(&shutdown, |packet| match tx.try_send(packet) {
+    Ok(()) => Ok(()),
+    Err(TrySendError::Full(_)) => {
+        dropped.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+    Err(TrySendError::Disconnected(_)) => Err(anyhow!("packet channel closed")),
 }) {
     Ok(()) => debug!("usbmon reader for bus {bus} finished"),
     Err(e) => warn!("usbmon reader for bus {bus} stopped: {e}"),
