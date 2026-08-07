@@ -16,6 +16,17 @@ use crossterm::event::{self, Event};
 /// one interval coalesce into the single frame that closes it.
 pub const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
+/// Longest the loop may sleep regardless of what it owes the screen.
+///
+/// Nothing wakes the loop when a packet arrives — the readers push onto their
+/// own bounded channel and discard once it is full — so the wait doubles as
+/// the drain cadence. Left uncapped it would stretch to a whole `--refresh`
+/// interval (1s by default), which at the channel's bound is a few thousand
+/// packets silently dropped from the numbers this tool exists to report. This
+/// is a bare wake: it touches neither the dirty flag nor the frame cap, so an
+/// idle session still repaints only on its tick.
+pub const PACKET_DRAIN_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Anything that can wake the event loop.
 pub enum UiEvent {
     /// A terminal event: key press, resize, focus change.
@@ -90,6 +101,15 @@ pub fn next_deadline(now: Instant, dirty: bool, next_tick: Instant, last_draw: I
     deadline.max(now)
 }
 
+/// How long the loop may wait for events before its next pass: whatever it
+/// owes the screen, but never longer than [`PACKET_DRAIN_INTERVAL`], because
+/// the packet channel has no way to wake it.
+pub fn next_wait(now: Instant, dirty: bool, next_tick: Instant, last_draw: Instant) -> Duration {
+    next_deadline(now, dirty, next_tick, last_draw)
+        .saturating_duration_since(now)
+        .min(PACKET_DRAIN_INTERVAL)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +134,39 @@ mod tests {
         assert_eq!(next_deadline(t0, false, tick, t0), tick);
         let d = next_deadline(t0 + Duration::from_millis(20), true, tick, t0);
         assert_eq!(d, t0 + Duration::from_millis(33));
+    }
+
+    #[test]
+    fn wait_never_outlasts_the_packet_drain_interval() {
+        // An idle session's next deadline is its tick, which at the default
+        // --refresh is a second away; the readers' channel would overflow long
+        // before then, so the wait is capped whatever the screen is doing.
+        let t0 = Instant::now();
+        let far_tick = t0 + Duration::from_secs(10);
+        assert_eq!(next_wait(t0, false, far_tick, t0), PACKET_DRAIN_INTERVAL);
+        assert_eq!(
+            next_wait(t0, true, far_tick, far_tick),
+            PACKET_DRAIN_INTERVAL
+        );
+    }
+
+    #[test]
+    fn wait_is_the_pending_frame_when_that_comes_first() {
+        let t0 = Instant::now();
+        let tick = t0 + Duration::from_secs(1);
+        // Dirty, 20ms since the last frame: 13ms left on the frame cap.
+        assert_eq!(
+            next_wait(t0 + Duration::from_millis(20), true, tick, t0),
+            Duration::from_millis(13)
+        );
+    }
+
+    #[test]
+    fn an_overdue_deadline_waits_not_at_all() {
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_millis(500);
+        assert_eq!(next_wait(now, true, t0, t0), Duration::ZERO);
+        assert_eq!(next_wait(now, false, t0, t0), Duration::ZERO);
     }
 
     #[test]
