@@ -1,5 +1,4 @@
-use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -37,7 +36,8 @@ const HISTORY_WINDOW_SECS: f64 = 60.0;
 /// Most packets applied in one pass of the event loop. The channel's bound is
 /// what caps memory; this caps how long a single frame can spend catching up,
 /// so a burst can never stall input handling or the redraw. Anything left over
-/// is still queued for the next pass, one poll interval (~50ms) later.
+/// stays queued, and a pass that fills its batch tells the loop to come
+/// straight back for the rest instead of sleeping until the next tick.
 pub(crate) const DRAIN_BATCH: usize = 8_192;
 
 /// One device as rendered: its physical port chain plus a snapshot of the
@@ -69,8 +69,9 @@ pub struct UsbTopApp {
     pub bandwidth_history: Vec<(f64, f64)>, // (timestamp, total_bandwidth)
     pub selected_device: Option<String>,
     pub show_help: bool,
-    pub last_update: Instant,
     pub start_time: Instant,
+    /// How often the loop takes a fresh snapshot of the devices; the schedule
+    /// itself lives in the loop (see `tui::run_app`), not here.
     pub refresh_rate: Duration,
     pub total_bandwidth: f64,
     pub peak_bandwidth: f64,
@@ -92,7 +93,6 @@ impl UsbTopApp {
             bandwidth_history: Vec::new(),
             selected_device: None,
             show_help: false,
-            last_update: Instant::now(),
             start_time: Instant::now(),
             refresh_rate,
             total_bandwidth: 0.0,
@@ -185,25 +185,6 @@ impl UsbTopApp {
         let cutoff = now - HISTORY_WINDOW_SECS;
         let expired = self.bandwidth_history.partition_point(|(t, _)| *t < cutoff);
         self.bandwidth_history.drain(0..expired);
-
-        self.last_update = Instant::now();
-    }
-
-    pub fn handle_input(&mut self) -> Result<bool> {
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
-                        KeyCode::Char('h') => self.show_help = !self.show_help,
-                        KeyCode::Up => self.select_previous_device(),
-                        KeyCode::Down => self.select_next_device(),
-                        _ => {}
-                    }
-                }
-            }
-        }
-        Ok(false)
     }
 
     fn select_previous_device(&mut self) {
@@ -269,6 +250,51 @@ impl UsbTopApp {
 
         let max_scroll = (total_lines as u16).saturating_sub(visible_height);
         self.list_scroll = self.list_scroll.min(max_scroll);
+    }
+}
+
+/// What a key press leaves the event loop owing the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyOutcome {
+    /// The session is over.
+    Quit,
+    /// App state changed; the screen is stale until the next frame.
+    Redraw,
+    /// The screen itself is suspect (Ctrl-L): wipe it, then repaint.
+    ClearAndRedraw,
+    /// The key means nothing here; the screen is still correct.
+    None,
+}
+
+/// Apply one key event to `app` and report what the loop owes the screen.
+///
+/// Kept apart from the loop so every binding is testable without a terminal.
+pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
+    // Terminals that report repeat and release (kitty protocol, Windows) send
+    // several events per physical press; only the press acts.
+    if key.kind != KeyEventKind::Press {
+        return KeyOutcome::None;
+    }
+
+    match key.code {
+        // Checked before the bare letters so Ctrl-L stays a redraw request.
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyOutcome::ClearAndRedraw
+        }
+        KeyCode::Char('q') | KeyCode::Esc => KeyOutcome::Quit,
+        KeyCode::Char('h') => {
+            app.show_help = !app.show_help;
+            KeyOutcome::Redraw
+        }
+        KeyCode::Up => {
+            app.select_previous_device();
+            KeyOutcome::Redraw
+        }
+        KeyCode::Down => {
+            app.select_next_device();
+            KeyOutcome::Redraw
+        }
+        _ => KeyOutcome::None,
     }
 }
 
@@ -1111,6 +1137,90 @@ mod tests {
         assert_eq!(app.selected_device.as_deref(), Some("3:6"));
         app.select_previous_device(); // wraps
         assert_eq!(app.selected_device.as_deref(), Some("4:2"));
+    }
+
+    /// A plain, unmodified key press.
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn quit_keys_end_the_session() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('q'))),
+            KeyOutcome::Quit
+        );
+        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Quit);
+    }
+
+    #[test]
+    fn ctrl_l_asks_for_a_wipe_and_a_repaint() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(
+            apply_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)
+            ),
+            KeyOutcome::ClearAndRedraw
+        );
+        // Bare "l" is an unbound letter, not a redraw request.
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('l'))),
+            KeyOutcome::None
+        );
+    }
+
+    #[test]
+    fn help_key_toggles_the_overlay() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('h'))),
+            KeyOutcome::Redraw
+        );
+        assert!(app.show_help);
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('h'))),
+            KeyOutcome::Redraw
+        );
+        assert!(!app.show_help);
+    }
+
+    #[test]
+    fn unbound_keys_leave_the_screen_alone() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('x'))),
+            KeyOutcome::None
+        );
+    }
+
+    #[test]
+    fn only_presses_act() {
+        // Terminals that report key repeat and release (kitty protocol,
+        // Windows) would otherwise fire a binding up to three times per press.
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            let event = KeyEvent::new_with_kind(KeyCode::Char('q'), KeyModifiers::NONE, kind);
+            assert_eq!(apply_key(&mut app, event), KeyOutcome::None);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn arrow_keys_move_the_selection() {
+        let (_t, mut mgr) = topology_fixture();
+        feed(
+            &mut mgr,
+            &["f1 100 C Bi:3:006:1 0 64 <", "f2 300 C Bi:4:002:1 0 64 <"],
+        );
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        assert_eq!(apply_key(&mut app, key(KeyCode::Down)), KeyOutcome::Redraw);
+        assert_eq!(app.selected_device.as_deref(), Some("3:6"));
+        assert_eq!(apply_key(&mut app, key(KeyCode::Up)), KeyOutcome::Redraw);
+        assert_eq!(app.selected_device.as_deref(), Some("4:2"), "wraps to last");
     }
 
     /// Total display width of a device row: every column plus one space between.
