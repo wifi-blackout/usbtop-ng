@@ -281,6 +281,9 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             KeyOutcome::ClearAndRedraw
         }
+        // Raw mode turns off ISIG, so the terminal never turns ^C into a
+        // SIGINT. It arrives as this key event, and it still means quit.
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyOutcome::Quit,
         KeyCode::Char('q') | KeyCode::Esc => KeyOutcome::Quit,
         KeyCode::Char('h') => {
             app.show_help = !app.show_help;
@@ -1152,6 +1155,20 @@ mod tests {
             KeyOutcome::Quit
         );
         assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Quit);
+    }
+
+    #[test]
+    fn ctrl_c_ends_the_session_too() {
+        // Raw mode turns off ISIG, so ^C never becomes a SIGINT: it arrives
+        // here as an ordinary key press and has to be honored as one.
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(
+            apply_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
+            KeyOutcome::Quit
+        );
     }
 
     #[test]

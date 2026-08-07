@@ -183,15 +183,24 @@ pub fn prompt_user_to_load_module() -> Result<bool> {
     Ok(is_yes_response(&input))
 }
 
+/// What the user is asked before an unload. It is a constant because it is
+/// asked two ways: straight from stdin before the TUI starts, and over the UI
+/// event channel after it exits, when stdin belongs to the input thread.
+pub const UNLOAD_QUESTION: &str = concat!(
+    "usbtop-ng loaded usbmon for this session.\n",
+    "You can leave it loaded for future USB monitoring, or unload it now with:\n",
+    "  sudo modprobe -r usbmon\n",
+    "\n",
+    "This may ask for your sudo password. Answer 'n' to leave usbmon loaded.\n",
+    "Unload usbmon now? (y/N): ",
+);
+
+/// Ask about unloading by reading stdin. Only safe before the TUI starts:
+/// once the input thread exists it owns stdin, and this would race it.
 pub fn prompt_user_to_unload_module() -> Result<bool> {
     use std::io::{self, Write};
 
-    println!("usbtop-ng loaded usbmon for this session.");
-    println!("You can leave it loaded for future USB monitoring, or unload it now with:");
-    println!("  sudo modprobe -r usbmon");
-    println!();
-    println!("This may ask for your sudo password. Answer 'n' to leave usbmon loaded.");
-    print!("Unload usbmon now? (y/N): ");
+    print!("{}", UNLOAD_QUESTION);
     io::stdout().flush()?;
 
     let mut input = String::new();
@@ -284,22 +293,45 @@ pub fn unload_mode(preferences: &crate::config::Preferences) -> UnloadMode {
     }
 }
 
+/// Unload usbmon, logging a failure instead of propagating it: every caller is
+/// on an exit path, where a module left loaded is a nuisance and not a reason
+/// to fail.
+fn unload_logging_failure() {
+    if let Err(e) = attempt_unload_usbmon() {
+        log::warn!("Failed to unload usbmon: {}", e);
+    }
+}
+
 /// Offer to unload usbmon after a session in which usbtop-ng loaded it.
 /// Called on every exit path that follows a successful load — including
 /// startup failures after the module was loaded.
-pub fn offer_unload_after_session(preferences: &crate::config::Preferences) {
+///
+/// `ask` is how the question reaches the user, because that differs by exit
+/// path: before the TUI starts it is a plain stdin read, and after it exits
+/// stdin belongs to the input thread, so the answer comes back over the UI
+/// event channel instead.
+pub fn offer_unload_after_session(
+    preferences: &crate::config::Preferences,
+    ask: impl FnOnce() -> bool,
+) {
     let should_unload = match unload_mode(preferences) {
         UnloadMode::Automatic => {
             println!("unload_usbmon_on_exit=true, so usbtop-ng will try to unload usbmon now.");
             true
         }
-        UnloadMode::Ask => prompt_user_to_unload_module().unwrap_or(false),
+        UnloadMode::Ask => ask(),
     };
     if should_unload {
-        if let Err(e) = attempt_unload_usbmon() {
-            log::warn!("Failed to unload usbmon: {}", e);
-        }
+        unload_logging_failure();
     }
+}
+
+/// The unload path for exits with nobody to ask — a hangup, a dead terminal, a
+/// failure inside the UI. The same flow, with the question already answered:
+/// a standing `unload_usbmon_on_exit` is honored, and anything that would have
+/// needed an answer leaves usbmon loaded, because silence is not consent.
+pub fn unload_without_asking(preferences: &crate::config::Preferences) {
+    offer_unload_after_session(preferences, || false);
 }
 
 pub fn print_platform_instructions() {

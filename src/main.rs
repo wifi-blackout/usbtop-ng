@@ -18,11 +18,12 @@ mod usbmon;
 use std::time::Duration;
 
 use config::{load_or_create_default_at, Preferences};
+use tui::lifecycle::{unload_policy, UnloadPolicy};
 use tui::{effective_refresh_ms, run_ui};
 use ui::UsbTopApp;
 use usbmon::{
     attempt_load_usbmon, check_usbmon_status, print_platform_instructions,
-    prompt_user_to_load_module,
+    prompt_user_to_load_module, prompt_user_to_unload_module,
 };
 
 #[derive(Parser)]
@@ -133,7 +134,10 @@ fn main() -> Result<()> {
                         "usbmon was loaded, but the usbmon debugfs interface is still unavailable"
                     );
                     print_platform_instructions();
-                    usbmon::offer_unload_after_session(&preferences);
+                    // Still before the TUI, so stdin is nobody else's yet.
+                    usbmon::offer_unload_after_session(&preferences, || {
+                        prompt_user_to_unload_module().unwrap_or(false)
+                    });
                     process::exit(1);
                 }
 
@@ -167,17 +171,34 @@ fn main() -> Result<()> {
     // the UI needs the count to say so in its header.
     let app = UsbTopApp::new(Duration::from_millis(effective_refresh_ms(cli.refresh)))
         .with_dropped_counter(Arc::clone(&monitor.dropped));
-    let run_result = run_ui(app, manager, packets);
+    let session = run_ui(app, manager, packets);
 
     // Close the usbmon files before anything tries to unload the module: an
     // open debugfs `Nu` file pins usbmon, so `modprobe -r` would fail EBUSY.
+    // This runs on every exit path, prompts or no prompts.
     monitor.stop();
 
-    if loaded_usbmon_for_this_run {
-        usbmon::offer_unload_after_session(&preferences);
+    match &session {
+        Ok(session) => match unload_policy(&session.reason, loaded_usbmon_for_this_run) {
+            // The session ended with a user still in front of it, so the
+            // answer comes back over the event channel: the input thread owns
+            // stdin until the process exits.
+            UnloadPolicy::PromptFlow => {
+                usbmon::offer_unload_after_session(&preferences, || {
+                    session.confirm(usbmon::UNLOAD_QUESTION)
+                });
+            }
+            UnloadPolicy::AutoOnly => usbmon::unload_without_asking(&preferences),
+            UnloadPolicy::Skip => {}
+        },
+        // A failure inside run_ui leaves the terminal in an unknown state and
+        // may have left no input thread to read an answer, so this path never
+        // asks either.
+        Err(_) if loaded_usbmon_for_this_run => usbmon::unload_without_asking(&preferences),
+        Err(_) => {}
     }
 
-    run_result?;
+    session?;
 
     Ok(())
 }

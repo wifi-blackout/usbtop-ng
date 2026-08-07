@@ -2,7 +2,7 @@ use anyhow::Result;
 use crossterm::{
     event::Event,
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{enable_raw_mode, EnterAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
@@ -16,6 +16,7 @@ use crate::ui::{self, KeyOutcome, UsbTopApp};
 use crate::usbmon::parser::UsbPacket;
 
 pub(crate) mod events;
+pub(crate) mod lifecycle;
 
 use events::UiEvent;
 
@@ -29,11 +30,11 @@ pub fn effective_refresh_ms(requested: u64) -> u64 {
     requested.max(REFRESH_FLOOR_MS)
 }
 
-/// Why the event loop stopped. Task 3 turns this into exit policy (which
-/// teardown paths may still prompt); until then every reason is a clean stop.
+/// Why the event loop stopped. [`lifecycle::unload_policy`] turns this into
+/// what the exit path is still allowed to ask the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
-    /// The user pressed `q` or Esc.
+    /// The user pressed `q`, Esc or Ctrl-C.
     UserQuit,
     /// The terminal is gone; there is nothing left to draw on.
     TerminalDead,
@@ -41,31 +42,75 @@ pub enum ExitReason {
     Signal(i32),
 }
 
+/// A finished TUI session: why it ended, and the means to ask the user one
+/// more thing on the way out.
+pub struct UiSession {
+    /// Why the event loop stopped.
+    pub reason: ExitReason,
+    /// The input thread's channel. It is still running — a blocked terminal
+    /// read cannot be called off — so this, not stdin, is where a keystroke
+    /// arrives after teardown.
+    events: Receiver<UiEvent>,
+}
+
+impl UiSession {
+    /// Ask the user a yes/no question now that the TUI is down.
+    ///
+    /// Reading stdin directly here would race the input thread for every
+    /// keystroke and usually lose; see [`lifecycle::prompt_via_events`].
+    pub fn confirm(&self, question: &str) -> bool {
+        lifecycle::prompt_via_events(question, &self.events)
+    }
+}
+
 pub fn run_ui(
     mut app: UsbTopApp,
     mut manager: DeviceManager,
     packets: Receiver<UsbPacket>,
-) -> Result<()> {
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+) -> Result<UiSession> {
+    // First, so that everything below has a way back out of TUI mode even if
+    // it dies mid-frame.
+    lifecycle::install_panic_hook();
 
     let (tx, ui_events) = mpsc::channel();
+    // Signals arrive as ordinary events, so a SIGTERM leaves through the same
+    // teardown as `q` instead of dropping the process on an alternate screen.
+    // Spawned before the terminal changes state, so that a signal landing
+    // during setup is caught rather than defaulting to a kill that would leave
+    // the terminal raw.
+    #[cfg(unix)]
+    lifecycle::spawn_signal_thread(tx.clone());
+
+    let mut terminal = enter_terminal().inspect_err(|_| {
+        // Raw mode is already on if it was the alternate screen that failed.
+        lifecycle::restore_terminal();
+    })?;
+
+    // Only now: a reader started before raw mode would be handed whole lines
+    // instead of keys.
     events::spawn_input_thread(tx);
 
     let result = run_app(&mut terminal, &mut app, &mut manager, &packets, &ui_events);
 
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    // Explicit teardown; the panic hook is the safety net, not the plan.
+    lifecycle::restore_terminal();
 
-    // Task 3 threads the reason out to main's exit policy; for now every way
-    // out of the loop is just a clean stop.
-    result.map(|_reason| ())
+    // The receiver outlives the loop: after teardown it is the only way to
+    // read the keyboard, and the exit path may still have a question.
+    result.map(|reason| UiSession {
+        reason,
+        events: ui_events,
+    })
+}
+
+/// Put the terminal into TUI mode: raw input, alternate screen, ratatui on top.
+fn enter_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    enable_raw_mode()?;
+    // From here on there is something to undo, whoever gets to it first.
+    lifecycle::arm_restore();
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 /// The event loop.
