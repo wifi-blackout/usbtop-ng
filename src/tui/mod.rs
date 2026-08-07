@@ -6,7 +6,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
-    io, iter,
+    io, iter, mem,
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     time::{Duration, Instant},
 };
@@ -94,6 +94,19 @@ pub fn run_ui(
 
     // Explicit teardown; the panic hook is the safety net, not the plan.
     lifecycle::restore_terminal();
+
+    // ratatui's `Terminal` shows the cursor again when it drops, and if that
+    // write fails it `eprintln!`s — which panics, because the print macros
+    // unwrap. On a dead terminal the write always fails, so the destructor
+    // would panic here, on the way out of the one exit path that most needs to
+    // finish (`monitor.stop()` and the unload both still have to run). Doing
+    // ratatui's job here first reports whether its destructor is safe to run at
+    // all: if the write lands there is nothing left for it to do, and if it
+    // does not, the value must not be dropped. `restore_terminal` has already
+    // shown the cursor either way, so nothing is lost by skipping it.
+    if terminal.show_cursor().is_err() {
+        mem::forget(terminal);
+    }
 
     // The receiver outlives the loop: after teardown it is the only way to
     // read the keyboard, and the exit path may still have a question.

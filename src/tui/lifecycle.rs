@@ -242,10 +242,19 @@ fn prompt_within(question: &str, rx: &Receiver<UiEvent>, timeout: Duration) -> b
     // never agreed to unload.
     while rx.try_recv().is_ok() {}
 
-    print!("{question}");
-    let _ = io::stdout().flush();
+    ask(&mut io::stdout(), question);
 
     await_answer(rx, Instant::now() + timeout)
+}
+
+/// Put the question on the terminal, dropping a write failure on the floor.
+///
+/// `print!` would panic on that failure, and everything this module does is for
+/// terminals that may already have gone away — the answer to an unwritable
+/// question is the same as the answer to an unanswered one, not a crash.
+fn ask(out: &mut impl Write, question: &str) {
+    let _ = write!(out, "{question}");
+    let _ = out.flush();
 }
 
 /// Read events until one of them answers the question, or `deadline` passes.
@@ -264,7 +273,9 @@ fn await_answer(rx: &Receiver<UiEvent>, deadline: Instant) -> bool {
             // stop asking. So is running out of time, or running out of anyone
             // who could still send. "No" is the answer that changes nothing.
             Ok(UiEvent::Signal(_) | UiEvent::TerminalDead) | Err(_) => {
-                println!();
+                // Closes the prompt line for whatever prints next. Ignored on
+                // failure for the same reason as the question itself.
+                let _ = writeln!(io::stdout());
                 return false;
             }
         }
@@ -303,6 +314,21 @@ mod tests {
         SERIAL
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A terminal that has already gone away: every write fails, as writes to a
+    /// pty whose master closed do (EIO). This is the state the SIGHUP and
+    /// terminal-death paths run in.
+    struct GoneTerminal;
+
+    impl Write for GoneTerminal {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -390,6 +416,25 @@ mod tests {
             "a restored terminal has nothing left to undo"
         );
         assert_eq!(out.len(), after_first, "the second restore writes nothing");
+    }
+
+    #[test]
+    fn a_terminal_that_is_already_gone_is_still_restored() {
+        let _serial = serialized();
+
+        arm_restore();
+        // Nothing here may panic: this is the path a hangup takes, and a panic
+        // would abandon the rest of the exit — including the unload.
+        assert!(restore_to(&mut GoneTerminal), "the restore still ran");
+        assert!(
+            !ARMED.load(Ordering::SeqCst),
+            "and it still disarmed, so the panic hook will not try again"
+        );
+    }
+
+    #[test]
+    fn a_question_nobody_can_read_is_not_fatal() {
+        ask(&mut GoneTerminal, "unload? ");
     }
 
     #[test]
