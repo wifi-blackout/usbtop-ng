@@ -11,13 +11,15 @@ use std::sync::Arc;
 mod config;
 mod device;
 mod stats;
+mod tui;
 mod ui;
 mod usbmon;
 
 use std::time::Duration;
 
 use config::{load_or_create_default_at, Preferences};
-use ui::{run_ui, UsbTopApp};
+use tui::{effective_refresh_ms, run_ui};
+use ui::UsbTopApp;
 use usbmon::{
     attempt_load_usbmon, check_usbmon_status, print_platform_instructions,
     prompt_user_to_load_module,
@@ -36,7 +38,7 @@ struct Cli {
     #[arg(short, long)]
     config: Option<String>,
 
-    /// Refresh rate in milliseconds
+    /// Refresh rate in milliseconds (floored at 100ms)
     #[arg(short, long, default_value = "1000")]
     refresh: u64,
 
@@ -163,7 +165,7 @@ fn main() -> Result<()> {
     let manager = device::manager::DeviceManager::new();
     // The readers discard packets rather than block when the channel fills, so
     // the UI needs the count to say so in its header.
-    let app = UsbTopApp::new(Duration::from_millis(cli.refresh))
+    let app = UsbTopApp::new(Duration::from_millis(effective_refresh_ms(cli.refresh)))
         .with_dropped_counter(Arc::clone(&monitor.dropped));
     let run_result = run_ui(app, manager, packets);
 
