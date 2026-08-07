@@ -71,10 +71,13 @@ pub fn run_ui(
 /// The event loop.
 ///
 /// It sleeps until the earliest deadline it owes — the next data tick, or the
-/// next frame when something is waiting to be painted — rather than polling on
-/// a fixed interval. An idle session therefore costs one wake per `--refresh`
-/// interval, a burst of events costs one repaint instead of one per event, and
-/// nothing repaints at all unless something changed.
+/// next frame when something is waiting to be painted — rather than drawing on
+/// a fixed interval. A burst of events costs one repaint instead of one per
+/// event, and nothing repaints at all unless something changed.
+///
+/// The one thing that cannot wake it is a packet: the readers push onto a
+/// bounded channel and drop once it fills. So the wait is capped at
+/// [`events::PACKET_DRAIN_INTERVAL`] — a wake that only drains, never draws.
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut UsbTopApp,
@@ -96,12 +99,11 @@ fn run_app(
         let now = Instant::now();
         let timeout = if packet_backlog {
             // The last drain filled its batch, so the channel may still hold
-            // more. Take the next pass right away rather than letting the
-            // drain rate fall to one batch per tick, which is far below what
-            // the readers can produce.
+            // more: come straight back for the rest instead of spending a
+            // drain interval on what is already queued.
             Duration::ZERO
         } else {
-            events::next_deadline(now, dirty, next_tick, last_draw).saturating_duration_since(now)
+            events::next_wait(now, dirty, next_tick, last_draw)
         };
 
         match ui_events.recv_timeout(timeout) {
