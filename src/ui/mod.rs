@@ -1,21 +1,15 @@
 use anyhow::Result;
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
-    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
     widgets::{Axis, Block, Borders, Chart, Clear, Dataset, Paragraph, Wrap},
-    Frame, Terminal,
+    Frame,
 };
 use std::{
     collections::BTreeMap,
-    io,
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::Receiver,
@@ -44,7 +38,7 @@ const HISTORY_WINDOW_SECS: f64 = 60.0;
 /// what caps memory; this caps how long a single frame can spend catching up,
 /// so a burst can never stall input handling or the redraw. Anything left over
 /// is still queued for the next pass, one poll interval (~50ms) later.
-const DRAIN_BATCH: usize = 8_192;
+pub(crate) const DRAIN_BATCH: usize = 8_192;
 
 /// One device as rendered: its physical port chain plus a snapshot of the
 /// device itself, taken once per tick from the `DeviceManager`.
@@ -321,62 +315,10 @@ fn side_label(speed: &UsbSpeed) -> &'static str {
     }
 }
 
-pub fn run_ui(
-    mut app: UsbTopApp,
-    mut manager: DeviceManager,
-    packets: Receiver<UsbPacket>,
-) -> Result<()> {
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let result = run_app(&mut terminal, &mut app, &mut manager, &packets);
-
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    result
-}
-
-fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    app: &mut UsbTopApp,
-    manager: &mut DeviceManager,
-    packets: &Receiver<UsbPacket>,
-) -> Result<()> {
-    loop {
-        drain_packets(manager, packets, DRAIN_BATCH);
-
-        if app.last_update.elapsed() >= app.refresh_rate {
-            // `sync_from` rebuilds the whole snapshot, so the list of devices
-            // dropped by this refresh needs no separate handling.
-            let _ = manager.refresh();
-            app.sync_from(manager);
-            app.update_bandwidth_history();
-        }
-
-        terminal.draw(|f| draw_ui(f, app))?;
-
-        if app.handle_input()? {
-            break;
-        }
-    }
-    Ok(())
-}
-
 /// Apply up to `batch` queued packets to the manager and report how many were
 /// applied. Any `try_recv` error (empty or disconnected) means "nothing to
 /// drain", which keeps the UI alive in --force mode with no usbmon readers.
-fn drain_packets(
+pub(crate) fn drain_packets(
     manager: &mut DeviceManager,
     packets: &Receiver<UsbPacket>,
     batch: usize,
@@ -394,7 +336,7 @@ fn drain_packets(
     applied
 }
 
-fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
+pub(crate) fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
     if app.show_help {
         draw_help_overlay(f);
         return;
@@ -926,6 +868,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::usbmon::parser::parse_usbmon_text_line;
+    use ratatui::Terminal;
 
     fn feed(mgr: &mut DeviceManager, lines: &[&str]) {
         for l in lines {
