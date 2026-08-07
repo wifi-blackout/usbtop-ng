@@ -1747,9 +1747,11 @@ dependencies = [
  "clap",
  "crossterm",
  "env_logger",
+ "libc",
  "log",
  "ratatui",
  "serde",
+ "signal-hook",
  "tempfile",
  "toml",
 ]
