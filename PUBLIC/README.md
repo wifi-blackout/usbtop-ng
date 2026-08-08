@@ -29,7 +29,7 @@ usbtop-ng builds, runs its setup checks, and opens the terminal UI with live pac
 - Non-blocking output with tmux-style backpressure shedding: whole frames are dropped rather than stalling the loop behind a terminal that stopped reading, and the header adds `shed: N` so a session that fell behind never looks like a quiet one
 - A failed write invalidates the screen and costs a full repaint; a terminal that is really gone ends the session cleanly instead of hanging
 - `Ctrl-L` wipes and repaints the screen without asking the terminal anything
-- Panics, `SIGHUP` and `SIGTERM` all leave through the same teardown as `q`; the teardown is bounded, switches the render pipeline off before handing the terminal back, and skips its remaining stdout writes (the unload question and notice) when the terminal would not take the restore. stderr is left alone on purpose — log lines and a panic's backtrace are diagnostics, and a non-blocking stderr would truncate them — so those still wait on a terminal that has stopped reading, as any program's would
+- Panics, `SIGHUP` and `SIGTERM` all leave through the same teardown as `q`; the teardown is bounded, switches the render pipeline off before handing the terminal back, and skips its remaining stdout writes (the unload question and notice) when the terminal would not take the restore. stderr is left alone on purpose — log lines and a panic's backtrace are diagnostics, and a non-blocking stderr would truncate them — so those still wait on a terminal that has stopped reading, as any program's would; the exit flow is kept clear of them instead, so a hangup still runs its usbmon unload
 
 ## 📦 Installation
 

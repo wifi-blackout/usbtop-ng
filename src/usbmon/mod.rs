@@ -253,8 +253,21 @@ pub fn attempt_load_usbmon() -> Result<()> {
     }
 }
 
+/// Unload usbmon with `sudo modprobe -r`.
+///
+/// The progress line here is `debug!` where its counterpart in
+/// [`attempt_load_usbmon`] is `info!`, and the asymmetry is deliberate rather
+/// than an oversight. This is the only one of the two that runs on an *exit*
+/// path, and the default filter level is Info — so at the default settings that
+/// line was a write to stderr, in front of the unload, on a descriptor nobody
+/// manages. On a terminal that is still open but has stopped reading it waited
+/// there, and the unload it was announcing never happened; a pty check found it
+/// parked in `write(2, …, 116)`. Nothing is lost by dropping it below the
+/// default: the user is already told about an unload through stdout, by
+/// [`announce_automatic_unload`] or by the question itself, and both of those
+/// are skipped when the terminal cannot take them.
 pub fn attempt_unload_usbmon() -> Result<()> {
-    info!("Attempting to unload usbmon kernel module");
+    debug!("Attempting to unload usbmon kernel module");
 
     #[cfg(target_os = "linux")]
     {
@@ -323,6 +336,12 @@ fn announce_automatic_unload(out: &mut impl Write, terminal_reachable: bool) {
 /// Unload usbmon, logging a failure instead of propagating it: every caller is
 /// on an exit path, where a module left loaded is a nuisance and not a reason
 /// to fail.
+///
+/// This warning stays at its level, unlike the progress line inside
+/// [`attempt_unload_usbmon`]. It is a real failure rather than routine
+/// progress, and it is written *after* the attempt — so a terminal that has
+/// stopped reading can delay this exit here, but it can no longer cost it the
+/// unload.
 fn unload_logging_failure() {
     if let Err(e) = attempt_unload_usbmon() {
         log::warn!("Failed to unload usbmon: {}", e);
