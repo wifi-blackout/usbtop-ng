@@ -84,6 +84,11 @@ pub struct UsbTopApp {
     /// attached; the header surfaces it once it goes above zero, so a lossy
     /// session never reads like a complete one.
     pub dropped_counter: Option<Arc<AtomicU64>>,
+    /// Shared count of frames the output stage had to discard because the
+    /// terminal stopped reading (see `tui::output`). `None` outside a TUI
+    /// session. Same bargain as [`Self::dropped_counter`]: a session that is
+    /// showing less than it measured has to say so.
+    pub shed_counter: Option<Arc<AtomicU64>>,
 }
 
 impl UsbTopApp {
@@ -99,6 +104,7 @@ impl UsbTopApp {
             peak_bandwidth: 0.0,
             list_scroll: 0,
             dropped_counter: None,
+            shed_counter: None,
         }
     }
 
@@ -112,6 +118,13 @@ impl UsbTopApp {
     /// Packets discarded so far, or 0 when no counter is attached.
     fn dropped_packets(&self) -> u64 {
         self.dropped_counter
+            .as_ref()
+            .map_or(0, |counter| counter.load(Ordering::Relaxed))
+    }
+
+    /// Frames discarded so far, or 0 when no counter is attached.
+    fn shed_frames(&self) -> u64 {
+        self.shed_counter
             .as_ref()
             .map_or(0, |counter| counter.load(Ordering::Relaxed))
     }
@@ -426,6 +439,19 @@ fn draw_header(f: &mut Frame, area: Rect, app: &UsbTopApp) {
         stats_line.push(Span::raw(" | dropped: "));
         stats_line.push(Span::styled(
             dropped.to_string(),
+            Style::default()
+                .fg(SECONDARY_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Same bargain one layer out: these numbers were measured, but the screen
+    // showing them is behind by this many frames.
+    let shed = app.shed_frames();
+    if shed > 0 {
+        stats_line.push(Span::raw(" | shed: "));
+        stats_line.push(Span::styled(
+            shed.to_string(),
             Style::default()
                 .fg(SECONDARY_COLOR)
                 .add_modifier(Modifier::BOLD),
@@ -1593,6 +1619,29 @@ mod tests {
         counter.store(42, Ordering::Relaxed);
         let screen = render(&app);
         assert!(screen.contains("dropped: 42"), "{screen}");
+    }
+
+    /// A session whose terminal could not keep up is showing stale numbers,
+    /// and the header is the only place that can admit it.
+    #[test]
+    fn header_reports_shed_frames_only_once_some_were_shed() {
+        let render = |app: &UsbTopApp| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(90, 4)).unwrap();
+            terminal.draw(|f| draw_header(f, f.area(), app)).unwrap();
+            terminal.backend().to_string()
+        };
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert!(!render(&app).contains("shed"), "no counter wired up");
+
+        let counter = Arc::new(AtomicU64::new(0));
+        app.shed_counter = Some(Arc::clone(&counter));
+        let screen = render(&app);
+        assert!(!screen.contains("shed"), "nothing shed yet: {screen}");
+
+        counter.store(7, Ordering::Relaxed);
+        let screen = render(&app);
+        assert!(screen.contains("shed: 7"), "{screen}");
     }
 
     /// The chart's x-axis is 60 seconds wide, so the history it plots is
