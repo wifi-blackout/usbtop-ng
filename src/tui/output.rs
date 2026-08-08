@@ -160,6 +160,7 @@ pub struct ShedHandles {
     high_watermark: Arc<AtomicUsize>,
     discard_requested: Arc<AtomicBool>,
     synchronized: Arc<AtomicBool>,
+    abandoned: Arc<AtomicBool>,
 }
 
 impl ShedHandles {
@@ -218,6 +219,22 @@ impl ShedHandles {
     pub fn set_sync_mode(&self, mode: SyncMode) {
         self.synchronized
             .store(matches!(mode, SyncMode::Supported), Ordering::SeqCst);
+    }
+
+    /// The latch that stops the output stage writing at all, for
+    /// `lifecycle::arm_output_latch` to hold on to.
+    ///
+    /// It exists because the descriptor's non-blocking flag is not the writer's
+    /// to keep. `lifecycle::restore_terminal` puts stdout's original — blocking
+    /// — flags back on the way out, and from that instant a write through this
+    /// writer is an *unbounded* write to a terminal that may have stopped
+    /// reading. On the ordinary exit path nothing writes after that, because
+    /// `tui::run_ui` drops the terminal first. On the panic path it does:
+    /// unwinding drops ratatui's `Terminal` after the hook has already run, and
+    /// its destructor shows the cursor. Tripping this latch is what makes that
+    /// destructor a no-op rather than the place the process stops.
+    pub fn abandon_latch(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.abandoned)
     }
 }
 
@@ -289,6 +306,9 @@ pub struct ShedWriter<R: RawOut> {
     /// because the answer arrives from the handles; see
     /// [`ShedHandles::set_sync_mode`].
     synchronized: Arc<AtomicBool>,
+    /// Once set, nothing more is written: the terminal has been given back.
+    /// See [`ShedHandles::abandon_latch`].
+    abandoned: Arc<AtomicBool>,
 }
 
 impl<R: RawOut> ShedWriter<R> {
@@ -311,6 +331,7 @@ impl<R: RawOut> ShedWriter<R> {
             // Until the handshake says otherwise, frames go out bare — which is
             // what they did before mode 2026 was ever asked about.
             synchronized: Arc::new(AtomicBool::new(false)),
+            abandoned: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -325,12 +346,26 @@ impl<R: RawOut> ShedWriter<R> {
             high_watermark: Arc::clone(&self.high_watermark),
             discard_requested: Arc::clone(&self.discard_requested),
             synchronized: Arc::clone(&self.synchronized),
+            abandoned: Arc::clone(&self.abandoned),
         }
     }
 
     /// The body of [`Write::flush`], with the clock as a parameter so the grace
     /// period is testable without sitting out a real second.
     fn flush_at(&mut self, now: Instant) {
+        // The terminal has been given back. Whatever is staged or queued is a
+        // diff against a screen that no longer exists, and the descriptor it
+        // would go to is blocking again — so writing here would be both wrong
+        // and, on a terminal that has stopped reading, unbounded. Dropping the
+        // bytes is the whole of the work.
+        if self.abandoned.load(Ordering::SeqCst) {
+            self.staging.clear();
+            self.pending.clear();
+            self.front_cursor = 0;
+            self.pending_bytes = 0;
+            return;
+        }
+
         if self.discard_requested.swap(false, Ordering::SeqCst) {
             self.pending.clear();
             self.front_cursor = 0;
@@ -1053,6 +1088,48 @@ mod tests {
         assert!(writer.pending.is_empty());
         assert!(writer.raw().written.is_empty());
         assert_eq!(writer.raw().calls, 0);
+    }
+
+    #[test]
+    fn an_abandoned_writer_writes_nothing_ever_again() {
+        // What the panic path relies on. By the time ratatui's destructor runs,
+        // `restore_terminal` has put stdout back to blocking — so a write here
+        // would be unbounded against a terminal that may have stopped reading.
+        // The terminal is readable in this test precisely to show that the
+        // latch, not the terminal, is what stops the writes.
+        let (mut writer, handles) = writer(ScriptedRaw::scripted(vec![]), 80, 24);
+        frame(&mut writer, b"the last frame of the session");
+        assert_eq!(writer.raw().calls, 1, "still writing up to this point");
+
+        handles.abandon_latch().store(true, Ordering::SeqCst);
+
+        // Both halves of what a destructor does: queued frames and a new one.
+        writer.write_all(b"\x1b[?25h").expect("staging cannot fail");
+        writer.flush().expect("flush never reports failure");
+        assert_eq!(writer.raw().calls, 1, "not one more write was attempted");
+        assert!(writer.staging.is_empty(), "and nothing is held for later");
+        assert!(writer.pending.is_empty());
+        assert_eq!(writer.pending_bytes, 0);
+    }
+
+    #[test]
+    fn abandoning_drops_a_backlog_rather_than_writing_it() {
+        // A wedged session reaches teardown with frames still queued. They are
+        // diffs against a screen that is being given back; writing them would
+        // be both wrong and, on a blocking descriptor, unbounded.
+        let (mut writer, handles) = writer(ScriptedRaw::wedged(), 80, 24);
+        frame(&mut writer, b"a frame that never got out");
+        assert_eq!(writer.pending.len(), 1);
+
+        handles.abandon_latch().store(true, Ordering::SeqCst);
+        writer.flush().expect("flush never reports failure");
+
+        assert!(
+            writer.pending.is_empty(),
+            "the backlog is gone, not written"
+        );
+        assert_eq!(writer.pending_bytes, 0);
+        assert!(writer.raw().written.is_empty());
     }
 
     #[test]

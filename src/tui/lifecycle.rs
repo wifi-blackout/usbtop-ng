@@ -12,7 +12,7 @@ use std::io::{self, Write};
 use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::Once;
+use std::sync::{Arc, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -49,6 +49,23 @@ const RESTORE_ATTEMPTS: u32 = 25;
 /// restore. This is what makes [`restore_terminal`] idempotent.
 static ARMED: AtomicBool = AtomicBool::new(false);
 
+/// The live output stage's abandon latch, for [`restore_terminal`] to trip.
+///
+/// Process-global for the same reason [`ARMED`] and [`SAVED_FD`] are: the
+/// restore runs from the panic hook, and a panic hook is handed nothing. This
+/// is how it reaches a writer it was never given. `OnceLock` rather than a
+/// mutex because the hook must not be able to wait on anything — a read here is
+/// a load, and usbtop-ng puts up one TUI per process.
+static OUTPUT_LATCH: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+/// Whether the last restore got its sequences onto the terminal.
+///
+/// A terminal that would not take twenty-odd bytes in [`RESTORE_ATTEMPTS`]
+/// tries is not reading, which is the one thing an exit path needs to know
+/// before it decides to ask the user a question. Starts `true`, so a process
+/// that never put up a TUI is never treated as having a broken one.
+static RESTORE_LANDED: AtomicBool = AtomicBool::new(true);
+
 /// The output descriptor whose flags [`restore_terminal`] puts back, and the
 /// flags it puts back. A negative descriptor means nothing was saved.
 #[cfg(unix)]
@@ -69,6 +86,28 @@ static SAVED_FD_FLAGS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI
 pub fn arm_restore() {
     save_output_flags();
     ARMED.store(true, Ordering::SeqCst);
+}
+
+/// Hand [`restore_terminal`] the latch that stops the output stage writing.
+///
+/// Called once, from `tui::enter_terminal`, with
+/// `output::ShedHandles::abandon_latch`. Without it the restore still restores;
+/// what it cannot then do is stop a write that comes *after* it, which on the
+/// panic path is ratatui's destructor writing into a descriptor the restore has
+/// just made blocking again.
+pub fn arm_output_latch(latch: Arc<AtomicBool>) {
+    // A second TUI in one process would keep the first latch. There is no such
+    // thing here — `run_ui` is called once — and a hook that cannot wait is
+    // worth more than handling a case that does not arise.
+    let _ = OUTPUT_LATCH.set(latch);
+}
+
+/// Whether the terminal took the last restore.
+///
+/// The exit path asks before it asks the *user* anything: see
+/// [`prompt_via_events`].
+fn restore_landed() -> bool {
+    RESTORE_LANDED.load(Ordering::SeqCst)
 }
 
 /// Give the terminal back: leave raw mode, close any open synchronized update,
@@ -162,6 +201,16 @@ fn restore_with(out: &mut impl Write, sleep: impl FnMut(Duration)) -> bool {
         return false;
     }
 
+    // First, before anything here writes and long before the flags go back: the
+    // terminal is the shell's again from this moment, so the output stage has
+    // nothing left to paint on. On the ordinary exit path this is free — the
+    // terminal was dropped before the call. On the panic path it is the whole
+    // point: unwinding drops ratatui's `Terminal` *after* this hook returns,
+    // and its destructor writes.
+    if let Some(latch) = OUTPUT_LATCH.get() {
+        latch.store(true, Ordering::SeqCst);
+    }
+
     let _ = disable_raw_mode();
 
     // Assembled in memory first, so that what follows is one bounded push of a
@@ -178,7 +227,10 @@ fn restore_with(out: &mut impl Write, sleep: impl FnMut(Duration)) -> bool {
     // path that exists to end the session. That used to be unreachable —
     // nothing survived a wedged terminal this far — and the output stage is
     // exactly what changed that.
-    write_within_budget(out, &sequence, sleep);
+    // Recorded, not just discarded: a terminal that would not take these bytes
+    // is not reading, and the exit path has a question it must not ask a
+    // terminal that is not reading. See [`prompt_via_events`].
+    RESTORE_LANDED.store(write_within_budget(out, &sequence, sleep), Ordering::SeqCst);
     // Last, once nothing else here is going to write and nothing anywhere is
     // holding bytes for this descriptor: from here on stdout is whatever it was
     // before the TUI, which is what the shell inherits.
@@ -367,13 +419,32 @@ pub fn unload_policy(reason: &ExitReason, loaded_this_run: bool) -> UnloadPolicy
 /// burst when the user presses Enter. The first `y` or `n` in that burst is the
 /// answer; anything else, including no answer at all, leaves things as they
 /// are.
+///
+/// A terminal that would not take the restore does not get asked at all. By
+/// then stdout is blocking again — [`restore_output_flags`] has run — so the
+/// question would be an unbounded write to something that has stopped reading,
+/// on the last path of a process that is trying to leave. This is
+/// [`unload_policy`]'s rule one layer down: the question is not whether anyone
+/// is *there*, but whether anything said to them would arrive.
 pub fn prompt_via_events(question: &str, rx: &Receiver<UiEvent>) -> bool {
-    prompt_within(question, rx, PROMPT_TIMEOUT)
+    prompt_within(question, rx, PROMPT_TIMEOUT, restore_landed())
 }
 
-/// The body of [`prompt_via_events`], with the wait as a parameter so tests do
-/// not have to sit out a real one.
-fn prompt_within(question: &str, rx: &Receiver<UiEvent>, timeout: Duration) -> bool {
+/// The body of [`prompt_via_events`], with the wait and the terminal's state as
+/// parameters so tests need neither a real minute nor a real terminal.
+fn prompt_within(
+    question: &str,
+    rx: &Receiver<UiEvent>,
+    timeout: Duration,
+    terminal_reachable: bool,
+) -> bool {
+    if !terminal_reachable {
+        // "No" is the answer that changes nothing, which is the same answer an
+        // unread question gets — reached without spending a minute of the
+        // exit's time waiting for it.
+        return false;
+    }
+
     // Whatever is already queued was typed at the UI, not at a question that
     // had not been asked yet. Answering with it would unload a module the user
     // never agreed to unload.
@@ -636,6 +707,41 @@ mod tests {
     }
 
     #[test]
+    fn the_restore_silences_the_output_stage_before_it_restores_the_flags() {
+        let _serial = serialized();
+        // The one test that may arm a latch: the slot behind `arm_output_latch`
+        // is set once per process, so a second one anywhere would be ignored
+        // and this assertion would go quiet rather than fail loudly.
+        let latch = Arc::new(AtomicBool::new(false));
+        arm_output_latch(Arc::clone(&latch));
+        arm_restore();
+
+        assert!(restore_to(&mut Vec::new()), "the restore ran");
+        assert!(
+            latch.load(Ordering::SeqCst),
+            "the writer is told to stop before stdout goes back to blocking, \
+             because on the panic path ratatui's destructor still has a write in it"
+        );
+    }
+
+    #[test]
+    fn a_terminal_that_took_the_restore_may_still_be_asked() {
+        let _serial = serialized();
+
+        arm_restore();
+        restore_to(&mut Vec::new());
+        assert!(restore_landed(), "a `Vec` takes everything, first time");
+
+        arm_restore();
+        restore_with(&mut WedgedTerminal::default(), |_| {});
+        assert!(
+            !restore_landed(),
+            "and a terminal that spent the whole budget refusing 22 bytes is \
+             not one to put a question to"
+        );
+    }
+
+    #[test]
     fn the_restore_budget_is_a_quarter_of_a_second() {
         // Pinned, because the number that matters is the product: a terminal
         // that is never coming back holds the exit for exactly this long.
@@ -760,9 +866,50 @@ mod tests {
         tx.send(key_event(KeyCode::Char('y'))).unwrap();
         drop(tx);
         assert!(
-            !prompt_within("unload? ", &rx, PROMPT_TIMEOUT),
+            !prompt_within("unload? ", &rx, PROMPT_TIMEOUT, true),
             "the stale keystroke was drained, and a channel nobody can send on declines"
         );
+    }
+
+    #[test]
+    fn a_terminal_that_refused_the_restore_is_not_asked_anything() {
+        let (tx, rx) = mpsc::channel();
+        // A "yes" is waiting, and a live sender means the wait would otherwise
+        // run to the full timeout rather than ending on a disconnect.
+        tx.send(key_event(KeyCode::Char('y'))).unwrap();
+
+        let answered = prompt_within("unload? ", &rx, PROMPT_TIMEOUT, false);
+
+        assert!(!answered, "nothing to ask, so the answer is the safe one");
+        assert!(
+            rx.try_recv().is_ok(),
+            "and it returned without even draining the channel, let alone writing \
+             the question into a descriptor that is blocking again"
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn a_restore_that_landed_still_asks() {
+        // The guard must not turn every prompt off: a healthy exit still runs
+        // the whole flow. Which path it took is visible in the drain — the
+        // short-circuit above leaves the queue untouched, this one empties it.
+        let (tx, rx) = mpsc::channel();
+        tx.send(key_event(KeyCode::Char('y'))).unwrap();
+
+        // A tiny wait rather than the real minute: what is under test is the
+        // path, not the answer, and an unanswered question declines either way.
+        assert!(!prompt_within(
+            "unload? ",
+            &rx,
+            Duration::from_millis(10),
+            true
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "the stale keystroke was drained, so the question really was asked"
+        );
+        drop(tx);
     }
 
     #[test]
