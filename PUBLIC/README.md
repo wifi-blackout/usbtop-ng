@@ -22,6 +22,15 @@ usbtop-ng builds, runs its setup checks, and opens the terminal UI with live pac
 - Linux usbmon support (binary `/dev/usbmonN` interface with automatic text fallback); live monitoring is Linux-only — on BSD/macOS the UI can open (with `--force` where needed) but shows no devices
 - Low resource footprint
 
+### Degraded-terminal robustness
+
+- Frames are drawn only when something changed, at most ~30 per second; an idle session repaints on its refresh tick and not in between
+- Synchronized output (mode 2026) when the terminal answers a startup probe saying it supports it; ssh sessions are not probed
+- Non-blocking output with tmux-style backpressure shedding: whole frames are dropped rather than stalling the loop behind a terminal that stopped reading, and the header adds `shed: N` so a session that fell behind never looks like a quiet one
+- A failed write invalidates the screen and costs a full repaint; a terminal that is really gone ends the session cleanly instead of hanging
+- `Ctrl-L` wipes and repaints the screen without asking the terminal anything
+- Panics, `SIGHUP` and `SIGTERM` all leave through the same teardown as `q`; the teardown is bounded, switches the render pipeline off before handing the terminal back, and skips its remaining stdout writes (the unload question and notice) when the terminal would not take the restore. stderr is left alone on purpose — log lines and a panic's backtrace are diagnostics, and a non-blocking stderr would truncate them — so those still wait on a terminal that has stopped reading, as any program's would; the exit flow is kept clear of them instead, so at default verbosity, and unless a reader thread panicked mid-session, a hangup still runs its usbmon unload (`-v`, or a panicked reader thread's own warning, can land one back in front of it)
+
 ## 📦 Installation
 
 ```bash
@@ -40,7 +49,7 @@ sudo cp target/release/usbtop-ng /usr/local/bin/
 usbtop-ng
 ```
 
-Press `q` to quit.  
+Press `h` for help, `Ctrl-L` to repaint the screen, `q` (or `Esc`, or `Ctrl-C`) to quit.  
 Run with `--help` to see all options.
 
 On Linux, usbtop-ng asks before loading usbmon with `sudo modprobe usbmon` when live monitoring needs it. If usbtop-ng loaded usbmon for this session, it asks on quit whether to unload it with `sudo modprobe -r usbmon`. Preferences live in `~/.usbtop-ng/preferences.toml`.
