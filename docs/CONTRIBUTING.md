@@ -1,117 +1,140 @@
 # Contributing to usbtop-ng
 
-Thank you for your interest in contributing to usbtop-ng! This document provides guidelines and information for contributors.
+This document covers the development environment, the checks a change has to
+pass, and how to send it.
 
-## Table of Contents
+## Table of contents
 
-- [Getting Started](#getting-started)
-- [Development Environment](#development-environment)
-- [Code Style](#code-style)
+- [Getting started](#getting-started)
+- [Development environment](#development-environment)
+- [Code style](#code-style)
 - [Testing](#testing)
-- [Pull Request Process](#pull-request-process)
-- [Issue Reporting](#issue-reporting)
-- [Architecture Overview](#architecture-overview)
+- [Pull request process](#pull-request-process)
+- [Issue reporting](#issue-reporting)
+- [Architecture overview](#architecture-overview)
+- [Platform-specific development](#platform-specific-development)
+- [Release process](#release-process)
+- [Getting help](#getting-help)
+- [Conduct](#conduct)
 
-## Getting Started
+## Getting started
 
 ### Prerequisites
 
-- **Rust 1.88+** - Install from [rustup.rs](https://rustup.rs/)
-- **Git** for version control
-- **Linux system** for full testing (usbmon support)
-- Basic understanding of USB protocols and system monitoring
+- Rust 1.88 or later. Install it from [rustup.rs](https://rustup.rs/).
+- Git.
+- A Linux host, to test usbmon paths.
+- Working knowledge of USB transfers and system monitoring.
 
-### Fork and Clone
+### Fork and clone
 
-1. Fork the repository on GitHub
-2. Clone your fork locally:
+1. Fork the repository on GitHub.
+2. Clone your fork:
    ```bash
    git clone https://github.com/wifi-blackout/usbtop-ng.git
+   ```
+   Use your fork's URL in place of the one above.
+3. Enter the checkout:
+   ```bash
    cd usbtop-ng
    ```
-3. Add the upstream repository:
+4. Add the upstream remote:
    ```bash
    git remote add upstream https://github.com/wifi-blackout/usbtop-ng.git
    ```
+   The command prints nothing on success. If it reports that the remote
+   exists, run `git remote -v` and confirm the URL.
 
-## Development Environment
+## Development environment
 
 ### Setup
 
+1. Install the optional development tools:
+   ```bash
+   cargo install cargo-watch cargo-audit cargo-deny
+   ```
+   Each tool lands in `~/.cargo/bin`. If one fails to build, skip it. Nothing
+   below needs it.
+2. Build the project:
+   ```bash
+   cargo build
+   ```
+   The build writes `target/debug/usbtop-ng`. If it fails on a compiler error,
+   confirm that `cargo --version` reports Rust 1.88 or later.
+3. Run the tests:
+   ```bash
+   cargo test
+   ```
+   The command reports 188 passed. A failure names the test. Fix it and repeat.
+4. To run with debug output, use:
+   ```bash
+   RUST_LOG=debug cargo run -- --verbose
+   ```
+
+### Other development commands
+
 ```bash
-# Install development dependencies
-cargo install cargo-watch cargo-audit cargo-deny
-
-# Build the project
-cargo build
-
-# Run tests
-cargo test
-
-# Run with debug output
-RUST_LOG=debug cargo run -- --verbose
-```
-
-### Useful Development Commands
-
-```bash
-# Watch for changes and rebuild
+# Rebuild on every change
 cargo watch -x build
 
-# Check code without building
+# Type-check without building
 cargo check
 
-# Run clippy for linting
+# Lint
 cargo clippy -- -D warnings
 
-# Format code
+# Format
 cargo fmt
 
-# Check for security vulnerabilities
+# Audit dependencies for advisories
 cargo audit
 
-# Generate documentation
+# Build and open the API documentation
 cargo doc --open
 ```
 
-## Code Style
+## Code style
 
-### Rust Guidelines
+### Rust guidelines
 
-We follow the official Rust style guidelines:
+- Run `cargo fmt` before every commit.
+- Follow Rust naming conventions: `snake_case` for functions, `PascalCase` for
+  types.
+- Run `cargo clippy` and fix every warning.
+- Document public items with `///` doc comments.
 
-- Use `cargo fmt` for consistent formatting
-- Follow Rust naming conventions (snake_case, PascalCase, etc.)
-- Write idiomatic Rust code
-- Use `cargo clippy` and address all warnings
-- Document public APIs with doc comments (`///`)
-
-### Code Organization
+### Code organization
 
 ```
 src/
-├── main.rs           # Entry point and CLI
+├── main.rs           # Entry point, CLI, usbmon startup checks, exit flow
 ├── usbmon/           # USB monitoring core
 │   ├── mod.rs        # Module detection, load/unload, setup instructions
-│   ├── monitor.rs    # Binary/text interface probe, reader thread spawning, mpsc channel
-│   ├── reader.rs     # Blocking read loop over the usbmon Nu text interface
-│   ├── binary.rs     # Blocking read loop over the usbmon /dev/usbmonN binary interface
-│   └── parser.rs     # Nu text-format parsing; UsbSpeed bandwidth/color tables
+│   ├── monitor.rs    # Interface probe, reader threads, bounded channel
+│   ├── reader.rs     # Read loop over the usbmon Nu text interface
+│   ├── binary.rs     # Read loop over the usbmon /dev/usbmonN binary interface
+│   └── parser.rs     # Nu text-format parsing, UsbSpeed bandwidth/color tables
 ├── device/           # Device management
-│   ├── mod.rs        # Device structure, sysfs metadata resolution, %busy/indicators
-│   └── manager.rs    # Bus/device aggregation, controller resolution, packet routing, disconnect handling
+│   ├── mod.rs        # Device structure, sysfs metadata, %busy, indicators
+│   └── manager.rs    # Bus aggregation, controller resolution, packet routing
 ├── stats/            # Statistics engine
-│   └── mod.rs        # Bandwidth calculations
-├── ui/               # Terminal interface
-│   ├── mod.rs        # App state, event loop, and rendering
+│   └── mod.rs        # Bucketed sliding window, peak, rate history
+├── tui/              # Terminal chassis
+│   ├── mod.rs        # Terminal setup/teardown and the event loop
+│   ├── events.rs     # Input thread, UiEvent, redraw scheduling
+│   ├── output.rs     # ShedWriter, the non-blocking output stage
+│   ├── sync.rs       # Mode-2026 handshake and probe policy
+│   └── lifecycle.rs  # Restore, panic hook, signal thread, exit prompts
+├── ui/               # Application state and widgets
+│   ├── mod.rs        # App state, key handling, packet drain, rendering
 │   └── colors.rs     # Color definitions
 └── config/           # Preferences
     └── mod.rs        # ~/.usbtop-ng/preferences.toml handling
 ```
 
-### Commit Messages
+### Commit messages
 
-Use conventional commit format:
+Use the conventional commit format:
 
 ```
 type(scope): brief description
@@ -125,6 +148,7 @@ Longer description if needed
 **Types:** feat, fix, docs, style, refactor, test, chore
 
 **Examples:**
+
 ```
 feat(ui): add device search functionality
 fix(usbmon): handle malformed text-line parsing edge case
@@ -133,52 +157,52 @@ docs: update installation instructions
 
 ## Testing
 
-### Test Categories
+### Test categories
 
-1. **Unit Tests**: Test individual functions and modules
-2. **Integration Tests**: Test component interactions
-3. **Platform Tests**: Test platform-specific functionality
+1. **Unit tests** cover single functions and modules.
+2. **Integration tests** cover how components fit together.
+3. **Platform tests** cover platform-specific code.
 
-### Running Tests
+### Running tests
 
 ```bash
-# Run all tests
+# Run the default suite
 cargo test
 
-# Run specific test module
+# Run one module's tests
 cargo test usbmon::parser
 
-# Run tests with output
+# Run tests with their output
 cargo test -- --nocapture
 
-# Run all test targets (unit tests plus any integration test binaries)
+# Run every target, which is what CI runs
 cargo test --all-targets
 ```
 
-`cargo test` (and `cargo test --all-targets`) run the default, hermetic suite
-only: everything is exercised against fixture files, FIFOs, and `tempfile`
-paths, so it passes on any OS with no `/dev` or debugfs access required. CI
-runs this default suite only.
+`cargo test` and `cargo test --all-targets` run the hermetic suite only. Every
+test there works against fixture files, FIFOs, and `tempfile` paths. The suite
+therefore passes on any operating system, with no `/dev` and no debugfs access.
+It reports 188 passed. CI runs this suite and no other.
 
-### Live System Tests (`integration` feature)
+### Live system tests (the `integration` feature)
 
-The opt-in `integration` cargo feature adds tests that talk to the real
-usbmon interfaces instead of fixtures:
+The opt-in `integration` cargo feature adds 1 test that reads the real usbmon
+interfaces instead of fixtures.
 
-```bash
-# Requires Linux, the usbmon kernel module loaded, and read access to
-# /sys/kernel/debug/usb/usbmon (typically root)
-cargo test --features integration
-```
+1. Confirm that usbmon is loaded and that you can read
+   `/sys/kernel/debug/usb/usbmon`. Root access is the usual route.
+2. Run the suite with the feature:
+   ```bash
+   cargo test --features integration
+   ```
+   The command reports 189 passed. On Linux without usbmon the extra test
+   prints a skip message and passes.
 
-These tests are gated behind `target_os = "linux"` as well as the feature, so
-they compile to nothing (and are skipped) on non-Linux hosts and on default
-builds. On Linux, if usbmon itself is unavailable the test prints a skip
-message and returns rather than failing, since not every Linux dev box has
-usbmon loaded. CI intentionally does not run this feature — it is meant for
-manual verification on a real machine with real USB traffic.
+The live test is gated on `target_os = "linux"` as well as the feature, so it
+compiles to nothing on other hosts and on default builds. CI does not run this
+feature. It exists for manual checks on a real machine with real USB traffic.
 
-### Writing Tests
+### Writing tests
 
 ```rust
 #[cfg(test)]
@@ -194,58 +218,67 @@ mod tests {
     fn test_packet_reading() {
         // Reader tests point UsbmonReader at a fixture file via
         // UsbmonReader::with_path(bus_id, path, follow) instead of the real
-        // debugfs path — see src/usbmon/reader.rs for examples.
+        // debugfs path. See src/usbmon/reader.rs for examples.
         // BinaryReader::with_path(bus_id, path, follow) is the equivalent
-        // seam for the binary interface — see src/usbmon/binary.rs.
+        // seam for the binary interface. See src/usbmon/binary.rs.
     }
 }
 ```
 
-### Test Coverage
+### Test coverage
 
-Aim for high test coverage, especially for:
-- USB packet parsing logic
-- Bandwidth calculations
-- Error handling paths
-- Platform-specific code
+Cover these areas first:
 
-## Pull Request Process
+- USB packet parsing.
+- Bandwidth calculation.
+- Error handling paths.
+- Platform-specific code.
 
-### Before Submitting
+## Pull request process
 
-1. **Update from upstream:**
+### Before you submit
+
+1. Update from upstream:
    ```bash
    git fetch upstream
+   ```
+2. Rebase onto the upstream branch:
+   ```bash
    git rebase upstream/main
    ```
-
-2. **Run full test suite:**
+   If the rebase stops on a conflict, resolve the files it names, run
+   `git add` on each, then run `git rebase --continue`.
+3. Check formatting, exactly as CI does:
    ```bash
-   cargo test
-   cargo clippy
-   cargo fmt --check
+   cargo fmt --all -- --check
    ```
+   The command prints nothing when formatting is correct. If it prints a diff,
+   run `cargo fmt` and repeat.
+4. Lint, exactly as CI does:
+   ```bash
+   cargo clippy --all-targets -- -D warnings
+   ```
+   Any warning fails the command. Fix it and repeat.
+5. Test, exactly as CI does:
+   ```bash
+   cargo test --all-targets
+   ```
+   The command reports 188 passed. A failure names the test. Fix it and repeat.
+6. Update the documentation your change affects.
+7. Add tests for new behavior.
 
-3. **Update documentation** if needed
+### Pull request guidelines
 
-4. **Add tests** for new functionality
-
-### PR Guidelines
-
-1. **Create a feature branch:**
+1. Create a feature branch:
    ```bash
    git checkout -b feature/amazing-feature
    ```
+2. Make focused commits with clear messages.
+3. Add your user-facing changes to `CHANGELOG.md`.
+4. Confirm that CI passes.
+5. Request a review from a maintainer.
 
-2. **Make focused commits** with clear messages
-
-3. **Update CHANGELOG.md** for user-facing changes
-
-4. **Ensure CI passes** on all platforms
-
-5. **Request review** from maintainers
-
-### PR Template
+### Pull request template
 
 ```markdown
 ## Description
@@ -269,110 +302,134 @@ Brief description of changes
 - [ ] Tests added/updated
 ```
 
-## Issue Reporting
+## Issue reporting
 
-### Bug Reports
+### Bug reports
 
 Use the bug report template and include:
 
-- **Environment**: OS, Rust version, usbtop-ng version
-- **Steps to reproduce** the bug
-- **Expected vs actual behavior**
-- **Log output** with `RUST_LOG=debug`
-- **System information**: `lsusb`, `lsmod | grep usbmon`
+- **Environment**: operating system, Rust version, usbtop-ng version.
+- **Steps to reproduce** the bug.
+- **Expected behavior and actual behavior.**
+- **Log output**, captured with `RUST_LOG=debug`.
+- **System information**: the output of `lsusb` and `lsmod | grep usbmon`.
 
-### Feature Requests
-
-For new features, provide:
-
-- **Use case**: Why is this needed?
-- **Proposed solution**: How should it work?
-- **Alternatives considered**: Other approaches
-- **Additional context**: Screenshots, examples
-
-### Performance Issues
+### Feature requests
 
 Include:
-- **System specs**: CPU, RAM, USB controller
-- **Performance metrics**: CPU/memory usage
-- **USB device count** and types
-- **Profiling data** if available
 
-## Architecture Overview
+- **Use case**: why the feature is needed.
+- **Proposed solution**: how it should work.
+- **Alternatives considered**: other approaches.
+- **Additional context**: screenshots and examples.
 
-### Core Components
+### Performance issues
 
-1. **usbmon Module**: Interfaces with Linux usbmon for packet capture
-2. **Device Manager**: Tracks USB devices and metadata
-3. **Stats Engine**: Calculates bandwidth statistics
-4. **UI Layer**: Terminal interface with ratatui
-5. **Config System**: TOML-based configuration
+Include:
 
-### Data Flow
+- **System specifications**: CPU, RAM, USB controller.
+- **Performance figures**: CPU and memory use.
+- **USB device count** and device types.
+- **Profiling data**, if you have it.
+
+## Architecture overview
+
+### Core components
+
+1. **usbmon module** reads packets from the Linux usbmon interfaces.
+2. **Device manager** tracks devices, buses, and metadata.
+3. **Statistics engine** calculates bandwidth.
+4. **TUI chassis** owns terminal setup, the event loop, output, and teardown.
+5. **UI layer** holds app state and draws the widgets with ratatui.
+6. **Configuration** reads and writes the preferences file.
+
+### Data flow
 
 ```
 /dev/usbmonN (binary, preferred) ─┐
-                                   ├─→ Reader thread → Parser → UsbPacket → mpsc channel
-usbmon Nu file (text, fallback)  ─┘                                            ↓
-               UI thread ← DeviceManager (sysfs metadata, bandwidth stats, %busy, controller/port grouping)
+                                  ├─→ Reader thread → Parser → UsbPacket
+usbmon Nu file (text, fallback)  ─┘                              │
+                                                    bounded mpsc channel
+                                                                 ↓
+       UI thread ← DeviceManager (sysfs metadata, bandwidth stats, %busy,
+                                  controller and port grouping)
 ```
 
-### Adding New Features
+[ARCHITECTURE.md](ARCHITECTURE.md) covers the modules, the TUI chassis, and the
+known limitations.
 
-1. **Platform Support**: Add new OS in platform-specific modules
-2. **UI Components**: Extend rendering in `ui/mod.rs` (and `ui/colors.rs` for the color scheme)
-3. **Monitoring**: Add new packet analysis in `usbmon/parser.rs` (text interface) or `usbmon/binary.rs` (binary interface)
-4. **Statistics**: Enhance calculations in `stats/mod.rs`
+### Where new work goes
+
+1. **Platform support**: the platform-specific modules under `src/usbmon/` and
+   `src/device/`.
+2. **UI components**: new `draw_*` functions in `src/ui/mod.rs`, and colors in
+   `src/ui/colors.rs`.
+3. **Packet analysis**: `src/usbmon/parser.rs` for the text interface, and
+   `src/usbmon/binary.rs` for the binary interface.
+4. **Statistics**: `src/stats/mod.rs`.
 
 ### Dependencies
 
-Key external dependencies:
-- `ratatui`: Terminal UI framework
-- `crossterm`: Cross-platform terminal manipulation
-- `clap`: Command-line parsing
-- `serde` / `toml`: Preferences serialization (`~/.usbtop-ng/preferences.toml`)
-- `anyhow` / `log` / `env_logger`: Error handling and logging
+- `ratatui`: terminal UI framework.
+- `crossterm`: terminal control.
+- `clap`: command-line parsing.
+- `serde` and `toml`: preferences serialization for
+  `~/.usbtop-ng/preferences.toml`.
+- `anyhow`, `log`, and `env_logger`: error handling and logging.
+- `libc`: `fcntl` for the non-blocking descriptor, `write(2)` for the frame
+  drain, and the `EIO` and `SIGHUP` constants.
+- `signal-hook`: the signal thread behind the terminal restore.
 
-## Platform-Specific Development
+## Platform-specific development
 
 ### Linux
 
-- Test with different kernel versions
-- Verify usbmon parsing on both interfaces: the binary `/dev/usbmonN` device (preferred when it can be opened) and the debugfs `Nu` text fallback
-- Check debugfs mount requirements
-- Test permission scenarios
+- Test against more than one kernel version.
+- Verify parsing on both interfaces: the binary `/dev/usbmonN` device, which
+  usbtop-ng prefers when it opens, and the debugfs `Nu` text fallback.
+- Check the debugfs mount requirements.
+- Test the permission cases, as root and as a plain user.
 
-### BSD Systems
+### BSD
 
-- No live monitoring or device enumeration is implemented yet; `usbconfig`/`usbdevs` can be used manually to compare against what the (currently empty) device list shows
-- Test on FreeBSD, OpenBSD, NetBSD
-- Handle different device path formats
+- No live monitoring and no device enumeration exist yet. Run `usbconfig` or
+  `usbdevs` by hand to compare against the empty device table.
+- Test on FreeBSD, OpenBSD, and NetBSD.
+- Handle the different device path formats.
 
 ### macOS
 
-- No usbmon equivalent, so live monitoring is not implemented
-- No device-enumeration fallback exists either; verify usbtop-ng exits without `--force` and opens with an empty device list when `--force` is passed
-- `system_profiler`/`ioreg` are only referenced in the printed setup instructions as manual alternatives for the user, not integrated into the app
+- No usbmon equivalent exists, so live monitoring is not implemented.
+- No device enumeration fallback exists. Verify that usbtop-ng exits without
+  `--force`, and opens with an empty device table with `--force`.
+- `system_profiler` and `ioreg` appear only in the printed setup instructions,
+  as manual alternatives. Nothing in usbtop-ng calls them.
 
-## Release Process
+## Release process
 
-1. **Version Bump**: Update `Cargo.toml` version
-2. **Update CHANGELOG.md**: Document all changes
-3. **Tag Release**: `git tag v0.x.y`
-4. **GitHub Release**: Create release with binaries
-5. **Crate Publication**: `cargo publish`
+1. Update the version in `Cargo.toml`.
+2. Record the changes in `CHANGELOG.md`.
+3. Tag the release:
+   ```bash
+   git tag v0.x.y
+   ```
+   If the tag already exists, git says so. Choose the next version rather than
+   moving the tag.
+4. Create the GitHub release and attach the binaries.
+5. Publish the crate:
+   ```bash
+   cargo publish
+   ```
+   The command uploads the crate. If it reports a missing login, run
+   `cargo login` first.
 
-## Getting Help
+## Getting help
 
-- **GitHub Discussions**: General questions and ideas
-- **GitHub Issues**: Bug reports and feature requests  
-- **Code Review**: Tag maintainers in PRs
-- **Discord/Matrix**: Real-time chat (links in README)
+- **GitHub Discussions**: questions and ideas.
+- **GitHub Issues**: bug reports and feature requests.
+- **Code review**: tag a maintainer on the pull request.
 
-## Code of Conduct
+## Conduct
 
-Please follow our [Code of Conduct](CODE_OF_CONDUCT.md) in all interactions.
-
----
-
-Thank you for contributing to usbtop-ng! 🚀
+Be direct and be respectful in issues, pull requests, and reviews. Review the
+change, not the person who wrote it.
