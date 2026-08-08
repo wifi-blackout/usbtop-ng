@@ -898,7 +898,7 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from("  • Color-coded USB link speeds"),
         Line::from("  • Split charts: aggregate total, plus the selected device's rx/tx"),
         Line::from("  • Device disconnect detection"),
-        Line::from("  • Multi-platform support (Linux/BSD/macOS)"),
+        Line::from("  • Live monitoring on Linux only. BSD and macOS list no devices"),
         Line::from(""),
         Line::from("Press 'h' to close this help"),
     ];
