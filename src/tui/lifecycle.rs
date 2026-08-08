@@ -13,6 +13,7 @@ use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Once;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -33,6 +34,16 @@ const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 /// was interrupted mid-update the terminal is holding everything back until it
 /// sees this — including the restore sequences that follow it.
 const END_SYNCHRONIZED_UPDATE: &str = "\x1b[?2026l";
+
+/// How long [`restore_with`] waits between attempts to get the restore
+/// sequences onto a terminal that is not taking them.
+const RESTORE_POLL: Duration = Duration::from_millis(10);
+
+/// How many attempts it makes. With [`RESTORE_POLL`] between them the whole
+/// budget is a quarter of a second — long enough for a link that is merely
+/// congested to catch up, short enough that a terminal which is never going to
+/// read again does not read as a hung process.
+const RESTORE_ATTEMPTS: u32 = 25;
 
 /// Whether the terminal is currently in TUI mode, and so has something to
 /// restore. This is what makes [`restore_terminal`] idempotent.
@@ -60,22 +71,91 @@ pub fn arm_restore() {
     ARMED.store(true, Ordering::SeqCst);
 }
 
-/// Give the terminal back: leave raw mode, restore the output descriptor's
-/// flags, close any open synchronized update, leave the alternate screen, show
-/// the cursor.
+/// Give the terminal back: leave raw mode, close any open synchronized update,
+/// leave the alternate screen, show the cursor, and put the output
+/// descriptor's original flags back last of all.
 ///
-/// Idempotent and infallible by design. It is called from the panic hook and
-/// from teardown, and neither has anywhere to report a failure to — a terminal
-/// that will not take the restore sequences will not take an error message
-/// either.
+/// Idempotent, infallible and bounded by design. It is called from the panic
+/// hook and from teardown, and neither has anywhere to report a failure to — a
+/// terminal that will not take the restore sequences will not take an error
+/// message either. Nor can either afford to wait: the sequences go out on a
+/// budget (see [`write_within_budget`]), because a terminal that has stopped
+/// reading must not be able to hold the process here.
 pub fn restore_terminal() {
-    restore_to(&mut io::stdout());
+    restore_to(&mut RawStdout);
+}
+
+/// Standard output with nothing buffered in front of it.
+///
+/// [`io::Stdout`] cannot be used here, and the reason is the whole point of the
+/// budget. It is a `LineWriter`; the restore sequences contain no newline, so
+/// they would sit in its buffer while this module concluded they had been
+/// written — and then be flushed by std's own exit handler, after
+/// [`restore_output_flags`] had put the descriptor back to blocking, into the
+/// terminal that had just refused them. That flush answers to nothing and
+/// cannot give up. It is the hang the budget exists to prevent, moved one frame
+/// later, and a pty-driven check found it there.
+#[cfg(unix)]
+struct RawStdout;
+
+#[cfg(unix)]
+impl Write for RawStdout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // SAFETY: stdout is valid for the life of the process; the pointer and
+        // length describe a slice this call only reads from, and the return is
+        // checked before it is used as a length.
+        let written = unsafe {
+            libc::write(
+                libc::STDOUT_FILENO,
+                buf.as_ptr().cast::<libc::c_void>(),
+                buf.len(),
+            )
+        };
+        if written < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(usize::try_from(written).unwrap_or(0))
+    }
+
+    /// Nothing is held back, so there is nothing to push.
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Standard output on platforms with no `write(2)` to reach for.
+///
+/// The descriptor is never switched to non-blocking off unix, so a write there
+/// cannot come back `WouldBlock` and the budget never has anything to spend.
+#[cfg(not(unix))]
+struct RawStdout;
+
+#[cfg(not(unix))]
+impl Write for RawStdout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut out = io::stdout();
+        out.write_all(buf)?;
+        out.flush()?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()
+    }
 }
 
 /// The body of [`restore_terminal`], writing to `out` so tests can read the
 /// sequences instead of the developer's terminal. Reports whether it found
 /// anything to do.
+///
+/// `out` must be unbuffered: see [`RawStdout`] for what a buffered one costs.
 fn restore_to(out: &mut impl Write) -> bool {
+    restore_with(out, thread::sleep)
+}
+
+/// The body of [`restore_to`], with the wait as a parameter so tests can watch
+/// the budget being spent without sitting out a real quarter of a second.
+fn restore_with(out: &mut impl Write, sleep: impl FnMut(Duration)) -> bool {
     // The one place the "is there anything to undo" question is asked, and it
     // answers "no" to everyone who arrives after the first caller.
     if !ARMED.swap(false, Ordering::SeqCst) {
@@ -83,12 +163,69 @@ fn restore_to(out: &mut impl Write) -> bool {
     }
 
     let _ = disable_raw_mode();
-    // Before the writes below, not after: a descriptor left non-blocking can
-    // refuse them, and the restore sequences are exactly what must not be lost.
+
+    // Assembled in memory first, so that what follows is one bounded push of a
+    // known number of bytes rather than a sequence of writes each of which
+    // could stall half-done somewhere this function cannot see.
+    let mut sequence = Vec::new();
+    let _ = write!(sequence, "{END_SYNCHRONIZED_UPDATE}");
+    let _ = queue!(sequence, LeaveAlternateScreen, Show);
+
+    // Written while the descriptor is still non-blocking, and so on a budget.
+    // The alternative is to put the original flags back first and write into a
+    // blocking descriptor, which reads as the safer order and is not: a
+    // terminal that has stopped reading takes the process with it, on the one
+    // path that exists to end the session. That used to be unreachable —
+    // nothing survived a wedged terminal this far — and the output stage is
+    // exactly what changed that.
+    write_within_budget(out, &sequence, sleep);
+    // Last, once nothing else here is going to write and nothing anywhere is
+    // holding bytes for this descriptor: from here on stdout is whatever it was
+    // before the TUI, which is what the shell inherits.
     restore_output_flags();
-    let _ = write!(out, "{END_SYNCHRONIZED_UPDATE}");
-    let _ = queue!(out, LeaveAlternateScreen, Show);
-    let _ = out.flush();
+    true
+}
+
+/// Push `bytes` out, waiting for a terminal that is merely behind but giving up
+/// on one that is not reading at all. Reports whether they all landed.
+///
+/// A healthy terminal takes twenty-odd bytes on the first attempt and never
+/// sees the wait. A wedged one costs [`RESTORE_ATTEMPTS`] waits of
+/// [`RESTORE_POLL`] and then gets its shell back anyway, minus a repaint the
+/// user can ask for with `reset`. Only a wait spends the budget: a short write
+/// is progress, and progress is allowed to continue.
+fn write_within_budget(
+    out: &mut impl Write,
+    mut bytes: &[u8],
+    mut sleep: impl FnMut(Duration),
+) -> bool {
+    let mut waits = 0;
+
+    while !bytes.is_empty() {
+        match out.write(bytes) {
+            // No progress and no reason given; looping on it would spin.
+            Ok(0) => return false,
+            // Cannot exceed the slice by the `write` contract, but a `min` is
+            // cheaper than trusting it.
+            Ok(written) => bytes = &bytes[written.min(bytes.len())..],
+            // The terminal is full, or a signal landed mid-write. Both say
+            // "not yet" rather than "never", so they are worth a wait.
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::Interrupted =>
+            {
+                waits += 1;
+                if waits >= RESTORE_ATTEMPTS {
+                    return false;
+                }
+                sleep(RESTORE_POLL);
+            }
+            // Anything else is a terminal that is gone rather than behind, and
+            // waiting out the budget for it would be waiting for nothing.
+            Err(_) => return false,
+        }
+    }
+
     true
 }
 
@@ -331,6 +468,48 @@ mod tests {
         }
     }
 
+    /// A terminal that has stopped reading: every write comes straight back
+    /// `WouldBlock`, forever, which is what a non-blocking write to a full pty
+    /// does. This is the state a session now survives long enough to exit from.
+    #[derive(Default)]
+    struct WedgedTerminal {
+        attempts: u32,
+    }
+
+    impl Write for WedgedTerminal {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            self.attempts += 1;
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A terminal that takes one byte per call: progress, but slowly. Nothing
+    /// here may read as a stall, because it is not one.
+    #[derive(Default)]
+    struct ByteAtATime {
+        written: Vec<u8>,
+    }
+
+    impl Write for ByteAtATime {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            match buf.first() {
+                Some(&byte) => {
+                    self.written.push(byte);
+                    Ok(1)
+                }
+                None => Ok(0),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -430,6 +609,79 @@ mod tests {
             !ARMED.load(Ordering::SeqCst),
             "and it still disarmed, so the panic hook will not try again"
         );
+    }
+
+    #[test]
+    fn a_wedged_terminal_cannot_hold_the_exit_open() {
+        let _serial = serialized();
+        arm_restore();
+
+        let mut out = WedgedTerminal::default();
+        let mut waits = Vec::new();
+        // The restore is written on a descriptor that is still non-blocking, so
+        // this returns rather than parking the process forever inside a write
+        // nobody is reading.
+        assert!(restore_with(&mut out, |wait| waits.push(wait)), "it ran");
+
+        assert_eq!(out.attempts, RESTORE_ATTEMPTS, "it tried, and then stopped");
+        let waited: Duration = waits.iter().sum();
+        assert!(
+            waited <= RESTORE_POLL * RESTORE_ATTEMPTS,
+            "and it waited a bounded quarter of a second: {waited:?}"
+        );
+        assert!(
+            !ARMED.load(Ordering::SeqCst),
+            "and it disarmed, so the panic hook will not try the same wait again"
+        );
+    }
+
+    #[test]
+    fn the_restore_budget_is_a_quarter_of_a_second() {
+        // Pinned, because the number that matters is the product: a terminal
+        // that is never coming back holds the exit for exactly this long.
+        assert_eq!(RESTORE_POLL * RESTORE_ATTEMPTS, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn a_terminal_that_is_gone_is_not_waited_for_at_all() {
+        // `GoneTerminal` fails with `BrokenPipe`, which is not "not yet".
+        // Spending the budget on it would be spending it on nothing.
+        let mut waits = Vec::new();
+        assert!(!write_within_budget(
+            &mut GoneTerminal,
+            b"\x1b[?25h",
+            |wait| {
+                waits.push(wait);
+            }
+        ));
+        assert!(waits.is_empty(), "nothing to wait for: {waits:?}");
+    }
+
+    #[test]
+    fn a_healthy_terminal_pays_nothing_for_the_budget() {
+        let mut out = Vec::new();
+        let mut waits = Vec::new();
+        assert!(write_within_budget(&mut out, b"\x1b[?25h", |wait| {
+            waits.push(wait);
+        }));
+        assert_eq!(out, b"\x1b[?25h", "and all of it went out");
+        assert!(waits.is_empty(), "it landed first time: {waits:?}");
+    }
+
+    #[test]
+    fn a_short_write_is_progress_and_does_not_spend_the_budget() {
+        // A terminal taking the sequences a byte at a time is slow, not
+        // stalled. Counting its writes against the budget would abandon it
+        // partway through an escape sequence, which is worse than not writing
+        // at all: the tail would arrive on the shell as stray characters.
+        let sequence = b"\x1b[?2026l\x1b[?1049l\x1b[?25h";
+        let mut out = ByteAtATime::default();
+        let mut waits = Vec::new();
+        assert!(write_within_budget(&mut out, sequence, |wait| {
+            waits.push(wait);
+        }));
+        assert_eq!(out.written, sequence, "every byte, in order");
+        assert!(waits.is_empty(), "nothing stalled: {waits:?}");
     }
 
     #[test]

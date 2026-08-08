@@ -221,11 +221,42 @@ impl ShedHandles {
     }
 }
 
+/// Smallest backlog the writer will hold before shedding, however small the
+/// screen says it is.
+///
+/// [`high_watermark`]'s formula is a function of the screen's area, and a
+/// screen can report an area no frame could ever fit in: crossterm hands back
+/// 0x0 for a terminal caught mid-resize or without a window size at all, and
+/// 1x1 for a pane dragged shut. The allowance there is one byte and nine bytes
+/// respectively, less than a single cursor move — and with mode 2026 in play
+/// the brackets alone are sixteen. Every frame would be over the line, every
+/// shed would ask
+/// for a repaint, and the repaint would be shed in its turn: a storm that burns
+/// the loop and climbs the `shed:` counter for a screen nobody can read anyway.
+/// Four kilobytes is a couple of full repaints of a genuinely small terminal.
+const WATERMARK_FLOOR: usize = 4096;
+
 /// tmux's rule for "too far behind": a screen's worth of cells at eight bytes
-/// each, which is roughly two full repaints' worth of escape sequences.
+/// each, which is roughly two full repaints' worth of escape sequences — with
+/// [`WATERMARK_FLOOR`] under it, because the rule degenerates on a screen with
+/// no area.
 fn high_watermark(cols: u16, rows: u16) -> usize {
-    1 + usize::from(cols) * usize::from(rows) * 8
+    (1 + usize::from(cols) * usize::from(rows) * 8).max(WATERMARK_FLOOR)
 }
+
+/// How many write failures in a row, with nothing landing in between, mean the
+/// terminal is not coming back.
+///
+/// An unclassified write error is treated as one bad frame: the frame is
+/// dropped, the screen is repainted from scratch, and the session carries on.
+/// That is right once, and for a descriptor that is permanently broken in a way
+/// [`is_terminal_death`] does not name — `EBADF` after something closed the
+/// descriptor out from under us, `ENXIO`, a driver that has given up — it is a
+/// spin: the repaint fails exactly like the frame before it, asks for another
+/// repaint, and the loop turns as fast as the terminal can refuse it. After this
+/// many in a row the writer stops calling it a hiccup and reports the terminal
+/// dead, which is the one thing that ends the session.
+const MAX_CONSECUTIVE_WRITE_FAILURES: u32 = 30;
 
 /// A [`Write`] that never blocks the render loop and never lies about it.
 ///
@@ -246,6 +277,9 @@ pub struct ShedWriter<R: RawOut> {
     high_watermark: Arc<AtomicUsize>,
     /// While set, [`ShedWriter::flush_at`] will not shed. See [`SHED_GRACE`].
     grace_until: Option<Instant>,
+    /// Unclassified write failures since the last write that landed. See
+    /// [`MAX_CONSECUTIVE_WRITE_FAILURES`].
+    consecutive_failures: u32,
     shed_frames: Arc<AtomicU64>,
     needs_full_repaint: Arc<AtomicBool>,
     invalidated: Arc<AtomicBool>,
@@ -268,6 +302,7 @@ impl<R: RawOut> ShedWriter<R> {
             pending_bytes: 0,
             high_watermark: Arc::new(AtomicUsize::new(high_watermark(cols, rows))),
             grace_until: None,
+            consecutive_failures: 0,
             shed_frames: Arc::new(AtomicU64::new(0)),
             needs_full_repaint: Arc::new(AtomicBool::new(false)),
             invalidated: Arc::new(AtomicBool::new(false)),
@@ -418,6 +453,9 @@ impl<R: RawOut> ShedWriter<R> {
                 Ok(written) => {
                     self.front_cursor += written;
                     self.pending_bytes = self.pending_bytes.saturating_sub(written);
+                    // Bytes reached the terminal, so whatever went wrong before
+                    // was a hiccup after all.
+                    self.consecutive_failures = 0;
                 }
                 // A signal landed mid-write; nothing was written, so retry.
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -430,10 +468,16 @@ impl<R: RawOut> ShedWriter<R> {
                 }
                 // Something else went wrong, so the terminal's contents no
                 // longer match ratatui's idea of them. The frame is beyond
-                // saving; the loop repaints the screen from scratch.
+                // saving; the loop repaints the screen from scratch — unless
+                // this has been going on long enough that the repaint is the
+                // thing failing, in which case there is no screen left to fix.
                 Err(_) => {
                     self.invalidated.store(true, Ordering::SeqCst);
                     self.drop_front_frame();
+                    self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                    if self.consecutive_failures >= MAX_CONSECUTIVE_WRITE_FAILURES {
+                        self.terminal_dead.store(true, Ordering::SeqCst);
+                    }
                     return;
                 }
             }
@@ -561,6 +605,23 @@ mod tests {
         Err(io::Error::from(io::ErrorKind::WouldBlock))
     }
 
+    /// `count` write failures of the kind the writer cannot classify: not a
+    /// full terminal, not a dead one, just a write that did not work.
+    fn unclassified_failures(count: u32) -> Vec<io::Result<usize>> {
+        (0..count)
+            .map(|_| Err(io::Error::other("the device is confused")))
+            .collect()
+    }
+
+    /// Half the watermark floor, so two frames of it sit exactly on the line
+    /// and three are over it — the shed tests' shape, in bytes a 1x1 screen
+    /// still has to allow.
+    const HALF_FLOOR: usize = WATERMARK_FLOOR / 2;
+
+    /// A full repaint, as the recovery-frame tests need it: over the watermark
+    /// on its own, so nothing but the grace period can save it.
+    const REPAINT_FRAME: usize = WATERMARK_FLOOR + 1;
+
     /// A writer over a scripted terminal, plus the loop's view of it.
     fn writer(raw: ScriptedRaw, cols: u16, rows: u16) -> (ShedWriter<ScriptedRaw>, ShedHandles) {
         let writer = ShedWriter::new(raw, cols, rows);
@@ -600,16 +661,20 @@ mod tests {
 
     #[test]
     fn a_backlog_past_the_watermark_is_shed_whole_and_asks_for_a_repaint() {
-        // A 1x1 screen: watermark 1 + 1*1*8 = 9 bytes.
+        // A 1x1 screen, so the watermark is the floor rather than the nine
+        // bytes the area formula would give.
         let (mut writer, handles) = writer(ScriptedRaw::wedged(), 1, 1);
-        assert_eq!(writer.high_watermark.load(Ordering::SeqCst), 9);
+        assert_eq!(
+            writer.high_watermark.load(Ordering::SeqCst),
+            WATERMARK_FLOOR
+        );
 
-        frame(&mut writer, b"aaaa"); // 4 queued
-        frame(&mut writer, b"bbbb"); // 8 queued, still under
+        frame(&mut writer, &[b'a'; HALF_FLOOR]); // half the allowance queued
+        frame(&mut writer, &[b'b'; HALF_FLOOR]); // exactly on the line
         assert_eq!(handles.shed_frames.load(Ordering::Relaxed), 0);
         assert!(!handles.needs_full_repaint.load(Ordering::SeqCst));
 
-        frame(&mut writer, b"cccc"); // 12 queued: over
+        frame(&mut writer, &[b'c'; HALF_FLOOR]); // over
         assert_eq!(
             handles.shed_frames.load(Ordering::Relaxed),
             3,
@@ -628,33 +693,36 @@ mod tests {
     fn the_recovery_frame_is_not_shed_in_its_turn() {
         let (mut writer, handles) = writer(ScriptedRaw::wedged(), 1, 1);
         for _ in 0..3 {
-            frame(&mut writer, b"aaaa");
+            frame(&mut writer, &[b'a'; HALF_FLOOR]);
         }
         assert_eq!(handles.shed_frames.load(Ordering::Relaxed), 3);
 
         // A full repaint is the biggest frame there is, and it lands on the
         // same wedged terminal: without the grace it would be shed at once and
         // ask for another repaint, forever.
-        frame(&mut writer, &[b'r'; 40]);
+        frame(&mut writer, &[b'r'; REPAINT_FRAME]);
         assert_eq!(
             handles.shed_frames.load(Ordering::Relaxed),
             3,
             "the grace period held"
         );
-        assert_eq!(writer.pending_bytes, 40, "and the repaint is still queued");
+        assert_eq!(
+            writer.pending_bytes, REPAINT_FRAME,
+            "and the repaint is still queued"
+        );
     }
 
     #[test]
     fn the_grace_period_runs_out() {
         let (mut writer, handles) = writer(ScriptedRaw::wedged(), 1, 1);
         for _ in 0..3 {
-            frame(&mut writer, b"aaaa");
+            frame(&mut writer, &[b'a'; HALF_FLOOR]);
         }
         let shed_at = writer.grace_until.expect("a shed starts a grace period");
 
         // Still behind a whole grace period later: the terminal is not slow,
         // it is gone quiet, and the queue must not grow forever.
-        writer.write_all(&[b'r'; 40]).unwrap();
+        writer.write_all(&[b'r'; REPAINT_FRAME]).unwrap();
         writer.flush_at(shed_at + Duration::from_millis(1));
         assert_eq!(handles.shed_frames.load(Ordering::Relaxed), 4);
         assert_eq!(writer.pending_bytes, 0);
@@ -664,13 +732,13 @@ mod tests {
     fn draining_the_queue_lifts_the_grace_period_early() {
         let (mut writer, _handles) = writer(ScriptedRaw::wedged(), 1, 1);
         for _ in 0..3 {
-            frame(&mut writer, b"aaaa");
+            frame(&mut writer, &[b'a'; HALF_FLOOR]);
         }
         assert!(writer.grace_until.is_some(), "the shed armed the grace");
 
         // The terminal starts reading again and the recovery frame gets out.
         writer.raw.after_script = Exhausted::Accept;
-        frame(&mut writer, &[b'r'; 40]);
+        frame(&mut writer, &[b'r'; REPAINT_FRAME]);
         assert!(writer.pending.is_empty());
         assert!(
             writer.grace_until.is_none(),
@@ -680,21 +748,23 @@ mod tests {
 
     #[test]
     fn a_shed_never_truncates_a_frame_the_terminal_has_started_reading() {
-        // Watermark 9. The first frame gets two bytes out and then stalls, so
-        // its tail may be the rest of an escape sequence.
+        // The first frame gets two bytes out and then stalls, so its tail may
+        // be the rest of an escape sequence.
         let (mut writer, handles) = writer(ScriptedRaw::scripted(vec![Ok(2), would_block()]), 1, 1);
-        frame(&mut writer, b"aaaaaa");
+        frame(&mut writer, &[b'a'; WATERMARK_FLOOR]);
         assert_eq!(writer.front_cursor, 2);
 
         writer.raw.after_script = Exhausted::Block;
-        frame(&mut writer, b"bbbbbb"); // 4 + 6 = 10 queued: over
+        // (floor - 2) still owed, plus a whole floor: over.
+        frame(&mut writer, &[b'b'; WATERMARK_FLOOR]);
         assert_eq!(
             handles.shed_frames.load(Ordering::Relaxed),
             1,
             "only the frame that put nothing on the wire"
         );
         assert_eq!(
-            writer.pending_bytes, 4,
+            writer.pending_bytes,
+            WATERMARK_FLOOR - 2,
             "the started frame keeps its unwritten tail"
         );
     }
@@ -806,6 +876,76 @@ mod tests {
     }
 
     #[test]
+    fn the_watermark_never_falls_below_its_floor() {
+        // The area formula alone would allow nine bytes at 1x1 and one byte at
+        // 0x0 — less than a cursor move, and a third of what the mode-2026
+        // brackets cost before the frame says anything. Every frame would be
+        // shed, every shed would ask for a repaint, and the repaint would be
+        // shed in its turn.
+        assert_eq!(high_watermark(0, 0), WATERMARK_FLOOR);
+        assert_eq!(high_watermark(1, 1), WATERMARK_FLOOR);
+        // A screen big enough to want more than the floor still gets it.
+        assert_eq!(high_watermark(80, 24), 1 + 80 * 24 * 8);
+
+        // And the floor holds when the resize arrives through the handles,
+        // which is how a pane dragged shut reaches the writer.
+        let (writer, handles) = writer(ScriptedRaw::wedged(), 80, 24);
+        handles.set_area(0, 0);
+        assert_eq!(
+            writer.high_watermark.load(Ordering::SeqCst),
+            WATERMARK_FLOOR
+        );
+    }
+
+    #[test]
+    fn a_terminal_that_fails_every_write_is_declared_dead_in_the_end() {
+        let (mut writer, handles) = writer(
+            ScriptedRaw::scripted(unclassified_failures(MAX_CONSECUTIVE_WRITE_FAILURES)),
+            80,
+            24,
+        );
+
+        for _ in 1..MAX_CONSECUTIVE_WRITE_FAILURES {
+            frame(&mut writer, b"a frame nobody sees");
+            assert!(
+                !handles.terminal_dead(),
+                "a failure the writer cannot classify is one bad frame, not a death"
+            );
+            assert!(handles.take_repaint_request(), "and it costs a repaint");
+        }
+
+        frame(&mut writer, b"the last straw");
+        assert!(
+            handles.terminal_dead(),
+            "but a repaint that keeps failing the same way is not recovering"
+        );
+    }
+
+    #[test]
+    fn a_write_that_lands_forgives_the_failures_before_it() {
+        let mut script = unclassified_failures(MAX_CONSECUTIVE_WRITE_FAILURES - 1);
+        // The terminal comes back for exactly one frame, then goes wrong again.
+        script.push(Ok(usize::MAX));
+        script.extend(unclassified_failures(MAX_CONSECUTIVE_WRITE_FAILURES - 1));
+        let attempts = script.len();
+        let (mut writer, handles) = writer(ScriptedRaw::scripted(script), 80, 24);
+
+        for _ in 0..attempts {
+            frame(&mut writer, b"frame");
+        }
+
+        assert!(
+            !handles.terminal_dead(),
+            "twice as many failures as the limit, but never that many in a row"
+        );
+        assert_eq!(
+            writer.consecutive_failures,
+            MAX_CONSECUTIVE_WRITE_FAILURES - 1
+        );
+        assert_eq!(writer.raw().written, b"frame", "the one that landed");
+    }
+
+    #[test]
     fn both_repaint_flags_are_consumed_together() {
         let (_writer, handles) = writer(ScriptedRaw::wedged(), 80, 24);
 
@@ -886,12 +1026,12 @@ mod tests {
 
     #[test]
     fn a_shed_drops_bracketed_frames_whole() {
-        // A 1x1 screen: watermark 9, and the brackets alone are 16 bytes, so
-        // every frame is over on its own.
         let (mut writer, handles) = writer(ScriptedRaw::wedged(), 1, 1);
         handles.set_sync_mode(SyncMode::Supported);
 
-        frame(&mut writer, b"a");
+        // A frame that fills the allowance on its own; the brackets put it
+        // over, and they have to go with it or nothing closes them.
+        frame(&mut writer, &[b'a'; WATERMARK_FLOOR]);
         assert_eq!(handles.shed_frames.load(Ordering::Relaxed), 1);
         assert!(writer.pending.is_empty(), "nothing half-bracketed is left");
         assert_eq!(writer.pending_bytes, 0);

@@ -390,7 +390,10 @@ pub(crate) fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Header
+            // Four, not three: the header is a title line and a stats line
+            // inside a border, and a row short of that clips the stats line —
+            // which is where `dropped:` and `shed:` are reported.
+            Constraint::Length(4), // Header
             Constraint::Length(8), // Bandwidth graph
             Constraint::Min(10),   // Device list
             Constraint::Length(4), // Controls
@@ -872,8 +875,16 @@ fn draw_help_overlay(f: &mut Frame) {
             Span::raw("        Toggle this help"),
         ]),
         Line::from(vec![
+            Span::styled("  Ctrl-L", Style::default().fg(ACCENT_COLOR)),
+            Span::raw("   Wipe the screen and repaint it from scratch"),
+        ]),
+        Line::from(vec![
             Span::styled("  q/Esc", Style::default().fg(ACCENT_COLOR)),
             Span::raw("    Quit application"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Ctrl-C", Style::default().fg(ACCENT_COLOR)),
+            Span::raw("   Quit application"),
         ]),
         Line::from(""),
         Line::from("Features:"),
@@ -882,6 +893,8 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from("  • ⚡ high-utilization indicator (>80% of practical bandwidth)"),
         Line::from("  • 🔺 device declares USB 3.x support but linked slower — best-effort signal"),
         Line::from("  • Header shows 'dropped: N' if packets were lost to a full queue"),
+        Line::from("  • Header shows 'shed: N' if frames were dropped to keep up with a slow"),
+        Line::from("    terminal — the numbers are current, the screen is N frames behind"),
         Line::from("  • Color-coded USB link speeds"),
         Line::from("  • Split charts: aggregate total, plus the selected device's rx/tx"),
         Line::from("  • Device disconnect detection"),
@@ -1173,6 +1186,11 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// The same key press with Control held.
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
     #[test]
     fn quit_keys_end_the_session() {
         let mut app = UsbTopApp::new(Duration::from_millis(100));
@@ -1227,6 +1245,37 @@ mod tests {
             KeyOutcome::Redraw
         );
         assert!(!app.show_help);
+    }
+
+    /// The overlay is the only place the bindings are written down, so what it
+    /// says has to be what `apply_key` does — and it has to survive the layout,
+    /// which is the half a text-only assertion would miss.
+    #[test]
+    fn the_help_overlay_lists_the_bindings_that_exist() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.show_help = true;
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 60)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+
+        // Distinctive strings, not bare letters: a lone "h" would match
+        // anywhere on the screen and assert nothing.
+        for binding in ["↑/↓", "Toggle this help", "Ctrl-L", "q/Esc", "Ctrl-C"] {
+            assert!(screen.contains(binding), "{binding} missing from {screen}");
+        }
+        // And both counters the header can spring on the user are explained.
+        assert!(screen.contains("dropped: N"), "{screen}");
+        assert!(screen.contains("shed: N"), "{screen}");
+
+        assert_eq!(
+            apply_key(&mut app, ctrl(KeyCode::Char('l'))),
+            KeyOutcome::ClearAndRedraw
+        );
+        assert_eq!(
+            apply_key(&mut app, ctrl(KeyCode::Char('c'))),
+            KeyOutcome::Quit
+        );
     }
 
     #[test]
@@ -1641,6 +1690,31 @@ mod tests {
 
         counter.store(7, Ordering::Relaxed);
         let screen = render(&app);
+        assert!(screen.contains("shed: 7"), "{screen}");
+    }
+
+    /// The two tests above draw the header into a rect of their own choosing,
+    /// which is exactly the blind spot this one closes: the header is two
+    /// content lines inside a border, so a layout that hands it any less than
+    /// four rows clips the stats line away — and every counter this program has
+    /// for admitting it is behind lives on that line.
+    #[test]
+    fn the_whole_ui_leaves_room_for_the_header_stats_line() {
+        let dropped = Arc::new(AtomicU64::new(42));
+        let shed = Arc::new(AtomicU64::new(7));
+        let mut app =
+            UsbTopApp::new(Duration::from_millis(100)).with_dropped_counter(Arc::clone(&dropped));
+        app.shed_counter = Some(Arc::clone(&shed));
+
+        // Drawn through `draw_ui`, not `draw_header`: the layout is the thing
+        // under test.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(screen.contains("Total: "), "{screen}");
+        assert!(screen.contains("Peak: "), "{screen}");
+        assert!(screen.contains("dropped: 42"), "{screen}");
         assert!(screen.contains("shed: 7"), "{screen}");
     }
 

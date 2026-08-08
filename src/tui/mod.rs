@@ -6,7 +6,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
-    env, io, iter, mem,
+    env, io, iter,
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     time::{Duration, Instant},
 };
@@ -117,29 +117,29 @@ pub fn run_ui(
     // across the shell the user just got back, so it is dropped here instead.
     // On a terminal that kept up there is nothing queued and nothing to drop.
     shed.discard_pending();
-    // And no more synchronized updates, for the same reason. `show_cursor`
-    // below still writes through the shed writer, but it writes *after* the
-    // restore has already emitted its defensive `?2026l` — so a bracket around
-    // it would open an update that only its own closing half could ever close
-    // again, on the shell the user just got back, with nothing left to rescue
-    // it if that write does not land whole.
+    // And no more synchronized updates. The last thing ratatui writes is the
+    // `show_cursor` in its destructor, on a terminal already on its way out; a
+    // bracket around it buys nothing and can cost everything, because a write
+    // that stalls after the opening half leaves the terminal holding its screen
+    // back until something closes the update — and the only thing left to do
+    // that is the restore below, whose own writes are now on a budget and may
+    // never land either.
     shed.set_sync_mode(SyncMode::Unsupported);
+
+    // Before the restore, deliberately. ratatui's destructor shows the cursor
+    // again, which is a write through the shed writer, and the shed writer only
+    // stays non-blocking until `restore_terminal` puts stdout's original flags
+    // back — after which that same write would park the process on a terminal
+    // that has stopped reading. Here it either goes out or is shed, and it
+    // cannot fail: the writer answers through its flags rather than through
+    // `io::Result`, so ratatui's "failed to show the cursor" branch — which
+    // `eprintln!`s, and so would panic mid-destructor — is unreachable and
+    // needs no guarding. `restore_terminal` shows the cursor too, so nothing is
+    // lost if this one is shed.
+    drop(terminal);
 
     // Explicit teardown; the panic hook is the safety net, not the plan.
     lifecycle::restore_terminal();
-
-    // ratatui's `Terminal` shows the cursor again when it drops, and if that
-    // write fails it `eprintln!`s — which panics, because the print macros
-    // unwrap. On a dead terminal the write always fails, so the destructor
-    // would panic here, on the way out of the one exit path that most needs to
-    // finish (`monitor.stop()` and the unload both still have to run). Doing
-    // ratatui's job here first reports whether its destructor is safe to run at
-    // all: if the write lands there is nothing left for it to do, and if it
-    // does not, the value must not be dropped. `restore_terminal` has already
-    // shown the cursor either way, so nothing is lost by skipping it.
-    if terminal.show_cursor().is_err() {
-        mem::forget(terminal);
-    }
 
     // The receiver outlives the loop: after teardown it is the only way to
     // read the keyboard, and the exit path may still have a question.
