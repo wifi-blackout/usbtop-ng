@@ -27,6 +27,18 @@ usbtop-ng builds, runs its setup checks, and opens the terminal UI with live pac
 - Cross-platform support (Linux, *BSD, macOS — Windows WIP); live monitoring via usbmon is Linux-only — on BSD/macOS the UI can open (with `--force` where needed) but shows no devices
 - Low resource footprint
 
+### Degraded-terminal robustness
+
+A monitoring tool is most useful over the link that is least able to draw it. usbtop-ng is built to keep working — and to say what it lost — when the terminal cannot keep up:
+
+- **Dirty-gated rendering**: frames are drawn only when something actually changed, and never more often than ~30 per second. An idle session repaints on its `--refresh` tick and not in between, so nothing is redrawn just because the loop woke up.
+- **Synchronized output when the terminal supports it**: at startup usbtop-ng asks the terminal whether it understands mode 2026 (DECRQM, answered within 100ms) and brackets whole frames only if it says yes. A session that came in over ssh is not asked at all — the reply would cross a network, and a wrong answer costs more than the tearing it prevents.
+- **Backpressure shedding**: output goes to a non-blocking descriptor through a queue of whole frames. When the terminal stops reading and the backlog outgrows its allowance, queued frames are dropped rather than buffered forever — a slow link can no longer stall the loop that is reading usbmon. The header then adds `shed: N`, because the numbers on screen are current but the screen itself is N frames behind.
+- **Write-failure recovery**: a write that fails without the terminal being gone invalidates the screen, and the next pass wipes it and repaints from scratch instead of drawing diffs against a display that no longer matches. A terminal that is genuinely gone (`EPIPE`/`EIO`), or that fails every write for 30 attempts running, ends the session through the normal exit path.
+- **`Ctrl-L` manual repaint**: wipes the screen and paints a full frame, for whatever another program scribbled across it. It asks the terminal nothing (no cursor-position round trip), so it also works on the terminal that needs it most.
+- **Clean restore on panic and on signals**: a panic, a `SIGHUP`, a `SIGTERM` or a closing terminal emulator all leave through the same teardown as `q` — raw mode off, alternate screen left, cursor back, stdout's original flags restored. That restore is itself bounded to a quarter of a second, so a terminal that has stopped reading cannot hold the process on the way out.
+- **`--refresh` floor**: values below 100ms are clamped, because below that the loop spends more time waking up than the terminal can usefully repaint.
+
 ## 📦 Installation
 
 ```bash
@@ -59,7 +71,7 @@ usbtop-ng
 usbtop
 ```
 
-Press `q` to quit.  
+Press `h` for help, `Ctrl-L` to repaint the screen, `q` (or `Esc`, or `Ctrl-C`) to quit.  
 Run with `--help` to see all options.
 
 ### usbmon loading and unloading
@@ -95,7 +107,7 @@ usbtop-ng [OPTIONS]
 Options:
   -v, --verbose            Enable verbose logging
   -c, --config <CONFIG>    Preferences file path (default: ~/.usbtop-ng/preferences.toml)
-  -r, --refresh <REFRESH>  Refresh rate in milliseconds [default: 1000]
+  -r, --refresh <REFRESH>  Refresh rate in milliseconds (floored at 100ms) [default: 1000]
       --force              Force run without usbmon (limited functionality)
       --setup              Show platform-specific setup instructions
       --create-alias       Create shell alias for 'usbtop' command
