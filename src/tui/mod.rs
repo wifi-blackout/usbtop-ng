@@ -136,6 +136,11 @@ pub fn run_ui(
     // `eprintln!`s, and so would panic mid-destructor — is unreachable and
     // needs no guarding. `restore_terminal` shows the cursor too, so nothing is
     // lost if this one is shed.
+    //
+    // The panic path cannot be ordered like this — the hook runs, and unwinding
+    // drops the terminal afterwards — which is what the abandon latch armed in
+    // `enter_terminal` is for. Two mechanisms because there are two orders; do
+    // not retire either on the strength of the other.
     drop(terminal);
 
     // Explicit teardown; the panic hook is the safety net, not the plan.
@@ -191,6 +196,10 @@ fn enter_terminal() -> Result<(TuiTerminal, ShedHandles)> {
     // so these shared cells are the only way back in.
     let shed = writer.handles();
     shed.set_sync_mode(sync_mode);
+    // The restore has to be able to silence this writer before it makes stdout
+    // blocking again, and on the panic path it is handed nothing to silence it
+    // with — so it is given the latch now, while there is somewhere to put it.
+    lifecycle::arm_output_latch(shed.abandon_latch());
 
     Ok((Terminal::new(CrosstermBackend::new(writer))?, shed))
 }

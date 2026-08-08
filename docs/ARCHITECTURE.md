@@ -300,7 +300,7 @@ their own bounded channel and discard when it fills, with nothing to signal on. 
 wait is capped at `PACKET_DRAIN_INTERVAL`, a bare wake that drains the channel without
 touching the dirty flag or the frame cap.
 
-The numbers, all pinned by tests:
+The numbers, all exercised by tests:
 
 | Constant | Value | What it governs |
 | --- | --- | --- |
@@ -405,6 +405,18 @@ is still non-blocking it either goes out or is shed, and it cannot fail — whic
 keeps ratatui's "failed to show the cursor" branch (an `eprintln!`, and so a panic inside
 a destructor) unreachable.
 
+That ordering is only available to the *ordinary* exit path, which is why the restore also
+trips an **abandon latch** (`ShedHandles::abandon_latch`, registered with
+`lifecycle::arm_output_latch`) before it touches the flags. On the panic path nothing can
+be reordered: the hook runs, and unwinding drops the `Terminal` afterwards — by which time
+the descriptor is blocking again and the destructor's write would be unbounded against a
+terminal that may have stopped reading. With the latch tripped, `ShedWriter::flush_at`
+drops whatever is staged or queued and writes nothing. The same reasoning decides the exit
+question: if the restore's own bytes did not land inside the budget, the terminal is not
+reading, so `prompt_via_events` declines instead of writing a question into it. Both were
+verified on a pty in both directions — with the latch the panicking process leaves in
+0.26s, without it, it stops forever inside ratatui's destructor.
+
 Signals are turned into ordinary `UiEvent`s by a `signal-hook` thread, so a `SIGTERM`
 leaves through the same teardown as `q` instead of dropping the process on an alternate
 screen. Note that raw mode disables ISIG, so a `^C` typed at the UI never becomes a
@@ -433,6 +445,17 @@ answer nobody can type — holding usbmon loaded and the reader files open.
 - **Shedding is unix-only.** Off unix there is no `fcntl`, so `StdoutRaw` is an ordinary
   blocking stdout: nothing can tell that the terminal is behind, because a blocking write
   returns only once the bytes are gone. That is the pre-TUI-chassis behavior, kept as-is.
+- **The bound stops at usbtop-ng's own writes.** Everything above governs what this
+  program writes; it says nothing about what the language runtime writes. A panic's
+  message and backtrace are std's default hook writing to *stderr*, which usbtop-ng never
+  makes non-blocking (doing so would truncate the trace, and would leak `O_NONBLOCK` onto
+  the shell's stderr). On a terminal that has stopped reading, that write waits — and it
+  happens *inside* the hook, so it is reached before unwinding gets anywhere near the
+  latch. A pty check confirms the ordering: the panicking process parks in
+  `write(2, …, 115)`. The same goes for anything printed after teardown — the
+  automatic-unload notice, a `log::warn!`, or `sudo modprobe -r`'s own output. These are
+  ordinary blocking writes, no different from any other program's, and bounding them would
+  mean losing the very messages they carry.
 
 ### Dependencies
 
@@ -525,8 +548,9 @@ loop {
 - **Bounded buffers**: Historical data limited to prevent memory growth — bandwidth history by wall-clock age (60s), the sliding rate window by 250ms buckets
 - **Bounded channel**: The reader→UI channel holds at most `CHANNEL_BOUND` (16384) packets; a consumer that cannot keep up costs dropped (counted) packets, never growing memory
 - **Device cleanup**: Automatic removal of stale devices
-- **Packet pooling**: Reuse packet structures to reduce allocations
-- **String interning**: Common strings (vendor names) are deduplicated
+- **No packet retention**: a `UsbPacket` is parsed per event, moved through the bounded channel, folded into `BandwidthStats` by `apply_packet`, and dropped. Nothing accumulates per packet — the binary reader drains each event's captured payload rather than keeping it, and the sliding window is 250ms buckets rather than one entry per URB
+- **Per-device metadata**: vendor/product/serial are plain owned `Option<String>` fields on `UsbDevice` — no interning, no shared table. They are read from sysfs when the device is first seen, retried on later ticks only while the sysfs path is still unresolved, and then reused for the life of that device: the cost is a handful of allocations per device, not per packet or per frame
+- **Render snapshot**: `UsbTopApp::sync_from` rebuilds the whole `ControllerView`/`BusView`/`DeviceRow` tree each tick and drops the previous one, which is what keeps totals consistent (see [Snapshot Model](#snapshot-model-and-topology-resolution)); it is bounded by the device count, not by session length
 
 ## Platform Abstraction
 
