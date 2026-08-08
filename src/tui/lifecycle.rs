@@ -24,16 +24,12 @@ use crossterm::{
 };
 
 use super::events::UiEvent;
+use super::sync::END_SYNCHRONIZED_UPDATE;
 use super::ExitReason;
 
 /// Longest [`prompt_via_events`] waits for an answer before deciding for the
 /// user. The answer it picks is always the one that changes nothing.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// End a synchronized update. Emitted unconditionally on restore: if a frame
-/// was interrupted mid-update the terminal is holding everything back until it
-/// sees this — including the restore sequences that follow it.
-const END_SYNCHRONIZED_UPDATE: &str = "\x1b[?2026l";
 
 /// How long [`restore_with`] waits between attempts to get the restore
 /// sequences onto a terminal that is not taking them.

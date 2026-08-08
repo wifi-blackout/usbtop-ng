@@ -475,6 +475,11 @@ answer nobody can type — holding usbmon loaded and the reader files open.
   path: routine progress goes to `debug!`; a warning goes after the work it might have to
   report on.
 
+  One warning predates the rule and breaks it: if a reader thread panicked, `MonitorHandle::stop`
+  logs `warn!("usbmon reader thread panicked")` before it returns, and `stop()` itself runs
+  before the unload flow — so on a wedged-but-open terminal this warning, not just `-v`'s
+  `debug!` line, can park in front of the unload it was supposed to leave clear.
+
   Child processes are their own business too, though less than it looks:
   `attempt_unload_usbmon` uses `Command::output()`, which pipes `modprobe`'s stdout and
   stderr rather than letting them reach the terminal. What can still touch it is `sudo`
