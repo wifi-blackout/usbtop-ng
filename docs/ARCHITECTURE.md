@@ -54,14 +54,15 @@ interfaces alike.
 ### Core principles
 
 1. **Thread-based I/O.** Dedicated blocking reader threads read usbmon and pass
-   packets over an `mpsc` channel, so a stalled or idle interface never blocks
+   packets over an `mpsc` channel. A stalled or idle interface never blocks
    rendering.
 2. **Module boundaries.** Each module exposes a small interface and hides its
    internals.
 3. **Platform separation.** Platform-specific code sits behind `cfg` gates.
 4. **Memory safety.** Rust's ownership rules prevent the common errors.
 5. **Bounded work.** Every queue, window, and history has a limit.
-6. **Keyboard-driven UI.** Five key bindings cover the whole interface.
+6. **Keyboard-driven UI.** Seven keys cover the whole interface: `↑`, `↓`,
+   `h`, `Ctrl-L`, `q`, `Esc`, and `Ctrl-C`.
 
 ### Key components
 
@@ -72,7 +73,7 @@ interfaces alike.
 - `monitor.rs`: probes for the binary interface and spawns the reader threads,
   one per bus, or one for the aggregate interface. It owns the shutdown handle.
   It exposes the bounded `mpsc` receiver and the shared drop counter. Each
-  thread's `run_source` re-checks its own binary device, and falls back to that
+  thread's `run_source` re-checks its own binary node, and falls back to that
   bus's text interface when it cannot open it.
 - `reader.rs`: the blocking read loop over the text interface. The file opens
   `O_NONBLOCK` and polls, so a shutdown request lands promptly.
@@ -173,13 +174,13 @@ impl BinaryReader {
 - The callback interface keeps packet handling flexible. The production
   callback forwards each `UsbPacket` over an `mpsc` channel.
 - Both usbmon interfaces produce the same `UsbPacket` type.
-  `monitor::start_monitoring` probes once per process by opening
-  `/dev/usbmon<bus>` for the first target bus. Success means every target bus
+  `monitor::start_monitoring` probes once per process by opening the first
+  target bus's binary node, `/dev/usbmon<bus>`. Success means every target bus
   is read through `BinaryReader`. Failure, from a missing node, from
   permissions, or from an older kernel, falls back to `UsbmonReader` over the
   text interface for every target bus. One `info!` line states the choice.
 - That process-wide choice is a starting point rather than a promise. Each
-  reader thread re-opens its own `/dev/usbmon<bus>` before it enters the read
+  reader thread re-opens its own binary node before it enters the read
   loop. If that open fails, the thread warns and reads this bus's text
   interface instead. One bus with a missing or unreadable binary node therefore
   degrades to text rather than going dark.
@@ -335,8 +336,9 @@ Buses that share a controller id render under one `═ <controller id> ═`
 heading, sorted by bus id. A controller that does not resolve falls into an
 `unknown` group, which always sorts last.
 
-The side label comes from the bus's own speed. 480 Mbps or below is "USB2
-side", and 5 Gbps or above is "USB3 side". An unknown bus speed gets no label.
+The side label comes from the bus's own speed. A bus at 480 Mbps or below takes
+"USB2 side", and a faster bus takes "USB3 side". An unknown bus speed gets no
+label.
 That is how a shared xHCI controller's two root hubs list as adjacent sibling
 buses.
 
@@ -382,8 +384,8 @@ claim to show something it is not showing.
 ```
 
 The loop does not poll. Every pass it sleeps until the earliest instant at
-which it owes something. That is the next data tick, or, when the screen is
-dirty, one frame interval after the last frame. It folds whatever arrives into
+which it owes something. That is the next refresh interval, or, when the screen
+is dirty, one frame interval after the last frame. It folds whatever arrives into
 a single repaint. A burst of fifty resize events costs one frame rather than
 fifty. A session where nothing changed costs no frames at all between refresh
 intervals.
@@ -413,9 +415,9 @@ The numbers, all exercised by tests:
 ### Output stage: `ShedWriter`
 
 A terminal is a pipe, and a pipe fills up. Writing to a blocking stdout stops
-the render loop dead whenever the far end stops reading: a scrolled-back tmux
-pane, a laggy ssh link, a suspended emulator. A stopped render loop is also a
-stopped input loop. `ShedWriter` takes the descriptor non-blocking and absorbs
+the render loop dead whenever the far end stops reading. That end may be a
+scrolled-back tmux pane, a laggy ssh link, or a suspended emulator. A stopped
+render loop is also a stopped input loop. `ShedWriter` takes the descriptor non-blocking and absorbs
 the difference:
 
 ```
@@ -482,15 +484,17 @@ marker every terminal that does not know the mode would cost the full timeout.
 Reading up to the DA1 reply also keeps the reply bytes out of the input
 thread's keystrokes.
 
-The handshake runs in the one window where all three of its preconditions hold:
-raw mode is on, stdout is still blocking, and the input thread has not been
-spawned. usbtop-ng does not probe a remote session, which it detects from
-`SSH_TTY`, `SSH_CONNECTION`, or `SSH_CLIENT`. The one exception is a session
-whose `TERM` sits on a known-good list, and that list ships empty. No
-synchronized output over ssh is today's policy rather than an oversight.
-`sudo`'s default `env_reset` strips all three variables, so `sudo usbtop-ng`
-over ssh does get probed. That costs at most one `PROBE_TIMEOUT`, and `sudo -E`
-restores the conservative posture.
+The handshake runs in the one window where all three of its preconditions hold.
+Raw mode is on, stdout is still blocking, and the input thread has not been
+spawned.
+
+usbtop-ng does not probe a remote session, which it detects from `SSH_TTY`,
+`SSH_CONNECTION`, or `SSH_CLIENT`. The one exception is a session whose `TERM`
+sits on a known-good list, and that list ships empty. No synchronized output
+over ssh is today's policy rather than an oversight. `sudo`'s default
+`env_reset` strips all three variables, so `sudo usbtop-ng` over ssh does get
+probed. That costs at most one `PROBE_TIMEOUT`, and `sudo -E` restores the
+conservative posture.
 
 ### Lifecycle hooks
 
@@ -518,7 +522,8 @@ would panic inside a destructor.
 That ordering is only available to the ordinary exit path. So the restore also
 trips an abandon latch before it touches the flags. That latch is
 `ShedHandles::abandon_latch`, registered with `lifecycle::arm_output_latch`.
-Nothing can be reordered on the panic path: the hook runs, and unwinding drops
+
+Nothing can be reordered on the panic path. The hook runs, and unwinding drops
 the `Terminal` afterwards. By then the descriptor is blocking again, and the
 destructor's write would be unbounded against a terminal that may have stopped
 reading. With the latch tripped, `ShedWriter::flush_at` drops whatever is
@@ -570,13 +575,14 @@ then takes the answer that changes nothing.
   because a blocking write returns only once the bytes are gone. That is the
   pre-chassis behavior, kept as it was.
 - **The bound is drawn at stdout, and stops there.** The rule is mechanical,
-  which is what makes it checkable: fd 1 is the TUI's channel and is managed,
-  and fd 2 is diagnostics and is never touched. Every write usbtop-ng makes to
-  stdout after teardown is bounded or skipped. `write_within_budget` bounds the
-  restore sequences, the abandon latch stops the render pipeline, and
-  `restore_landed` gates the two remaining exit-flow writes:
-  `prompt_via_events`'s question and `usbmon::announce_automatic_unload`'s
-  notice.
+  which is what makes it checkable. usbtop-ng manages fd 1, the TUI's channel.
+  It never touches fd 2, which carries diagnostics.
+
+  Every write usbtop-ng makes to stdout after teardown is bounded or skipped.
+  `write_within_budget` bounds the restore sequences, and the abandon latch
+  stops the render pipeline. `restore_landed` gates the two remaining
+  exit-flow writes, which are `prompt_via_events`'s question and
+  `usbmon::announce_automatic_unload`'s notice.
 
   Nothing bounds stderr, on purpose. A panic's message and backtrace come from
   std's default hook writing there, and `log::info!` and `log::warn!` go there
@@ -599,9 +605,9 @@ then takes the answer that changes nothing.
 
   Genuine warnings keep their level. The unload's own failure warning is one,
   and it is written after the attempt. It can therefore delay that exit, but it
-  can no longer cost it the unload. The rule for anything added to this path:
-  routine progress goes to `debug!`, and a warning goes after the work it might
-  have to report on.
+  can no longer cost it the unload. Two rules cover anything added to this
+  path. Routine progress goes to `debug!`. A warning goes after the work it
+  might have to report on.
 
   One warning predates the rule and breaks it. If a reader thread panicked,
   `MonitorHandle::stop` logs `warn!("usbmon reader thread panicked")` before it
@@ -799,8 +805,8 @@ usbmon packets, and macOS has no packet source.
    thread by an `mpsc` channel.
 2. **Constant-time accounting.** One packet costs one bucket update and one sum
    adjustment, whatever the packet rate.
-3. **Bounded collections.** The channel holds 16384 packets, one pass applies
-   at most 8192 of them, and both 60 second histories evict by age.
+3. **Bounded collections.** The channel holds 16384 packets, and one pass
+   applies at most 8192 of them. Both 60 second histories evict by age.
 4. **Payload discarded, not copied.** The binary reader drains each event's
    captured bytes rather than carrying them into a `UsbPacket`.
 5. **Metadata read once.** usbtop-ng reads a device's sysfs metadata when it
@@ -820,6 +826,12 @@ usbmon loop are separate threads.
 A UI thread that cannot keep up costs packets rather than memory. Readers
 discard on a full channel and count the loss, which the header reports as
 `dropped: N`.
+
+### What this section does not claim
+
+No benchmark exists in this tree. This section states the limits the code
+enforces, and nothing about throughput, memory use, or CPU use. Add a benchmark
+before adding a figure of that kind.
 
 ## Security model
 
@@ -849,8 +861,8 @@ usbtop-ng needs elevated privileges to read usbmon.
    processes, and it prints the command it wants to run before it asks.
 2. **Parsing that rejects rather than guesses.** A malformed text line returns
    an error, which the reader logs and skips. The binary reader reads a fixed
-   48 byte header and drains exactly `len_cap` bytes, so a truncated capture
-   ends the loop instead of desynchronizing it.
+   48 byte header and drains exactly `len_cap` bytes. A truncated capture ends
+   the loop instead of desynchronizing it.
 3. **Preferences parsed through `toml` and `serde`.** A file that does not
    parse aborts startup with a message naming the path.
 4. **Directory permissions.** usbtop-ng creates its own `~/.usbtop-ng` with

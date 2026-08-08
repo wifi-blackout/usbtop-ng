@@ -14,6 +14,8 @@ pass, and how to send it.
 - [Architecture overview](#architecture-overview)
 - [Platform-specific development](#platform-specific-development)
 - [Release process](#release-process)
+- [Getting help](#getting-help)
+- [Conduct](#conduct)
 
 ## Getting started
 
@@ -51,14 +53,19 @@ pass, and how to send it.
    ```bash
    cargo install cargo-watch cargo-audit cargo-deny
    ```
+   Each tool lands in `~/.cargo/bin`. If one fails to build, skip it. Nothing
+   below needs it.
 2. Build the project:
    ```bash
    cargo build
    ```
+   The build writes `target/debug/usbtop-ng`. If it fails on a compiler error,
+   confirm that `cargo --version` reports Rust 1.88 or later.
 3. Run the tests:
    ```bash
    cargo test
    ```
+   The command reports 188 passed. A failure names the test. Fix it and repeat.
 4. To run with debug output, use:
    ```bash
    RUST_LOG=debug cargo run -- --verbose
@@ -406,11 +413,15 @@ known limitations.
    ```bash
    git tag v0.x.y
    ```
+   If the tag already exists, git says so. Choose the next version rather than
+   moving the tag.
 4. Create the GitHub release and attach the binaries.
 5. Publish the crate:
    ```bash
    cargo publish
    ```
+   The command uploads the crate. If it reports a missing login, run
+   `cargo login` first.
 
 ## Getting help
 

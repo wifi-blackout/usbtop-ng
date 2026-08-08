@@ -104,8 +104,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - The UI loop is event-driven instead of a fixed 50ms poll. It sleeps until the
-  earliest deadline it owes, either the next data tick or a pending frame one
-  33ms frame interval after the last. It folds a whole batch of queued events
+  earliest deadline it owes, either the next refresh interval or a pending
+  frame one 33ms frame interval after the last. It folds a whole batch of queued events
   into a single repaint, and draws only when something changed. An idle session
   no longer redraws at all between refresh intervals, and a burst of resize
   events costs one frame rather than one per event. The wait is capped at 50ms

@@ -18,6 +18,8 @@ and list no devices.
    ```bash
    git clone https://github.com/wifi-blackout/usbtop-ng.git
    ```
+   The clone creates a `usbtop-ng` directory. If that directory already exists,
+   skip to step 2.
 2. Enter the checkout:
    ```bash
    cd usbtop-ng
@@ -32,6 +34,8 @@ and list no devices.
    ```bash
    sudo cp target/release/usbtop-ng /usr/local/bin/
    ```
+   Confirm the copy with `usbtop-ng --version`. If `sudo` refuses, copy the
+   binary into a directory on your own path instead.
 
 To install through Cargo instead of copying the binary, run this from the
 checkout:
@@ -51,6 +55,8 @@ usbtop-ng loads usbmon for you. It prints the command and asks first, unless
    ```bash
    sudo modprobe usbmon
    ```
+   The command prints nothing on success. If it reports that the module was not
+   found, your kernel lacks usbmon.
 2. Confirm that the module is loaded:
    ```bash
    lsmod | grep usbmon

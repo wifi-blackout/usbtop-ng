@@ -29,6 +29,7 @@ Four blocks fill the window, top to bottom.
 - Read access to the usbmon interfaces. Root has that access. Anything short of
   root depends on the distribution.
 - Rust 1.88 or later, to build from source.
+- Git, to clone the repository.
 
 ## Install
 
@@ -104,9 +105,9 @@ key press and quits through the same teardown as `q`.
 - 🔺 marks the `!` column when the device's sysfs `version` reads 3.00 or
   higher and both its bus and its link run slower than SuperSpeed. 🔺 takes
   precedence over ⚡.
-- Every link speed carries a color, in the Speed cell, in the bus header's Mbps
-  figure, and in the controls bar legend: 1.5M, 12M, 480M, 5G, 10G+, and `?`
-  for unknown.
+- Every link speed carries a color. It tints the Speed cell, the bus header's
+  Mbps figure, and the controls bar legend. The legend reads 1.5M, 12M, 480M,
+  5G, 10G+, and `?` for unknown.
 - A device that disappears greys out for 5 seconds, then leaves the table.
 - The table scrolls to follow the selection, so `↑` and `↓` cannot walk the
   selection off screen.
