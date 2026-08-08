@@ -828,6 +828,26 @@ mod tests {
     }
 
     #[test]
+    fn withdrawing_support_stops_the_bracketing_from_the_next_frame_on() {
+        // What teardown relies on. The last thing written through this writer
+        // goes out after `restore_terminal` has already emitted its defensive
+        // `?2026l`, so a bracket around it would open an update on the restored
+        // shell that nothing else is left to close.
+        let (mut writer, handles) = writer(ScriptedRaw::scripted(vec![]), 80, 24);
+        handles.set_sync_mode(SyncMode::Supported);
+        frame(&mut writer, b"in the alternate screen");
+
+        handles.set_sync_mode(SyncMode::Unsupported);
+        frame(&mut writer, b"\x1b[?25h");
+
+        assert!(
+            writer.raw().written.ends_with(b"\x1b[?25h"),
+            "the last write is bare: {:?}",
+            writer.raw().written
+        );
+    }
+
+    #[test]
     fn an_unprobed_or_unsupported_terminal_gets_the_frame_bare() {
         // Two writers rather than one: "never told" and "told no" have to be
         // the same thing, because the second is what every ssh session gets.

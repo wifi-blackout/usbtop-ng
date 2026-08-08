@@ -117,6 +117,13 @@ pub fn run_ui(
     // across the shell the user just got back, so it is dropped here instead.
     // On a terminal that kept up there is nothing queued and nothing to drop.
     shed.discard_pending();
+    // And no more synchronized updates, for the same reason. `show_cursor`
+    // below still writes through the shed writer, but it writes *after* the
+    // restore has already emitted its defensive `?2026l` — so a bracket around
+    // it would open an update that only its own closing half could ever close
+    // again, on the shell the user just got back, with nothing left to rescue
+    // it if that write does not land whole.
+    shed.set_sync_mode(SyncMode::Unsupported);
 
     // Explicit teardown; the panic hook is the safety net, not the plan.
     lifecycle::restore_terminal();
