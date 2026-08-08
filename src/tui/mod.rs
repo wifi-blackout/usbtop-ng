@@ -174,6 +174,8 @@ fn enter_terminal() -> Result<(TuiTerminal, ShedHandles)> {
 
     let sync_mode = match probe_decision(
         env::var("SSH_TTY").ok().as_deref(),
+        env::var("SSH_CONNECTION").ok().as_deref(),
+        env::var("SSH_CLIENT").ok().as_deref(),
         env::var("TERM").ok().as_deref(),
     ) {
         ProbeDecision::Probe => probe_sync_mode(),

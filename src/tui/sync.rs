@@ -24,6 +24,18 @@
 //! is on a list of terminals known to behave — a list that ships empty, which
 //! makes "no synchronized output over ssh" today's policy rather than an
 //! accident.
+//!
+//! That policy is worth stating honestly, because it is only as good as the
+//! environment it reads. `sshd` exports `SSH_TTY`, `SSH_CONNECTION` and
+//! `SSH_CLIENT`, and [`probe_decision`] takes any one of them as proof of a
+//! remote session — but `sudo` strips all three under its default `env_reset`,
+//! and `sudo usbtop-ng` is the invocation this program's own setup instructions
+//! recommend. Such a session looks local from in here and *is* probed, over the
+//! network, which is exactly what the paragraph above says will not happen.
+//! What that costs is bounded: at worst one [`PROBE_TIMEOUT`] added to startup,
+//! or synchronized output over a link whose terminal did answer the query
+//! anyway. `sudo -E`, or an `env_keep` for those three variables, restores the
+//! conservative posture in full.
 
 #[cfg(unix)]
 use std::io;
@@ -92,15 +104,43 @@ const KNOWN_GOOD_OVER_SSH: &[&str] = &[];
 
 /// Whether to run the handshake, given the environment the session started in.
 ///
-/// `ssh_tty` is `SSH_TTY` and `term` is `TERM`, both as the process received
-/// them. A variable that is set but empty names nothing and is read as absent,
-/// which is what a shell that exported it without a value meant.
-pub fn probe_decision(ssh_tty: Option<&str>, term: Option<&str>) -> ProbeDecision {
-    let remote = ssh_tty.is_some_and(|tty| !tty.is_empty());
-    if !remote || term.is_some_and(|term| KNOWN_GOOD_OVER_SSH.contains(&term)) {
+/// Every argument is an environment variable as the process received it:
+/// `SSH_TTY`, `SSH_CONNECTION`, `SSH_CLIENT` and `TERM`. A remote session gets
+/// the handshake only if its `TERM` is in [`KNOWN_GOOD_OVER_SSH`], which ships
+/// empty; a local one always gets it.
+pub fn probe_decision(
+    ssh_tty: Option<&str>,
+    ssh_connection: Option<&str>,
+    ssh_client: Option<&str>,
+    term: Option<&str>,
+) -> ProbeDecision {
+    if !remote_session(ssh_tty, ssh_connection, ssh_client)
+        || term.is_some_and(|term| KNOWN_GOOD_OVER_SSH.contains(&term))
+    {
         return ProbeDecision::Probe;
     }
     ProbeDecision::AssumeUnsupported
+}
+
+/// Whether this session came in over ssh, as far as the environment admits.
+///
+/// Three variables rather than one because only the first is reliably present
+/// and none of them reliably survives. `sshd` sets `SSH_TTY` only when it
+/// allocated a tty, and `sudo`'s default `env_reset` drops all three — so any
+/// one of them non-empty is proof of a remote session, and none of them being
+/// set is not proof of a local one. See the module documentation for what that
+/// gap costs.
+///
+/// A variable that is set but empty names nothing and is read as absent, which
+/// is what a shell that exported it without a value meant.
+fn remote_session(
+    ssh_tty: Option<&str>,
+    ssh_connection: Option<&str>,
+    ssh_client: Option<&str>,
+) -> bool {
+    [ssh_tty, ssh_connection, ssh_client]
+        .into_iter()
+        .any(|marker| marker.is_some_and(|value| !value.is_empty()))
 }
 
 /// What the terminal's reply says about mode 2026.
@@ -366,13 +406,15 @@ pub fn probe_sync_mode() -> SyncMode {
 mod tests {
     use super::*;
 
+    /// A session with none of sshd's variables in it.
+    fn local(term: Option<&str>) -> ProbeDecision {
+        probe_decision(None, None, None, term)
+    }
+
     #[test]
     fn a_local_session_asks_the_terminal() {
-        assert_eq!(
-            probe_decision(None, Some("xterm-256color")),
-            ProbeDecision::Probe
-        );
-        assert_eq!(probe_decision(None, None), ProbeDecision::Probe);
+        assert_eq!(local(Some("xterm-256color")), ProbeDecision::Probe);
+        assert_eq!(local(None), ProbeDecision::Probe);
     }
 
     #[test]
@@ -387,11 +429,45 @@ mod tests {
             None,
         ] {
             assert_eq!(
-                probe_decision(Some("/dev/pts/3"), term),
+                probe_decision(Some("/dev/pts/3"), None, None, term),
                 ProbeDecision::AssumeUnsupported,
                 "TERM={term:?} over ssh"
             );
         }
+    }
+
+    #[test]
+    fn any_one_of_sshds_variables_is_enough_to_call_it_remote() {
+        // `SSH_TTY` is set only when sshd allocated a tty, so a session that
+        // reaches the TUI some other way — `ssh -T`, a forced command, a
+        // multiplexer — is still remote and still must not be probed.
+        let remote = [
+            ("SSH_TTY", (Some("/dev/pts/3"), None, None)),
+            (
+                "SSH_CONNECTION",
+                (None, Some("10.0.0.2 51234 10.0.0.1 22"), None),
+            ),
+            ("SSH_CLIENT", (None, None, Some("10.0.0.2 51234 22"))),
+        ];
+        for (name, (tty, connection, client)) in remote {
+            assert_eq!(
+                probe_decision(tty, connection, client, Some("xterm-256color")),
+                ProbeDecision::AssumeUnsupported,
+                "{name} alone"
+            );
+        }
+
+        // And all three together, which is what a plain interactive ssh looks
+        // like.
+        assert_eq!(
+            probe_decision(
+                Some("/dev/pts/3"),
+                Some("10.0.0.2 51234 10.0.0.1 22"),
+                Some("10.0.0.2 51234 22"),
+                Some("xterm-256color"),
+            ),
+            ProbeDecision::AssumeUnsupported
+        );
     }
 
     #[test]
@@ -403,8 +479,33 @@ mod tests {
     }
 
     #[test]
-    fn a_variable_exported_without_a_value_names_no_tty() {
-        assert_eq!(probe_decision(Some(""), Some("foot")), ProbeDecision::Probe);
+    fn a_variable_exported_without_a_value_names_nothing() {
+        // `${SSH_TTY:-}` in a shell profile, and the same for the other two: a
+        // variable with no value is not a session.
+        assert_eq!(
+            probe_decision(Some(""), Some(""), Some(""), Some("foot")),
+            ProbeDecision::Probe
+        );
+        assert!(!remote_session(Some(""), None, None));
+        assert!(!remote_session(None, Some(""), None));
+        assert!(!remote_session(None, None, Some("")));
+        // One real value among the empties is still a remote session.
+        assert!(remote_session(
+            Some(""),
+            Some("10.0.0.2 51234 10.0.0.1 22"),
+            None
+        ));
+    }
+
+    #[test]
+    fn sudo_strips_the_evidence_and_the_probe_cannot_tell() {
+        // Documented, not desired. `sudo`'s default `env_reset` drops all three
+        // variables, and `sudo usbtop-ng` is what this program's own setup text
+        // recommends — so an ssh session behind plain sudo is indistinguishable
+        // from a local one here and gets probed. This test exists so that the
+        // day someone finds a signal that does survive sudo, the gap it closes
+        // is written down rather than rediscovered.
+        assert_eq!(local(Some("xterm-256color")), ProbeDecision::Probe);
     }
 
     #[test]
