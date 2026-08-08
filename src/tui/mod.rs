@@ -165,6 +165,29 @@ fn enter_terminal() -> Result<(TuiTerminal, ShedHandles)> {
     Ok((Terminal::new(CrosstermBackend::new(writer))?, shed))
 }
 
+/// Wipe the screen and make the next draw a whole frame rather than a diff.
+///
+/// Deliberately not `Terminal::clear`, which snapshots the cursor position
+/// first — a DECRQM-style round trip that writes `ESC [ 6 n` and then waits for
+/// the terminal to answer on stdin. Both halves of that fail exactly when this
+/// function is needed most. The write goes to a descriptor that is refusing
+/// writes, and the answer would have to come from a terminal that has stopped
+/// reading; crossterm gives up after two seconds and reports an error, which
+/// would end the session on the one path that exists to rescue it. (The answer
+/// is not even reliably ours: the input thread owns stdin, so it can take the
+/// reply first — crossterm documents `position()` as unreliable while another
+/// thread is in `read()`.)
+///
+/// `resize` to the size already in force does the two things that matter —
+/// clear the screen, reset the diff's baseline — and asks the terminal nothing.
+fn force_full_repaint(terminal: &mut TuiTerminal) -> Result<()> {
+    // An ioctl, not a terminal round trip; `Terminal::draw` makes the same call
+    // on every frame anyway.
+    let size = terminal.size()?;
+    terminal.resize(size.into())?;
+    Ok(())
+}
+
 /// The event loop.
 ///
 /// It sleeps until the earliest deadline it owes — the next data tick, or the
@@ -222,7 +245,7 @@ fn run_app(
                     shed.set_area(cols, rows);
                 }
                 if fold.clear {
-                    terminal.clear()?;
+                    force_full_repaint(terminal)?;
                 }
                 dirty |= fold.dirty;
             }
@@ -265,7 +288,7 @@ fn run_app(
             // Frames were shed, or bytes were lost to a failed write: either
             // way the screen no longer matches ratatui's mirror of it, and
             // only a wipe plus a full frame can put that right.
-            terminal.clear()?;
+            force_full_repaint(terminal)?;
             dirty = true;
         }
     }
