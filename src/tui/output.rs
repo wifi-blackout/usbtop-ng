@@ -29,6 +29,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::sync::{SyncMode, BEGIN_SYNCHRONIZED_UPDATE, END_SYNCHRONIZED_UPDATE};
+
 /// How long after a shed the writer refuses to shed again.
 ///
 /// The frame that follows a shed is a full repaint — the biggest frame the app
@@ -157,6 +159,7 @@ pub struct ShedHandles {
     terminal_dead: Arc<AtomicBool>,
     high_watermark: Arc<AtomicUsize>,
     discard_requested: Arc<AtomicBool>,
+    synchronized: Arc<AtomicBool>,
 }
 
 impl ShedHandles {
@@ -202,6 +205,20 @@ impl ShedHandles {
     pub fn discard_pending(&self) {
         self.discard_requested.store(true, Ordering::SeqCst);
     }
+
+    /// Tell the writer whether the terminal can hold a frame back until it is
+    /// whole, which decides whether frames go out bracketed.
+    ///
+    /// Set once, from `tui::enter_terminal`, out of the DECRQM handshake; read
+    /// on every staged frame. The carrier is a shared `AtomicBool` for the same
+    /// reason every other cell here is: the writer disappears into ratatui's
+    /// backend, which keeps it private, so this is the only way to reach it. A
+    /// bool rather than the enum because the writer's question at staging time
+    /// is the binary one — bracket this frame or do not.
+    pub fn set_sync_mode(&self, mode: SyncMode) {
+        self.synchronized
+            .store(matches!(mode, SyncMode::Supported), Ordering::SeqCst);
+    }
 }
 
 /// tmux's rule for "too far behind": a screen's worth of cells at eight bytes
@@ -234,6 +251,10 @@ pub struct ShedWriter<R: RawOut> {
     invalidated: Arc<AtomicBool>,
     terminal_dead: Arc<AtomicBool>,
     discard_requested: Arc<AtomicBool>,
+    /// Whether staged frames get wrapped in a synchronized update. Shared
+    /// because the answer arrives from the handles; see
+    /// [`ShedHandles::set_sync_mode`].
+    synchronized: Arc<AtomicBool>,
 }
 
 impl<R: RawOut> ShedWriter<R> {
@@ -252,6 +273,9 @@ impl<R: RawOut> ShedWriter<R> {
             invalidated: Arc::new(AtomicBool::new(false)),
             terminal_dead: Arc::new(AtomicBool::new(false)),
             discard_requested: Arc::new(AtomicBool::new(false)),
+            // Until the handshake says otherwise, frames go out bare — which is
+            // what they did before mode 2026 was ever asked about.
+            synchronized: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -265,6 +289,7 @@ impl<R: RawOut> ShedWriter<R> {
             terminal_dead: Arc::clone(&self.terminal_dead),
             high_watermark: Arc::clone(&self.high_watermark),
             discard_requested: Arc::clone(&self.discard_requested),
+            synchronized: Arc::clone(&self.synchronized),
         }
     }
 
@@ -283,11 +308,38 @@ impl<R: RawOut> ShedWriter<R> {
     }
 
     /// Close off what ratatui just wrote and queue it as one frame.
+    ///
+    /// On a terminal that answered the mode-2026 handshake, the frame is
+    /// wrapped in a synchronized update *here* rather than around the write of
+    /// it. Inside the queue entry the begin, the diff and the end are one
+    /// indivisible thing: a shed drops whole frames, so it can only ever drop
+    /// both brackets together, and a partial write resumes inside them. There
+    /// is no arrangement in which the terminal sees a begin whose end was
+    /// dropped — which would be a screen that stops updating until teardown.
     fn stage_frame(&mut self) {
         if self.staging.is_empty() {
+            // An empty synchronized update is not free: it is a round trip
+            // through the terminal's presentation machinery for a screen that
+            // did not change.
             return;
         }
-        let frame = std::mem::take(&mut self.staging);
+
+        let frame = if self.synchronized.load(Ordering::SeqCst) {
+            let mut bracketed = Vec::with_capacity(
+                BEGIN_SYNCHRONIZED_UPDATE.len()
+                    + self.staging.len()
+                    + END_SYNCHRONIZED_UPDATE.len(),
+            );
+            bracketed.extend_from_slice(BEGIN_SYNCHRONIZED_UPDATE.as_bytes());
+            // Drains the staging buffer but keeps its allocation for the next
+            // frame, which is a frame's worth of `Vec` growth saved per flush.
+            bracketed.append(&mut self.staging);
+            bracketed.extend_from_slice(END_SYNCHRONIZED_UPDATE.as_bytes());
+            bracketed
+        } else {
+            std::mem::take(&mut self.staging)
+        };
+
         self.pending_bytes += frame.len();
         self.pending.push_back(frame);
     }
@@ -764,6 +816,83 @@ mod tests {
             !handles.take_repaint_request(),
             "one repaint answers both; a leftover flag would cost another"
         );
+    }
+
+    #[test]
+    fn a_supported_terminal_gets_its_frames_bracketed() {
+        let (mut writer, handles) = writer(ScriptedRaw::scripted(vec![]), 80, 24);
+        handles.set_sync_mode(SyncMode::Supported);
+
+        frame(&mut writer, b"hello");
+        assert_eq!(writer.raw().written, b"\x1b[?2026hhello\x1b[?2026l");
+    }
+
+    #[test]
+    fn an_unprobed_or_unsupported_terminal_gets_the_frame_bare() {
+        // Two writers rather than one: "never told" and "told no" have to be
+        // the same thing, because the second is what every ssh session gets.
+        for mode in [None, Some(SyncMode::Unsupported)] {
+            let (mut writer, handles) = writer(ScriptedRaw::scripted(vec![]), 80, 24);
+            if let Some(mode) = mode {
+                handles.set_sync_mode(mode);
+            }
+
+            frame(&mut writer, b"hello");
+            assert_eq!(writer.raw().written, b"hello", "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn the_bracket_is_part_of_the_frame_it_wraps() {
+        // The one property that matters: begin, frame and end are a single
+        // queue entry, so nothing downstream — a shed, a partial write, a
+        // teardown discard — can separate the end from its begin and leave the
+        // terminal holding a screen back forever.
+        let (mut writer, handles) = writer(ScriptedRaw::wedged(), 80, 24);
+        handles.set_sync_mode(SyncMode::Supported);
+
+        writer.write_all(b"\x1b[1;1H").unwrap();
+        writer.write_all(b"hello").unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(writer.pending.len(), 1, "one flush, one queue entry");
+        assert_eq!(writer.pending[0], b"\x1b[?2026h\x1b[1;1Hhello\x1b[?2026l");
+        assert_eq!(
+            writer.pending_bytes,
+            writer.pending[0].len(),
+            "the brackets are bytes the terminal owes like any others"
+        );
+    }
+
+    #[test]
+    fn a_shed_drops_bracketed_frames_whole() {
+        // A 1x1 screen: watermark 9, and the brackets alone are 16 bytes, so
+        // every frame is over on its own.
+        let (mut writer, handles) = writer(ScriptedRaw::wedged(), 1, 1);
+        handles.set_sync_mode(SyncMode::Supported);
+
+        frame(&mut writer, b"a");
+        assert_eq!(handles.shed_frames.load(Ordering::Relaxed), 1);
+        assert!(writer.pending.is_empty(), "nothing half-bracketed is left");
+        assert_eq!(writer.pending_bytes, 0);
+        assert!(
+            writer.raw().written.is_empty(),
+            "and nothing reached the wire"
+        );
+    }
+
+    #[test]
+    fn a_flush_with_nothing_staged_emits_no_empty_bracket() {
+        // An empty synchronized update is not free: it is a round trip through
+        // the terminal's presentation machinery for a screen that did not
+        // change, on every idle flush.
+        let (mut writer, handles) = writer(ScriptedRaw::scripted(vec![]), 80, 24);
+        handles.set_sync_mode(SyncMode::Supported);
+
+        writer.flush().unwrap();
+        assert!(writer.pending.is_empty());
+        assert!(writer.raw().written.is_empty());
+        assert_eq!(writer.raw().calls, 0);
     }
 
     #[test]

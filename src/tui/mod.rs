@@ -6,7 +6,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
-    io, iter, mem,
+    env, io, iter, mem,
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     time::{Duration, Instant},
 };
@@ -18,9 +18,11 @@ use crate::usbmon::parser::UsbPacket;
 pub(crate) mod events;
 pub(crate) mod lifecycle;
 pub(crate) mod output;
+pub(crate) mod sync;
 
 use events::UiEvent;
 use output::{ShedHandles, ShedWriter, StdoutRaw};
+use sync::{probe_decision, probe_sync_mode, ProbeDecision, SyncMode};
 
 /// The terminal as this program has it: ratatui, over crossterm, over the
 /// non-blocking output stage.
@@ -140,19 +142,37 @@ pub fn run_ui(
     })
 }
 
-/// Put the terminal into TUI mode: raw input, alternate screen, the
-/// non-blocking output stage, ratatui on top.
+/// Put the terminal into TUI mode: raw input, the mode-2026 handshake,
+/// alternate screen, the non-blocking output stage, ratatui on top.
 ///
-/// Order matters twice here. `arm_restore` runs before [`StdoutRaw::new`]
+/// Order matters three times here. `arm_restore` runs before [`StdoutRaw::new`]
 /// switches stdout to non-blocking, so what it saves — and what
-/// `restore_terminal` puts back — is stdout's *pre-TUI* flags. And the
-/// alternate screen is entered on the still-blocking descriptor, so that write
-/// cannot come back short.
+/// `restore_terminal` puts back — is stdout's *pre-TUI* flags. The alternate
+/// screen is entered on the still-blocking descriptor, so that write cannot
+/// come back short. And the handshake sits where it does because it is the only
+/// window in the program's life with all three of its preconditions true at
+/// once: raw mode is on (so the reply arrives a byte at a time and is not
+/// echoed), stdout is still blocking (so the query cannot come back short), and
+/// [`events::spawn_input_thread`] has not run (so the reply is still this
+/// thread's to read — afterwards stdin belongs to the input thread, which would
+/// deliver the reply to the event loop as keystrokes). It runs before the
+/// alternate screen for the same reason it runs at all: a terminal that hangs
+/// on the query has not yet been given a screen to hang on.
 fn enter_terminal() -> Result<(TuiTerminal, ShedHandles)> {
     enable_raw_mode()?;
-    // From here on there is something to undo, whoever gets to it first. This
-    // is also where stdout's original file-status flags are saved.
+    // From here on there is something to undo, whoever gets to it first — the
+    // handshake below included. This is also where stdout's original
+    // file-status flags are saved.
     lifecycle::arm_restore();
+
+    let sync_mode = match probe_decision(
+        env::var("SSH_TTY").ok().as_deref(),
+        env::var("TERM").ok().as_deref(),
+    ) {
+        ProbeDecision::Probe => probe_sync_mode(),
+        ProbeDecision::AssumeUnsupported => SyncMode::Unsupported,
+    };
+
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
 
@@ -161,6 +181,7 @@ fn enter_terminal() -> Result<(TuiTerminal, ShedHandles)> {
     // Taken before ratatui swallows the writer: the backend keeps it private,
     // so these shared cells are the only way back in.
     let shed = writer.handles();
+    shed.set_sync_mode(sync_mode);
 
     Ok((Terminal::new(CrosstermBackend::new(writer))?, shed))
 }
