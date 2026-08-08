@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use log::{debug, info, warn};
 use std::fs;
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -166,8 +167,6 @@ fn is_yes_response(input: &str) -> bool {
 }
 
 pub fn prompt_user_to_load_module() -> Result<bool> {
-    use std::io::{self, Write};
-
     println!("usbmon is not loaded, so usbtop-ng cannot read live USB traffic yet.");
     println!("usbtop-ng can run 'sudo modprobe usbmon' for you now.");
     println!("If debugfs is not mounted, it can also run:");
@@ -183,15 +182,25 @@ pub fn prompt_user_to_load_module() -> Result<bool> {
     Ok(is_yes_response(&input))
 }
 
-pub fn prompt_user_to_unload_module() -> Result<bool> {
-    use std::io::{self, Write};
+/// What the user is asked before an unload. It is a constant because it is
+/// asked two ways: straight from stdin before the TUI starts, and over the UI
+/// event channel after it exits, when stdin belongs to the input thread.
+pub const UNLOAD_QUESTION: &str = concat!(
+    "usbtop-ng loaded usbmon for this session.\n",
+    "You can leave it loaded for future USB monitoring, or unload it now with:\n",
+    "  sudo modprobe -r usbmon\n",
+    "\n",
+    "This may ask for your sudo password. Answer 'n' to leave usbmon loaded.\n",
+    "Unload usbmon now? (y/N): ",
+);
 
-    println!("usbtop-ng loaded usbmon for this session.");
-    println!("You can leave it loaded for future USB monitoring, or unload it now with:");
-    println!("  sudo modprobe -r usbmon");
-    println!();
-    println!("This may ask for your sudo password. Answer 'n' to leave usbmon loaded.");
-    print!("Unload usbmon now? (y/N): ");
+/// Ask about unloading by reading stdin. Only safe before the TUI starts:
+/// once the input thread exists it owns stdin, and this would race it.
+pub fn prompt_user_to_unload_module() -> Result<bool> {
+    // `write!` rather than `print!`: this is an exit path, and `print!` turns a
+    // failed write into a panic instead of the error this function already
+    // reports.
+    write!(io::stdout(), "{}", UNLOAD_QUESTION)?;
     io::stdout().flush()?;
 
     let mut input = String::new();
@@ -244,8 +253,21 @@ pub fn attempt_load_usbmon() -> Result<()> {
     }
 }
 
+/// Unload usbmon with `sudo modprobe -r`.
+///
+/// The progress line here is `debug!` where its counterpart in
+/// [`attempt_load_usbmon`] is `info!`, and the asymmetry is deliberate rather
+/// than an oversight. This is the only one of the two that runs on an *exit*
+/// path, and the default filter level is Info — so at the default settings that
+/// line was a write to stderr, in front of the unload, on a descriptor nobody
+/// manages. On a terminal that is still open but has stopped reading it waited
+/// there, and the unload it was announcing never happened; a pty check found it
+/// parked in `write(2, …, 116)`. Nothing is lost by dropping it below the
+/// default: the user is already told about an unload through stdout, by
+/// [`announce_automatic_unload`] or by the question itself, and both of those
+/// are skipped when the terminal cannot take them.
 pub fn attempt_unload_usbmon() -> Result<()> {
-    info!("Attempting to unload usbmon kernel module");
+    debug!("Attempting to unload usbmon kernel module");
 
     #[cfg(target_os = "linux")]
     {
@@ -284,22 +306,86 @@ pub fn unload_mode(preferences: &crate::config::Preferences) -> UnloadMode {
     }
 }
 
+/// Said when preferences have already decided, so that an unload the user did
+/// not ask for right now is at least announced.
+const AUTOMATIC_UNLOAD_NOTICE: &str =
+    "unload_usbmon_on_exit=true, so usbtop-ng will try to unload usbmon now.";
+
+/// Print the notice, unless there is nothing on the other end to read it.
+///
+/// Two different terminals fail here, and only one of them fails loudly. A
+/// terminal that is *gone* makes the write return an error, so `writeln!` and
+/// not `println!`: the print macros unwrap, and a panic on this line would skip
+/// the very unload it is announcing and turn a clean exit into a 101. That is
+/// the SIGHUP case — the emulator closed, so writes to the pty return EIO.
+///
+/// A terminal that has merely *stopped reading* fails silently and much worse.
+/// It is still open, so the write does not fail — it waits, and by the time this
+/// line runs `lifecycle::restore_terminal` has put stdout back to blocking, so
+/// it waits forever. `terminal_reachable` is that terminal's answer: the restore
+/// could not get twenty-odd bytes out inside its budget, so this notice would
+/// not get out either. The unload still happens; only the sentence about it is
+/// dropped.
+fn announce_automatic_unload(out: &mut impl Write, terminal_reachable: bool) {
+    if !terminal_reachable {
+        return;
+    }
+    let _ = writeln!(out, "{AUTOMATIC_UNLOAD_NOTICE}");
+}
+
+/// Unload usbmon, logging a failure instead of propagating it: every caller is
+/// on an exit path, where a module left loaded is a nuisance and not a reason
+/// to fail.
+///
+/// This warning stays at its level, unlike the progress line inside
+/// [`attempt_unload_usbmon`]. It is a real failure rather than routine
+/// progress, and it is written *after* the attempt — so a terminal that has
+/// stopped reading can delay this exit here, but it can no longer cost it the
+/// unload.
+fn unload_logging_failure() {
+    if let Err(e) = attempt_unload_usbmon() {
+        log::warn!("Failed to unload usbmon: {}", e);
+    }
+}
+
 /// Offer to unload usbmon after a session in which usbtop-ng loaded it.
 /// Called on every exit path that follows a successful load — including
 /// startup failures after the module was loaded.
-pub fn offer_unload_after_session(preferences: &crate::config::Preferences) {
+///
+/// `ask` is how the question reaches the user, because that differs by exit
+/// path: before the TUI starts it is a plain stdin read, and after it exits
+/// stdin belongs to the input thread, so the answer comes back over the UI
+/// event channel instead.
+///
+/// `terminal_reachable` is whether anything written here would actually arrive.
+/// Before the TUI it is simply true. After it, it is
+/// `tui::lifecycle::restore_landed` — because from the moment the terminal is
+/// handed back, stdout is blocking again, and a notice written to a terminal
+/// that has stopped reading is a process that never exits. What is dropped is
+/// only the words: the unload itself does not depend on anyone seeing them.
+pub fn offer_unload_after_session(
+    preferences: &crate::config::Preferences,
+    terminal_reachable: bool,
+    ask: impl FnOnce() -> bool,
+) {
     let should_unload = match unload_mode(preferences) {
         UnloadMode::Automatic => {
-            println!("unload_usbmon_on_exit=true, so usbtop-ng will try to unload usbmon now.");
+            announce_automatic_unload(&mut io::stdout(), terminal_reachable);
             true
         }
-        UnloadMode::Ask => prompt_user_to_unload_module().unwrap_or(false),
+        UnloadMode::Ask => ask(),
     };
     if should_unload {
-        if let Err(e) = attempt_unload_usbmon() {
-            log::warn!("Failed to unload usbmon: {}", e);
-        }
+        unload_logging_failure();
     }
+}
+
+/// The unload path for exits with nobody to ask — a hangup, a dead terminal, a
+/// failure inside the UI. The same flow, with the question already answered:
+/// a standing `unload_usbmon_on_exit` is honored, and anything that would have
+/// needed an answer leaves usbmon loaded, because silence is not consent.
+pub fn unload_without_asking(preferences: &crate::config::Preferences, terminal_reachable: bool) {
+    offer_unload_after_session(preferences, terminal_reachable, || false);
 }
 
 pub fn print_platform_instructions() {
@@ -339,7 +425,51 @@ pub fn print_platform_instructions() {
 #[cfg(test)]
 mod tests {
     use super::is_yes_response;
-    use super::{unload_mode, UnloadMode};
+    use super::{announce_automatic_unload, unload_mode, UnloadMode, AUTOMATIC_UNLOAD_NOTICE};
+    use std::io::{self, Write};
+
+    /// A terminal that has already gone away: every write fails, as writes to a
+    /// pty whose master closed do (EIO).
+    struct GoneTerminal;
+
+    impl Write for GoneTerminal {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    #[test]
+    fn the_automatic_unload_notice_survives_a_dead_terminal() {
+        // The one exit path that reaches this line without a user is the one
+        // where the terminal is gone, so the announcement must not panic:
+        // `println!` would, and would skip the unload it announces.
+        announce_automatic_unload(&mut GoneTerminal, true);
+    }
+
+    #[test]
+    fn the_automatic_unload_notice_is_not_written_to_a_terminal_that_stopped_reading() {
+        // The worse terminal: still open, so the write would not fail — it
+        // would wait, on a descriptor the teardown has already put back to
+        // blocking, on the last path of a process that is trying to leave.
+        let mut out = Vec::new();
+        announce_automatic_unload(&mut out, false);
+        assert!(out.is_empty(), "not one byte: {out:?}");
+    }
+
+    #[test]
+    fn the_automatic_unload_notice_is_written_when_the_terminal_is_reachable() {
+        // The gate must not silence the ordinary case: an unload the user did
+        // not ask for right now is still announced.
+        let mut out = Vec::new();
+        announce_automatic_unload(&mut out, true);
+        let said = String::from_utf8(out).expect("the notice is utf-8");
+        assert!(said.contains(AUTOMATIC_UNLOAD_NOTICE), "{said:?}");
+        assert!(said.ends_with('\n'), "and it closes its own line: {said:?}");
+    }
 
     #[test]
     fn yes_response_accepts_y_and_yes_case_insensitively() {

@@ -1,21 +1,14 @@
-use anyhow::Result;
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
-    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
     widgets::{Axis, Block, Borders, Chart, Clear, Dataset, Paragraph, Wrap},
-    Frame, Terminal,
+    Frame,
 };
 use std::{
     collections::BTreeMap,
-    io,
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::Receiver,
@@ -43,8 +36,9 @@ const HISTORY_WINDOW_SECS: f64 = 60.0;
 /// Most packets applied in one pass of the event loop. The channel's bound is
 /// what caps memory; this caps how long a single frame can spend catching up,
 /// so a burst can never stall input handling or the redraw. Anything left over
-/// is still queued for the next pass, one poll interval (~50ms) later.
-const DRAIN_BATCH: usize = 8_192;
+/// stays queued, and a pass that fills its batch tells the loop to come
+/// straight back for the rest instead of sleeping until the next tick.
+pub(crate) const DRAIN_BATCH: usize = 8_192;
 
 /// One device as rendered: its physical port chain plus a snapshot of the
 /// device itself, taken once per tick from the `DeviceManager`.
@@ -75,8 +69,9 @@ pub struct UsbTopApp {
     pub bandwidth_history: Vec<(f64, f64)>, // (timestamp, total_bandwidth)
     pub selected_device: Option<String>,
     pub show_help: bool,
-    pub last_update: Instant,
     pub start_time: Instant,
+    /// How often the loop takes a fresh snapshot of the devices; the schedule
+    /// itself lives in the loop (see `tui::run_app`), not here.
     pub refresh_rate: Duration,
     pub total_bandwidth: f64,
     pub peak_bandwidth: f64,
@@ -89,6 +84,11 @@ pub struct UsbTopApp {
     /// attached; the header surfaces it once it goes above zero, so a lossy
     /// session never reads like a complete one.
     pub dropped_counter: Option<Arc<AtomicU64>>,
+    /// Shared count of frames the output stage had to discard because the
+    /// terminal stopped reading (see `tui::output`). `None` outside a TUI
+    /// session. Same bargain as [`Self::dropped_counter`]: a session that is
+    /// showing less than it measured has to say so.
+    pub shed_counter: Option<Arc<AtomicU64>>,
 }
 
 impl UsbTopApp {
@@ -98,13 +98,13 @@ impl UsbTopApp {
             bandwidth_history: Vec::new(),
             selected_device: None,
             show_help: false,
-            last_update: Instant::now(),
             start_time: Instant::now(),
             refresh_rate,
             total_bandwidth: 0.0,
             peak_bandwidth: 0.0,
             list_scroll: 0,
             dropped_counter: None,
+            shed_counter: None,
         }
     }
 
@@ -118,6 +118,13 @@ impl UsbTopApp {
     /// Packets discarded so far, or 0 when no counter is attached.
     fn dropped_packets(&self) -> u64 {
         self.dropped_counter
+            .as_ref()
+            .map_or(0, |counter| counter.load(Ordering::Relaxed))
+    }
+
+    /// Frames discarded so far, or 0 when no counter is attached.
+    fn shed_frames(&self) -> u64 {
+        self.shed_counter
             .as_ref()
             .map_or(0, |counter| counter.load(Ordering::Relaxed))
     }
@@ -191,25 +198,6 @@ impl UsbTopApp {
         let cutoff = now - HISTORY_WINDOW_SECS;
         let expired = self.bandwidth_history.partition_point(|(t, _)| *t < cutoff);
         self.bandwidth_history.drain(0..expired);
-
-        self.last_update = Instant::now();
-    }
-
-    pub fn handle_input(&mut self) -> Result<bool> {
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
-                        KeyCode::Char('h') => self.show_help = !self.show_help,
-                        KeyCode::Up => self.select_previous_device(),
-                        KeyCode::Down => self.select_next_device(),
-                        _ => {}
-                    }
-                }
-            }
-        }
-        Ok(false)
     }
 
     fn select_previous_device(&mut self) {
@@ -278,6 +266,54 @@ impl UsbTopApp {
     }
 }
 
+/// What a key press leaves the event loop owing the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyOutcome {
+    /// The session is over.
+    Quit,
+    /// App state changed; the screen is stale until the next frame.
+    Redraw,
+    /// The screen itself is suspect (Ctrl-L): wipe it, then repaint.
+    ClearAndRedraw,
+    /// The key means nothing here; the screen is still correct.
+    None,
+}
+
+/// Apply one key event to `app` and report what the loop owes the screen.
+///
+/// Kept apart from the loop so every binding is testable without a terminal.
+pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
+    // Terminals that report repeat and release (kitty protocol, Windows) send
+    // several events per physical press; only the press acts.
+    if key.kind != KeyEventKind::Press {
+        return KeyOutcome::None;
+    }
+
+    match key.code {
+        // Checked before the bare letters so Ctrl-L stays a redraw request.
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyOutcome::ClearAndRedraw
+        }
+        // Raw mode turns off ISIG, so the terminal never turns ^C into a
+        // SIGINT. It arrives as this key event, and it still means quit.
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyOutcome::Quit,
+        KeyCode::Char('q') | KeyCode::Esc => KeyOutcome::Quit,
+        KeyCode::Char('h') => {
+            app.show_help = !app.show_help;
+            KeyOutcome::Redraw
+        }
+        KeyCode::Up => {
+            app.select_previous_device();
+            KeyOutcome::Redraw
+        }
+        KeyCode::Down => {
+            app.select_next_device();
+            KeyOutcome::Redraw
+        }
+        _ => KeyOutcome::None,
+    }
+}
+
 /// Snapshot one bus: its devices in physical port order.
 fn bus_view(bus: &UsbBus) -> BusView {
     let mut devices: Vec<DeviceRow> = bus
@@ -321,62 +357,10 @@ fn side_label(speed: &UsbSpeed) -> &'static str {
     }
 }
 
-pub fn run_ui(
-    mut app: UsbTopApp,
-    mut manager: DeviceManager,
-    packets: Receiver<UsbPacket>,
-) -> Result<()> {
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let result = run_app(&mut terminal, &mut app, &mut manager, &packets);
-
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    result
-}
-
-fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    app: &mut UsbTopApp,
-    manager: &mut DeviceManager,
-    packets: &Receiver<UsbPacket>,
-) -> Result<()> {
-    loop {
-        drain_packets(manager, packets, DRAIN_BATCH);
-
-        if app.last_update.elapsed() >= app.refresh_rate {
-            // `sync_from` rebuilds the whole snapshot, so the list of devices
-            // dropped by this refresh needs no separate handling.
-            let _ = manager.refresh();
-            app.sync_from(manager);
-            app.update_bandwidth_history();
-        }
-
-        terminal.draw(|f| draw_ui(f, app))?;
-
-        if app.handle_input()? {
-            break;
-        }
-    }
-    Ok(())
-}
-
 /// Apply up to `batch` queued packets to the manager and report how many were
 /// applied. Any `try_recv` error (empty or disconnected) means "nothing to
 /// drain", which keeps the UI alive in --force mode with no usbmon readers.
-fn drain_packets(
+pub(crate) fn drain_packets(
     manager: &mut DeviceManager,
     packets: &Receiver<UsbPacket>,
     batch: usize,
@@ -394,7 +378,7 @@ fn drain_packets(
     applied
 }
 
-fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
+pub(crate) fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
     if app.show_help {
         draw_help_overlay(f);
         return;
@@ -406,7 +390,10 @@ fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Header
+            // Four, not three: the header is a title line and a stats line
+            // inside a border, and a row short of that clips the stats line —
+            // which is where `dropped:` and `shed:` are reported.
+            Constraint::Length(4), // Header
             Constraint::Length(8), // Bandwidth graph
             Constraint::Min(10),   // Device list
             Constraint::Length(4), // Controls
@@ -455,6 +442,19 @@ fn draw_header(f: &mut Frame, area: Rect, app: &UsbTopApp) {
         stats_line.push(Span::raw(" | dropped: "));
         stats_line.push(Span::styled(
             dropped.to_string(),
+            Style::default()
+                .fg(SECONDARY_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Same bargain one layer out: these numbers were measured, but the screen
+    // showing them is behind by this many frames.
+    let shed = app.shed_frames();
+    if shed > 0 {
+        stats_line.push(Span::raw(" | shed: "));
+        stats_line.push(Span::styled(
+            shed.to_string(),
             Style::default()
                 .fg(SECONDARY_COLOR)
                 .add_modifier(Modifier::BOLD),
@@ -875,8 +875,16 @@ fn draw_help_overlay(f: &mut Frame) {
             Span::raw("        Toggle this help"),
         ]),
         Line::from(vec![
+            Span::styled("  Ctrl-L", Style::default().fg(ACCENT_COLOR)),
+            Span::raw("   Wipe the screen and repaint it from scratch"),
+        ]),
+        Line::from(vec![
             Span::styled("  q/Esc", Style::default().fg(ACCENT_COLOR)),
             Span::raw("    Quit application"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Ctrl-C", Style::default().fg(ACCENT_COLOR)),
+            Span::raw("   Quit application"),
         ]),
         Line::from(""),
         Line::from("Features:"),
@@ -885,6 +893,8 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from("  • ⚡ high-utilization indicator (>80% of practical bandwidth)"),
         Line::from("  • 🔺 device declares USB 3.x support but linked slower — best-effort signal"),
         Line::from("  • Header shows 'dropped: N' if packets were lost to a full queue"),
+        Line::from("  • Header shows 'shed: N' if frames were dropped to keep up with a slow"),
+        Line::from("    terminal — the numbers are current, the screen is N frames behind"),
         Line::from("  • Color-coded USB link speeds"),
         Line::from("  • Split charts: aggregate total, plus the selected device's rx/tx"),
         Line::from("  • Device disconnect detection"),
@@ -926,6 +936,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::usbmon::parser::parse_usbmon_text_line;
+    use ratatui::Terminal;
 
     fn feed(mgr: &mut DeviceManager, lines: &[&str]) {
         for l in lines {
@@ -1168,6 +1179,140 @@ mod tests {
         assert_eq!(app.selected_device.as_deref(), Some("3:6"));
         app.select_previous_device(); // wraps
         assert_eq!(app.selected_device.as_deref(), Some("4:2"));
+    }
+
+    /// A plain, unmodified key press.
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// The same key press with Control held.
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn quit_keys_end_the_session() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('q'))),
+            KeyOutcome::Quit
+        );
+        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Quit);
+    }
+
+    #[test]
+    fn ctrl_c_ends_the_session_too() {
+        // Raw mode turns off ISIG, so ^C never becomes a SIGINT: it arrives
+        // here as an ordinary key press and has to be honored as one.
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(
+            apply_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
+            KeyOutcome::Quit
+        );
+    }
+
+    #[test]
+    fn ctrl_l_asks_for_a_wipe_and_a_repaint() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(
+            apply_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)
+            ),
+            KeyOutcome::ClearAndRedraw
+        );
+        // Bare "l" is an unbound letter, not a redraw request.
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('l'))),
+            KeyOutcome::None
+        );
+    }
+
+    #[test]
+    fn help_key_toggles_the_overlay() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('h'))),
+            KeyOutcome::Redraw
+        );
+        assert!(app.show_help);
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('h'))),
+            KeyOutcome::Redraw
+        );
+        assert!(!app.show_help);
+    }
+
+    /// The overlay is the only place the bindings are written down, so what it
+    /// says has to be what `apply_key` does — and it has to survive the layout,
+    /// which is the half a text-only assertion would miss.
+    #[test]
+    fn the_help_overlay_lists_the_bindings_that_exist() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.show_help = true;
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 60)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+
+        // Distinctive strings, not bare letters: a lone "h" would match
+        // anywhere on the screen and assert nothing.
+        for binding in ["↑/↓", "Toggle this help", "Ctrl-L", "q/Esc", "Ctrl-C"] {
+            assert!(screen.contains(binding), "{binding} missing from {screen}");
+        }
+        // And both counters the header can spring on the user are explained.
+        assert!(screen.contains("dropped: N"), "{screen}");
+        assert!(screen.contains("shed: N"), "{screen}");
+
+        assert_eq!(
+            apply_key(&mut app, ctrl(KeyCode::Char('l'))),
+            KeyOutcome::ClearAndRedraw
+        );
+        assert_eq!(
+            apply_key(&mut app, ctrl(KeyCode::Char('c'))),
+            KeyOutcome::Quit
+        );
+    }
+
+    #[test]
+    fn unbound_keys_leave_the_screen_alone() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('x'))),
+            KeyOutcome::None
+        );
+    }
+
+    #[test]
+    fn only_presses_act() {
+        // Terminals that report key repeat and release (kitty protocol,
+        // Windows) would otherwise fire a binding up to three times per press.
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            let event = KeyEvent::new_with_kind(KeyCode::Char('q'), KeyModifiers::NONE, kind);
+            assert_eq!(apply_key(&mut app, event), KeyOutcome::None);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn arrow_keys_move_the_selection() {
+        let (_t, mut mgr) = topology_fixture();
+        feed(
+            &mut mgr,
+            &["f1 100 C Bi:3:006:1 0 64 <", "f2 300 C Bi:4:002:1 0 64 <"],
+        );
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        assert_eq!(apply_key(&mut app, key(KeyCode::Down)), KeyOutcome::Redraw);
+        assert_eq!(app.selected_device.as_deref(), Some("3:6"));
+        assert_eq!(apply_key(&mut app, key(KeyCode::Up)), KeyOutcome::Redraw);
+        assert_eq!(app.selected_device.as_deref(), Some("4:2"), "wraps to last");
     }
 
     /// Total display width of a device row: every column plus one space between.
@@ -1523,6 +1668,54 @@ mod tests {
         counter.store(42, Ordering::Relaxed);
         let screen = render(&app);
         assert!(screen.contains("dropped: 42"), "{screen}");
+    }
+
+    /// A session whose terminal could not keep up is showing stale numbers,
+    /// and the header is the only place that can admit it.
+    #[test]
+    fn header_reports_shed_frames_only_once_some_were_shed() {
+        let render = |app: &UsbTopApp| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(90, 4)).unwrap();
+            terminal.draw(|f| draw_header(f, f.area(), app)).unwrap();
+            terminal.backend().to_string()
+        };
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert!(!render(&app).contains("shed"), "no counter wired up");
+
+        let counter = Arc::new(AtomicU64::new(0));
+        app.shed_counter = Some(Arc::clone(&counter));
+        let screen = render(&app);
+        assert!(!screen.contains("shed"), "nothing shed yet: {screen}");
+
+        counter.store(7, Ordering::Relaxed);
+        let screen = render(&app);
+        assert!(screen.contains("shed: 7"), "{screen}");
+    }
+
+    /// The two tests above draw the header into a rect of their own choosing,
+    /// which is exactly the blind spot this one closes: the header is two
+    /// content lines inside a border, so a layout that hands it any less than
+    /// four rows clips the stats line away — and every counter this program has
+    /// for admitting it is behind lives on that line.
+    #[test]
+    fn the_whole_ui_leaves_room_for_the_header_stats_line() {
+        let dropped = Arc::new(AtomicU64::new(42));
+        let shed = Arc::new(AtomicU64::new(7));
+        let mut app =
+            UsbTopApp::new(Duration::from_millis(100)).with_dropped_counter(Arc::clone(&dropped));
+        app.shed_counter = Some(Arc::clone(&shed));
+
+        // Drawn through `draw_ui`, not `draw_header`: the layout is the thing
+        // under test.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(screen.contains("Total: "), "{screen}");
+        assert!(screen.contains("Peak: "), "{screen}");
+        assert!(screen.contains("dropped: 42"), "{screen}");
+        assert!(screen.contains("shed: 7"), "{screen}");
     }
 
     /// The chart's x-axis is 60 seconds wide, so the history it plots is

@@ -7,6 +7,7 @@ This document provides a detailed overview of usbtop-ng's architecture, design d
 - [Overview](#overview)
 - [System Architecture](#system-architecture)
 - [Module Design](#module-design)
+- [TUI Chassis](#tui-chassis)
 - [Data Flow](#data-flow)
 - [Platform Abstraction](#platform-abstraction)
 - [Performance Considerations](#performance-considerations)
@@ -71,10 +72,20 @@ usbtop-ng is designed as a modular USB monitoring tool with clear separation of 
 #### 4. User Interface (`ui/`)
 - **Purpose**: Terminal-based user interface
 - **Components**:
-  - `mod.rs`: App state, the packet-drain/refresh/draw event loop, and all widget rendering
+  - `mod.rs`: App state (`UsbTopApp`), the per-tick render snapshot, key handling (`apply_key`), the packet drain (`drain_packets`), and all widget rendering
   - `colors.rs`: Color scheme definitions
 
-#### 5. Configuration (`config/`)
+#### 5. TUI Chassis (`tui/`)
+- **Purpose**: Everything between the app state and the terminal device: when to draw, how the bytes get out, and how the terminal is given back
+- **Components**:
+  - `mod.rs`: terminal setup/teardown and the deadline-driven event loop (`run_app`)
+  - `events.rs`: the input thread, the `UiEvent` type every wake source arrives as, and the redraw scheduling arithmetic
+  - `output.rs`: `ShedWriter`, the non-blocking output stage with backpressure shedding
+  - `sync.rs`: the mode-2026 (synchronized output) handshake and the policy for when to run it
+  - `lifecycle.rs`: terminal restore, the panic hook, the signal thread, and what an exit path is still allowed to ask the user
+- See [TUI Chassis](#tui-chassis) for how these fit together
+
+#### 6. Configuration (`config/`)
 - **Purpose**: Settings management and persistence
 - **Features**:
   - TOML-based configuration
@@ -245,6 +256,248 @@ unresolved → `None` (sorts last, Port column shows `?`). Devices within a bus 
 by this chain, numerically level by level, which lists hub children in physical
 connector order.
 
+## TUI Chassis
+
+`src/tui/` holds everything between the app state and the terminal device. It exists
+because the interesting failures of a monitoring tool are not USB failures: they are a
+terminal that stopped reading, a link that went away mid-frame, a panic with the
+alternate screen still up. The design rule throughout is that the loop must never be
+blocked by the display, and must never claim to be showing something it is not.
+
+### Threads and wake sources
+
+```
+  input thread (detached)         signal thread (detached)
+  parks in event::read()          parks in signal-hook's iterator
+  owns stdin for the              SIGHUP / SIGINT / SIGTERM
+  life of the process                      │
+          │ UiEvent::Input                 │ UiEvent::Signal(n)
+          │ UiEvent::TerminalDead          │
+          └──────────────┬─────────────────┘
+                         ▼
+                mpsc::channel<UiEvent>          sync_channel<UsbPacket>(16384)
+                         │                        (usbmon reader threads)
+                         ▼                                  │
+        ┌────────────────────────────────────┐              │
+        │  deadline loop  (tui::run_app)      │◀─ drained ───┘
+        │                                     │   every pass, ≤8192/pass
+        │  recv_timeout(next_wait) ──▶ fold   │
+        │  drain packets ──▶ tick? ──▶ draw?  │
+        └───────────────┬─────────────────────┘
+                        │ ratatui frame
+                        ▼
+             ShedWriter ──▶ stdout (O_NONBLOCK)
+```
+
+The loop does not poll. Every pass it sleeps until the earliest instant at which it
+owes something — the next data tick, or, if the screen is dirty, one frame interval
+after the last frame — and folds whatever arrives into a single repaint. A burst of
+fifty resize events costs one frame, not fifty; a session where nothing changed costs
+no frames at all between refresh ticks.
+
+The one thing that cannot wake the loop is a packet: the reader threads push onto
+their own bounded channel and discard when it fills, with nothing to signal on. So the
+wait is capped at `PACKET_DRAIN_INTERVAL`, a bare wake that drains the channel without
+touching the dirty flag or the frame cap.
+
+The numbers, all exercised by tests:
+
+| Constant | Value | What it governs |
+| --- | --- | --- |
+| `events::MIN_FRAME_INTERVAL` | 33ms | Shortest gap between two frames (~30 FPS) |
+| `events::PACKET_DRAIN_INTERVAL` | 50ms | Longest the loop may sleep, so packets drain |
+| `tui::REFRESH_FLOOR_MS` | 100ms | Floor for `--refresh` |
+| `ui::DRAIN_BATCH` | 8192 | Most packets applied in one pass |
+| `output::WATERMARK_FLOOR` | 4096 bytes | Smallest output backlog allowed before shedding |
+| `output::SHED_GRACE` | 1s | How long after a shed the writer will not shed again |
+| `output::MAX_CONSECUTIVE_WRITE_FAILURES` | 30 | Unclassified write failures in a row that mean death |
+| `sync::PROBE_TIMEOUT` | 100ms | Longest the mode-2026 handshake waits for a reply |
+| `lifecycle` restore budget | 250ms | Longest teardown spends on a terminal that will not read |
+
+### Output stage: `ShedWriter`
+
+A terminal is a pipe, and a pipe fills up. Writing to a blocking stdout means the render
+loop stops dead whenever the far end stops reading — a scrolled-back tmux pane, a laggy
+ssh link, a suspended emulator — and a stopped render loop is also a stopped input loop.
+`ShedWriter` takes the descriptor non-blocking and absorbs the difference:
+
+```
+  ratatui write()  ──▶ staging buffer (bytes, no I/O yet)
+  ratatui flush()  ──▶ stage_frame:  staging becomes ONE queue entry
+                       (bracketed with ESC[?2026h / ESC[?2026l here, if
+                        the terminal said it supports synchronized output,
+                        so begin+diff+end are indivisible)
+                   ──▶ shed check:   backlog > watermark and not in grace?
+                                     drop every queued frame that has put
+                                     no bytes on the wire, count them,
+                                     ask the loop for a full repaint,
+                                     start a 1s grace period
+                   ──▶ drain:        non-blocking write(2) from the head of
+                                     the queue as far as it will go
+```
+
+Frame granularity is what makes truncation mid-escape-sequence impossible: a queue entry
+is a whole frame, so a shed drops whole frames and a partial write resumes inside one.
+The watermark is tmux's rule — `1 + cols * rows * 8`, roughly two full repaints' worth of
+escapes — with a 4096-byte floor under it, because a terminal reporting 0x0 (mid-resize)
+or 1x1 (a pane dragged shut) would otherwise be allowed a backlog smaller than a single
+cursor move, and would shed every frame it ever staged.
+
+What the drain does with each outcome:
+
+| From `write(2)` | Meaning | Response |
+| --- | --- | --- |
+| `Ok(n)` | Progress | Advance the cursor; forget any earlier failures |
+| `WouldBlock` | Terminal is full | Stop; the next flush resumes at the cursor |
+| `Interrupted` | A signal landed mid-write | Retry immediately |
+| `EPIPE` / `EIO` | The terminal is gone | Set `terminal_dead`; the loop leaves |
+| anything else | This write failed | Set `invalidated`, drop the frame — and after 30 in a row with nothing landing in between, `terminal_dead` |
+
+Nothing here reports failure through `io::Write`. Returning an error to ratatui mid-frame
+would take its teardown off the healthy path for something the loop can handle better a
+few microseconds later, so `write` and `flush` are infallible and the shared atomics
+behind `ShedHandles` are the signalling channel. The loop reads them after every pass:
+`terminal_dead` ends the session, `take_repaint_request` (set by a shed *or* by a failed
+write) forces a full repaint, because in both cases the screen no longer matches
+ratatui's mirror of it.
+
+That full repaint is deliberately not `Terminal::clear`, which snapshots the cursor
+position first — a round trip that writes `ESC[6n` and waits for the terminal to answer
+on stdin. Both halves fail exactly when a repaint is most needed. `force_full_repaint`
+uses `Terminal::resize` to the size already in force instead: it clears the screen and
+resets the diff's baseline while asking the terminal nothing.
+
+### Synchronized output
+
+`ESC[?2026h` / `ESC[?2026l` tells a terminal to stop presenting until the frame is whole,
+which is the difference between a clean update and a visibly half-drawn table over a slow
+link. Emitting it blind is not safe — a terminal that mishandles it leaves the user
+looking at a screen that has stopped updating — so `sync::probe_sync_mode` asks first,
+with DECRQM (`ESC[?2026$p`) followed by DA1 (`ESC[c`). DA1 is the part that makes the
+query cheap: DECRQM has no negative answer, so without a marker every terminal that does
+not know the mode would cost the full timeout. Reading up to the DA1 reply is also what
+keeps the reply bytes out of the input thread's keystrokes.
+
+The handshake runs in the one window where all three of its preconditions hold: raw mode
+is on, stdout is still blocking, and the input thread has not been spawned. A remote
+session (`SSH_TTY`, `SSH_CONNECTION` or `SSH_CLIENT` set) is not probed at all unless its
+`TERM` is on a known-good list that ships empty — "no synchronized output over ssh" is
+today's policy, not an oversight. `sudo`'s default `env_reset` strips all three variables,
+so `sudo usbtop-ng` over ssh does get probed; the cost is bounded at one `PROBE_TIMEOUT`,
+and `sudo -E` restores the conservative posture.
+
+### Lifecycle hooks
+
+`lifecycle::arm_restore` runs immediately after `enable_raw_mode`, before anything else
+can fail, and saves stdout's pre-TUI file-status flags. From then on `restore_terminal`
+has something to undo, and it is idempotent: teardown and the panic hook both race for it
+and only the first does any work. It leaves raw mode, closes any open synchronized update,
+leaves the alternate screen, shows the cursor — and puts the original descriptor flags
+back *last*, after the escape sequences have gone out on a bounded non-blocking retry.
+The order matters: restoring the flags first would mean writing the restore into a
+blocking descriptor, and a terminal that has stopped reading would hold the process there
+forever. That path only became reachable once sessions started surviving a wedged
+terminal all the way to exit.
+
+For the same reason ratatui's `Terminal` is dropped *before* the restore. Its destructor
+shows the cursor again, which is a write through `ShedWriter`; done while the descriptor
+is still non-blocking it either goes out or is shed, and it cannot fail — which is what
+keeps ratatui's "failed to show the cursor" branch (an `eprintln!`, and so a panic inside
+a destructor) unreachable.
+
+That ordering is only available to the *ordinary* exit path, which is why the restore also
+trips an **abandon latch** (`ShedHandles::abandon_latch`, registered with
+`lifecycle::arm_output_latch`) before it touches the flags. On the panic path nothing can
+be reordered: the hook runs, and unwinding drops the `Terminal` afterwards — by which time
+the descriptor is blocking again and the destructor's write would be unbounded against a
+terminal that may have stopped reading. With the latch tripped, `ShedWriter::flush_at`
+drops whatever is staged or queued and writes nothing. The same reasoning decides the exit
+question: if the restore's own bytes did not land inside the budget, the terminal is not
+reading, so `prompt_via_events` declines instead of writing a question into it — and so
+does `usbmon::offer_unload_after_session`, whose automatic-unload notice is the last
+stdout write on the `SIGHUP` + `unload_usbmon_on_exit` path. The unload still runs; only
+the sentence about it is dropped. All of it was verified on a pty in both directions —
+with the latch the panicking process leaves in 0.26s, without it, it stops forever inside
+ratatui's destructor; with the notice gated the hangup exit leaves in 0.26s having
+attempted the unload, without it, it stops forever in `write(1, …)`.
+
+Signals are turned into ordinary `UiEvent`s by a `signal-hook` thread, so a `SIGTERM`
+leaves through the same teardown as `q` instead of dropping the process on an alternate
+screen. Note that raw mode disables ISIG, so a `^C` typed at the UI never becomes a
+`SIGINT` at all: it arrives as a key event and is bound to quit.
+
+What an exit path may still ask the user is `lifecycle::unload_policy`'s decision, and it
+turns on who is left to answer: a hangup or a dead terminal unloads usbmon only if
+preferences already said to, because prompting would park the process forever on an
+answer nobody can type — holding usbmon loaded and the reader files open.
+
+### Known limitations
+
+- **Signal handlers stay registered for the life of the process.** The signal thread parks
+  in `signal-hook`'s iterator and is never torn down, so after the TUI exits `SIGINT` is
+  still swallowed into a channel nobody is reading. The visible consequence is that
+  `Ctrl-C` cannot interrupt the post-session `sudo modprobe -r usbmon`. Deregistering
+  would mean racing the thread that is parked inside the iterator, which is a worse
+  trade than the one being made.
+- **The input thread is detached and never joined.** A blocked read on a tty cannot be
+  portably cancelled — there is no cross-platform "cancel this read" and no timeout on
+  `read` itself — so the thread lives until the process exits. Two consequences are load
+  bearing: it owns stdin after the TUI comes up, which is why post-exit prompts are routed
+  through the `UiEvent` channel (`UiSession::confirm`) rather than read from stdin
+  directly; and the loop's receiver is deliberately kept alive past teardown so those
+  keystrokes still have somewhere to land.
+- **Shedding is unix-only.** Off unix there is no `fcntl`, so `StdoutRaw` is an ordinary
+  blocking stdout: nothing can tell that the terminal is behind, because a blocking write
+  returns only once the bytes are gone. That is the pre-TUI-chassis behavior, kept as-is.
+- **The bound is drawn at stdout, and stops there.** The rule is mechanical, which is what
+  makes it checkable: **fd 1 is the TUI's channel and is managed; fd 2 is diagnostics and
+  is never touched.** Every write usbtop-ng makes to stdout after teardown is bounded or
+  skipped — the restore sequences by `write_within_budget`, the render pipeline by the
+  abandon latch, and the two remaining exit-flow writes (`prompt_via_events`'s question and
+  `usbmon::announce_automatic_unload`'s notice) by `restore_landed`.
+
+  Nothing bounds stderr, on purpose. A panic's message and backtrace are std's default
+  hook writing there, and `log::info!`/`log::warn!` go there through `env_logger`. Making
+  that descriptor non-blocking would truncate exactly the messages worth having, and
+  `O_NONBLOCK` on a shared descriptor outlives the process onto the shell — the hazard
+  `save_output_flags` exists to prevent. So on a terminal that is still open but has
+  stopped reading, a diagnostic waits, the way any program's would; a pty check finds a
+  panicking process parked in `write(2, …, 115)`, the trace itself, written *inside* the
+  hook and so before unwinding gets anywhere near the latch.
+
+  What that costs is bounded by keeping the exit *flow* clear of routine diagnostics, which
+  is a different discipline from bounding writes. `attempt_unload_usbmon`'s progress line
+  is `debug!`, below the default filter, precisely because an `info!` there sat between the
+  exit and the unload: on a wedged-but-open terminal the process parked in
+  `write(2, …, 116)` and the module stayed loaded. Genuine warnings keep their level — the
+  unload's own failure warning is one, and it is written *after* the attempt, so it can
+  delay that exit but can no longer cost it the unload. The rule for anything added to this
+  path: routine progress goes to `debug!`; a warning goes after the work it might have to
+  report on.
+
+  One warning predates the rule and breaks it: if a reader thread panicked, `MonitorHandle::stop`
+  logs `warn!("usbmon reader thread panicked")` before it returns, and `stop()` itself runs
+  before the unload flow — so on a wedged-but-open terminal this warning, not just `-v`'s
+  `debug!` line, can park in front of the unload it was supposed to leave clear.
+
+  Child processes are their own business too, though less than it looks:
+  `attempt_unload_usbmon` uses `Command::output()`, which pipes `modprobe`'s stdout and
+  stderr rather than letting them reach the terminal. What can still touch it is `sudo`
+  opening `/dev/tty` itself to ask for a password — sudo's write, not usbtop-ng's.
+
+### Dependencies
+
+Two crates were added for this chassis, both already ubiquitous in the tree's dependency
+graph:
+
+- **`libc`** — `fcntl(F_GETFL/F_SETFL)` for the non-blocking descriptor and the flags that
+  have to be put back, `write(2)` for the frame drain (deliberately not `io::Stdout`,
+  which is a `LineWriter` and would buffer escape sequences with no newline to flush
+  them), and the `EIO`/`SIGHUP` constants the failure classification is written against.
+- **`signal-hook`** — a safe, iterator-shaped signal API. The alternative is `sigaction`
+  by hand and async-signal-safe handler code; `signal-hook` moves the whole problem onto a
+  thread that can send on an ordinary channel.
+
 ## Data Flow
 
 ### Primary Data Flow
@@ -267,28 +520,53 @@ connector order.
 
 ### Event Processing
 
-The UI thread owns a single loop (see `run_app` in `src/ui/mod.rs`): it drains
-what the reader threads produced since the last pass (at most `DRAIN_BATCH`
-packets, so one burst cannot stall a frame — the leftovers are picked up on the
-next pass ~50ms later), refreshes state on a fixed tick, redraws, and polls for
-input — no async runtime is involved.
+The UI thread owns a single loop (see `run_app` in `src/tui/mod.rs`): it sleeps until
+its earliest deadline, folds whatever events arrived into one repaint, drains what the
+reader threads produced since the last pass (at most `DRAIN_BATCH` packets, so one burst
+cannot stall a frame — the leftovers are picked up on the next pass), refreshes state on
+a fixed tick, and redraws only if something changed. No async runtime is involved. See
+[TUI Chassis](#tui-chassis) for the wake sources and the numbers.
 
 ```rust
-// Simplified event loop
+// Simplified event loop (src/tui/mod.rs)
 loop {
+    // Sleep until the next tick, or the pending frame, or the drain cadence —
+    // whichever comes first.
+    match ui_events.recv_timeout(events::next_wait(now, dirty, next_tick, last_draw)) {
+        // Fold the whole queued batch, not just the event that woke us: that is
+        // what turns a burst of resizes into a single repaint.
+        Ok(event) => { /* fold_events -> exit? resize? clear? dirty? */ }
+        Err(RecvTimeoutError::Timeout) => {}
+        Err(RecvTimeoutError::Disconnected) => return Ok(ExitReason::TerminalDead),
+    }
+
     // Apply up to DRAIN_BATCH (8192) packets; the rest wait for the next pass.
     drain_packets(manager, packets, DRAIN_BATCH);
 
-    if app.last_update.elapsed() >= app.refresh_rate {
+    if now >= next_tick {
         let _ = manager.refresh();     // decay rates, drop stale devices
         app.sync_from(manager);        // rebuild the render snapshot
         app.update_bandwidth_history();
+        next_tick = now + app.refresh_rate;
+        dirty = true;
     }
 
-    terminal.draw(|f| draw_ui(f, app))?;
+    // Dirty gate plus frame cap: nothing repaints unless something changed, and
+    // never faster than MIN_FRAME_INTERVAL.
+    if events::should_draw(now, dirty, last_draw) {
+        terminal.draw(|f| draw_ui(f, app))?;
+        last_draw = now;
+        dirty = false;
+    }
 
-    if app.handle_input()? {
-        break; // 'q' or Esc
+    // The output stage reports through flags, not errors, so this is where the
+    // writes issued above are answered for.
+    if shed.terminal_dead() {
+        return Ok(ExitReason::TerminalDead);
+    }
+    if shed.take_repaint_request() {
+        force_full_repaint(terminal)?;
+        dirty = true;
     }
 }
 ```
@@ -298,8 +576,9 @@ loop {
 - **Bounded buffers**: Historical data limited to prevent memory growth — bandwidth history by wall-clock age (60s), the sliding rate window by 250ms buckets
 - **Bounded channel**: The reader→UI channel holds at most `CHANNEL_BOUND` (16384) packets; a consumer that cannot keep up costs dropped (counted) packets, never growing memory
 - **Device cleanup**: Automatic removal of stale devices
-- **Packet pooling**: Reuse packet structures to reduce allocations
-- **String interning**: Common strings (vendor names) are deduplicated
+- **No packet retention**: a `UsbPacket` is parsed per event, moved through the bounded channel, folded into `BandwidthStats` by `apply_packet`, and dropped. Nothing accumulates per packet — the binary reader drains each event's captured payload rather than keeping it, and the sliding window is 250ms buckets rather than one entry per URB
+- **Per-device metadata**: vendor/product/serial are plain owned `Option<String>` fields on `UsbDevice` — no interning, no shared table. They are read from sysfs when the device is first seen, retried on later ticks only while the sysfs path is still unresolved, and then reused for the life of that device: the cost is a handful of allocations per device, not per packet or per frame
+- **Render snapshot**: `UsbTopApp::sync_from` rebuilds the whole `ControllerView`/`BusView`/`DeviceRow` tree each tick and drops the previous one, which is what keeps totals consistent (see [Snapshot Model](#snapshot-model-and-topology-resolution)); it is bounded by the device count, not by session length
 
 ## Platform Abstraction
 
@@ -363,7 +642,7 @@ macOS has no usbmon equivalent, so `is_usbmon_module_loaded` always returns `fal
 
 - **Idle state**: <0.1% CPU usage
 - **Active monitoring**: 0.5-2% depending on USB activity
-- **UI updates**: Minimal overhead with 1Hz refresh rate
+- **UI updates**: Dirty-gated — an idle session repaints only on its refresh tick (1Hz by default) and never faster than ~30 FPS
 - **Packet processing**: ~1000 packets/second sustainable
 
 ### Scalability
@@ -461,7 +740,7 @@ match reader.read_packets(&shutdown, |packet| match tx.try_send(packet) {
 
 ### UI Customization
 
-1. Extend `ui/widgets.rs` with new components
+1. Extend `ui/mod.rs` with new `draw_*` widget functions
 2. Add theme support in `ui/colors.rs`
 3. Implement custom layout managers
 4. Add configuration options
