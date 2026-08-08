@@ -461,12 +461,19 @@ answer nobody can type — holding usbmon loaded and the reader files open.
   that descriptor non-blocking would truncate exactly the messages worth having, and
   `O_NONBLOCK` on a shared descriptor outlives the process onto the shell — the hazard
   `save_output_flags` exists to prevent. So on a terminal that is still open but has
-  stopped reading, a diagnostic waits, the way any program's would. Two pty checks pin
-  where: a panicking process parks in `write(2, …, 115)` (the trace, written *inside* the
-  hook, before unwinding gets near the latch), and a `SIGHUP` exit with
-  `unload_usbmon_on_exit = true` parks in `write(2, …, 116)` — the `info!` inside
-  `attempt_unload_usbmon`, which means that exit does not reach the unload it was going to
-  attempt. Both clear the moment stderr is anywhere but the wedged terminal.
+  stopped reading, a diagnostic waits, the way any program's would; a pty check finds a
+  panicking process parked in `write(2, …, 115)`, the trace itself, written *inside* the
+  hook and so before unwinding gets anywhere near the latch.
+
+  What that costs is bounded by keeping the exit *flow* clear of routine diagnostics, which
+  is a different discipline from bounding writes. `attempt_unload_usbmon`'s progress line
+  is `debug!`, below the default filter, precisely because an `info!` there sat between the
+  exit and the unload: on a wedged-but-open terminal the process parked in
+  `write(2, …, 116)` and the module stayed loaded. Genuine warnings keep their level — the
+  unload's own failure warning is one, and it is written *after* the attempt, so it can
+  delay that exit but can no longer cost it the unload. The rule for anything added to this
+  path: routine progress goes to `debug!`; a warning goes after the work it might have to
+  report on.
 
   Child processes are their own business too, though less than it looks:
   `attempt_unload_usbmon` uses `Command::output()`, which pipes `modprobe`'s stdout and
