@@ -2,7 +2,7 @@ use anyhow::Result;
 use crossterm::{
     event::Event,
     execute,
-    terminal::{enable_raw_mode, EnterAlternateScreen},
+    terminal::{enable_raw_mode, size as terminal_size, EnterAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
@@ -17,8 +17,14 @@ use crate::usbmon::parser::UsbPacket;
 
 pub(crate) mod events;
 pub(crate) mod lifecycle;
+pub(crate) mod output;
 
 use events::UiEvent;
+use output::{ShedHandles, ShedWriter, StdoutRaw};
+
+/// The terminal as this program has it: ratatui, over crossterm, over the
+/// non-blocking output stage.
+type TuiTerminal = Terminal<CrosstermBackend<ShedWriter<StdoutRaw>>>;
 
 /// Floor for `--refresh`, in milliseconds. Below this the poll/redraw loop
 /// spends more time spinning than the terminal can usefully repaint, so
@@ -81,16 +87,34 @@ pub fn run_ui(
     #[cfg(unix)]
     lifecycle::spawn_signal_thread(tx.clone());
 
-    let mut terminal = enter_terminal().inspect_err(|_| {
+    let (mut terminal, shed) = enter_terminal().inspect_err(|_| {
         // Raw mode is already on if it was the alternate screen that failed.
         lifecycle::restore_terminal();
     })?;
+
+    // A session that has to shed frames is showing the user less than it
+    // measured, which the header says out loud — like `dropped:` does for
+    // packets nobody counted.
+    app.shed_counter = Some(shed.shed_frames());
 
     // Only now: a reader started before raw mode would be handed whole lines
     // instead of keys.
     events::spawn_input_thread(tx);
 
-    let result = run_app(&mut terminal, &mut app, &mut manager, &packets, &ui_events);
+    let result = run_app(
+        &mut terminal,
+        &mut app,
+        &mut manager,
+        &packets,
+        &ui_events,
+        &shed,
+    );
+
+    // Whatever is still queued is a diff against an alternate screen that is
+    // about to be gone. Flushing it after the restore below would paint it
+    // across the shell the user just got back, so it is dropped here instead.
+    // On a terminal that kept up there is nothing queued and nothing to drop.
+    shed.discard_pending();
 
     // Explicit teardown; the panic hook is the safety net, not the plan.
     lifecycle::restore_terminal();
@@ -116,14 +140,29 @@ pub fn run_ui(
     })
 }
 
-/// Put the terminal into TUI mode: raw input, alternate screen, ratatui on top.
-fn enter_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+/// Put the terminal into TUI mode: raw input, alternate screen, the
+/// non-blocking output stage, ratatui on top.
+///
+/// Order matters twice here. `arm_restore` runs before [`StdoutRaw::new`]
+/// switches stdout to non-blocking, so what it saves — and what
+/// `restore_terminal` puts back — is stdout's *pre-TUI* flags. And the
+/// alternate screen is entered on the still-blocking descriptor, so that write
+/// cannot come back short.
+fn enter_terminal() -> Result<(TuiTerminal, ShedHandles)> {
     enable_raw_mode()?;
-    // From here on there is something to undo, whoever gets to it first.
+    // From here on there is something to undo, whoever gets to it first. This
+    // is also where stdout's original file-status flags are saved.
     lifecycle::arm_restore();
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+
+    let (cols, rows) = terminal_size()?;
+    let writer = ShedWriter::new(StdoutRaw::new()?, cols, rows);
+    // Taken before ratatui swallows the writer: the backend keeps it private,
+    // so these shared cells are the only way back in.
+    let shed = writer.handles();
+
+    Ok((Terminal::new(CrosstermBackend::new(writer))?, shed))
 }
 
 /// The event loop.
@@ -137,11 +176,12 @@ fn enter_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
 /// bounded channel and drop once it fills. So the wait is capped at
 /// [`events::PACKET_DRAIN_INTERVAL`] — a wake that only drains, never draws.
 fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut TuiTerminal,
     app: &mut UsbTopApp,
     manager: &mut DeviceManager,
     packets: &Receiver<UsbPacket>,
     ui_events: &Receiver<UiEvent>,
+    shed: &ShedHandles,
 ) -> Result<ExitReason> {
     let start = Instant::now();
     // Start owing a frame, and owing it immediately: the first pass refreshes
@@ -175,6 +215,12 @@ fn run_app(
                 if let Some(reason) = fold.exit {
                     return Ok(reason);
                 }
+                // The writer's shed threshold is a function of the screen's
+                // area, so a resize has to reach it before the frames drawn at
+                // the new size do.
+                if let Some((cols, rows)) = fold.resize {
+                    shed.set_area(cols, rows);
+                }
                 if fold.clear {
                     terminal.clear()?;
                 }
@@ -207,6 +253,21 @@ fn run_app(
             last_draw = now;
             dirty = false;
         }
+
+        // The output stage reports through flags rather than errors — a write
+        // failure must not take ratatui's teardown off its healthy path — so
+        // this is where the writes issued above are actually answered for. It
+        // sits outside the draw gate because `terminal.clear()` writes too.
+        if shed.terminal_dead() {
+            return Ok(ExitReason::TerminalDead);
+        }
+        if shed.take_repaint_request() {
+            // Frames were shed, or bytes were lost to a failed write: either
+            // way the screen no longer matches ratatui's mirror of it, and
+            // only a wipe plus a full frame can put that right.
+            terminal.clear()?;
+            dirty = true;
+        }
     }
 }
 
@@ -220,6 +281,9 @@ struct Fold {
     dirty: bool,
     /// The screen itself is suspect and has to be wiped before the repaint.
     clear: bool,
+    /// The size the screen ended the batch at, when the batch resized it. Only
+    /// the last one in a drag matters, which is the whole point of folding.
+    resize: Option<(u16, u16)>,
     /// The batch ended the session; whatever is still queued no longer matters.
     exit: Option<ExitReason>,
 }
@@ -245,8 +309,13 @@ fn fold_events(app: &mut UsbTopApp, batch: impl Iterator<Item = UiEvent>) -> Fol
             },
             // A resize invalidates the frame and nothing else: the next draw
             // re-reads the terminal's size on its own, so only the last one in
-            // a drag matters and all of them fold into a single repaint.
-            UiEvent::Input(Event::Resize(_, _)) => fold.dirty = true,
+            // a drag matters and all of them fold into a single repaint. The
+            // dimensions are carried out because the output stage sizes its
+            // backlog allowance from them.
+            UiEvent::Input(Event::Resize(cols, rows)) => {
+                fold.dirty = true;
+                fold.resize = Some((cols, rows));
+            }
             // Focus, paste and (were they enabled) mouse events change nothing
             // on screen.
             UiEvent::Input(_) => {}
@@ -300,6 +369,9 @@ mod tests {
             Fold {
                 dirty: true,
                 clear: false,
+                // The size the drag finished at, not the five it passed
+                // through: that is the one the writer has to be told about.
+                resize: Some((85, 24)),
                 exit: None
             }
         );
@@ -332,6 +404,7 @@ mod tests {
             Fold {
                 dirty: true,
                 clear: true,
+                resize: None,
                 exit: None
             }
         );
