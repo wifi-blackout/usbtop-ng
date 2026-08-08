@@ -102,11 +102,17 @@ pub fn arm_output_latch(latch: Arc<AtomicBool>) {
     let _ = OUTPUT_LATCH.set(latch);
 }
 
-/// Whether the terminal took the last restore.
+/// Whether the terminal took the last restore, and so whether anything written
+/// to it after teardown would arrive.
 ///
-/// The exit path asks before it asks the *user* anything: see
-/// [`prompt_via_events`].
-fn restore_landed() -> bool {
+/// Every exit-path write to stdout consults this, because by then
+/// [`restore_output_flags`] has put the descriptor back to blocking: a write to
+/// a terminal that has stopped reading no longer fails, it waits, and nothing
+/// after it runs. [`prompt_via_events`] uses it to decline the question;
+/// `usbmon::offer_unload_after_session` uses it to skip the notice. Before any
+/// TUI has been up it is `true`, which is the honest answer for a plain stdout
+/// nobody has touched.
+pub fn restore_landed() -> bool {
     RESTORE_LANDED.load(Ordering::SeqCst)
 }
 

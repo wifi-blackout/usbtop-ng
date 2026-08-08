@@ -413,9 +413,13 @@ the descriptor is blocking again and the destructor's write would be unbounded a
 terminal that may have stopped reading. With the latch tripped, `ShedWriter::flush_at`
 drops whatever is staged or queued and writes nothing. The same reasoning decides the exit
 question: if the restore's own bytes did not land inside the budget, the terminal is not
-reading, so `prompt_via_events` declines instead of writing a question into it. Both were
-verified on a pty in both directions — with the latch the panicking process leaves in
-0.26s, without it, it stops forever inside ratatui's destructor.
+reading, so `prompt_via_events` declines instead of writing a question into it — and so
+does `usbmon::offer_unload_after_session`, whose automatic-unload notice is the last
+stdout write on the `SIGHUP` + `unload_usbmon_on_exit` path. The unload still runs; only
+the sentence about it is dropped. All of it was verified on a pty in both directions —
+with the latch the panicking process leaves in 0.26s, without it, it stops forever inside
+ratatui's destructor; with the notice gated the hangup exit leaves in 0.26s having
+attempted the unload, without it, it stops forever in `write(1, …)`.
 
 Signals are turned into ordinary `UiEvent`s by a `signal-hook` thread, so a `SIGTERM`
 leaves through the same teardown as `q` instead of dropping the process on an alternate
@@ -445,17 +449,29 @@ answer nobody can type — holding usbmon loaded and the reader files open.
 - **Shedding is unix-only.** Off unix there is no `fcntl`, so `StdoutRaw` is an ordinary
   blocking stdout: nothing can tell that the terminal is behind, because a blocking write
   returns only once the bytes are gone. That is the pre-TUI-chassis behavior, kept as-is.
-- **The bound stops at usbtop-ng's own writes.** Everything above governs what this
-  program writes; it says nothing about what the language runtime writes. A panic's
-  message and backtrace are std's default hook writing to *stderr*, which usbtop-ng never
-  makes non-blocking (doing so would truncate the trace, and would leak `O_NONBLOCK` onto
-  the shell's stderr). On a terminal that has stopped reading, that write waits — and it
-  happens *inside* the hook, so it is reached before unwinding gets anywhere near the
-  latch. A pty check confirms the ordering: the panicking process parks in
-  `write(2, …, 115)`. The same goes for anything printed after teardown — the
-  automatic-unload notice, a `log::warn!`, or `sudo modprobe -r`'s own output. These are
-  ordinary blocking writes, no different from any other program's, and bounding them would
-  mean losing the very messages they carry.
+- **The bound is drawn at stdout, and stops there.** The rule is mechanical, which is what
+  makes it checkable: **fd 1 is the TUI's channel and is managed; fd 2 is diagnostics and
+  is never touched.** Every write usbtop-ng makes to stdout after teardown is bounded or
+  skipped — the restore sequences by `write_within_budget`, the render pipeline by the
+  abandon latch, and the two remaining exit-flow writes (`prompt_via_events`'s question and
+  `usbmon::announce_automatic_unload`'s notice) by `restore_landed`.
+
+  Nothing bounds stderr, on purpose. A panic's message and backtrace are std's default
+  hook writing there, and `log::info!`/`log::warn!` go there through `env_logger`. Making
+  that descriptor non-blocking would truncate exactly the messages worth having, and
+  `O_NONBLOCK` on a shared descriptor outlives the process onto the shell — the hazard
+  `save_output_flags` exists to prevent. So on a terminal that is still open but has
+  stopped reading, a diagnostic waits, the way any program's would. Two pty checks pin
+  where: a panicking process parks in `write(2, …, 115)` (the trace, written *inside* the
+  hook, before unwinding gets near the latch), and a `SIGHUP` exit with
+  `unload_usbmon_on_exit = true` parks in `write(2, …, 116)` — the `info!` inside
+  `attempt_unload_usbmon`, which means that exit does not reach the unload it was going to
+  attempt. Both clear the moment stderr is anywhere but the wedged terminal.
+
+  Child processes are their own business too, though less than it looks:
+  `attempt_unload_usbmon` uses `Command::output()`, which pipes `modprobe`'s stdout and
+  stderr rather than letting them reach the terminal. What can still touch it is `sudo`
+  opening `/dev/tty` itself to ask for a password — sudo's write, not usbtop-ng's.
 
 ### Dependencies
 

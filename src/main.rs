@@ -134,8 +134,10 @@ fn main() -> Result<()> {
                         "usbmon was loaded, but the usbmon debugfs interface is still unavailable"
                     );
                     print_platform_instructions();
-                    // Still before the TUI, so stdin is nobody else's yet.
-                    usbmon::offer_unload_after_session(&preferences, || {
+                    // Still before the TUI, so stdin is nobody else's yet — and
+                    // stdout is the plain blocking one this process started
+                    // with, which nothing has had a chance to wedge.
+                    usbmon::offer_unload_after_session(&preferences, true, || {
                         prompt_user_to_unload_module().unwrap_or(false)
                     });
                     process::exit(1);
@@ -178,23 +180,33 @@ fn main() -> Result<()> {
     // This runs on every exit path, prompts or no prompts.
     monitor.stop();
 
+    // Everything below writes to a stdout that the teardown has already put
+    // back to blocking, so a terminal that stopped reading would swallow the
+    // rest of this exit rather than fail. This is the same answer the prompt
+    // path uses, asked once for all of them.
+    let terminal_reachable = tui::lifecycle::restore_landed();
+
     match &session {
         Ok(session) => match unload_policy(&session.reason, loaded_usbmon_for_this_run) {
             // The session ended with a user still in front of it, so the
             // answer comes back over the event channel: the input thread owns
             // stdin until the process exits.
             UnloadPolicy::PromptFlow => {
-                usbmon::offer_unload_after_session(&preferences, || {
+                usbmon::offer_unload_after_session(&preferences, terminal_reachable, || {
                     session.confirm(usbmon::UNLOAD_QUESTION)
                 });
             }
-            UnloadPolicy::AutoOnly => usbmon::unload_without_asking(&preferences),
+            UnloadPolicy::AutoOnly => {
+                usbmon::unload_without_asking(&preferences, terminal_reachable);
+            }
             UnloadPolicy::Skip => {}
         },
         // A failure inside run_ui leaves the terminal in an unknown state and
         // may have left no input thread to read an answer, so this path never
         // asks either.
-        Err(_) if loaded_usbmon_for_this_run => usbmon::unload_without_asking(&preferences),
+        Err(_) if loaded_usbmon_for_this_run => {
+            usbmon::unload_without_asking(&preferences, terminal_reachable);
+        }
         Err(_) => {}
     }
 
