@@ -11,11 +11,6 @@ pub mod monitor;
 pub mod parser;
 pub mod reader;
 
-/// Generic Linux value of `O_NONBLOCK`. Hardcoded because usbtop-ng has no
-/// libc dependency; the value differs only on mips/alpha/sparc, which this
-/// tool does not target.
-const O_NONBLOCK: i32 = 0o4000;
-
 /// How long a reader parks between polls when the interface has nothing to
 /// give (EAGAIN or EOF). Also the worst-case latency of a shutdown request.
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -32,7 +27,7 @@ pub(crate) fn open_nonblocking(path: &Path) -> std::io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     fs::OpenOptions::new()
         .read(true)
-        .custom_flags(O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK)
         .open(path)
 }
 

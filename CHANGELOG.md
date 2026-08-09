@@ -97,7 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   well
 - Help overlay and keyboard navigation
 - Command-line interface with multiple options
-- Platform-specific setup instructions
+- Setup instructions printed by `--setup`
 - Unit test coverage across parsing, aggregation, config, and UI state
 
 ### Changed

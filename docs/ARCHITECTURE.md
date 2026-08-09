@@ -57,7 +57,7 @@ interfaces alike.
 2. **Module boundaries.** Each module exposes a small interface and hides its
    internals.
 3. **Linux only.** `src/main.rs` carries a `compile_error!` for every other
-   target, which is the one platform `cfg` any module keeps in step.
+   target.
 4. **Memory safety.** Rust's ownership rules prevent the common errors.
 5. **Bounded work.** Every queue, window, and history has a limit.
 6. **Keyboard-driven UI.** Seven keys cover the whole interface: `↑`, `↓`,
