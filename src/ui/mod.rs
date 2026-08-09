@@ -898,7 +898,7 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from("  • Color-coded USB link speeds"),
         Line::from("  • Split charts: aggregate total, plus the selected device's rx/tx"),
         Line::from("  • Device disconnect detection"),
-        Line::from("  • Live monitoring on Linux only. BSD and macOS list no devices"),
+        Line::from("  • Linux only"),
         Line::from(""),
         Line::from("Press 'h' to close this help"),
     ];
@@ -960,7 +960,6 @@ mod tests {
         (temp, mgr)
     }
 
-    #[cfg(target_os = "linux")]
     fn topology_fixture() -> (tempfile::TempDir, DeviceManager) {
         topology_fixture_named("0000:00:14.0")
     }
@@ -968,7 +967,6 @@ mod tests {
     /// Fake sysfs: a PCI controller directory holding the real root hubs, with
     /// the flat `devices/` directory symlinking to them, so `canonicalize`
     /// resolves a root hub back to its controller exactly like real sysfs.
-    #[cfg(target_os = "linux")]
     fn topology_fixture_named(controller: &str) -> (tempfile::TempDir, DeviceManager) {
         use std::os::unix::fs::symlink;
         let temp = tempfile::tempdir().unwrap();
@@ -1074,7 +1072,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn sync_from_groups_by_controller_and_orders_by_port() {
         let (_t, mut mgr) = topology_fixture();
@@ -1110,7 +1107,6 @@ mod tests {
         assert!(app.total_bandwidth > 0.0);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn root_hub_sorts_first_and_unknown_controller_sorts_last() {
         // Controller id deliberately sorts after "unknown" alphabetically, so
@@ -1141,7 +1137,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn selection_walks_device_rows_across_groups() {
         let (_t, mut mgr) = topology_fixture();
@@ -1163,7 +1158,6 @@ mod tests {
         assert_eq!(app.selected_device.as_deref(), Some("3:6"));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn selection_walks_backwards_and_wraps() {
         let (_t, mut mgr) = topology_fixture();
@@ -1267,6 +1261,9 @@ mod tests {
         // And both counters the header can spring on the user are explained.
         assert!(screen.contains("dropped: N"), "{screen}");
         assert!(screen.contains("shed: N"), "{screen}");
+        // The one platform claim the overlay makes, and the only one it may:
+        // the binary does not build anywhere else.
+        assert!(screen.contains("Linux only"), "{screen}");
 
         assert_eq!(
             apply_key(&mut app, ctrl(KeyCode::Char('l'))),
@@ -1298,7 +1295,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn arrow_keys_move_the_selection() {
         let (_t, mut mgr) = topology_fixture();
@@ -1482,7 +1478,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn device_list_renders_headings_above_port_ordered_rows() {
         let (_t, mut mgr) = topology_fixture();

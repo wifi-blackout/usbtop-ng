@@ -412,7 +412,6 @@ mod tests {
     /// `/dev/usbmonN`. The event is split so a retry lands mid-header and
     /// mid-payload, proving the fill position survives both.
     #[test]
-    #[cfg(target_os = "linux")]
     fn wouldblock_retry_reassembles_partial_events() {
         use std::io::Write;
 
