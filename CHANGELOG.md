@@ -88,8 +88,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Device metadata (vendor, product, speed) resolved from sysfs by busnum and
   devnum topology
 - Interactive terminal UI with ratatui
-- Cross-platform builds. Live monitoring through usbmon is Linux-only. On BSD
-  and macOS the UI can open, with `--force` where needed, and shows no devices
 - Device disconnection tracking, with a 5-second grace period before removal
   from the UI
 - Bandwidth history visualization over a 60-second sliding window
@@ -103,6 +101,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unit test coverage across parsing, aggregation, config, and UI state
 
 ### Changed
+- The help overlay states `Linux only` in place of a line about which platforms
+  list no devices. `--setup` describes itself as showing setup instructions for
+  live monitoring, rather than platform-specific ones
 - The UI loop is event-driven instead of a fixed 50ms poll. It sleeps until the
   earliest deadline it owes, either the next refresh interval or a pending
   frame one 33ms frame interval after the last. It folds a whole batch of queued events
@@ -171,6 +172,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--refresh 2000`, while the charts kept claiming a minute
 
 ### Removed
+- The BSD and macOS code paths. They were stubs with no packet source behind
+  them: `kldstat` and `/dev` existence checks that could pass without a usbmon
+  equivalent, a `/dev/ugen{bus}.0` reader path, a `/dev/null` placeholder path,
+  and `update_bsd_device_info` and `update_macos_device_info`, both of which
+  returned `Ok(())` and populated nothing. The UI opened onto a device table
+  that could never fill
+- The BSD and macOS setup text printed by `--setup`, which pointed at
+  `usbconfig`, `system_profiler`, `ioreg`, and USB Prober. Nothing in usbtop-ng
+  ever called them
+- Every non-Linux `cfg` gate, including the `#[cfg(not(unix))]` fallbacks in
+  the TUI chassis and the preferences directory. `src/main.rs` now carries
+  `#[cfg(not(target_os = "linux"))] compile_error!`, so an unsupported target
+  fails at compile time instead of building a binary that lists no devices
 - Tokio and chrono dependencies
 
 ### Technical Details
@@ -211,8 +225,8 @@ terminal UI, written to replace and extend the original usbtop utility.
 - **Real-time monitoring**: live USB bandwidth tracking with sub-second updates
 - **Terminal UI**: a color, interactive interface in the shape of a modern
   system monitor
-- **Cross-platform**: builds for Linux, BSD variants, and macOS. Live
-  monitoring is Linux-only
+- **Cross-platform**: 0.1.0 built for Linux, BSD variants, and macOS. Live
+  monitoring was Linux-only
 - **usbmon detection**: usbmon module detection, printed setup steps, and
   optional saved load and unload preferences
 - **Visual feedback**: device status indicators, connected and disconnected
@@ -222,8 +236,8 @@ terminal UI, written to replace and extend the original usbtop utility.
 - Rust 1.88 or later, to build from source
 - Linux: the usbmon kernel module and debugfs
 - BSD: native USB monitoring interfaces
-- macOS: no live monitoring, because there is no usbmon equivalent. The UI
-  opens with `--force` and shows no devices
+- macOS: no live monitoring, because macOS had no usbmon equivalent. The UI
+  opened with `--force` and showed no devices
 
 #### Installation
 ```bash
@@ -250,10 +264,10 @@ usbtop-ng --setup
 
 #### Known Limitations
 - Needs root privileges on most systems
-- macOS support is limited, because there is no usbmon equivalent
+- macOS support was limited, because macOS had no usbmon equivalent
 - Some USB controllers may not be fully supported
-- Both usbmon interfaces (binary `/dev/usbmonN`, text `Nu`) are supported, but
-  on Linux only. There is no live-monitoring equivalent on BSD or macOS
+- Both usbmon interfaces (binary `/dev/usbmonN`, text `Nu`) were supported, but
+  on Linux only. Neither BSD nor macOS had a live-monitoring equivalent
 
 #### Roadmap
 - Additional platform-specific optimizations
