@@ -73,7 +73,6 @@ pub fn ensure_private_config_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn set_private_dir_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -81,11 +80,6 @@ fn set_private_dir_permissions(path: &Path) -> Result<()> {
     permissions.set_mode(0o700);
     fs::set_permissions(path, permissions)
         .with_context(|| format!("failed to set permissions on {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_private_dir_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -123,7 +117,6 @@ mod tests {
         assert!(prefs.unload_usbmon_on_exit);
     }
 
-    #[cfg(unix)]
     #[test]
     fn custom_path_write_does_not_change_parent_permissions() {
         use std::os::unix::fs::PermissionsExt;
@@ -142,7 +135,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn ensure_private_config_dir_creates_with_0700() {
         use std::os::unix::fs::PermissionsExt;
@@ -155,7 +147,6 @@ mod tests {
         assert_eq!(mode, 0o700);
     }
 
-    #[cfg(unix)]
     #[test]
     fn ensure_private_config_dir_leaves_existing_dir_permissions_alone() {
         use std::os::unix::fs::PermissionsExt;

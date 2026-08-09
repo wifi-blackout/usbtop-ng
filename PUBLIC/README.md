@@ -23,8 +23,7 @@ Four blocks fill the window, top to bottom.
 
 ## What you need
 
-- Linux, for live monitoring. The BSD and macOS builds can open the UI, with
-  `--force` where the startup checks fail, and list no devices.
+- Linux. usbtop-ng builds on no other platform.
 - The usbmon kernel module, and debugfs mounted at `/sys/kernel/debug`.
 - Read access to the usbmon interfaces. Root has that access. Anything short of
   root depends on the distribution.
@@ -228,7 +227,7 @@ key press and quits through the same teardown as `q`.
 - `cargo test --all-targets` runs 188 hermetic tests against fixture files,
   FIFOs, and temporary paths. They need no `/dev` and no debugfs access.
 - The `integration` cargo feature adds 1 test that reads the real usbmon
-  interfaces on Linux.
+  interfaces.
 
 ## Preferences file
 
@@ -254,7 +253,7 @@ Options:
   -c, --config <CONFIG>    Preferences file path (default: ~/.usbtop-ng/preferences.toml)
   -r, --refresh <REFRESH>  Refresh rate in milliseconds (floored at 100ms) [default: 1000]
       --force              Force run without usbmon (limited functionality)
-      --setup              Show platform-specific setup instructions
+      --setup              Show setup instructions for live monitoring
       --create-alias       Create shell alias for 'usbtop' command
   -h, --help               Print help
   -V, --version            Print version
@@ -262,8 +261,8 @@ Options:
 
 ## Limits
 
-- Live monitoring runs on Linux only. On BSD and macOS the UI opens, with
-  `--force` where the startup checks fail, and the device table stays empty.
+- usbtop-ng runs on Linux. A build for any other platform stops at a compile
+  error.
 - usbmon needs root, or read access granted to its interfaces some other way.
 - `sudo` strips `SSH_TTY`, `SSH_CONNECTION`, and `SSH_CLIENT` under its default
   `env_reset`. A `sudo usbtop-ng` session over SSH therefore gets probed for

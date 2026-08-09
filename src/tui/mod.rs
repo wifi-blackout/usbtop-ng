@@ -86,7 +86,6 @@ pub fn run_ui(
     // Spawned before the terminal changes state, so that a signal landing
     // during setup is caught rather than defaulting to a kill that would leave
     // the terminal raw.
-    #[cfg(unix)]
     lifecycle::spawn_signal_thread(tx.clone());
 
     let (mut terminal, shed) = enter_terminal().inspect_err(|_| {

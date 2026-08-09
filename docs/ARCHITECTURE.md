@@ -10,7 +10,7 @@ behind them.
 - [Module design](#module-design)
 - [TUI chassis](#tui-chassis)
 - [Data flow](#data-flow)
-- [Platform abstraction](#platform-abstraction)
+- [Linux integration](#linux-integration)
 - [Performance](#performance)
 - [Security model](#security-model)
 - [Error handling](#error-handling)
@@ -42,10 +42,8 @@ interfaces alike.
 ├─────────────────┬─────────────────┬─────────────────────────────┤
 │  USB Monitor    │  Device Manager │  Statistics Engine          │
 │  (usbmon)       │  (sysfs)        │  (bandwidth calc)           │
-├─────────────────┼─────────────────┼─────────────────────────────┤
-│  Platform Abstraction Layer                                     │
-├─────────────────────────────────────────────────────────────────┤
-│  Operating System (Linux/BSD/macOS)                             │
+├─────────────────┴─────────────────┴─────────────────────────────┤
+│  Operating System (Linux)                                       │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -58,7 +56,8 @@ interfaces alike.
    rendering.
 2. **Module boundaries.** Each module exposes a small interface and hides its
    internals.
-3. **Platform separation.** Platform-specific code sits behind `cfg` gates.
+3. **Linux only.** `src/main.rs` carries a `compile_error!` for every other
+   target.
 4. **Memory safety.** Rust's ownership rules prevent the common errors.
 5. **Bounded work.** Every queue, window, and history has a limit.
 6. **Keyboard-driven UI.** Seven keys cover the whole interface: `↑`, `↓`,
@@ -93,8 +92,8 @@ interfaces alike.
   `get_speed_indicator`, and the best-effort capability signal read from sysfs
   `version` (bcdUSB).
 - `manager.rs`: routes usbmon packets into per-device bandwidth stats, and
-  resolves device metadata from sysfs on Linux. It groups devices into
-  `UsbBus`es, which resolve their host controller and their aggregate %busy.
+  resolves device metadata from sysfs. It groups devices into `UsbBus`es, which
+  resolve their host controller and their aggregate %busy.
 
 #### 3. Statistics engine (`stats/`)
 
@@ -184,10 +183,8 @@ impl BinaryReader {
   loop. If that open fails, the thread warns and reads this bus's text
   interface instead. One bus with a missing or unreadable binary node therefore
   degrades to text rather than going dark.
-- Both readers open their file `O_NONBLOCK` on Linux and poll every 50
-  milliseconds, so `shutdown` is observed within one poll instead of parking
-  inside `read()`.
-- Path resolution is platform-specific.
+- Both readers open their file `O_NONBLOCK` and poll every 50 milliseconds, so
+  `shutdown` is observed within one poll instead of parking inside `read()`.
 
 **Packet flow:**
 
@@ -248,8 +245,6 @@ pub struct UsbBus {
   (`bcdDevice`, `bMaxPacketSize0`) manufactures one.
 - Disconnect detection and tracking, with removal 5 seconds after the
   disconnect.
-- Device discovery runs on Linux only. BSD and macOS have no enumeration
-  fallback.
 
 ### Statistics engine
 
@@ -742,60 +737,25 @@ loop {
   [Snapshot model](#snapshot-model-and-topology-resolution). Its size follows
   the device count, not the session length.
 
-## Platform abstraction
+## Linux integration
 
-### Linux
+usbtop-ng targets Linux and nothing else. `src/main.rs` opens with a
+`compile_error!` for every other target, which is the only platform `cfg` in
+the tree. No code path stands in for an interface that does not exist.
 
 ```rust
-#[cfg(target_os = "linux")]
-mod linux {
-    fn get_usbmon_path(bus_id: u8) -> String {
-        format!("/sys/kernel/debug/usb/usbmon/{}u", bus_id)
-    }
-
-    fn enumerate_devices() -> Vec<UsbDevice> {
-        // sysfs enumeration
-    }
+fn get_usbmon_path(bus_id: u8) -> PathBuf {
+    PathBuf::from(format!("/sys/kernel/debug/usb/usbmon/{}u", bus_id))
 }
 ```
 
-**Implemented:**
+**What the kernel supplies:**
 
 - Direct access to both usbmon interfaces.
 - Device metadata from sysfs.
 - debugfs mount detection, by reading `/proc/mounts`.
 - Module detection, by reading `/proc/modules`, plus load and unload through
   `sudo modprobe`.
-
-### BSD
-
-BSD builds carry stub platform checks only. `is_usbmon_module_loaded` looks at
-`kldstat` output, and `check_usbmon_debugfs_exists` only checks that `/dev`
-exists, so the startup checks can pass without confirming a real
-usbmon-equivalent interface. No live-monitoring reader and no
-device-enumeration fallback are wired up. Devices are only ever created from
-usbmon packets, so with no packet source the device table stays empty even when
-the UI opens.
-
-**Status:**
-
-- No live monitoring.
-- No device enumeration. The sysfs-metadata population is a no-op stub.
-- The UI can open, with `--force` when the startup checks fail, and shows no
-  devices.
-
-### macOS
-
-macOS has no usbmon equivalent, so `is_usbmon_module_loaded` always returns
-`false` and usbtop-ng exits at startup unless it is run with `--force`. There
-is no device-enumeration fallback either. Devices are only ever created from
-usbmon packets, and macOS has no packet source.
-
-**Limits:**
-
-- No live monitoring, because there is no usbmon equivalent.
-- No device enumeration. The device table stays empty.
-- The UI opens only with `--force`, and shows no devices even then.
 
 ## Performance
 
@@ -839,20 +799,8 @@ before adding a figure of that kind.
 
 usbtop-ng needs elevated privileges to read usbmon.
 
-**Linux:**
-
 - Root access, or read access to `/sys/kernel/debug/usb/usbmon/` granted some
   other way. Which non-root routes exist depends on the distribution.
-
-**BSD:**
-
-- Root access would be needed for USB device access, but no live monitoring and
-  no device enumeration are implemented on BSD. Some BSDs allow user access to
-  USB devices.
-
-**macOS:**
-
-- A standard user account is enough, and the UI still lists no devices.
 
 ### Security measures
 
@@ -923,17 +871,6 @@ match reader.read_packets(&shutdown, |packet| match tx.try_send(packet) {
 to Debug. Every log line goes to stderr.
 
 ## Extension points
-
-### Adding a platform
-
-1. Add the platform's arms to the `cfg` blocks in `src/usbmon/mod.rs`, which
-   hold module detection, interface detection, and bus enumeration.
-2. Add a packet source in `src/usbmon/` that produces `UsbPacket`s and honors
-   the `read_packets(&shutdown, callback)` contract.
-3. Add the source to `PacketSource` and to `monitor::start_monitoring`.
-4. Add device metadata population in `src/device/mod.rs`, next to
-   `update_linux_device_info_from_base`.
-5. Add tests behind the same `cfg` gates.
 
 ### Adding a packet source
 

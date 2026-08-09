@@ -59,40 +59,15 @@ impl UsbDevice {
 
     /// Populate metadata from sysfs; `base` overrides /sys/bus/usb/devices for tests.
     pub fn populate_from_sysfs(&mut self, base: Option<&std::path::Path>) {
-        #[cfg(target_os = "linux")]
-        {
-            let default = std::path::Path::new("/sys/bus/usb/devices");
-            let _ = self.update_linux_device_info_from_base(base.unwrap_or(default));
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = base;
-            let _ = self.update_from_sysfs();
-        }
+        let default = std::path::Path::new("/sys/bus/usb/devices");
+        let _ = self.update_device_info_from_base(base.unwrap_or(default));
     }
 
-    /// Non-Linux fallback dispatcher: on Linux, `populate_from_sysfs` calls
-    /// `update_linux_device_info_from_base` directly, so this is unreachable
-    /// (and therefore not compiled) on that platform.
-    #[cfg(not(target_os = "linux"))]
-    pub fn update_from_sysfs(&mut self) -> Result<(), std::io::Error> {
-        #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
-        {
-            self.update_bsd_device_info()
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            self.update_macos_device_info()
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn update_linux_device_info_from_base(
+    fn update_device_info_from_base(
         &mut self,
         base: &std::path::Path,
     ) -> Result<(), std::io::Error> {
-        let Some(sysfs_path) = self.find_linux_sysfs_path(base) else {
+        let Some(sysfs_path) = self.find_sysfs_path(base) else {
             return Ok(());
         };
         self.sysfs_path = Some(sysfs_path.clone());
@@ -135,8 +110,7 @@ impl UsbDevice {
     /// this device. Real sysfs USB device directories are named by port
     /// topology (e.g. `3-1.4`), not by bus/device number, so a name guess
     /// doesn't work; we have to read the attribute files instead.
-    #[cfg(target_os = "linux")]
-    fn find_linux_sysfs_path(&self, base: &std::path::Path) -> Option<std::path::PathBuf> {
+    fn find_sysfs_path(&self, base: &std::path::Path) -> Option<std::path::PathBuf> {
         let entries = std::fs::read_dir(base).ok()?;
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
@@ -171,20 +145,6 @@ impl UsbDevice {
             return Some(path);
         }
         None
-    }
-
-    #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
-    fn update_bsd_device_info(&mut self) -> Result<(), std::io::Error> {
-        // For BSD systems, we might use usbconfig or similar utilities
-        // This is a placeholder implementation
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    fn update_macos_device_info(&mut self) -> Result<(), std::io::Error> {
-        // For macOS, we might use ioreg or system_profiler
-        // This is a placeholder implementation
-        Ok(())
     }
 
     pub fn mark_disconnected(&mut self) {
@@ -251,7 +211,6 @@ impl UsbDevice {
 /// its descriptor (sysfs `version`) is SuperSpeed-capable. Devices linked
 /// below their capability usually report bcdUSB 2.10 on the USB2 bus, so the
 /// absence of this signal proves nothing — 🔺 is best-effort by design.
-#[cfg(target_os = "linux")]
 fn read_max_capability(dir: &std::path::Path) -> Option<UsbSpeed> {
     let raw = std::fs::read_to_string(dir.join("version")).ok()?;
     let major: u32 = raw.trim().split('.').next()?.parse().ok()?;
@@ -322,7 +281,7 @@ fn format_speed(speed: &UsbSpeed) -> String {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

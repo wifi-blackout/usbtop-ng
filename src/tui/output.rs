@@ -59,12 +59,10 @@ pub trait RawOut {
 /// descriptor would be a second set of flags with nobody to put them back —
 /// and non-blocking outlives the process on a shared descriptor, so the shell
 /// that started usbtop-ng would inherit it.
-#[cfg(unix)]
 pub struct StdoutRaw {
     fd: std::os::unix::io::RawFd,
 }
 
-#[cfg(unix)]
 impl StdoutRaw {
     /// Switch stdout to non-blocking.
     ///
@@ -90,7 +88,6 @@ impl StdoutRaw {
     }
 }
 
-#[cfg(unix)]
 impl RawOut for StdoutRaw {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // Deliberately not `io::Stdout::write`: that is a `LineWriter`, and a
@@ -111,39 +108,6 @@ impl RawOut for StdoutRaw {
         // zero fallback would only mean "made no progress", which the drain
         // already handles.
         Ok(usize::try_from(written).unwrap_or(0))
-    }
-}
-
-/// Standard output, blocking, on platforms with no `fcntl`.
-///
-/// Nothing here can shed, because nothing here can tell that the terminal is
-/// behind: a blocking write returns only once the bytes are gone. That is the
-/// pre-existing behavior, kept so the rest of the module compiles and runs
-/// unchanged off unix.
-#[cfg(not(unix))]
-pub struct StdoutRaw {
-    stdout: io::Stdout,
-}
-
-#[cfg(not(unix))]
-impl StdoutRaw {
-    /// Never fails; the signature matches the unix one so callers need no
-    /// `cfg` of their own.
-    pub fn new() -> io::Result<Self> {
-        Ok(Self {
-            stdout: io::stdout(),
-        })
-    }
-}
-
-#[cfg(not(unix))]
-impl RawOut for StdoutRaw {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // All-or-nothing: a blocking descriptor has no reason to stop early,
-        // so there is no partial write to resume from.
-        self.stdout.write_all(buf)?;
-        self.stdout.flush()?;
-        Ok(buf.len())
     }
 }
 
@@ -565,14 +529,8 @@ impl<R: RawOut> Write for ShedWriter<R> {
 /// `EPIPE` is the pipe's far end closing; `EIO` is what a pty gives once its
 /// master is gone or the session leader has left. Neither is worth retrying —
 /// there is no terminal left to retry onto.
-#[cfg(unix)]
 fn is_terminal_death(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::BrokenPipe || error.raw_os_error() == Some(libc::EIO)
-}
-
-#[cfg(not(unix))]
-fn is_terminal_death(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::BrokenPipe
 }
 
 #[cfg(test)]
@@ -842,7 +800,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_pty_whose_master_left_is_terminal_death() {
         let (mut writer, handles) = writer(

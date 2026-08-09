@@ -12,7 +12,7 @@ pass, and how to send it.
 - [Pull request process](#pull-request-process)
 - [Issue reporting](#issue-reporting)
 - [Architecture overview](#architecture-overview)
-- [Platform-specific development](#platform-specific-development)
+- [Linux development](#linux-development)
 - [Release process](#release-process)
 - [Getting help](#getting-help)
 - [Conduct](#conduct)
@@ -161,7 +161,6 @@ docs: update installation instructions
 
 1. **Unit tests** cover single functions and modules.
 2. **Integration tests** cover how components fit together.
-3. **Platform tests** cover platform-specific code.
 
 ### Running tests
 
@@ -195,12 +194,12 @@ interfaces instead of fixtures.
    ```bash
    cargo test --features integration
    ```
-   The command reports 189 passed. On Linux without usbmon the extra test
-   prints a skip message and passes.
+   The command reports 189 passed. Without usbmon the extra test prints a skip
+   message and passes.
 
-The live test is gated on `target_os = "linux"` as well as the feature, so it
-compiles to nothing on other hosts and on default builds. CI does not run this
-feature. It exists for manual checks on a real machine with real USB traffic.
+The live test is gated on the feature, so it compiles to nothing on default
+builds. CI does not run this feature. It exists for manual checks on a real
+machine with real USB traffic.
 
 ### Writing tests
 
@@ -232,7 +231,6 @@ Cover these areas first:
 - USB packet parsing.
 - Bandwidth calculation.
 - Error handling paths.
-- Platform-specific code.
 
 ## Pull request process
 
@@ -360,8 +358,8 @@ known limitations.
 
 ### Where new work goes
 
-1. **Platform support**: the platform-specific modules under `src/usbmon/` and
-   `src/device/`.
+1. **Kernel interfaces**: the usbmon readers under `src/usbmon/`, and the sysfs
+   metadata under `src/device/`.
 2. **UI components**: new `draw_*` functions in `src/ui/mod.rs`, and colors in
    `src/ui/colors.rs`.
 3. **Packet analysis**: `src/usbmon/parser.rs` for the text interface, and
@@ -380,30 +378,16 @@ known limitations.
   drain, and the `EIO` and `SIGHUP` constants.
 - `signal-hook`: the signal thread behind the terminal restore.
 
-## Platform-specific development
+## Linux development
 
-### Linux
+usbtop-ng builds on Linux only. `src/main.rs` carries a `compile_error!` for
+every other target, so a change never needs a second platform's arm.
 
 - Test against more than one kernel version.
 - Verify parsing on both interfaces: the binary `/dev/usbmonN` device, which
   usbtop-ng prefers when it opens, and the debugfs `Nu` text fallback.
 - Check the debugfs mount requirements.
 - Test the permission cases, as root and as a plain user.
-
-### BSD
-
-- No live monitoring and no device enumeration exist yet. Run `usbconfig` or
-  `usbdevs` by hand to compare against the empty device table.
-- Test on FreeBSD, OpenBSD, and NetBSD.
-- Handle the different device path formats.
-
-### macOS
-
-- No usbmon equivalent exists, so live monitoring is not implemented.
-- No device enumeration fallback exists. Verify that usbtop-ng exits without
-  `--force`, and opens with an empty device table with `--force`.
-- `system_profiler` and `ioreg` appear only in the printed setup instructions,
-  as manual alternatives. Nothing in usbtop-ng calls them.
 
 ## Release process
 
