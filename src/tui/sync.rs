@@ -37,11 +37,8 @@
 //! anyway. `sudo -E`, or an `env_keep` for those three variables, restores the
 //! conservative posture in full.
 
-#[cfg(unix)]
 use std::io;
-use std::time::Duration;
-#[cfg(unix)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Whether the terminal will hold a frame back until it is whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,7 +264,6 @@ fn reported_mode_2026(sequence: &Csi) -> Option<SyncMode> {
 /// query must not come back short), and no input thread exists yet (whoever
 /// reads stdin next takes the reply). Every failure answers
 /// [`SyncMode::Unsupported`], which is the pre-existing behavior.
-#[cfg(unix)]
 pub fn probe_sync_mode() -> SyncMode {
     use std::io::Write;
 
@@ -300,12 +296,10 @@ pub fn probe_sync_mode() -> SyncMode {
 /// that answers something else entirely, so that a stuck handshake costs a
 /// bounded read rather than however much a confused terminal can produce in a
 /// tenth of a second.
-#[cfg(unix)]
 const MAX_REPLY: usize = 512;
 
 /// Accumulate stdin until the terminal has finished identifying itself, or
 /// `deadline` passes. Whatever arrived is the answer, complete or not.
-#[cfg(unix)]
 fn read_reply(deadline: Instant) -> Vec<u8> {
     let mut reply = Vec::new();
 
@@ -348,7 +342,6 @@ fn read_reply(deadline: Instant) -> Vec<u8> {
 /// `Ok(false)` is "not yet, and not for a reason worth reporting" — the wait
 /// expired, or a signal cut it short. Only a wait that could not be performed
 /// at all is an `Err`.
-#[cfg(unix)]
 fn stdin_readable(budget: Duration) -> io::Result<bool> {
     let mut watch = libc::pollfd {
         fd: libc::STDIN_FILENO,
@@ -375,7 +368,6 @@ fn stdin_readable(budget: Duration) -> io::Result<bool> {
 
 /// One `read(2)` of stdin. The caller has already established that it will not
 /// block.
-#[cfg(unix)]
 fn read_stdin(into: &mut [u8]) -> io::Result<usize> {
     // SAFETY: `STDIN_FILENO` is valid for the life of the process; the pointer
     // and length describe a slice this call only writes into, and the return
@@ -392,14 +384,6 @@ fn read_stdin(into: &mut [u8]) -> io::Result<usize> {
     }
     // Non-negative by the check above, so the conversion cannot fail.
     Ok(usize::try_from(read).unwrap_or(0))
-}
-
-/// Off unix there is no handshake to run: this path has no `poll(2)` on stdin,
-/// and a query nobody reads the answer to is just bytes on the screen. The
-/// answer is the pre-existing behavior, unbracketed frames.
-#[cfg(not(unix))]
-pub fn probe_sync_mode() -> SyncMode {
-    SyncMode::Unsupported
 }
 
 #[cfg(test)]

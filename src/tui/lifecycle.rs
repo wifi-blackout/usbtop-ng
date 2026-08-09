@@ -64,9 +64,7 @@ static RESTORE_LANDED: AtomicBool = AtomicBool::new(true);
 
 /// The output descriptor whose flags [`restore_terminal`] puts back, and the
 /// flags it puts back. A negative descriptor means nothing was saved.
-#[cfg(unix)]
 static SAVED_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-#[cfg(unix)]
 static SAVED_FD_FLAGS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// Record that the terminal is now in TUI mode, so the next
@@ -136,10 +134,8 @@ pub fn restore_terminal() {
 /// terminal that had just refused them. That flush answers to nothing and
 /// cannot give up. It is the hang the budget exists to prevent, moved one frame
 /// later, and a pty-driven check found it there.
-#[cfg(unix)]
 struct RawStdout;
 
-#[cfg(unix)]
 impl Write for RawStdout {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // SAFETY: stdout is valid for the life of the process; the pointer and
@@ -161,27 +157,6 @@ impl Write for RawStdout {
     /// Nothing is held back, so there is nothing to push.
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
-    }
-}
-
-/// Standard output on platforms with no `write(2)` to reach for.
-///
-/// The descriptor is never switched to non-blocking off unix, so a write there
-/// cannot come back `WouldBlock` and the budget never has anything to spend.
-#[cfg(not(unix))]
-struct RawStdout;
-
-#[cfg(not(unix))]
-impl Write for RawStdout {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut out = io::stdout();
-        out.write_all(buf)?;
-        out.flush()?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        io::stdout().flush()
     }
 }
 
@@ -285,37 +260,31 @@ fn write_within_budget(
 
 /// Save the output descriptor's file status flags for [`restore_terminal`].
 fn save_output_flags() {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
+    use std::os::unix::io::AsRawFd;
 
-        let fd = io::stdout().as_raw_fd();
-        // SAFETY: F_GETFL only reads the flags of a descriptor this process
-        // owns for its whole life, and reports failure as a negative return
-        // rather than through errno alone.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags >= 0 {
-            SAVED_FD_FLAGS.store(flags, Ordering::SeqCst);
-            // Published last: the restore reads the descriptor first and only
-            // then trusts the flags.
-            SAVED_FD.store(fd, Ordering::SeqCst);
-        }
+    let fd = io::stdout().as_raw_fd();
+    // SAFETY: F_GETFL only reads the flags of a descriptor this process owns
+    // for its whole life, and reports failure as a negative return rather than
+    // through errno alone.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 {
+        SAVED_FD_FLAGS.store(flags, Ordering::SeqCst);
+        // Published last: the restore reads the descriptor first and only then
+        // trusts the flags.
+        SAVED_FD.store(fd, Ordering::SeqCst);
     }
 }
 
 /// Put back what [`save_output_flags`] saved. Nothing saved, nothing to do.
 fn restore_output_flags() {
-    #[cfg(unix)]
-    {
-        let fd = SAVED_FD.swap(-1, Ordering::SeqCst);
-        if fd < 0 {
-            return;
-        }
-        let flags = SAVED_FD_FLAGS.load(Ordering::SeqCst);
-        // SAFETY: `fd` is stdout, saved by `save_output_flags` from this same
-        // process; F_SETFL with flags read out of F_GETFL is a round trip.
-        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    let fd = SAVED_FD.swap(-1, Ordering::SeqCst);
+    if fd < 0 {
+        return;
     }
+    let flags = SAVED_FD_FLAGS.load(Ordering::SeqCst);
+    // SAFETY: `fd` is stdout, saved by `save_output_flags` from this same
+    // process; F_SETFL with flags read out of F_GETFL is a round trip.
+    let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
 }
 
 /// Put the terminal back before the panic message prints, then let the hook
@@ -346,7 +315,6 @@ pub fn install_panic_hook() {
 ///
 /// The thread is detached, like the input thread: it is parked in the signal
 /// iterator, and process exit reaps it.
-#[cfg(unix)]
 pub fn spawn_signal_thread(tx: std::sync::mpsc::Sender<UiEvent>) {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
@@ -384,12 +352,8 @@ pub enum UnloadPolicy {
     Skip,
 }
 
-/// `SIGHUP` on unix; an inert placeholder elsewhere, where no signal can reach
-/// [`unload_policy`] because no signal thread runs.
-#[cfg(unix)]
+/// The signal that means the terminal is already gone.
 const HANGUP: i32 = libc::SIGHUP;
-#[cfg(not(unix))]
-const HANGUP: i32 = 1;
 
 /// What this exit may still do about usbmon.
 ///
@@ -635,7 +599,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn hangup_is_the_real_sighup() {
         assert_eq!(HANGUP, libc::SIGHUP);

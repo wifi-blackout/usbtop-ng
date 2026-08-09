@@ -7,17 +7,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::parser::{parse_usbmon_text_line, UsbPacket};
 use super::{open_nonblocking, POLL_INTERVAL};
 
-/// Reads usbmon's `Nu` text interface (`/sys/kernel/debug/usb/usbmon/{bus}u`
-/// on Linux). debugfs's `Nu` files ARE the text interface described in
+/// Reads usbmon's `Nu` text interface (`/sys/kernel/debug/usb/usbmon/{bus}u`).
+/// debugfs's `Nu` files ARE the text interface described in
 /// Documentation/usb/usbmon.rst; the binary API is the separate
 /// `/dev/usbmonN` character devices, read by
 /// [`BinaryReader`](super::binary::BinaryReader). This reader is the fallback
 /// [`start_monitoring`](super::monitor::start_monitoring) picks when those
 /// devices cannot be opened.
 ///
-/// On Linux the file is opened non-blocking and polled every
-/// [`POLL_INTERVAL`], so a silent bus never parks the reader thread inside a
-/// `read` where it could neither be joined nor release the debugfs file.
+/// The file is opened non-blocking and polled every [`POLL_INTERVAL`], so a
+/// silent bus never parks the reader thread inside a `read` where it could
+/// neither be joined nor release the debugfs file.
 #[derive(Debug, Clone)]
 pub struct UsbmonReader {
     pub bus_id: u8,
@@ -47,22 +47,7 @@ impl UsbmonReader {
     }
 
     fn get_usbmon_path(bus_id: u8) -> PathBuf {
-        #[cfg(target_os = "linux")]
-        {
-            PathBuf::from(format!("/sys/kernel/debug/usb/usbmon/{}u", bus_id))
-        }
-
-        #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
-        {
-            // BSD systems might use different paths
-            PathBuf::from(format!("/dev/ugen{}.0", bus_id))
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            // macOS doesn't have usbmon, return a placeholder
-            PathBuf::from("/dev/null")
-        }
+        PathBuf::from(format!("/sys/kernel/debug/usb/usbmon/{}u", bus_id))
     }
 
     pub fn is_available(&self) -> bool {
@@ -209,7 +194,6 @@ mod tests {
     /// attached and then answers reads with EAGAIN, just like an idle usbmon
     /// interface.
     #[test]
-    #[cfg(target_os = "linux")]
     fn wouldblock_retry_reassembles_partial_lines() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("5u");
