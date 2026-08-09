@@ -7,10 +7,10 @@ monitoring.
 
 - Rust 1.88 or later.
 - Git.
-- Linux, with a kernel that provides usbmon, for live USB traffic monitoring.
+- Linux, with a kernel that provides usbmon.
 
-Linux usbmon is the only monitoring backend. BSD and macOS builds open the UI
-and list no devices.
+usbmon is the only monitoring backend, and it is a Linux kernel module. A build
+for any other platform stops at a compile error.
 
 ## Build from source
 
@@ -114,7 +114,7 @@ root, or read access granted some other way, depending on the distribution.
    ```bash
    usbtop-ng --help
    ```
-3. Print the setup steps for this platform:
+3. Print the setup steps:
    ```bash
    usbtop-ng --setup
    ```

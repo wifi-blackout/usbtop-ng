@@ -38,42 +38,25 @@ impl UsbBus {
                 .and_then(|real| Some(real.parent()?.file_name()?.to_string_lossy().into_owned()));
         }
 
-        #[cfg(target_os = "linux")]
-        {
-            // Try to read the root hub speed (usually device 1 on the bus)
-            let root_hub_path = base_path.join(format!("usb{}", self.bus_id)).join("speed");
-            if root_hub_path.exists() {
-                if let Ok(speed_str) = fs::read_to_string(&root_hub_path) {
-                    self.speed = UsbSpeed::from_speed_str(speed_str.trim());
-                    return Ok(());
-                }
+        // Try to read the root hub speed (usually device 1 on the bus)
+        let root_hub_path = base_path.join(format!("usb{}", self.bus_id)).join("speed");
+        if root_hub_path.exists() {
+            if let Ok(speed_str) = fs::read_to_string(&root_hub_path) {
+                self.speed = UsbSpeed::from_speed_str(speed_str.trim());
+                return Ok(());
             }
-
-            // Fallback: find the highest speed device on the bus as bus speed
-            let highest_speed = self
-                .devices
-                .values()
-                .map(|device| &device.speed)
-                .max_by_key(|speed| speed.to_mbps() as u64)
-                .cloned()
-                .unwrap_or(UsbSpeed::Unknown);
-
-            self.speed = highest_speed;
         }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            // For non-Linux systems, estimate bus speed from devices
-            let highest_speed = self
-                .devices
-                .values()
-                .map(|device| &device.speed)
-                .max_by_key(|speed| speed.to_mbps() as u64)
-                .cloned()
-                .unwrap_or(UsbSpeed::Unknown);
+        // Fallback: find the highest speed device on the bus as bus speed
+        let highest_speed = self
+            .devices
+            .values()
+            .map(|device| &device.speed)
+            .max_by_key(|speed| speed.to_mbps() as u64)
+            .cloned()
+            .unwrap_or(UsbSpeed::Unknown);
 
-            self.speed = highest_speed;
-        }
+        self.speed = highest_speed;
 
         Ok(())
     }
@@ -292,7 +275,6 @@ mod tests {
         assert_eq!(bus.busy_percentage(), Some(100.0));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn refresh_marks_devices_disconnected_when_sysfs_path_vanishes() {
         let temp = tempfile::tempdir().unwrap();

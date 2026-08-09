@@ -1,3 +1,10 @@
+// usbmon is the only packet source usbtop-ng has, and usbmon is a Linux
+// kernel module. Every other platform once carried stub checks that passed
+// without a source behind them, so the UI opened onto a table that could never
+// fill. This says so at compile time instead.
+#[cfg(not(target_os = "linux"))]
+compile_error!("usbtop-ng supports Linux only.");
+
 use anyhow::Result;
 use clap::Parser;
 use log::{error, info, warn};
@@ -22,8 +29,8 @@ use tui::lifecycle::{unload_policy, UnloadPolicy};
 use tui::{effective_refresh_ms, run_ui};
 use ui::UsbTopApp;
 use usbmon::{
-    attempt_load_usbmon, check_usbmon_status, print_platform_instructions,
-    prompt_user_to_load_module, prompt_user_to_unload_module,
+    attempt_load_usbmon, check_usbmon_status, print_setup_instructions, prompt_user_to_load_module,
+    prompt_user_to_unload_module,
 };
 
 #[derive(Parser)]
@@ -47,7 +54,7 @@ struct Cli {
     #[arg(long)]
     force: bool,
 
-    /// Show platform-specific setup instructions
+    /// Show setup instructions for live monitoring
     #[arg(long)]
     setup: bool,
 
@@ -74,7 +81,7 @@ fn main() -> Result<()> {
 
     // Show setup instructions if requested
     if cli.setup {
-        print_platform_instructions();
+        print_setup_instructions();
         return Ok(());
     }
 
@@ -122,7 +129,7 @@ fn main() -> Result<()> {
                 if let Err(e) = attempt_load_usbmon() {
                     error!("Failed to load usbmon: {}", e);
                     println!();
-                    print_platform_instructions();
+                    print_setup_instructions();
                     process::exit(1);
                 }
                 loaded_usbmon_for_this_run = true;
@@ -133,7 +140,7 @@ fn main() -> Result<()> {
                     error!(
                         "usbmon was loaded, but the usbmon debugfs interface is still unavailable"
                     );
-                    print_platform_instructions();
+                    print_setup_instructions();
                     // Still before the TUI, so stdin is nobody else's yet — and
                     // stdout is the plain blocking one this process started
                     // with, which nothing has had a chance to wedge.
@@ -151,11 +158,11 @@ fn main() -> Result<()> {
             }
         } else if !usbmon_status.debugfs_mounted {
             error!("debugfs is not mounted, so /sys/kernel/debug/usb/usbmon is unavailable");
-            print_platform_instructions();
+            print_setup_instructions();
             process::exit(1);
         } else {
             error!("usbmon is loaded, but /sys/kernel/debug/usb/usbmon is unavailable");
-            print_platform_instructions();
+            print_setup_instructions();
             process::exit(1);
         }
     }
