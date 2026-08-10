@@ -1175,6 +1175,54 @@ mod tests {
     }
 
     #[test]
+    fn hiding_idle_devices_prunes_empty_buses_and_controllers() {
+        let (_t, mut mgr) = manager_with_rates(&[]);
+
+        // Bus 3, alone on its controller, has only an idle device: hiding
+        // idle devices should empty the bus and, since it's the only bus on
+        // that controller, prune the controller too.
+        let idle_bus = mgr.get_or_create_bus(3);
+        idle_bus.controller = Some("idle-controller".to_string());
+        idle_bus.devices.insert(1, UsbDevice::new(3, 1));
+
+        // Bus 4, on a different controller, has one device with traffic:
+        // both the bus and its controller must survive.
+        let busy_bus = mgr.get_or_create_bus(4);
+        busy_bus.controller = Some("busy-controller".to_string());
+        let mut busy_device = UsbDevice::new(4, 1);
+        busy_device.bandwidth_stats.current_bps = 500.0;
+        busy_bus.devices.insert(1, busy_device);
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+
+        app.hide_idle_devices = false;
+        app.sync_from(&mgr);
+        assert_eq!(
+            app.controllers.len(),
+            2,
+            "both controllers present while idle devices show"
+        );
+
+        app.hide_idle_devices = true;
+        app.sync_from(&mgr);
+        assert_eq!(
+            app.controllers.len(),
+            1,
+            "the idle-only controller is pruned, not left as a bare header"
+        );
+        assert_eq!(app.controllers[0].id, "busy-controller");
+        assert_eq!(app.controllers[0].buses.len(), 1);
+        assert_eq!(app.controllers[0].buses[0].bus_id, 4);
+        assert!(
+            app.controllers
+                .iter()
+                .flat_map(|c| c.buses.iter())
+                .all(|b| !b.devices.is_empty()),
+            "no bus with zero visible devices remains"
+        );
+    }
+
+    #[test]
     fn pressing_i_toggles_and_saves_the_preference() {
         use crossterm::event::{KeyCode, KeyEvent};
         let temp = tempfile::tempdir().unwrap();

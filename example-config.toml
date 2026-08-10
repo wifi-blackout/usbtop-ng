@@ -14,3 +14,8 @@ auto_load_usbmon = false
 # If true, usbtop-ng automatically runs `sudo modprobe -r usbmon` on exit, but only
 # when usbtop-ng loaded usbmon for this session.
 unload_usbmon_on_exit = false
+
+# If false, idle devices (no active transfer) show in the device table.
+# If true, usbtop-ng hides idle devices. Press `i` in the UI to toggle this
+# and save the choice here.
+hide_idle_devices = false
