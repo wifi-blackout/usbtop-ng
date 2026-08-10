@@ -24,25 +24,52 @@ for any other platform stops at a compile error.
    ```bash
    cd usbtop-ng
    ```
-3. Build the release binary:
+3. Run the install script:
    ```bash
-   cargo build --release
+   ./install.sh
    ```
-   The build writes `target/release/usbtop-ng`. If the build fails on a
-   compiler error, confirm that `cargo --version` reports Rust 1.88 or later.
-4. Copy the binary onto your path:
+   The script runs `cargo build --release`, then asks for `sudo` to copy the
+   binary to `/usr/local/bin` and to create a `usbtop` symlink. It prints the
+   two paths it installed. If the build fails on a compiler error, confirm that
+   `cargo --version` reports Rust 1.88 or later.
+4. Confirm the install:
    ```bash
-   sudo cp target/release/usbtop-ng /usr/local/bin/
+   usbtop-ng --version
    ```
-   Confirm the copy with `usbtop-ng --version`. If `sudo` refuses, copy the
-   binary into a directory on your own path instead.
+   The command reports the installed version.
 
-To install through Cargo instead of copying the binary, run this from the
-checkout:
+The symlink makes `usbtop` and `sudo usbtop` both work, because both resolve
+through your path. A shell alias would not work under `sudo`.
+
+To install somewhere other than `/usr/local/bin`, set `PREFIX`:
 
 ```bash
-cargo install --path .
+PREFIX="$HOME/.local/bin" ./install.sh
 ```
+
+To install by hand instead, build and copy the binary yourself:
+
+```bash
+cargo build --release
+sudo install -m 0755 target/release/usbtop-ng /usr/local/bin/usbtop-ng
+sudo ln -sf usbtop-ng /usr/local/bin/usbtop
+```
+
+## Update
+
+1. Pull the latest code:
+   ```bash
+   git pull
+   ```
+2. Reinstall:
+   ```bash
+   ./install.sh
+   ```
+   The script rebuilds and replaces the binary and the symlink.
+3. Confirm the new version:
+   ```bash
+   usbtop-ng --version
+   ```
 
 ## Linux setup
 
@@ -142,15 +169,11 @@ From the source tree, run the same three checks CI runs:
 
 ## Uninstall
 
-1. If you copied the binary to `/usr/local/bin`, remove it:
+1. If you installed to `/usr/local/bin`, remove the binary and the symlink:
    ```bash
-   sudo rm /usr/local/bin/usbtop-ng
+   sudo rm /usr/local/bin/usbtop-ng /usr/local/bin/usbtop
    ```
-2. If you installed with Cargo, remove it:
-   ```bash
-   cargo uninstall usbtop-ng
-   ```
-3. To remove the preferences file and its directory, run:
+2. To remove the preferences file and its directory, run:
    ```bash
    rm -r ~/.usbtop-ng
    ```
