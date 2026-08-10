@@ -93,6 +93,10 @@ pub struct UsbTopApp {
     /// runtime with `i` and saved to the preferences file (see
     /// [`Self::toggle_hide_idle`]).
     pub hide_idle_devices: bool,
+    /// Where to write the preference when `i` toggles it: the config path and
+    /// the full preferences snapshot, so the other keys survive the write.
+    /// `None` in tests and whenever no config file backs the session.
+    idle_persist: Option<(std::path::PathBuf, crate::config::Preferences)>,
 }
 
 impl UsbTopApp {
@@ -110,6 +114,7 @@ impl UsbTopApp {
             dropped_counter: None,
             shed_counter: None,
             hide_idle_devices: false,
+            idle_persist: None,
         }
     }
 
@@ -118,6 +123,32 @@ impl UsbTopApp {
     pub fn with_dropped_counter(mut self, dropped: Arc<AtomicU64>) -> Self {
         self.dropped_counter = Some(dropped);
         self
+    }
+
+    /// Supply the saved value, the config path, and the preferences snapshot so
+    /// `i` can persist the choice. Preserves the builder style of
+    /// [`Self::with_dropped_counter`].
+    pub fn with_idle_setting(
+        mut self,
+        hide: bool,
+        path: std::path::PathBuf,
+        preferences: crate::config::Preferences,
+    ) -> Self {
+        self.hide_idle_devices = hide;
+        self.idle_persist = Some((path, preferences));
+        self
+    }
+
+    /// Flip the hide-idle flag and save it. A write failure logs and keeps the
+    /// flag effective for the session; it never fails the UI.
+    fn toggle_hide_idle(&mut self) {
+        self.hide_idle_devices = !self.hide_idle_devices;
+        if let Some((path, preferences)) = &mut self.idle_persist {
+            preferences.hide_idle_devices = self.hide_idle_devices;
+            if let Err(e) = crate::config::write_preferences_at(path, preferences) {
+                log::warn!("could not save the hide-idle preference: {e}");
+            }
+        }
     }
 
     /// Packets discarded so far, or 0 when no counter is attached.
@@ -330,6 +361,10 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
         }
         KeyCode::Down => {
             app.select_next_device();
+            KeyOutcome::Redraw
+        }
+        KeyCode::Char('i') => {
+            app.toggle_hide_idle();
             KeyOutcome::Redraw
         }
         _ => KeyOutcome::None,
@@ -872,6 +907,13 @@ fn draw_color_reference(f: &mut Frame, area: Rect) {
             ),
             Span::raw(" Help  "),
             Span::styled(
+                "i",
+                Style::default()
+                    .fg(ACCENT_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Idle devices  "),
+            Span::styled(
                 "q/Esc",
                 Style::default()
                     .fg(ACCENT_COLOR)
@@ -910,6 +952,10 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from(vec![
             Span::styled("  Ctrl-L", Style::default().fg(ACCENT_COLOR)),
             Span::raw("   Wipe the screen and repaint it from scratch"),
+        ]),
+        Line::from(vec![
+            Span::styled("  i", Style::default().fg(ACCENT_COLOR)),
+            Span::raw("        Show or hide idle devices"),
         ]),
         Line::from(vec![
             Span::styled("  q/Esc", Style::default().fg(ACCENT_COLOR)),
@@ -1129,6 +1175,42 @@ mod tests {
     }
 
     #[test]
+    fn pressing_i_toggles_and_saves_the_preference() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.toml");
+        let prefs = crate::config::Preferences {
+            auto_load_usbmon: true,
+            unload_usbmon_on_exit: false,
+            hide_idle_devices: false,
+        };
+        let mut app = UsbTopApp::new(Duration::from_millis(100)).with_idle_setting(
+            false,
+            path.clone(),
+            prefs,
+        );
+
+        let outcome = apply_key(&mut app, KeyEvent::from(KeyCode::Char('i')));
+        assert!(matches!(outcome, KeyOutcome::Redraw));
+        assert!(app.hide_idle_devices);
+
+        let saved = crate::config::load_or_create_default_at(&path).unwrap();
+        assert!(saved.hide_idle_devices, "written to disk");
+        assert!(saved.auto_load_usbmon, "other keys preserved");
+    }
+
+    #[test]
+    fn toggling_without_a_config_path_stays_in_memory() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        apply_key(&mut app, KeyEvent::from(KeyCode::Char('i')));
+        assert!(
+            app.hide_idle_devices,
+            "flips even with no persistence attached"
+        );
+    }
+
+    #[test]
     fn totals_do_not_accumulate_float_error_across_syncs() {
         let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.1), (1, 4, 0.2)]);
         let mut app = UsbTopApp::new(Duration::from_millis(100));
@@ -1325,7 +1407,14 @@ mod tests {
 
         // Distinctive strings, not bare letters: a lone "h" would match
         // anywhere on the screen and assert nothing.
-        for binding in ["↑/↓", "Toggle this help", "Ctrl-L", "q/Esc", "Ctrl-C"] {
+        for binding in [
+            "↑/↓",
+            "Toggle this help",
+            "Ctrl-L",
+            "Show or hide idle devices",
+            "q/Esc",
+            "Ctrl-C",
+        ] {
             assert!(screen.contains(binding), "{binding} missing from {screen}");
         }
         // And both counters the header can spring on the user are explained.
