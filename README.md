@@ -93,6 +93,7 @@ Run `sudo usbtop-ng` when your account cannot read
 | --- | --- |
 | `↑` / `↓` | Select a device. The device table scrolls to keep it visible. |
 | `h` | Open or close the help overlay. |
+| `i` | Show or hide idle devices. Saves the choice to `~/.usbtop-ng/preferences.toml`. |
 | `Ctrl-L` | Wipe the screen and repaint it from scratch. |
 | `q` or `Esc` | Quit. |
 | `Ctrl-C` | Quit. |
@@ -146,6 +147,10 @@ key press and quits through the same teardown as `q`.
 - A device that disappears greys out for 5 seconds, then leaves the table.
 - The table scrolls to follow the selection, so `↑` and `↓` cannot walk the
   selection off screen.
+- Idle-device enumeration shows a row for every connected device, at zero
+  bandwidth until it transfers. Enumeration runs by default.
+- `i` hides devices with no current traffic and saves the choice to
+  `~/.usbtop-ng/preferences.toml`.
 
 ### The chart pane
 
@@ -260,7 +265,7 @@ key press and quits through the same teardown as `q`.
 
 ### Tests
 
-- `cargo test --all-targets` runs 188 hermetic tests against fixture files,
+- `cargo test --all-targets` runs 200 hermetic tests against fixture files,
   FIFOs, and temporary paths. They need no `/dev` and no debugfs access.
 - The `integration` cargo feature adds 1 test that reads the real usbmon
   interfaces. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
