@@ -89,6 +89,10 @@ pub struct UsbTopApp {
     /// session. Same bargain as [`Self::dropped_counter`]: a session that is
     /// showing less than it measured has to say so.
     pub shed_counter: Option<Arc<AtomicU64>>,
+    /// Hide devices with no current traffic. Off by default. Toggled at
+    /// runtime with `i` and saved to the preferences file (see
+    /// [`Self::toggle_hide_idle`]).
+    pub hide_idle_devices: bool,
 }
 
 impl UsbTopApp {
@@ -105,6 +109,7 @@ impl UsbTopApp {
             list_scroll: 0,
             dropped_counter: None,
             shed_counter: None,
+            hide_idle_devices: false,
         }
     }
 
@@ -166,6 +171,10 @@ impl UsbTopApp {
             self.peak_bandwidth = self.total_bandwidth;
         }
 
+        if self.hide_idle_devices {
+            self.retain_active_devices();
+        }
+
         if let Some(selected) = &self.selected_device {
             if !self.device_keys().iter().any(|key| key == selected) {
                 self.selected_device = None;
@@ -184,6 +193,19 @@ impl UsbTopApp {
                     .map(move |row| format!("{}:{}", bus.bus_id, row.device.device_id))
             })
             .collect()
+    }
+
+    /// Drop rows with no current traffic, then drop any bus or controller left
+    /// empty, so hiding idle devices does not leave bare headers.
+    fn retain_active_devices(&mut self) {
+        for controller in &mut self.controllers {
+            for bus in &mut controller.buses {
+                bus.devices
+                    .retain(|row| row.device.bandwidth_stats.current_bps > 0.0);
+            }
+            controller.buses.retain(|bus| !bus.devices.is_empty());
+        }
+        self.controllers.retain(|c| !c.buses.is_empty());
     }
 
     pub fn update_bandwidth_history(&mut self) {
@@ -1066,6 +1088,43 @@ mod tests {
         assert_eq!(
             app.selected_device, None,
             "selection drops when the device vanishes"
+        );
+    }
+
+    #[test]
+    fn hide_idle_devices_filters_zero_bandwidth_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        // Two devices in sysfs; only one gets traffic.
+        for (name, dev) in [("1-3", 3u8), ("1-4", 4u8)] {
+            let dir = temp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("busnum"), "1\n").unwrap();
+            std::fs::write(dir.join("devnum"), format!("{dev}\n")).unwrap();
+            std::fs::write(dir.join("speed"), "480\n").unwrap();
+        }
+        let mut manager =
+            crate::device::manager::DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        manager.enumerate_present_devices();
+        manager.apply_packet(
+            &crate::usbmon::parser::parse_usbmon_text_line("f 1 C Bi:1:003:1 0 4096 <").unwrap(),
+        );
+        manager.refresh();
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+
+        app.hide_idle_devices = false;
+        app.sync_from(&manager);
+        assert_eq!(
+            app.device_keys(),
+            vec!["1:3".to_string(), "1:4".to_string()]
+        );
+
+        app.hide_idle_devices = true;
+        app.sync_from(&manager);
+        assert_eq!(
+            app.device_keys(),
+            vec!["1:3".to_string()],
+            "idle 1:4 hidden"
         );
     }
 
