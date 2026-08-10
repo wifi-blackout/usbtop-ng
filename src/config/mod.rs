@@ -20,16 +20,6 @@ pub struct Preferences {
     pub hide_idle_devices: bool,
 }
 
-impl Preferences {
-    pub fn load_or_create_default() -> Result<Self> {
-        let path = preferences_path()?;
-        if let Some(parent) = path.parent() {
-            ensure_private_config_dir(parent)?;
-        }
-        load_or_create_default_at(&path)
-    }
-}
-
 pub fn preferences_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME is not set; cannot locate ~/.usbtop-ng")?;
     Ok(PathBuf::from(home)
