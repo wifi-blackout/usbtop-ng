@@ -1,4 +1,4 @@
-# usbtop-ng
+# usbtop-ng  by https://wifi-blackout.com
 
 usbtop-ng reports live USB bandwidth per device in a terminal. It reads the
 Linux usbmon interfaces and repaints when the numbers change.
@@ -6,7 +6,8 @@ Linux usbmon interfaces and repaints when the numbers change.
 usbtop-ng is an independent reimplementation of
 [usbtop](https://github.com/aguinet/usbtop). It shares no code with the
 original project. The original authors do not endorse usbtop-ng and have no
-affiliation with it.
+affiliation with it. I wanted to have a more robust modern TUI that also was
+up-to-date with modern USB devices. 
 
 ## What the screen shows
 
@@ -326,6 +327,7 @@ Options:
   pull requests.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): modules, data flow, the TUI
   chassis, known limitations.
+- [docs/ROADMAP.md](docs/ROADMAP.md): feature ideas and follow-up work.
 - [CHANGELOG.md](CHANGELOG.md): what changed per release.
 
 ## Development
