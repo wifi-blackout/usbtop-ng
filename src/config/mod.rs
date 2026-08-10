@@ -9,9 +9,15 @@ pub const PREFERENCES_FILE_NAME: &str = "preferences.toml";
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preferences {
     /// Load the Linux usbmon kernel module automatically when it is missing.
+    #[serde(default)]
     pub auto_load_usbmon: bool,
     /// Unload usbmon automatically on exit when usbtop-ng loaded it for this run.
+    #[serde(default)]
     pub unload_usbmon_on_exit: bool,
+    /// Hide devices that are not transferring. Off by default, so every
+    /// connected device shows even at zero bandwidth.
+    #[serde(default)]
+    pub hide_idle_devices: bool,
 }
 
 impl Preferences {
@@ -159,5 +165,41 @@ mod tests {
 
         let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "existing dir must not be re-chmodded");
+    }
+
+    #[test]
+    fn hide_idle_devices_defaults_to_false() {
+        assert!(!Preferences::default().hide_idle_devices);
+    }
+
+    #[test]
+    fn old_preferences_file_without_the_key_still_loads() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".usbtop-ng/preferences.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "auto_load_usbmon = true\nunload_usbmon_on_exit = false\n",
+        )
+        .unwrap();
+
+        let prefs = load_or_create_default_at(&path).unwrap();
+        assert!(prefs.auto_load_usbmon);
+        assert!(!prefs.hide_idle_devices);
+    }
+
+    #[test]
+    fn hide_idle_devices_round_trips_and_keeps_the_other_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.toml");
+        let prefs = Preferences {
+            auto_load_usbmon: true,
+            unload_usbmon_on_exit: true,
+            hide_idle_devices: true,
+        };
+        write_preferences_at(&path, &prefs).unwrap();
+
+        let read = load_or_create_default_at(&path).unwrap();
+        assert_eq!(read, prefs);
     }
 }

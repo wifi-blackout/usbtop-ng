@@ -383,6 +383,7 @@ mod tests {
         let auto = crate::config::Preferences {
             auto_load_usbmon: false,
             unload_usbmon_on_exit: true,
+            hide_idle_devices: false,
         };
         assert_eq!(unload_mode(&auto), UnloadMode::Automatic);
         let ask = crate::config::Preferences::default();
