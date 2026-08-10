@@ -300,6 +300,7 @@ fn run_app(
         if now >= next_tick {
             // `sync_from` rebuilds the whole snapshot, so the list of devices
             // dropped by this refresh needs no separate handling.
+            manager.enumerate_present_devices();
             let _ = manager.refresh();
             app.sync_from(manager);
             app.update_bandwidth_history();
