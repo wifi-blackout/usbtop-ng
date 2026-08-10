@@ -36,7 +36,7 @@ use usbmon::{
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(name = "usbtop-ng")]
-#[command(about = "Next-generation USB monitoring tool with real-time bandwidth tracking")]
+#[command(about = "Live USB bandwidth monitor for Linux")]
 struct Cli {
     /// Enable verbose logging
     #[arg(short, long)]

@@ -410,18 +410,29 @@ pub(crate) fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
     draw_color_reference(f, chunks[3]);
 }
 
+/// Bytes per second as MB/s, floored at zero. Bandwidth is never negative, so
+/// this also keeps a `-0.0` sum from rendering as "-0.0 MB/s".
+fn to_mbps(bytes_per_second: f64) -> f64 {
+    let mbps = bytes_per_second / 1_000_000.0;
+    if mbps <= 0.0 {
+        0.0
+    } else {
+        mbps
+    }
+}
+
 fn draw_header(f: &mut Frame, area: Rect, app: &UsbTopApp) {
     let mut stats_line = vec![
         Span::raw("Total: "),
         Span::styled(
-            format!("{:.1} MB/s", app.total_bandwidth / 1_000_000.0),
+            format!("{:.1} MB/s", to_mbps(app.total_bandwidth)),
             Style::default()
                 .fg(PRIMARY_COLOR)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" | Peak: "),
         Span::styled(
-            format!("{:.1} MB/s", app.peak_bandwidth / 1_000_000.0),
+            format!("{:.1} MB/s", to_mbps(app.peak_bandwidth)),
             Style::default()
                 .fg(SECONDARY_COLOR)
                 .add_modifier(Modifier::BOLD),
@@ -469,7 +480,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &UsbTopApp) {
                     .fg(ACCENT_COLOR)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" - Next-Gen USB Traffic Monitor"),
+            Span::raw(" - live USB bandwidth monitor"),
         ]),
         Line::from(stats_line),
     ];
@@ -1667,6 +1678,14 @@ mod tests {
 
     /// A session whose terminal could not keep up is showing stale numbers,
     /// and the header is the only place that can admit it.
+    #[test]
+    fn header_bandwidth_floors_at_positive_zero() {
+        assert_eq!(to_mbps(-0.0), 0.0);
+        assert!(to_mbps(-0.0).is_sign_positive(), "must not render as -0.0");
+        assert!(to_mbps(-5.0).is_sign_positive());
+        assert_eq!(to_mbps(48_000_000.0), 48.0);
+    }
+
     #[test]
     fn header_reports_shed_frames_only_once_some_were_shed() {
         let render = |app: &UsbTopApp| {
