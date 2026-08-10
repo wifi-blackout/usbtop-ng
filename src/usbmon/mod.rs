@@ -36,6 +36,7 @@ pub struct UsbmonStatus {
     pub module_loaded: bool,
     pub debugfs_mounted: bool,
     pub usbmon_available: bool,
+    pub permission_denied: bool,
     pub available_buses: Vec<u8>,
 }
 
@@ -44,7 +45,9 @@ pub fn check_usbmon_status() -> Result<UsbmonStatus> {
 
     let module_loaded = is_usbmon_module_loaded()?;
     let debugfs_mounted = is_debugfs_mounted()?;
-    let usbmon_available = debugfs_mounted && check_usbmon_debugfs_exists()?;
+    let state = usbmon_debugfs_state();
+    let usbmon_available = debugfs_mounted && state == DebugfsState::Present;
+    let permission_denied = debugfs_mounted && state == DebugfsState::Unreadable;
     let available_buses = if usbmon_available {
         get_available_buses()?
     } else {
@@ -55,6 +58,7 @@ pub fn check_usbmon_status() -> Result<UsbmonStatus> {
         module_loaded,
         debugfs_mounted,
         usbmon_available,
+        permission_denied,
         available_buses,
     })
 }
@@ -71,23 +75,41 @@ fn is_debugfs_mounted() -> Result<bool> {
         .any(|line| line.contains("debugfs") && line.contains("/sys/kernel/debug")))
 }
 
-fn check_usbmon_debugfs_exists() -> Result<bool> {
-    Ok(Path::new("/sys/kernel/debug/usb/usbmon").exists())
+/// What a stat of the usbmon debugfs directory tells us: present and
+/// readable, absent entirely, or present but blocked by permissions.
+/// `Path::exists()` collapses the latter two into one `false`, which is what
+/// sends a non-root user to `modprobe`/`mount` instructions that cannot fix a
+/// permission problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebugfsState {
+    Present,
+    Absent,
+    Unreadable,
+}
+
+fn classify_debugfs_path(path: &Path) -> DebugfsState {
+    match std::fs::metadata(path) {
+        Ok(_) => DebugfsState::Present,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => DebugfsState::Unreadable,
+        Err(_) => DebugfsState::Absent,
+    }
+}
+
+fn usbmon_debugfs_state() -> DebugfsState {
+    classify_debugfs_path(Path::new("/sys/kernel/debug/usb/usbmon"))
 }
 
 fn get_available_buses() -> Result<Vec<u8>> {
     let mut buses = Vec::new();
 
-    if let Ok(entries) = fs::read_dir("/sys/kernel/debug/usb/usbmon") {
-        for entry in entries.flatten() {
-            let filename = entry.file_name();
-            let filename_str = filename.to_string_lossy();
+    for entry in fs::read_dir("/sys/kernel/debug/usb/usbmon")?.flatten() {
+        let filename = entry.file_name();
+        let filename_str = filename.to_string_lossy();
 
-            // Look for files like "0u", "1u", "2u", etc.
-            if filename_str.ends_with('u') && filename_str.len() >= 2 {
-                if let Ok(bus_num) = filename_str[0..filename_str.len() - 1].parse::<u8>() {
-                    buses.push(bus_num);
-                }
+        // Look for files like "0u", "1u", "2u", etc.
+        if filename_str.ends_with('u') && filename_str.len() >= 2 {
+            if let Ok(bus_num) = filename_str[0..filename_str.len() - 1].parse::<u8>() {
+                buses.push(bus_num);
             }
         }
     }
@@ -315,6 +337,14 @@ pub fn print_setup_instructions() {
     );
 }
 
+/// Printed when usbmon is present but this user cannot read it. The tool needs
+/// root, so the only remedy is `sudo`.
+pub fn print_permission_remedy() {
+    println!("usbmon is present but this user cannot read it.");
+    println!("Run usbtop-ng with sudo:");
+    println!("  sudo usbtop-ng");
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_yes_response;
@@ -388,6 +418,41 @@ mod tests {
         assert_eq!(unload_mode(&auto), UnloadMode::Automatic);
         let ask = crate::config::Preferences::default();
         assert_eq!(unload_mode(&ask), UnloadMode::Ask);
+    }
+
+    #[test]
+    fn debugfs_state_reads_present_and_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let present = temp.path().join("usbmon");
+        std::fs::create_dir_all(&present).unwrap();
+        assert_eq!(
+            super::classify_debugfs_path(&present),
+            super::DebugfsState::Present
+        );
+        assert_eq!(
+            super::classify_debugfs_path(&temp.path().join("missing")),
+            super::DebugfsState::Absent
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn debugfs_state_reads_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root bypasses directory permissions, so this check cannot be made to
+        // fail as root. Skip it there.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("locked");
+        std::fs::create_dir_all(parent.join("usbmon")).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let state = super::classify_debugfs_path(&parent.join("usbmon"));
+        // Restore so the tempdir can be cleaned up.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(state, super::DebugfsState::Unreadable);
     }
 }
 
