@@ -41,50 +41,50 @@ Four blocks fill the window, top to bottom.
    ```bash
    cd usbtop-ng
    ```
-3. Build the release binary:
+3. Run the install script:
    ```bash
-   cargo build --release
+   ./install.sh
    ```
-   The build writes `target/release/usbtop-ng`. If the build fails on a
-   compiler error, check that `cargo --version` reports Rust 1.88 or later.
-4. Copy the binary onto your path:
-   ```bash
-   sudo cp target/release/usbtop-ng /usr/local/bin/
-   ```
+   The script runs `cargo build --release`, then asks for `sudo` to copy the
+   binary to `/usr/local/bin` and to create a `usbtop` symlink. If the build
+   fails on a compiler error, check that `cargo --version` reports Rust 1.88 or
+   later.
+
+The install creates `/usr/local/bin/usbtop` as a symlink to `usbtop-ng`, so
+`usbtop` and `sudo usbtop` both work. A shell alias would not work under
+`sudo`.
+
+To install by hand instead, build and copy the binary yourself:
+
+```bash
+cargo build --release
+sudo install -m 0755 target/release/usbtop-ng /usr/local/bin/usbtop-ng
+sudo ln -sf usbtop-ng /usr/local/bin/usbtop
+```
 
 [docs/INSTALL.md](docs/INSTALL.md) covers the usbmon setup, the permission
 checks, and how to remove usbtop-ng again.
 
-### Shell alias
+## Update
 
-usbtop-ng can add a `usbtop` alias to your shell configuration file.
-
-1. Run the alias command:
+1. Pull the latest code:
    ```bash
-   usbtop-ng --create-alias
+   git pull
    ```
-2. Answer `y` at the confirmation prompt. usbtop-ng prints the file it wrote
-   to. Record that path.
-3. Load the alias into the current shell:
+2. Reinstall:
    ```bash
-   source ~/.bashrc
+   ./install.sh
    ```
-   Use the path from step 2 in place of `~/.bashrc`.
-
-To add the alias by hand instead, put this line in `~/.bashrc`, `~/.zshrc`, or
-your shell's equivalent:
-
-```bash
-alias usbtop='usbtop-ng'
-```
+   The script rebuilds and replaces the binary and the symlink. Confirm the
+   version with `usbtop-ng --version`.
 
 ## Start it
 
 ```bash
-usbtop-ng
+usbtop
 ```
 
-Run `sudo usbtop-ng` when your account cannot read
+Run `sudo usbtop` when your account cannot read
 `/sys/kernel/debug/usb/usbmon`.
 
 ## Keys
