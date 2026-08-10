@@ -179,18 +179,68 @@ impl DeviceManager {
         self.update_bus_speeds();
         removed
     }
+
+    /// Add a row for every USB device currently in sysfs, so idle devices show
+    /// before they transfer. Metadata is read once, when a device is first seen.
+    /// A device already known keeps its row and its bandwidth untouched. Removal
+    /// stays in `refresh`, through the existing disconnect path.
+    pub fn enumerate_present_devices(&mut self) {
+        let base = self
+            .sysfs_base
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/sys/bus/usb/devices"));
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.contains(':') {
+                continue; // an interface, not a device
+            }
+            let dir = entry.path();
+            let (Some(bus), Some(dev)) = (
+                read_sysfs_u8(&dir.join("busnum")),
+                read_sysfs_u8(&dir.join("devnum")),
+            ) else {
+                continue;
+            };
+            self.buses
+                .entry(bus)
+                .or_insert_with(|| UsbBus::new(bus))
+                .devices
+                .entry(dev)
+                .or_insert_with(|| {
+                    let mut device = UsbDevice::new(bus, dev);
+                    device.populate_from_sysfs(Some(&base));
+                    device
+                });
+        }
+    }
+}
+
+fn read_sysfs_u8(path: &Path) -> Option<u8> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usbmon::parser::parse_usbmon_text_line;
+    use crate::usbmon::parser::{parse_usbmon_text_line, UsbSpeed};
     use std::time::Duration;
 
     fn manager_with_empty_sysfs() -> (tempfile::TempDir, DeviceManager) {
         let temp = tempfile::tempdir().unwrap();
         let mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
         (temp, mgr)
+    }
+
+    fn write_sysfs_device(base: &std::path::Path, name: &str, bus: u8, dev: u8, speed: &str) {
+        let dir = base.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("busnum"), format!("{bus}\n")).unwrap();
+        std::fs::write(dir.join("devnum"), format!("{dev}\n")).unwrap();
+        std::fs::write(dir.join("speed"), format!("{speed}\n")).unwrap();
     }
 
     #[test]
@@ -291,5 +341,53 @@ mod tests {
         std::fs::remove_dir_all(&dev_dir).unwrap();
         mgr.refresh();
         assert!(mgr.buses[&1].devices[&3].is_disconnected);
+    }
+
+    #[test]
+    fn enumeration_adds_a_row_per_present_device_at_zero_bandwidth() {
+        let temp = tempfile::tempdir().unwrap();
+        write_sysfs_device(temp.path(), "usb1", 1, 1, "480"); // root hub
+        write_sysfs_device(temp.path(), "1-4", 1, 4, "480"); // a device
+        std::fs::create_dir_all(temp.path().join("1-4:1.0")).unwrap(); // interface, skipped
+
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.enumerate_present_devices();
+
+        let bus = mgr.buses.get(&1).expect("bus 1 present");
+        assert!(bus.devices.contains_key(&1), "root hub enumerated");
+        assert!(bus.devices.contains_key(&4), "device enumerated");
+        assert_eq!(bus.devices.len(), 2, "the interface dir is not a device");
+        assert_eq!(bus.devices[&4].bandwidth_stats.current_bps, 0.0);
+        assert_eq!(bus.devices[&4].speed, UsbSpeed::High);
+    }
+
+    #[test]
+    fn enumeration_does_not_disturb_a_device_that_has_traffic() {
+        let temp = tempfile::tempdir().unwrap();
+        write_sysfs_device(temp.path(), "1-4", 1, 4, "480");
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+
+        let callback = parse_usbmon_text_line("ffff0000aaaa0001 100 C Bi:1:004:1 0 512 <").unwrap();
+        mgr.apply_packet(&callback);
+        mgr.enumerate_present_devices();
+
+        assert_eq!(
+            mgr.buses[&1].devices[&4].bandwidth_stats.total_rx_bytes,
+            512
+        );
+        assert_eq!(mgr.buses[&1].devices.len(), 1, "same row, not a duplicate");
+    }
+
+    #[test]
+    fn refresh_marks_an_unplugged_enumerated_device_disconnected() {
+        let temp = tempfile::tempdir().unwrap();
+        write_sysfs_device(temp.path(), "1-4", 1, 4, "480");
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.enumerate_present_devices();
+        assert!(!mgr.buses[&1].devices[&4].is_disconnected);
+
+        std::fs::remove_dir_all(temp.path().join("1-4")).unwrap();
+        mgr.refresh();
+        assert!(mgr.buses[&1].devices[&4].is_disconnected);
     }
 }
