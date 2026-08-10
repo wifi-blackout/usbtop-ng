@@ -24,7 +24,7 @@ mod usbmon;
 
 use std::time::Duration;
 
-use config::{load_or_create_default_at, Preferences};
+use config::{ensure_private_config_dir, load_or_create_default_at, preferences_path};
 use tui::lifecycle::{unload_policy, UnloadPolicy};
 use tui::{effective_refresh_ms, run_ui};
 use ui::UsbTopApp;
@@ -91,10 +91,17 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let preferences = match &cli.config {
-        Some(path) => load_or_create_default_at(Path::new(path))?,
-        None => Preferences::load_or_create_default()?,
+    let config_path = match &cli.config {
+        Some(path) => std::path::PathBuf::from(path),
+        None => {
+            let path = preferences_path()?;
+            if let Some(parent) = path.parent() {
+                ensure_private_config_dir(parent)?;
+            }
+            path
+        }
     };
+    let preferences = load_or_create_default_at(&config_path)?;
 
     // Check usbmon status
     let mut usbmon_status = match check_usbmon_status() {
@@ -109,6 +116,7 @@ fn main() -> Result<()> {
                 module_loaded: false,
                 debugfs_mounted: false,
                 usbmon_available: false,
+                permission_denied: false,
                 available_buses: Vec::new(),
             }
         }
@@ -140,7 +148,11 @@ fn main() -> Result<()> {
                     error!(
                         "usbmon was loaded, but the usbmon debugfs interface is still unavailable"
                     );
-                    print_setup_instructions();
+                    if usbmon_status.permission_denied {
+                        usbmon::print_permission_remedy();
+                    } else {
+                        print_setup_instructions();
+                    }
                     // Still before the TUI, so stdin is nobody else's yet — and
                     // stdout is the plain blocking one this process started
                     // with, which nothing has had a chance to wedge.
@@ -162,7 +174,11 @@ fn main() -> Result<()> {
             process::exit(1);
         } else {
             error!("usbmon is loaded, but /sys/kernel/debug/usb/usbmon is unavailable");
-            print_setup_instructions();
+            if usbmon_status.permission_denied {
+                usbmon::print_permission_remedy();
+            } else {
+                print_setup_instructions();
+            }
             process::exit(1);
         }
     }
@@ -179,7 +195,12 @@ fn main() -> Result<()> {
     // The readers discard packets rather than block when the channel fills, so
     // the UI needs the count to say so in its header.
     let app = UsbTopApp::new(Duration::from_millis(effective_refresh_ms(cli.refresh)))
-        .with_dropped_counter(Arc::clone(&monitor.dropped));
+        .with_dropped_counter(Arc::clone(&monitor.dropped))
+        .with_idle_setting(
+            preferences.hide_idle_devices,
+            config_path,
+            preferences.clone(),
+        );
     let session = run_ui(app, manager, packets);
 
     // Close the usbmon files before anything tries to unload the module: an

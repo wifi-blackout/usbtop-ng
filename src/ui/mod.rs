@@ -89,6 +89,14 @@ pub struct UsbTopApp {
     /// session. Same bargain as [`Self::dropped_counter`]: a session that is
     /// showing less than it measured has to say so.
     pub shed_counter: Option<Arc<AtomicU64>>,
+    /// Hide devices with no current traffic. Off by default. Toggled at
+    /// runtime with `i` and saved to the preferences file (see
+    /// [`Self::toggle_hide_idle`]).
+    pub hide_idle_devices: bool,
+    /// Where to write the preference when `i` toggles it: the config path and
+    /// the full preferences snapshot, so the other keys survive the write.
+    /// `None` in tests and whenever no config file backs the session.
+    idle_persist: Option<(std::path::PathBuf, crate::config::Preferences)>,
 }
 
 impl UsbTopApp {
@@ -105,6 +113,8 @@ impl UsbTopApp {
             list_scroll: 0,
             dropped_counter: None,
             shed_counter: None,
+            hide_idle_devices: false,
+            idle_persist: None,
         }
     }
 
@@ -113,6 +123,32 @@ impl UsbTopApp {
     pub fn with_dropped_counter(mut self, dropped: Arc<AtomicU64>) -> Self {
         self.dropped_counter = Some(dropped);
         self
+    }
+
+    /// Supply the saved value, the config path, and the preferences snapshot so
+    /// `i` can persist the choice. Preserves the builder style of
+    /// [`Self::with_dropped_counter`].
+    pub fn with_idle_setting(
+        mut self,
+        hide: bool,
+        path: std::path::PathBuf,
+        preferences: crate::config::Preferences,
+    ) -> Self {
+        self.hide_idle_devices = hide;
+        self.idle_persist = Some((path, preferences));
+        self
+    }
+
+    /// Flip the hide-idle flag and save it. A write failure logs and keeps the
+    /// flag effective for the session; it never fails the UI.
+    fn toggle_hide_idle(&mut self) {
+        self.hide_idle_devices = !self.hide_idle_devices;
+        if let Some((path, preferences)) = &mut self.idle_persist {
+            preferences.hide_idle_devices = self.hide_idle_devices;
+            if let Err(e) = crate::config::write_preferences_at(path, preferences) {
+                log::warn!("could not save the hide-idle preference: {e}");
+            }
+        }
     }
 
     /// Packets discarded so far, or 0 when no counter is attached.
@@ -166,6 +202,10 @@ impl UsbTopApp {
             self.peak_bandwidth = self.total_bandwidth;
         }
 
+        if self.hide_idle_devices {
+            self.retain_active_devices();
+        }
+
         if let Some(selected) = &self.selected_device {
             if !self.device_keys().iter().any(|key| key == selected) {
                 self.selected_device = None;
@@ -184,6 +224,19 @@ impl UsbTopApp {
                     .map(move |row| format!("{}:{}", bus.bus_id, row.device.device_id))
             })
             .collect()
+    }
+
+    /// Drop rows with no current traffic, then drop any bus or controller left
+    /// empty, so hiding idle devices does not leave bare headers.
+    fn retain_active_devices(&mut self) {
+        for controller in &mut self.controllers {
+            for bus in &mut controller.buses {
+                bus.devices
+                    .retain(|row| row.device.bandwidth_stats.current_bps > 0.0);
+            }
+            controller.buses.retain(|bus| !bus.devices.is_empty());
+        }
+        self.controllers.retain(|c| !c.buses.is_empty());
     }
 
     pub fn update_bandwidth_history(&mut self) {
@@ -308,6 +361,10 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
         }
         KeyCode::Down => {
             app.select_next_device();
+            KeyOutcome::Redraw
+        }
+        KeyCode::Char('i') => {
+            app.toggle_hide_idle();
             KeyOutcome::Redraw
         }
         _ => KeyOutcome::None,
@@ -850,6 +907,13 @@ fn draw_color_reference(f: &mut Frame, area: Rect) {
             ),
             Span::raw(" Help  "),
             Span::styled(
+                "i",
+                Style::default()
+                    .fg(ACCENT_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Idle devices  "),
+            Span::styled(
                 "q/Esc",
                 Style::default()
                     .fg(ACCENT_COLOR)
@@ -888,6 +952,10 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from(vec![
             Span::styled("  Ctrl-L", Style::default().fg(ACCENT_COLOR)),
             Span::raw("   Wipe the screen and repaint it from scratch"),
+        ]),
+        Line::from(vec![
+            Span::styled("  i", Style::default().fg(ACCENT_COLOR)),
+            Span::raw("        Show or hide idle devices"),
         ]),
         Line::from(vec![
             Span::styled("  q/Esc", Style::default().fg(ACCENT_COLOR)),
@@ -1066,6 +1134,127 @@ mod tests {
         assert_eq!(
             app.selected_device, None,
             "selection drops when the device vanishes"
+        );
+    }
+
+    #[test]
+    fn hide_idle_devices_filters_zero_bandwidth_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        // Two devices in sysfs; only one gets traffic.
+        for (name, dev) in [("1-3", 3u8), ("1-4", 4u8)] {
+            let dir = temp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("busnum"), "1\n").unwrap();
+            std::fs::write(dir.join("devnum"), format!("{dev}\n")).unwrap();
+            std::fs::write(dir.join("speed"), "480\n").unwrap();
+        }
+        let mut manager =
+            crate::device::manager::DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        manager.enumerate_present_devices();
+        manager.apply_packet(
+            &crate::usbmon::parser::parse_usbmon_text_line("f 1 C Bi:1:003:1 0 4096 <").unwrap(),
+        );
+        manager.refresh();
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+
+        app.hide_idle_devices = false;
+        app.sync_from(&manager);
+        assert_eq!(
+            app.device_keys(),
+            vec!["1:3".to_string(), "1:4".to_string()]
+        );
+
+        app.hide_idle_devices = true;
+        app.sync_from(&manager);
+        assert_eq!(
+            app.device_keys(),
+            vec!["1:3".to_string()],
+            "idle 1:4 hidden"
+        );
+    }
+
+    #[test]
+    fn hiding_idle_devices_prunes_empty_buses_and_controllers() {
+        let (_t, mut mgr) = manager_with_rates(&[]);
+
+        // Bus 3, alone on its controller, has only an idle device: hiding
+        // idle devices should empty the bus and, since it's the only bus on
+        // that controller, prune the controller too.
+        let idle_bus = mgr.get_or_create_bus(3);
+        idle_bus.controller = Some("idle-controller".to_string());
+        idle_bus.devices.insert(1, UsbDevice::new(3, 1));
+
+        // Bus 4, on a different controller, has one device with traffic:
+        // both the bus and its controller must survive.
+        let busy_bus = mgr.get_or_create_bus(4);
+        busy_bus.controller = Some("busy-controller".to_string());
+        let mut busy_device = UsbDevice::new(4, 1);
+        busy_device.bandwidth_stats.current_bps = 500.0;
+        busy_bus.devices.insert(1, busy_device);
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+
+        app.hide_idle_devices = false;
+        app.sync_from(&mgr);
+        assert_eq!(
+            app.controllers.len(),
+            2,
+            "both controllers present while idle devices show"
+        );
+
+        app.hide_idle_devices = true;
+        app.sync_from(&mgr);
+        assert_eq!(
+            app.controllers.len(),
+            1,
+            "the idle-only controller is pruned, not left as a bare header"
+        );
+        assert_eq!(app.controllers[0].id, "busy-controller");
+        assert_eq!(app.controllers[0].buses.len(), 1);
+        assert_eq!(app.controllers[0].buses[0].bus_id, 4);
+        assert!(
+            app.controllers
+                .iter()
+                .flat_map(|c| c.buses.iter())
+                .all(|b| !b.devices.is_empty()),
+            "no bus with zero visible devices remains"
+        );
+    }
+
+    #[test]
+    fn pressing_i_toggles_and_saves_the_preference() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.toml");
+        let prefs = crate::config::Preferences {
+            auto_load_usbmon: true,
+            unload_usbmon_on_exit: false,
+            hide_idle_devices: false,
+        };
+        let mut app = UsbTopApp::new(Duration::from_millis(100)).with_idle_setting(
+            false,
+            path.clone(),
+            prefs,
+        );
+
+        let outcome = apply_key(&mut app, KeyEvent::from(KeyCode::Char('i')));
+        assert!(matches!(outcome, KeyOutcome::Redraw));
+        assert!(app.hide_idle_devices);
+
+        let saved = crate::config::load_or_create_default_at(&path).unwrap();
+        assert!(saved.hide_idle_devices, "written to disk");
+        assert!(saved.auto_load_usbmon, "other keys preserved");
+    }
+
+    #[test]
+    fn toggling_without_a_config_path_stays_in_memory() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        apply_key(&mut app, KeyEvent::from(KeyCode::Char('i')));
+        assert!(
+            app.hide_idle_devices,
+            "flips even with no persistence attached"
         );
     }
 
@@ -1266,7 +1455,14 @@ mod tests {
 
         // Distinctive strings, not bare letters: a lone "h" would match
         // anywhere on the screen and assert nothing.
-        for binding in ["↑/↓", "Toggle this help", "Ctrl-L", "q/Esc", "Ctrl-C"] {
+        for binding in [
+            "↑/↓",
+            "Toggle this help",
+            "Ctrl-L",
+            "Show or hide idle devices",
+            "q/Esc",
+            "Ctrl-C",
+        ] {
             assert!(screen.contains(binding), "{binding} missing from {screen}");
         }
         // And both counters the header can spring on the user are explained.

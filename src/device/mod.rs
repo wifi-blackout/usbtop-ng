@@ -63,6 +63,18 @@ impl UsbDevice {
         let _ = self.update_device_info_from_base(base.unwrap_or(default));
     }
 
+    /// Populate metadata from a directory the caller already knows is this
+    /// device's sysfs entry (e.g. found while enumerating `base`), skipping
+    /// the linear rescan `populate_from_sysfs` would otherwise do to
+    /// rediscover it. Always sets `sysfs_path` to `dir`, even when the
+    /// metadata files underneath it can't be read, so a device the caller
+    /// enumerated never ends up path-less: `refresh` needs a `sysfs_path` to
+    /// notice the device is gone and mark it disconnected.
+    pub fn populate_from_dir(&mut self, dir: &std::path::Path) {
+        self.sysfs_path = Some(dir.to_path_buf());
+        self.read_metadata_from(dir);
+    }
+
     fn update_device_info_from_base(
         &mut self,
         base: &std::path::Path,
@@ -71,8 +83,13 @@ impl UsbDevice {
             return Ok(());
         };
         self.sysfs_path = Some(sysfs_path.clone());
+        self.read_metadata_from(&sysfs_path);
+        Ok(())
+    }
 
-        // Read device attributes
+    /// Read the attribute files under a known sysfs device directory. Does
+    /// not touch `sysfs_path`; callers set that themselves.
+    fn read_metadata_from(&mut self, sysfs_path: &std::path::Path) {
         if let Ok(speed_str) = std::fs::read_to_string(sysfs_path.join("speed")) {
             self.speed = UsbSpeed::from_speed_str(speed_str.trim());
         }
@@ -101,9 +118,7 @@ impl UsbDevice {
             self.serial = Some(serial.trim().to_string());
         }
 
-        self.max_capability = read_max_capability(&sysfs_path);
-
-        Ok(())
+        self.max_capability = read_max_capability(sysfs_path);
     }
 
     /// Scan `base` for the sysfs entry whose `busnum`/`devnum` files match
@@ -352,6 +367,39 @@ mod tests {
 
         assert_eq!(device.sysfs_path, None);
         assert_eq!(device.vendor, None);
+    }
+
+    #[test]
+    fn populate_from_dir_reads_metadata_from_the_given_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("1-4");
+        write_device(&dir, 1, 4, &[("speed", "480"), ("idVendor", "1d6b")]);
+
+        let mut device = UsbDevice::new(1, 4);
+        device.populate_from_dir(&dir);
+
+        assert_eq!(device.sysfs_path, Some(dir));
+        assert_eq!(device.speed, UsbSpeed::High);
+        assert_eq!(device.vendor_id, Some(0x1d6b));
+    }
+
+    #[test]
+    fn populate_from_dir_sets_sysfs_path_even_when_the_dir_is_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        // Never created: simulates a device that was unplugged in the window
+        // between enumeration finding this directory and populating from it.
+        let dir = temp.path().join("1-4");
+
+        let mut device = UsbDevice::new(1, 4);
+        device.populate_from_dir(&dir);
+
+        assert_eq!(
+            device.sysfs_path,
+            Some(dir),
+            "an enumerated device must keep a sysfs_path even when its metadata \
+             can't be read, so refresh() can detect the disconnect instead of \
+             leaving a path-less phantom row"
+        );
     }
 
     #[test]

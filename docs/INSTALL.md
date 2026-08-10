@@ -97,7 +97,9 @@ root, or read access granted some other way, depending on the distribution.
    ```
    The device table fills within one refresh interval. If it stays empty,
    generate USB traffic, such as a file copy to a USB drive.
-2. To open the UI without usbmon, run:
+2. Press `i` to hide idle devices, or press `i` again to show them. usbtop-ng
+   saves the choice to the preferences file.
+3. To open the UI without usbmon, run:
    ```bash
    usbtop-ng --force
    ```
@@ -136,7 +138,7 @@ From the source tree, run the same three checks CI runs:
    ```bash
    cargo test --all-targets
    ```
-   The command reports 188 passed.
+   The command reports 200 passed.
 
 ## Uninstall
 
