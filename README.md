@@ -278,13 +278,16 @@ values:
 ```toml
 auto_load_usbmon = false
 unload_usbmon_on_exit = false
+hide_idle_devices = false
 ```
 
 - Set `auto_load_usbmon = true` to load usbmon without the startup question.
 - Set `unload_usbmon_on_exit = true` to unload usbmon on exit without the quit
   question. usbtop-ng unloads only when it loaded usbmon for that session.
+- `hide_idle_devices` controls whether idle devices show. Idle devices show by
+  default; press `i` to hide them, and usbtop-ng saves the choice here.
 
-`example-config.toml` in the repository root holds the same two keys with
+`example-config.toml` in the repository root holds the same three keys with
 comments.
 
 ## Command line options

@@ -181,9 +181,12 @@ impl DeviceManager {
     }
 
     /// Add a row for every USB device currently in sysfs, so idle devices show
-    /// before they transfer. Metadata is read once, when a device is first seen.
-    /// A device already known keeps its row and its bandwidth untouched. Removal
-    /// stays in `refresh`, through the existing disconnect path.
+    /// before they transfer. Metadata is read once, when a device is first
+    /// seen, from the directory this scan already found; `busnum`/`devnum`
+    /// are still re-read every tick for every present entry, to detect newly
+    /// connected devices. A device already known keeps its row and its
+    /// bandwidth untouched. Removal stays in `refresh`, through the existing
+    /// disconnect path.
     pub fn enumerate_present_devices(&mut self) {
         let base = self
             .sysfs_base
@@ -212,7 +215,7 @@ impl DeviceManager {
                 .entry(dev)
                 .or_insert_with(|| {
                     let mut device = UsbDevice::new(bus, dev);
-                    device.populate_from_sysfs(Some(&base));
+                    device.populate_from_dir(&dir);
                     device
                 });
         }
@@ -359,6 +362,20 @@ mod tests {
         assert_eq!(bus.devices.len(), 2, "the interface dir is not a device");
         assert_eq!(bus.devices[&4].bandwidth_stats.current_bps, 0.0);
         assert_eq!(bus.devices[&4].speed, UsbSpeed::High);
+    }
+
+    #[test]
+    fn enumeration_sets_sysfs_path_to_the_dir_it_found() {
+        let temp = tempfile::tempdir().unwrap();
+        write_sysfs_device(temp.path(), "1-4", 1, 4, "480");
+
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.enumerate_present_devices();
+
+        assert_eq!(
+            mgr.buses[&1].devices[&4].sysfs_path,
+            Some(temp.path().join("1-4"))
+        );
     }
 
     #[test]
