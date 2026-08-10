@@ -5,6 +5,21 @@ All notable changes to usbtop-ng are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-08-09
+
+### Added
+
+- Idle-device enumeration. Every connected USB device shows a row, at zero
+  bandwidth until it transfers. On by default.
+- `hide_idle_devices` preference and the `i` key. `i` hides devices with no
+  current traffic and saves the choice to `~/.usbtop-ng/preferences.toml`.
+
+### Fixed
+
+- The setup message when usbmon is present but unreadable. usbtop-ng now tells
+  the user to run with `sudo`, instead of pointing at `modprobe` and `mount`,
+  which cannot fix a permission problem.
+
 ## [1.0.0] - 2026-08-09
 
 Initial release. usbtop-ng is a USB bandwidth monitor for Linux with a
