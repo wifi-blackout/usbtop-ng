@@ -116,6 +116,7 @@ fn main() -> Result<()> {
                 module_loaded: false,
                 debugfs_mounted: false,
                 usbmon_available: false,
+                permission_denied: false,
                 available_buses: Vec::new(),
             }
         }
@@ -147,7 +148,11 @@ fn main() -> Result<()> {
                     error!(
                         "usbmon was loaded, but the usbmon debugfs interface is still unavailable"
                     );
-                    print_setup_instructions();
+                    if usbmon_status.permission_denied {
+                        usbmon::print_permission_remedy();
+                    } else {
+                        print_setup_instructions();
+                    }
                     // Still before the TUI, so stdin is nobody else's yet — and
                     // stdout is the plain blocking one this process started
                     // with, which nothing has had a chance to wedge.
@@ -169,7 +174,11 @@ fn main() -> Result<()> {
             process::exit(1);
         } else {
             error!("usbmon is loaded, but /sys/kernel/debug/usb/usbmon is unavailable");
-            print_setup_instructions();
+            if usbmon_status.permission_denied {
+                usbmon::print_permission_remedy();
+            } else {
+                print_setup_instructions();
+            }
             process::exit(1);
         }
     }
