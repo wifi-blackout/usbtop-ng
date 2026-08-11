@@ -1,6 +1,6 @@
 [package]
 name = "usbtop-ng"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 authors = ["usbtop-ng contributors"]
 description = "USB bandwidth monitor for Linux with a terminal UI"
