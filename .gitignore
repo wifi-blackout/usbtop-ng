@@ -59,6 +59,9 @@ temp/
 .env
 .env.local
 
+# Local release helper, never published
+release.sh
+
 # Packaging
 *.tar.gz
 *.zip
