@@ -41,6 +41,10 @@ for any other platform stops at a compile error.
 The symlink makes `usbtop` and `sudo usbtop` both work, because both resolve
 through your path. A shell alias would not work under `sudo`.
 
+The script refuses to replace a `usbtop` command it does not own. It stops
+before touching anything and names the conflicting file. Remove that file
+yourself, or rerun with `FORCE_ALIAS=1 ./install.sh` to replace it.
+
 To install somewhere other than `/usr/local/bin`, set `PREFIX`:
 
 ```bash
