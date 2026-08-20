@@ -12,8 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--filter` expressions down to endpoint, direction, and transfer type.
 - `--once` and `--batch` reports, with `--json` output (documented in
   docs/SCRIPTING.md).
-- `--print-man` and `--print-completions` for the man page and shell
-  completions, installed by install.sh.
+- `--print-man` prints the man page. install.sh installs it.
+- `--print-completions` prints a shell completion script for bash, zsh, or
+  fish.
 - Per-bus rx/tx figures in bus heading rows.
 - `~` estimate markers for isochronous rates on the text interface.
 - A release workflow that attaches Linux x86_64 binaries to tagged releases.
