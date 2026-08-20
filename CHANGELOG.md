@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `~` estimate markers for isochronous rates on the text interface.
 - A release workflow that attaches Linux x86_64 binaries to tagged releases.
 
+### Fixed
+
+- A headless run whose capture readers all stopped now fails with an error
+  instead of printing zero reports forever.
+- install.sh refuses to replace a `usbtop.1` man page it does not own, the
+  same guard the `usbtop` command already had.
+
 ## [1.1.1] - 2026-08-10
 
 ### Added
