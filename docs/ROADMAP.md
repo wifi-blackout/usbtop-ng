@@ -14,6 +14,43 @@ schedule. Items move to [CHANGELOG.md](../CHANGELOG.md) when they ship.
 - Plugin system for custom monitors.
 - Monitoring of remote systems over the network.
 
+## eBPF backend
+
+A third packet source built on kprobes, prototyped on 2026-08-19 with
+bpftrace 0.20.2 on kernel 7.0.0-29-generic. Two probes cover all USB
+traffic: `usb_submit_urb` and `__usb_hcd_giveback_urb`. The kernel BTF at
+`/sys/kernel/btf/vmlinux` resolved every struct field with no header files.
+In-kernel maps aggregated bytes keyed by bus, device, endpoint, direction,
+and transfer type. usbtop-ng would read the maps once per refresh tick.
+
+Prototype numbers, from a 6-second camera stream (Chicony IR camera, bus 1
+device 4, 61 frames of 614,400 bytes each):
+
+- bpftrace summed `urb->actual_length` at giveback: 39,309,824 bytes on the
+  isochronous endpoint. That is the pixel data plus 5% UVC packet headers.
+- The usbmon binary interface reported 39,309,824 bytes for the same window.
+  The two sources match to the byte.
+- The usbmon text interface reported 154,028,160 bytes in a matched run, a
+  3.6x overcount. Its length column holds the 97,920-byte buffer size for
+  every isochronous completion. See the engineering follow-up below.
+
+Design notes:
+
+- Startup probes a backend chain: eBPF, then usbmon binary, then usbmon
+  text. Any BTF, attach, or lockdown failure degrades to the next source.
+- Headline feature: per-process attribution. `usb_submit_urb` runs with task
+  context, which usbmon never records. The prototype also showed the trap:
+  drivers resubmit periodic URBs from interrupt context, so the camera
+  stream logged 41 submissions under ffmpeg and 1,538 under idle-task and
+  kworker contexts. Attribution needs an owner map written at stream start,
+  not the submitter name.
+- Costs: libbpf-rs and libbpf-sys dependencies (libelf, zlib), a clang BPF
+  toolchain at build time, kernel BTF at runtime, and CI that cannot attach
+  kprobes unprivileged.
+- A cheaper middle path exists inside usbmon: the mmap ring with
+  MON_IOCX_MFETCH batch header fetches. It would end the payload copies the
+  binary reader makes and discards today, 39 MB over the 6-second stream.
+
 ## Engineering follow-ups
 
 These came out of code review. Each is small and none blocks a release.
@@ -25,6 +62,12 @@ These came out of code review. Each is small and none blocks a release.
 - One constant for the 60-second window. The device chart bounds and
   `RATE_HISTORY_WINDOW` state it separately.
 - Error and log strings brought under the documentation style guide.
+- The usbmon text fallback overcounts isochronous transfers. Its length
+  column holds the buffer size, not the bytes moved. On a camera stream the
+  overcount was 3.6x. The text format prints 5 of 32 descriptors per URB, so
+  no exact count exists in text mode. The binary interface reports true
+  bytes and is already the preferred source. Candidate fix: mark text-mode
+  rates as estimates in the UI.
 
 ## Testing follow-ups
 
