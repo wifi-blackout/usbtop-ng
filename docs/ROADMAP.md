@@ -69,8 +69,9 @@ These came out of code review. Each is small and none blocks a release.
   column holds the buffer size, not the bytes moved. On a camera stream the
   overcount was 3.6x. The text format prints 5 of 32 descriptors per URB, so
   no exact count exists in text mode. The binary interface reports true
-  bytes and is already the preferred source. Candidate fix: mark text-mode
-  rates as estimates in the UI.
+  bytes and is already the preferred source. The UI and the JSON output now
+  mark affected rates as estimates. The remaining idea: sum the printed
+  descriptors to tighten the estimate.
 
 ## Testing follow-ups
 
