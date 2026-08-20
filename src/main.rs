@@ -298,6 +298,11 @@ fn main() -> Result<()> {
                 json: cli.json,
                 batch: cli.batch,
                 window,
+                // Readers spawn only for detected buses. With none (--force on
+                // a busless host), empty reports are the intended output; with
+                // buses, a dead channel means capture failed and the run must
+                // say so (see headless::run).
+                expect_capture: !usbmon_status.available_buses.is_empty(),
             },
         );
         monitor.stop();
