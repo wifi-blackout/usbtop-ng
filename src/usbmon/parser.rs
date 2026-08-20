@@ -119,11 +119,6 @@ impl TransferType {
     }
 
     /// Lowercase label used by filters, JSON reports, and docs.
-    ///
-    /// `cfg(test)`-only for now: nothing in production code reads this yet —
-    /// it lands with the `--filter` expressions and JSON reports of later
-    /// tasks; verified here and ready for that wiring.
-    #[cfg(test)]
     pub fn label(&self) -> &'static str {
         match self {
             Self::Control => "control",
