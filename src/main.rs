@@ -290,7 +290,8 @@ fn main() -> Result<()> {
             config_path,
             preferences.clone(),
         )
-        .with_filter(filter);
+        .with_filter(filter)
+        .with_text_source_flag(Arc::clone(&monitor.text_active));
     let session = run_ui(app, manager, packets);
 
     // Close the usbmon files before anything tries to unload the module: an
