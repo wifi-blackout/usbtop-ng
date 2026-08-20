@@ -4,22 +4,26 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::Serialize;
 
 use crate::device::manager::DeviceManager;
 use crate::filter::FilterSet;
-use crate::ui::drain_packets;
 use crate::usbmon::parser::UsbPacket;
 
 pub struct HeadlessOptions {
     pub json: bool,
     pub batch: bool,
     pub window: Duration,
+    /// Whether reader threads were spawned for this run. When they were, a
+    /// disconnected packet channel means capture failed, and the run must
+    /// fail rather than report zeros forever. `--force` with no detected
+    /// buses spawns no readers, so its empty reports stay legitimate.
+    pub expect_capture: bool,
 }
 
 #[derive(Serialize)]
@@ -321,12 +325,37 @@ pub fn render_text(report: &Report) -> String {
     out
 }
 
+/// One bounded drain pass. `Disconnected` means the queue is empty AND every
+/// reader thread has exited (the monitor's senders are all dropped), so no
+/// packet can ever arrive again. Queued packets are always consumed before
+/// that state surfaces, so nothing a dying reader captured is lost.
+#[derive(Debug, PartialEq)]
+enum DrainStatus {
+    Alive,
+    Disconnected,
+}
+
+fn drain(manager: &mut DeviceManager, packets: &Receiver<UsbPacket>) -> DrainStatus {
+    for _ in 0..crate::ui::DRAIN_BATCH {
+        match packets.try_recv() {
+            Ok(packet) => manager.apply_packet(&packet),
+            Err(TryRecvError::Empty) => return DrainStatus::Alive,
+            Err(TryRecvError::Disconnected) => return DrainStatus::Disconnected,
+        }
+    }
+    DrainStatus::Alive
+}
+
 /// Sample the manager's state on `opts.window`-second windows, printing a
 /// report at the end of each. `--once` (`opts.batch == false`) prints one and
-/// returns; `--batch` repeats until SIGINT/SIGTERM or the reader stops. A
-/// signal that lands mid-window ends the wait early; the report that follows
-/// carries the true measured elapsed time (see `build_report`), not the
-/// nominal `opts.window`.
+/// returns; `--batch` repeats until SIGINT/SIGTERM. A signal that lands
+/// mid-window ends the wait early; the report that follows carries the true
+/// measured elapsed time (see `build_report`), not the nominal `opts.window`.
+///
+/// When `opts.expect_capture` is set and every reader has stopped, the run
+/// fails with an error instead of printing a report: a zero report after a
+/// capture failure would read as a quiet bus, and automation would believe
+/// it.
 pub fn run(
     mut manager: DeviceManager,
     packets: Receiver<UsbPacket>,
@@ -345,10 +374,18 @@ pub fn run(
         let window_start = Instant::now();
         let deadline = window_start + opts.window;
         while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
-            drain_packets(&mut manager, &packets, crate::ui::DRAIN_BATCH);
+            if drain(&mut manager, &packets) == DrainStatus::Disconnected && opts.expect_capture {
+                return Err(anyhow!(
+                    "every usbmon reader stopped; no capture source remains"
+                ));
+            }
             std::thread::sleep(Duration::from_millis(50).min(opts.window));
         }
-        drain_packets(&mut manager, &packets, crate::ui::DRAIN_BATCH);
+        if drain(&mut manager, &packets) == DrainStatus::Disconnected && opts.expect_capture {
+            return Err(anyhow!(
+                "every usbmon reader stopped; no capture source remains"
+            ));
+        }
         manager.enumerate_present_devices();
         manager.refresh();
 
@@ -412,6 +449,57 @@ mod tests {
     use super::*;
     use crate::device::manager::DeviceManager;
     use crate::usbmon::parser::parse_usbmon_text_line;
+    use std::sync::mpsc::sync_channel;
+
+    #[test]
+    fn drain_consumes_queued_packets_before_reporting_disconnected() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let (tx, rx) = sync_channel(4);
+        let cb = parse_usbmon_text_line("ffff0000aaaa0001 200 C Bi:1:004:1 0 1000 <").unwrap();
+        tx.send(cb).unwrap();
+        drop(tx);
+
+        assert_eq!(drain(&mut mgr, &rx), DrainStatus::Disconnected);
+        assert_eq!(
+            mgr.buses[&1].devices[&4].bandwidth_stats.total_rx_bytes, 1000,
+            "a dying reader's queued packets must land before the disconnect surfaces"
+        );
+    }
+
+    #[test]
+    fn drain_reports_alive_while_a_sender_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let (tx, rx) = sync_channel::<crate::usbmon::parser::UsbPacket>(4);
+
+        assert_eq!(drain(&mut mgr, &rx), DrainStatus::Alive);
+        drop(tx);
+    }
+
+    #[test]
+    fn run_fails_when_capture_was_expected_and_every_reader_stopped() {
+        let temp = tempfile::tempdir().unwrap();
+        let mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let (tx, rx) = sync_channel::<crate::usbmon::parser::UsbPacket>(1);
+        drop(tx);
+
+        let err = run(
+            mgr,
+            rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            FilterSet::default(),
+            HeadlessOptions {
+                json: true,
+                batch: false,
+                window: Duration::from_millis(300),
+                expect_capture: true,
+            },
+        )
+        .expect_err("a dead capture channel must fail the run, not report zeros");
+        assert!(err.to_string().contains("usbmon reader"));
+    }
 
     #[test]
     fn report_rates_come_from_window_deltas() {

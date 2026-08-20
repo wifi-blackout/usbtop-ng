@@ -190,6 +190,10 @@ sudo usbtop-ng --batch --json | jq -c '.total_rx_bps'
   piping into `head` or a script that closes early — usbtop-ng exits 0
   instead of reporting a broken-pipe error. A script that only wants the
   first report can safely do `usbtop-ng --batch --json | head -n 1`.
+- If every usbmon reader stops mid-run — capture failed, so nothing new can
+  arrive — usbtop-ng prints an error to stderr and exits 1 instead of
+  reporting zeros. `--force` on a host with no detected buses is the
+  exception: no capture was expected, so its empty reports print normally.
 
 ## The `estimated` field
 

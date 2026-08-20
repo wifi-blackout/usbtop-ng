@@ -45,9 +45,10 @@ The script also installs the man page to
 `$(dirname "$PREFIX")/share/man/man1/usbtop-ng.1`, with a `usbtop.1` symlink
 alongside it, so `man usbtop-ng` and `man usbtop` both work.
 
-The script refuses to replace a `usbtop` command it does not own. It stops
-before touching anything and names the conflicting file. Remove that file
-yourself, or rerun with `FORCE_ALIAS=1 ./install.sh` to replace it.
+The script refuses to replace a `usbtop` command or a `usbtop.1` man page it
+does not own. It stops before touching anything and names the conflicting
+file. Remove that file yourself, or rerun with `FORCE_ALIAS=1 ./install.sh`
+to replace it.
 
 To install somewhere other than `/usr/local/bin`, set `PREFIX`:
 
