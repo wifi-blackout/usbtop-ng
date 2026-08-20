@@ -171,6 +171,16 @@ key press and quits through the same teardown as `q`.
   `ep`, `dir`, and `type` narrow which packets on a visible device count,
   without hiding the device itself.
 
+### Scriptable output
+
+- `--once` samples one window and prints a bandwidth report to stdout, then
+  exits. `--batch` prints one report per window, repeated until `Ctrl-C`.
+  Neither mode opens the TUI or prompts for anything.
+- Add `--json` to either mode for one JSON document per report (NDJSON in
+  `--batch`). `--window SECONDS` sets the sample length.
+- See [docs/SCRIPTING.md](docs/SCRIPTING.md) for the full flag reference, the
+  JSON field list, and an example document.
+
 ### The chart pane
 
 - The left chart plots the session total in MB/s over the last 60 seconds.
@@ -323,9 +333,17 @@ Options:
       --create-alias       Create shell alias for 'usbtop' command
       --filter <KEY=VALUE[,KEY=VALUE...]>
                            Show only traffic matching KEY=VALUE terms (repeatable, expressions OR)
+      --once               Sample one window, print a report, and exit
+      --batch              Print a report every window until interrupted
+      --json               Print reports as JSON (one document per report)
+      --window <SECONDS>   Sample window in seconds (default: 5 with --once, 1 with --batch)
   -h, --help               Print help
   -V, --version            Print version
 ```
+
+`--once` and `--batch` never open the TUI or prompt for anything, which makes
+them safe in a script or a cron job. See
+[docs/SCRIPTING.md](docs/SCRIPTING.md) for details.
 
 ## Limits
 
@@ -356,6 +374,8 @@ Options:
   pull requests.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): modules, data flow, the TUI
   chassis, known limitations.
+- [docs/SCRIPTING.md](docs/SCRIPTING.md): `--once`/`--batch` reports, the
+  `--json` field list, and exit behavior.
 - [docs/ROADMAP.md](docs/ROADMAP.md): feature ideas and follow-up work.
 - [CHANGELOG.md](CHANGELOG.md): what changed per release.
 

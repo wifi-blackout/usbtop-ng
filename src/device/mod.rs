@@ -8,13 +8,8 @@ pub mod manager;
 
 /// One endpoint's traffic: its transfer type, cumulative bytes, and a
 /// windowed rate. Keyed in [`UsbDevice::endpoints`] by (number, IN?).
-///
-/// `transfer_type` is `cfg(test)`-only for now: its only reader,
-/// [`UsbDevice::has_iso_traffic`], is itself unconsumed until the iso
-/// estimate marker lands; still recorded and verified here.
 #[derive(Debug, Clone)]
 pub struct EndpointStats {
-    #[cfg(test)]
     pub transfer_type: TransferType,
     pub total_bytes: u64,
     pub counter: WindowCounter,
@@ -247,23 +242,18 @@ impl UsbDevice {
 
     /// Account `bytes` against one endpoint. The transfer type is fixed by the
     /// hardware per endpoint, so the first packet's type sticks.
-    ///
-    /// `transfer_type` is bound with a leading underscore: the field it feeds
-    /// is `cfg(test)`-only for now (see `EndpointStats` docs), so nothing in
-    /// production reads it back yet.
     pub fn record_endpoint(
         &mut self,
         endpoint: u8,
         dir_in: bool,
-        _transfer_type: TransferType,
+        transfer_type: TransferType,
         bytes: u64,
     ) {
         let entry = self
             .endpoints
             .entry((endpoint, dir_in))
             .or_insert_with(|| EndpointStats {
-                #[cfg(test)]
-                transfer_type: _transfer_type,
+                transfer_type,
                 total_bytes: 0,
                 counter: WindowCounter::new(ENDPOINT_WINDOW),
             });
@@ -279,12 +269,10 @@ impl UsbDevice {
     }
 
     /// True when any isochronous endpoint has carried bytes. Drives the
-    /// text-source estimate marker.
-    ///
-    /// `cfg(test)`-only for now: no production code reads this yet — it
-    /// lands with a later task's iso estimate marker; verified here and
-    /// ready for that wiring.
-    #[cfg(test)]
+    /// text-source estimate marker (see `headless::build_report`): the
+    /// debugfs text interface reports iso callbacks at a rate roughly 3.6x
+    /// the actual transfer count, so a report built from it flags these
+    /// devices as estimated rather than exact.
     pub fn has_iso_traffic(&self) -> bool {
         self.endpoints
             .values()

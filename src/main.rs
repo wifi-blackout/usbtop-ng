@@ -18,6 +18,7 @@ use std::sync::Arc;
 mod config;
 mod device;
 mod filter;
+mod headless;
 mod stats;
 mod tui;
 mod ui;
@@ -66,6 +67,22 @@ struct Cli {
     /// Show only traffic matching KEY=VALUE terms (repeatable, expressions OR)
     #[arg(long, value_name = "KEY=VALUE[,KEY=VALUE...]")]
     filter: Vec<String>,
+
+    /// Sample one window, print a report, and exit
+    #[arg(long)]
+    once: bool,
+
+    /// Print a report every window until interrupted
+    #[arg(long, conflicts_with = "once")]
+    batch: bool,
+
+    /// Print reports as JSON (one document per report)
+    #[arg(long)]
+    json: bool,
+
+    /// Sample window in seconds (default: 5 with --once, 1 with --batch)
+    #[arg(long, value_name = "SECONDS")]
+    window: Option<f64>,
 }
 
 fn main() -> Result<()> {
@@ -108,6 +125,24 @@ fn main() -> Result<()> {
     };
     let preferences = load_or_create_default_at(&config_path)?;
 
+    let filter = filter::FilterSet::parse(&cli.filter).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(2);
+    });
+
+    // `--once`/`--batch` select a headless report instead of the TUI; `--json`
+    // and `--window` only make sense alongside one of them.
+    let headless = cli.once || cli.batch;
+    if (cli.json || cli.window.is_some()) && !headless {
+        eprintln!("error: --json and --window need --once or --batch");
+        process::exit(2);
+    }
+    let window = Duration::from_secs_f64(
+        cli.window
+            .unwrap_or(if cli.batch { 1.0 } else { 5.0 })
+            .max(0.25),
+    );
+
     // Check usbmon status
     let mut usbmon_status = match check_usbmon_status() {
         Ok(status) => status,
@@ -132,8 +167,14 @@ fn main() -> Result<()> {
     if !usbmon_status.usbmon_available && !cli.force {
         if !usbmon_status.module_loaded {
             let should_load = if preferences.auto_load_usbmon {
-                println!("usbmon is not loaded; auto_load_usbmon=true, so usbtop-ng will try to load it now.");
+                if !headless {
+                    println!("usbmon is not loaded; auto_load_usbmon=true, so usbtop-ng will try to load it now.");
+                }
                 true
+            } else if headless {
+                eprintln!("error: usbmon is not available and this mode never prompts.");
+                eprintln!("Set auto_load_usbmon = true in the preferences file, run 'sudo modprobe usbmon' first, or run 'usbtop-ng --setup' for the manual steps.");
+                process::exit(1);
             } else {
                 prompt_user_to_load_module()?
             };
@@ -175,11 +216,17 @@ fn main() -> Result<()> {
             }
         } else if !usbmon_status.debugfs_mounted {
             error!("debugfs is not mounted, so /sys/kernel/debug/usb/usbmon is unavailable");
-            print_setup_instructions();
+            if headless {
+                print_remedy_to_stderr(false);
+            } else {
+                print_setup_instructions();
+            }
             process::exit(1);
         } else {
             error!("usbmon is loaded, but /sys/kernel/debug/usb/usbmon is unavailable");
-            if usbmon_status.permission_denied {
+            if headless {
+                print_remedy_to_stderr(usbmon_status.permission_denied);
+            } else if usbmon_status.permission_denied {
                 usbmon::print_permission_remedy();
             } else {
                 print_setup_instructions();
@@ -195,12 +242,30 @@ fn main() -> Result<()> {
         warn!("No USB buses detected");
     }
 
-    let filter = filter::FilterSet::parse(&cli.filter).unwrap_or_else(|e| {
-        eprintln!("error: {e}");
-        process::exit(2);
-    });
-
     let (packets, monitor) = usbmon::monitor::start_monitoring(&usbmon_status.available_buses);
+
+    if headless {
+        let mut manager = device::manager::DeviceManager::new();
+        manager.set_filter(filter.clone());
+        let result = headless::run(
+            manager,
+            packets,
+            Arc::clone(&monitor.dropped),
+            Arc::clone(&monitor.text_active),
+            filter,
+            headless::HeadlessOptions {
+                json: cli.json,
+                batch: cli.batch,
+                window,
+            },
+        );
+        monitor.stop();
+        if loaded_usbmon_for_this_run {
+            usbmon::unload_without_asking(&preferences, true);
+        }
+        return result;
+    }
+
     let mut manager = device::manager::DeviceManager::new();
     manager.set_filter(filter.clone());
     // The readers discard packets rather than block when the channel fills, so
@@ -253,6 +318,26 @@ fn main() -> Result<()> {
     session?;
 
     Ok(())
+}
+
+/// Same guidance as [`print_setup_instructions`]/[`usbmon::print_permission_remedy`],
+/// routed to stderr instead of stdout. A headless run's stdout is either a
+/// report stream or, on this failing exit, silent, and setup prose belongs on
+/// neither: a script reading `--once --json` must not see it mixed in.
+fn print_remedy_to_stderr(permission_denied: bool) {
+    if permission_denied {
+        eprintln!("usbmon is present but this user cannot read it.");
+        eprintln!("Run usbtop-ng with sudo:");
+        eprintln!("  sudo usbtop-ng");
+    } else {
+        eprintln!("Linux setup for live USB monitoring:");
+        eprintln!("1. Make the usbmon kernel module available:");
+        eprintln!("   sudo modprobe usbmon");
+        eprintln!("2. Make the usbmon debugfs files available:");
+        eprintln!("   sudo mount -t debugfs none /sys/kernel/debug");
+        eprintln!("3. Run usbtop-ng with permission to read /sys/kernel/debug/usb/usbmon");
+        eprintln!("   The simplest test is: sudo usbtop-ng");
+    }
 }
 
 fn create_shell_alias() -> Result<()> {
