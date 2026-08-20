@@ -17,6 +17,8 @@ use std::sync::Arc;
 
 mod config;
 mod device;
+mod filter;
+mod headless;
 mod stats;
 mod tui;
 mod ui;
@@ -61,6 +63,34 @@ struct Cli {
     /// Create shell alias for 'usbtop' command
     #[arg(long)]
     create_alias: bool,
+
+    /// Show only traffic matching KEY=VALUE terms (repeatable, expressions OR)
+    #[arg(long, value_name = "KEY=VALUE[,KEY=VALUE...]")]
+    filter: Vec<String>,
+
+    /// Sample one window, print a report, and exit
+    #[arg(long)]
+    once: bool,
+
+    /// Print a report every window until interrupted
+    #[arg(long, conflicts_with = "once")]
+    batch: bool,
+
+    /// Print reports as JSON (one document per report)
+    #[arg(long)]
+    json: bool,
+
+    /// Sample window in seconds (default: 5 with --once, 1 with --batch)
+    #[arg(long, value_name = "SECONDS")]
+    window: Option<f64>,
+
+    /// Print the man page to stdout
+    #[arg(long)]
+    print_man: bool,
+
+    /// Print a completion script to stdout for the named shell (e.g. bash, zsh, fish)
+    #[arg(long, value_name = "SHELL")]
+    print_completions: Option<clap_complete::Shell>,
 }
 
 fn main() -> Result<()> {
@@ -85,6 +115,23 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Print the man page if requested
+    if cli.print_man {
+        use clap::CommandFactory;
+        let man = clap_mangen::Man::new(Cli::command());
+        let mut rendered = Vec::new();
+        man.render(&mut rendered)?;
+        io::stdout().write_all(&rendered)?;
+        return Ok(());
+    }
+
+    // Print a shell completion script if requested
+    if let Some(shell) = cli.print_completions {
+        use clap::CommandFactory;
+        clap_complete::generate(shell, &mut Cli::command(), "usbtop-ng", &mut io::stdout());
+        return Ok(());
+    }
+
     // Create shell alias if requested
     if cli.create_alias {
         create_shell_alias()?;
@@ -102,6 +149,23 @@ fn main() -> Result<()> {
         }
     };
     let preferences = load_or_create_default_at(&config_path)?;
+
+    let filter = filter::FilterSet::parse(&cli.filter).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(2);
+    });
+
+    // `--once`/`--batch` select a headless report instead of the TUI; `--json`
+    // and `--window` only make sense alongside one of them.
+    let headless = cli.once || cli.batch;
+    if (cli.json || cli.window.is_some()) && !headless {
+        eprintln!("error: --json and --window need --once or --batch");
+        process::exit(2);
+    }
+    let window = resolve_window(cli.window, cli.batch).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(2);
+    });
 
     // Check usbmon status
     let mut usbmon_status = match check_usbmon_status() {
@@ -127,8 +191,14 @@ fn main() -> Result<()> {
     if !usbmon_status.usbmon_available && !cli.force {
         if !usbmon_status.module_loaded {
             let should_load = if preferences.auto_load_usbmon {
-                println!("usbmon is not loaded; auto_load_usbmon=true, so usbtop-ng will try to load it now.");
+                if !headless {
+                    println!("usbmon is not loaded; auto_load_usbmon=true, so usbtop-ng will try to load it now.");
+                }
                 true
+            } else if headless {
+                eprintln!("error: usbmon is not available and this mode never prompts.");
+                eprintln!("Set auto_load_usbmon = true in the preferences file, run 'sudo modprobe usbmon' first, or run 'usbtop-ng --setup' for the manual steps.");
+                process::exit(1);
             } else {
                 prompt_user_to_load_module()?
             };
@@ -136,8 +206,12 @@ fn main() -> Result<()> {
             if should_load {
                 if let Err(e) = attempt_load_usbmon() {
                     error!("Failed to load usbmon: {}", e);
-                    println!();
-                    print_setup_instructions();
+                    if headless {
+                        print_remedy_to_stderr(false);
+                    } else {
+                        println!();
+                        print_setup_instructions();
+                    }
                     process::exit(1);
                 }
                 loaded_usbmon_for_this_run = true;
@@ -148,17 +222,30 @@ fn main() -> Result<()> {
                     error!(
                         "usbmon was loaded, but the usbmon debugfs interface is still unavailable"
                     );
-                    if usbmon_status.permission_denied {
+                    if headless {
+                        print_remedy_to_stderr(usbmon_status.permission_denied);
+                    } else if usbmon_status.permission_denied {
                         usbmon::print_permission_remedy();
                     } else {
                         print_setup_instructions();
                     }
                     // Still before the TUI, so stdin is nobody else's yet — and
                     // stdout is the plain blocking one this process started
-                    // with, which nothing has had a chance to wedge.
-                    usbmon::offer_unload_after_session(&preferences, true, || {
-                        prompt_user_to_unload_module().unwrap_or(false)
-                    });
+                    // with, which nothing has had a chance to wedge. Headless
+                    // mode has nobody to read a prompt either way, so it never
+                    // asks: it silently follows whatever `unload_usbmon_on_exit`
+                    // already decided instead of blocking a script on stdin.
+                    if may_prompt_before_unload(headless) {
+                        usbmon::offer_unload_after_session(&preferences, true, || {
+                            prompt_user_to_unload_module().unwrap_or(false)
+                        });
+                    } else {
+                        // headless: still unload if the preferences say so,
+                        // but never print the notice — a headless run's
+                        // stdout is either a report stream or silent, per
+                        // `print_remedy_to_stderr`'s doc comment above.
+                        usbmon::unload_without_asking(&preferences, false);
+                    }
                     process::exit(1);
                 }
 
@@ -170,11 +257,17 @@ fn main() -> Result<()> {
             }
         } else if !usbmon_status.debugfs_mounted {
             error!("debugfs is not mounted, so /sys/kernel/debug/usb/usbmon is unavailable");
-            print_setup_instructions();
+            if headless {
+                print_remedy_to_stderr(false);
+            } else {
+                print_setup_instructions();
+            }
             process::exit(1);
         } else {
             error!("usbmon is loaded, but /sys/kernel/debug/usb/usbmon is unavailable");
-            if usbmon_status.permission_denied {
+            if headless {
+                print_remedy_to_stderr(usbmon_status.permission_denied);
+            } else if usbmon_status.permission_denied {
                 usbmon::print_permission_remedy();
             } else {
                 print_setup_instructions();
@@ -191,7 +284,34 @@ fn main() -> Result<()> {
     }
 
     let (packets, monitor) = usbmon::monitor::start_monitoring(&usbmon_status.available_buses);
-    let manager = device::manager::DeviceManager::new();
+
+    if headless {
+        let mut manager = device::manager::DeviceManager::new();
+        manager.set_filter(filter.clone());
+        let result = headless::run(
+            manager,
+            packets,
+            Arc::clone(&monitor.dropped),
+            Arc::clone(&monitor.text_active),
+            filter,
+            headless::HeadlessOptions {
+                json: cli.json,
+                batch: cli.batch,
+                window,
+            },
+        );
+        monitor.stop();
+        if loaded_usbmon_for_this_run {
+            // `terminal_reachable = false`: headless unloads silently. The
+            // automatic-unload notice is stdout prose that would otherwise
+            // land after the report, corrupting `--once --json > file`.
+            usbmon::unload_without_asking(&preferences, false);
+        }
+        return result;
+    }
+
+    let mut manager = device::manager::DeviceManager::new();
+    manager.set_filter(filter.clone());
     // The readers discard packets rather than block when the channel fills, so
     // the UI needs the count to say so in its header.
     let app = UsbTopApp::new(Duration::from_millis(effective_refresh_ms(cli.refresh)))
@@ -200,7 +320,9 @@ fn main() -> Result<()> {
             preferences.hide_idle_devices,
             config_path,
             preferences.clone(),
-        );
+        )
+        .with_filter(filter)
+        .with_text_source_flag(Arc::clone(&monitor.text_active));
     let session = run_ui(app, manager, packets);
 
     // Close the usbmon files before anything tries to unload the module: an
@@ -241,6 +363,69 @@ fn main() -> Result<()> {
     session?;
 
     Ok(())
+}
+
+/// Same guidance as [`print_setup_instructions`]/[`usbmon::print_permission_remedy`],
+/// routed to stderr instead of stdout. A headless run's stdout is either a
+/// report stream or, on this failing exit, silent, and setup prose belongs on
+/// neither: a script reading `--once --json` must not see it mixed in.
+fn print_remedy_to_stderr(permission_denied: bool) {
+    let _ = write_remedy(&mut io::stderr(), permission_denied);
+}
+
+/// The text [`print_remedy_to_stderr`] writes, factored out onto an injected
+/// writer so its content is testable without capturing the real stderr (see
+/// the `remedy_text_*` tests below). Every write is a plain `writeln!`, and
+/// like the other exit-path writers in this codebase (e.g.
+/// `usbmon::announce_automatic_unload`), a failed write here changes nothing:
+/// this runs right before `process::exit(1)`, and the exit code is the part
+/// of this message that always gets through.
+fn write_remedy(out: &mut impl Write, permission_denied: bool) -> io::Result<()> {
+    if permission_denied {
+        writeln!(out, "usbmon is present but this user cannot read it.")?;
+        writeln!(out, "Run usbtop-ng with sudo:")?;
+        writeln!(out, "  sudo usbtop-ng")?;
+    } else {
+        writeln!(out, "Linux setup for live USB monitoring:")?;
+        writeln!(out, "1. Make the usbmon kernel module available:")?;
+        writeln!(out, "   sudo modprobe usbmon")?;
+        writeln!(out, "2. Make the usbmon debugfs files available:")?;
+        writeln!(out, "   sudo mount -t debugfs none /sys/kernel/debug")?;
+        writeln!(
+            out,
+            "3. Run usbtop-ng with permission to read /sys/kernel/debug/usb/usbmon"
+        )?;
+        writeln!(out, "   The simplest test is: sudo usbtop-ng")?;
+    }
+    Ok(())
+}
+
+/// Whether the "usbmon loaded but still unavailable" exit path may ask an
+/// interactive question before it decides whether to unload what this run
+/// loaded. A headless run has nobody to answer a stdin prompt — asking here
+/// would hang a script or a cron job forever on a question nobody will ever
+/// answer — so it must always take the silent path instead
+/// ([`usbmon::unload_without_asking`], which still honors a standing
+/// `unload_usbmon_on_exit = true`; it only skips the question).
+fn may_prompt_before_unload(headless: bool) -> bool {
+    !headless
+}
+
+/// Resolve `--window` into a [`Duration`], applying the default (5s for
+/// `--once`, 1s for `--batch`) and the 0.25s floor. `Duration::from_secs_f64`
+/// panics on a NaN, an infinity, or a finite value too large for a `Duration`
+/// to represent — `--window inf` reached it directly and turned an argument
+/// error into a panic (exit 101). This validates first and reports a normal
+/// exit-2 error instead, the same way an invalid `--filter` expression does.
+fn resolve_window(window: Option<f64>, batch: bool) -> Result<Duration, String> {
+    let seconds = window.unwrap_or(if batch { 1.0 } else { 5.0 });
+    if !seconds.is_finite() {
+        return Err(format!(
+            "--window must be a finite number of seconds, got {seconds}"
+        ));
+    }
+    let floored = seconds.max(0.25);
+    Duration::try_from_secs_f64(floored).map_err(|_| format!("--window {floored} is out of range"))
 }
 
 fn create_shell_alias() -> Result<()> {
@@ -326,4 +511,92 @@ fn create_shell_alias() -> Result<()> {
     println!("\nYou can now run: usbtop");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_parses_print_completions_shell() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["usbtop-ng", "--print-completions", "bash"]).unwrap();
+        assert!(cli.print_completions.is_some());
+        assert!(Cli::try_parse_from(["usbtop-ng", "--print-completions", "nosuch"]).is_err());
+    }
+
+    #[test]
+    fn headless_never_prompts_before_the_unload_offer() {
+        assert!(
+            !may_prompt_before_unload(true),
+            "a headless run must never block on a stdin prompt"
+        );
+        assert!(
+            may_prompt_before_unload(false),
+            "the interactive TUI path keeps asking"
+        );
+    }
+
+    #[test]
+    fn resolve_window_applies_the_right_default_per_mode() {
+        assert_eq!(
+            resolve_window(None, false).unwrap(),
+            Duration::from_secs_f64(5.0),
+            "--once defaults to a 5s window"
+        );
+        assert_eq!(
+            resolve_window(None, true).unwrap(),
+            Duration::from_secs_f64(1.0),
+            "--batch defaults to a 1s window"
+        );
+    }
+
+    #[test]
+    fn resolve_window_floors_a_too_small_value() {
+        assert_eq!(
+            resolve_window(Some(0.1), false).unwrap(),
+            Duration::from_secs_f64(0.25)
+        );
+        assert_eq!(
+            resolve_window(Some(-5.0), false).unwrap(),
+            Duration::from_secs_f64(0.25),
+            "a negative window floors the same as a too-small positive one"
+        );
+    }
+
+    #[test]
+    fn resolve_window_passes_through_an_ordinary_value() {
+        assert_eq!(
+            resolve_window(Some(10.0), true).unwrap(),
+            Duration::from_secs_f64(10.0)
+        );
+    }
+
+    #[test]
+    fn resolve_window_rejects_non_finite_values_instead_of_panicking() {
+        assert!(resolve_window(Some(f64::INFINITY), false).is_err());
+        assert!(resolve_window(Some(f64::NEG_INFINITY), false).is_err());
+        assert!(resolve_window(Some(f64::NAN), false).is_err());
+    }
+
+    #[test]
+    fn resolve_window_rejects_a_finite_value_too_large_for_duration() {
+        // Finite, but far beyond what `Duration` (u64 seconds) can hold.
+        assert!(resolve_window(Some(1e300), false).is_err());
+    }
+
+    #[test]
+    fn remedy_text_differs_by_permission_denied() {
+        let mut denied = Vec::new();
+        write_remedy(&mut denied, true).unwrap();
+        let denied = String::from_utf8(denied).unwrap();
+        assert!(denied.contains("sudo usbtop-ng"));
+        assert!(!denied.contains("modprobe"), "{denied}");
+
+        let mut missing = Vec::new();
+        write_remedy(&mut missing, false).unwrap();
+        let missing = String::from_utf8(missing).unwrap();
+        assert!(missing.contains("sudo modprobe usbmon"));
+        assert!(missing.contains("sudo mount -t debugfs"));
+    }
 }

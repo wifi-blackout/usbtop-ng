@@ -5,7 +5,10 @@ schedule. Items move to [CHANGELOG.md](../CHANGELOG.md) when they ship.
 
 ## Feature ideas
 
-- Device filtering and search in the device table.
+- Interactive `/` search in the device table. `--filter` covers the
+  command-line case; the table itself has no live search yet.
+- Endpoint rows in the TUI device list. The JSON output already carries
+  per-endpoint detail; the table shows only device totals.
 - Export of bandwidth data to a file.
 - One row per physical connector, using the sysfs port `peer` links. Today
   the USB2 side and the USB3 side of one connector list as sibling buses.
