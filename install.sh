@@ -44,7 +44,14 @@ cargo build --release
 sudo install -m 0755 target/release/usbtop-ng "$PREFIX/usbtop-ng"
 sudo ln -sfn usbtop-ng "$alias_path"
 
+man_dir="$(dirname "$PREFIX")/share/man/man1"
+sudo install -d "$man_dir"
+target/release/usbtop-ng --print-man | sudo tee "$man_dir/usbtop-ng.1" >/dev/null
+sudo ln -sfn usbtop-ng.1 "$man_dir/usbtop.1"
+
 echo "Installed:"
 echo "  $PREFIX/usbtop-ng"
 echo "  $PREFIX/usbtop -> usbtop-ng"
+echo "  $man_dir/usbtop-ng.1"
+echo "  $man_dir/usbtop.1 -> usbtop-ng.1"
 echo "Run: sudo usbtop"

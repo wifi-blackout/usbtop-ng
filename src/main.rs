@@ -83,6 +83,14 @@ struct Cli {
     /// Sample window in seconds (default: 5 with --once, 1 with --batch)
     #[arg(long, value_name = "SECONDS")]
     window: Option<f64>,
+
+    /// Print the man page to stdout
+    #[arg(long)]
+    print_man: bool,
+
+    /// Print a completion script to stdout for the named shell (e.g. bash, zsh, fish)
+    #[arg(long, value_name = "SHELL")]
+    print_completions: Option<clap_complete::Shell>,
 }
 
 fn main() -> Result<()> {
@@ -104,6 +112,23 @@ fn main() -> Result<()> {
     // Show setup instructions if requested
     if cli.setup {
         print_setup_instructions();
+        return Ok(());
+    }
+
+    // Print the man page if requested
+    if cli.print_man {
+        use clap::CommandFactory;
+        let man = clap_mangen::Man::new(Cli::command());
+        let mut rendered = Vec::new();
+        man.render(&mut rendered)?;
+        io::stdout().write_all(&rendered)?;
+        return Ok(());
+    }
+
+    // Print a shell completion script if requested
+    if let Some(shell) = cli.print_completions {
+        use clap::CommandFactory;
+        clap_complete::generate(shell, &mut Cli::command(), "usbtop-ng", &mut io::stdout());
         return Ok(());
     }
 
@@ -468,6 +493,14 @@ fn create_shell_alias() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_parses_print_completions_shell() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["usbtop-ng", "--print-completions", "bash"]).unwrap();
+        assert!(cli.print_completions.is_some());
+        assert!(Cli::try_parse_from(["usbtop-ng", "--print-completions", "nosuch"]).is_err());
+    }
 
     #[test]
     fn headless_never_prompts_before_the_unload_offer() {
