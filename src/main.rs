@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 mod config;
 mod device;
+mod filter;
 mod stats;
 mod tui;
 mod ui;
@@ -61,6 +62,10 @@ struct Cli {
     /// Create shell alias for 'usbtop' command
     #[arg(long)]
     create_alias: bool,
+
+    /// Show only traffic matching KEY=VALUE terms (repeatable, expressions OR)
+    #[arg(long, value_name = "KEY=VALUE[,KEY=VALUE...]")]
+    filter: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -190,8 +195,14 @@ fn main() -> Result<()> {
         warn!("No USB buses detected");
     }
 
+    let filter = filter::FilterSet::parse(&cli.filter).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(2);
+    });
+
     let (packets, monitor) = usbmon::monitor::start_monitoring(&usbmon_status.available_buses);
-    let manager = device::manager::DeviceManager::new();
+    let mut manager = device::manager::DeviceManager::new();
+    manager.set_filter(filter.clone());
     // The readers discard packets rather than block when the channel fills, so
     // the UI needs the count to say so in its header.
     let app = UsbTopApp::new(Duration::from_millis(effective_refresh_ms(cli.refresh)))
@@ -200,7 +211,8 @@ fn main() -> Result<()> {
             preferences.hide_idle_devices,
             config_path,
             preferences.clone(),
-        );
+        )
+        .with_filter(filter);
     let session = run_ui(app, manager, packets);
 
     // Close the usbmon files before anything tries to unload the module: an

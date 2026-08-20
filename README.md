@@ -152,6 +152,25 @@ key press and quits through the same teardown as `q`.
 - `i` hides devices with no current traffic and saves the choice to
   `~/.usbtop-ng/preferences.toml`.
 
+### Filtering
+
+- `--filter KEY=VALUE[,KEY=VALUE...]` narrows the device table and the traffic
+  it counts. Repeat the flag to add more expressions.
+- Keys within one `--filter` term AND together: every key in the term must
+  match. Separate `--filter` flags OR together: a device or packet counts if
+  any term matches. No `--filter` flag shows and counts everything.
+- Keys: `bus`, `dev`, `vid`, `pid`, `id`, `name`, `ep`, `dir`, `type`.
+- `bus` and `dev` match the USB bus number and device number.
+- `vid` and `pid` match the 4 hex digit vendor and product ID, e.g.
+  `vid=04f2`. `id` is shorthand for both together, e.g. `id=04f2:b71a`.
+- `name` matches a case-insensitive substring of the vendor or product string.
+- `ep` matches the endpoint number, 0 through 15. `dir` matches transfer
+  direction, `in` or `out`. `type` matches transfer type: `control` (or
+  `ctrl`), `iso`, `bulk`, `interrupt` (or `int`).
+- `bus`, `dev`, `vid`, `pid`, and `name` decide which devices show at all.
+  `ep`, `dir`, and `type` narrow which packets on a visible device count,
+  without hiding the device itself.
+
 ### The chart pane
 
 - The left chart plots the session total in MB/s over the last 60 seconds.
@@ -302,6 +321,8 @@ Options:
       --force              Force run without usbmon (limited functionality)
       --setup              Show setup instructions for live monitoring
       --create-alias       Create shell alias for 'usbtop' command
+      --filter <KEY=VALUE[,KEY=VALUE...]>
+                           Show only traffic matching KEY=VALUE terms (repeatable, expressions OR)
   -h, --help               Print help
   -V, --version            Print version
 ```

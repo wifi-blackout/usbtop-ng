@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::device::UsbDevice;
+use crate::filter::FilterSet;
 use crate::usbmon::parser::{UrbType, UsbPacket, UsbSpeed};
 
 #[derive(Debug, Clone)]
@@ -87,6 +88,7 @@ impl UsbBus {
 pub struct DeviceManager {
     pub buses: HashMap<u8, UsbBus>,
     sysfs_base: Option<PathBuf>,
+    filter: FilterSet,
 }
 
 impl DeviceManager {
@@ -94,6 +96,7 @@ impl DeviceManager {
         Self {
             buses: HashMap::new(),
             sysfs_base: None,
+            filter: FilterSet::default(),
         }
     }
 
@@ -104,7 +107,16 @@ impl DeviceManager {
         Self {
             buses: HashMap::new(),
             sysfs_base: Some(base),
+            filter: FilterSet::default(),
         }
+    }
+
+    /// Replace the active `--filter` set. Packets that don't match any
+    /// expression in it stop counting toward device/endpoint bandwidth (see
+    /// `apply_packet`), though their device row still appears and its
+    /// `update_activity` timer still resets.
+    pub fn set_filter(&mut self, filter: FilterSet) {
+        self.filter = filter;
     }
 
     /// Get or create a USB bus
@@ -127,6 +139,10 @@ impl DeviceManager {
     /// double-count every URB.
     pub fn apply_packet(&mut self, packet: &UsbPacket) {
         let sysfs_base = self.sysfs_base.clone();
+        // `matches_packet` needs `&self.filter` while `device` below is
+        // borrowed from `self.buses`, so the handle is cloned up front —
+        // same pattern as `sysfs_base` just above.
+        let filter = self.filter.clone();
         let bus = self.get_or_create_bus(packet.bus_id);
         let device = bus.devices.entry(packet.device_id).or_insert_with(|| {
             let mut d = UsbDevice::new(packet.bus_id, packet.device_id);
@@ -134,7 +150,8 @@ impl DeviceManager {
             d
         });
         device.update_activity();
-        if packet.urb_type == UrbType::Callback && packet.data_length > 0 {
+        let counts = filter.matches_packet(packet, device);
+        if counts && packet.urb_type == UrbType::Callback && packet.data_length > 0 {
             if packet.direction {
                 device
                     .bandwidth_stats
@@ -238,6 +255,7 @@ fn read_sysfs_u8(path: &Path) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter::FilterSet;
     use crate::usbmon::parser::{parse_usbmon_text_line, TransferType, UsbSpeed};
     use std::time::Duration;
 
@@ -430,6 +448,20 @@ mod tests {
         let s = parse_usbmon_text_line("ffff0000aaaa0001 100 S Bi:1:003:1 -115 512 <").unwrap();
         mgr.apply_packet(&s);
         assert!(mgr.buses[&1].devices[&3].endpoints.is_empty());
+    }
+
+    #[test]
+    fn filtered_out_packets_do_not_count() {
+        let (_t, mut mgr) = manager_with_empty_sysfs();
+        mgr.set_filter(FilterSet::parse(&["type=iso".into()]).unwrap());
+        let bulk = parse_usbmon_text_line("ffff0000aaaa0001 200 C Bi:1:003:1 0 512 = 00").unwrap();
+        mgr.apply_packet(&bulk);
+        let dev = &mgr.buses[&1].devices[&3];
+        assert_eq!(
+            dev.bandwidth_stats.total_rx_bytes, 0,
+            "bulk bytes must not count under type=iso"
+        );
+        assert!(dev.endpoints.is_empty());
     }
 
     #[test]

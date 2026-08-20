@@ -19,6 +19,7 @@ use std::{
 
 use crate::device::manager::{DeviceManager, UsbBus};
 use crate::device::UsbDevice;
+use crate::filter::FilterSet;
 use crate::usbmon::parser::{UsbPacket, UsbSpeed};
 
 pub mod colors;
@@ -97,6 +98,9 @@ pub struct UsbTopApp {
     /// the full preferences snapshot, so the other keys survive the write.
     /// `None` in tests and whenever no config file backs the session.
     idle_persist: Option<(std::path::PathBuf, crate::config::Preferences)>,
+    /// The active `--filter` set. Empty (the default) matches every device;
+    /// see [`Self::retain_filtered_devices`].
+    filter: FilterSet,
 }
 
 impl UsbTopApp {
@@ -115,6 +119,7 @@ impl UsbTopApp {
             shed_counter: None,
             hide_idle_devices: false,
             idle_persist: None,
+            filter: FilterSet::default(),
         }
     }
 
@@ -136,6 +141,13 @@ impl UsbTopApp {
     ) -> Self {
         self.hide_idle_devices = hide;
         self.idle_persist = Some((path, preferences));
+        self
+    }
+
+    /// Attach the active `--filter` set (see [`Self::filter`]). Preserves the
+    /// builder style of [`Self::with_dropped_counter`].
+    pub fn with_filter(mut self, filter: FilterSet) -> Self {
+        self.filter = filter;
         self
     }
 
@@ -191,6 +203,10 @@ impl UsbTopApp {
             }))
             .collect();
 
+        if !self.filter.is_empty() {
+            self.retain_filtered_devices();
+        }
+
         self.total_bandwidth = self
             .controllers
             .iter()
@@ -233,6 +249,19 @@ impl UsbTopApp {
             for bus in &mut controller.buses {
                 bus.devices
                     .retain(|row| row.device.bandwidth_stats.current_bps > 0.0);
+            }
+            controller.buses.retain(|bus| !bus.devices.is_empty());
+        }
+        self.controllers.retain(|c| !c.buses.is_empty());
+    }
+
+    /// Drop rows the active `--filter` set does not match, then drop any bus
+    /// or controller left empty, mirroring `retain_active_devices`.
+    fn retain_filtered_devices(&mut self) {
+        let filter = self.filter.clone();
+        for controller in &mut self.controllers {
+            for bus in &mut controller.buses {
+                bus.devices.retain(|row| filter.matches_device(&row.device));
             }
             controller.buses.retain(|bus| !bus.devices.is_empty());
         }
@@ -1220,6 +1249,36 @@ mod tests {
                 .all(|b| !b.devices.is_empty()),
             "no bus with zero visible devices remains"
         );
+    }
+
+    #[test]
+    fn filter_hides_non_matching_buses_and_prunes_empty_controllers() {
+        let (_t, mut mgr) = manager_with_rates(&[]);
+
+        // Bus 1, alone on its controller, matches the filter.
+        let matching_bus = mgr.get_or_create_bus(1);
+        matching_bus.controller = Some("matching-controller".to_string());
+        matching_bus.devices.insert(3, UsbDevice::new(1, 3));
+
+        // Bus 2, on a different controller, does not match: both the bus and
+        // its now-empty controller must be pruned.
+        let other_bus = mgr.get_or_create_bus(2);
+        other_bus.controller = Some("other-controller".to_string());
+        other_bus.devices.insert(5, UsbDevice::new(2, 5));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100))
+            .with_filter(FilterSet::parse(&["bus=1".into()]).unwrap());
+        app.sync_from(&mgr);
+
+        assert_eq!(
+            app.controllers.len(),
+            1,
+            "the non-matching controller is pruned, not left as a bare header"
+        );
+        assert_eq!(app.controllers[0].id, "matching-controller");
+        assert_eq!(app.controllers[0].buses.len(), 1);
+        assert_eq!(app.controllers[0].buses[0].bus_id, 1);
+        assert_eq!(app.device_keys(), vec!["1:3".to_string()]);
     }
 
     #[test]
