@@ -54,6 +54,9 @@ The install creates `/usr/local/bin/usbtop` as a symlink to `usbtop-ng`, so
 `usbtop` and `sudo usbtop` both work. A shell alias would not work under
 `sudo`.
 
+`install.sh` also installs a man page, so `man usbtop-ng` works right after
+install.
+
 To install by hand instead, build and copy the binary yourself:
 
 ```bash
@@ -62,8 +65,8 @@ sudo install -m 0755 target/release/usbtop-ng /usr/local/bin/usbtop-ng
 sudo ln -sf usbtop-ng /usr/local/bin/usbtop
 ```
 
-[docs/INSTALL.md](docs/INSTALL.md) covers the usbmon setup, the permission
-checks, and how to remove usbtop-ng again.
+[docs/INSTALL.md](docs/INSTALL.md) covers the usbmon setup, shell completions,
+the permission checks, and how to remove usbtop-ng again.
 
 ## Update
 

@@ -29,9 +29,9 @@ for any other platform stops at a compile error.
    ./install.sh
    ```
    The script runs `cargo build --release`, then asks for `sudo` to copy the
-   binary to `/usr/local/bin` and to create a `usbtop` symlink. It prints the
-   two paths it installed. If the build fails on a compiler error, confirm that
-   `cargo --version` reports Rust 1.88 or later.
+   binary to `/usr/local/bin`, create a `usbtop` symlink, and install the man
+   page. It prints the four paths it installed. If the build fails on a
+   compiler error, confirm that `cargo --version` reports Rust 1.88 or later.
 4. Confirm the install:
    ```bash
    usbtop-ng --version
@@ -40,6 +40,10 @@ for any other platform stops at a compile error.
 
 The symlink makes `usbtop` and `sudo usbtop` both work, because both resolve
 through your path. A shell alias would not work under `sudo`.
+
+The script also installs the man page to
+`$(dirname "$PREFIX")/share/man/man1/usbtop-ng.1`, with a `usbtop.1` symlink
+alongside it, so `man usbtop-ng` and `man usbtop` both work.
 
 The script refuses to replace a `usbtop` command it does not own. It stops
 before touching anything and names the conflicting file. Remove that file
@@ -59,6 +63,33 @@ sudo install -m 0755 target/release/usbtop-ng /usr/local/bin/usbtop-ng
 sudo ln -sf usbtop-ng /usr/local/bin/usbtop
 ```
 
+## Shell completions
+
+usbtop-ng prints a completion script for any shell `clap_complete` supports.
+Pick the section for your shell.
+
+1. Bash:
+   ```bash
+   usbtop-ng --print-completions bash | sudo tee /etc/bash_completion.d/usbtop-ng >/dev/null
+   ```
+   Start a new shell to pick it up.
+2. Zsh:
+   ```bash
+   mkdir -p ~/.zfunc
+   usbtop-ng --print-completions zsh > ~/.zfunc/_usbtop-ng
+   ```
+   Add `~/.zfunc` to `fpath` before `compinit` runs, in `~/.zshrc`:
+   ```zsh
+   fpath=(~/.zfunc $fpath)
+   autoload -Uz compinit && compinit
+   ```
+   Start a new shell to pick it up.
+3. Fish:
+   ```bash
+   usbtop-ng --print-completions fish > ~/.config/fish/completions/usbtop-ng.fish
+   ```
+   Fish picks up new completion files in the next shell.
+
 ## Update
 
 1. Pull the latest code:
@@ -69,7 +100,8 @@ sudo ln -sf usbtop-ng /usr/local/bin/usbtop
    ```bash
    ./install.sh
    ```
-   The script rebuilds and replaces the binary and the symlink.
+   The script rebuilds and replaces the binary, the symlink, and the man
+   page.
 3. Confirm the new version:
    ```bash
    usbtop-ng --version
@@ -169,7 +201,7 @@ From the source tree, run the same three checks CI runs:
    ```bash
    cargo test --all-targets
    ```
-   The command reports 200 passed.
+   The command reports 238 passed.
 
 ## Uninstall
 
@@ -177,7 +209,11 @@ From the source tree, run the same three checks CI runs:
    ```bash
    sudo rm /usr/local/bin/usbtop-ng /usr/local/bin/usbtop
    ```
-2. To remove the preferences file and its directory, run:
+2. Remove the man page and its symlink:
+   ```bash
+   sudo rm /usr/local/share/man/man1/usbtop-ng.1 /usr/local/share/man/man1/usbtop.1
+   ```
+3. To remove the preferences file and its directory, run:
    ```bash
    rm -r ~/.usbtop-ng
    ```
