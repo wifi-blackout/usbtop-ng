@@ -5,6 +5,19 @@ All notable changes to usbtop-ng are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `--filter` expressions down to endpoint, direction, and transfer type.
+- `--once` and `--batch` reports, with `--json` output (documented in
+  docs/SCRIPTING.md).
+- `--print-man` and `--print-completions` for the man page and shell
+  completions, installed by install.sh.
+- Per-bus rx/tx figures in bus heading rows.
+- `~` estimate markers for isochronous rates on the text interface.
+- A release workflow that attaches Linux x86_64 binaries to tagged releases.
+
 ## [1.1.1] - 2026-08-10
 
 ### Added

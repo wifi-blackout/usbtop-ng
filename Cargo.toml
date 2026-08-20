@@ -10,6 +10,7 @@ readme = "README.md"
 keywords = ["usb", "monitoring", "usbmon", "tui"]
 categories = ["command-line-utilities"]
 rust-version = "1.88"
+exclude = ["tmp/", ".claude/", ".github/", "release.sh"]
 
 [features]
 integration = []
