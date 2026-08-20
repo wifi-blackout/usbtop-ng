@@ -5,7 +5,7 @@ use std::io::{ErrorKind, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::parser::{UrbType, UsbPacket};
+use super::parser::{TransferType, UrbType, UsbPacket};
 use super::{open_nonblocking, POLL_INTERVAL};
 
 /// Bytes of the `usbmon_packet` header that a plain `read(2)` on the binary
@@ -222,10 +222,14 @@ pub fn parse_binary_header(buf: &[u8; HEADER_LEN]) -> Option<(UsbPacket, u32)> {
         direction: buf[10] & 0x80 != 0,
         // `length` (bytes the URB carried), not `len_cap` (bytes captured).
         data_length: u32::from_ne_bytes(bytes_at(buf, 32)),
+        // Bits 0-6 of `epnum`; bit 7 is the direction flag handled above.
+        endpoint: buf[10] & 0x7f,
+        // `xfer_type` byte: 0=Iso, 1=Interrupt, 2=Control, 3=Bulk (see
+        // `TransferType::from_binary_code`). Unrecognized codes stay `None`
+        // rather than guessing a transfer type.
+        transfer_type: TransferType::from_binary_code(buf[9]),
         #[cfg(test)]
         urb_tag: format!("{:016x}", u64::from_ne_bytes(bytes_at(buf, 0))),
-        #[cfg(test)]
-        endpoint: buf[10] & 0x7f,
         #[cfg(test)]
         status: i32::from_ne_bytes(bytes_at(buf, 28)),
         // `flag_setup` is 0 exactly when a control setup packet was captured;
@@ -248,7 +252,7 @@ pub fn parse_binary_header(buf: &[u8; HEADER_LEN]) -> Option<(UsbPacket, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usbmon::parser::UrbType;
+    use crate::usbmon::parser::{TransferType, UrbType};
 
     fn event(
         t: u8,
@@ -349,6 +353,27 @@ mod tests {
         assert_eq!(p.setup_packet, None);
         assert_eq!(p.data, None);
         assert_eq!(len_cap, 4);
+    }
+
+    #[test]
+    fn binary_header_maps_xfer_type_and_endpoint_into_production_fields() {
+        let e = event(b'C', 0x81, 3, 1, 0, 512, &[]);
+        let (p, _) = parse_binary_header(&e[..48].try_into().unwrap()).unwrap();
+        assert_eq!(p.endpoint, 1);
+        assert_eq!(p.transfer_type, Some(TransferType::Bulk));
+
+        let mut iso = event(b'C', 0x81, 3, 1, 0, 512, &[]);
+        iso[9] = 0;
+        let (p, _) = parse_binary_header(&iso[..48].try_into().unwrap()).unwrap();
+        assert_eq!(p.transfer_type, Some(TransferType::Isochronous));
+
+        let mut unknown = event(b'C', 0x81, 3, 1, 0, 512, &[]);
+        unknown[9] = 9;
+        let (p, _) = parse_binary_header(&unknown[..48].try_into().unwrap()).unwrap();
+        assert_eq!(
+            p.transfer_type, None,
+            "unrecognized codes stay honest: None"
+        );
     }
 
     #[test]

@@ -144,6 +144,14 @@ impl DeviceManager {
                     .bandwidth_stats
                     .update_tx(u64::from(packet.data_length));
             }
+            if let Some(transfer_type) = packet.transfer_type {
+                device.record_endpoint(
+                    packet.endpoint,
+                    packet.direction,
+                    transfer_type,
+                    u64::from(packet.data_length),
+                );
+            }
         }
     }
 
@@ -155,6 +163,7 @@ impl DeviceManager {
         for bus in self.buses.values_mut() {
             for device in bus.devices.values_mut() {
                 device.bandwidth_stats.refresh();
+                device.refresh_endpoints();
                 if let Some(path) = &device.sysfs_path {
                     if !path.exists() {
                         device.mark_disconnected();
@@ -229,7 +238,7 @@ fn read_sysfs_u8(path: &Path) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usbmon::parser::{parse_usbmon_text_line, UsbSpeed};
+    use crate::usbmon::parser::{parse_usbmon_text_line, TransferType, UsbSpeed};
     use std::time::Duration;
 
     fn manager_with_empty_sysfs() -> (tempfile::TempDir, DeviceManager) {
@@ -393,6 +402,34 @@ mod tests {
             512
         );
         assert_eq!(mgr.buses[&1].devices.len(), 1, "same row, not a duplicate");
+    }
+
+    #[test]
+    fn apply_packet_tracks_per_endpoint_stats() {
+        let (_t, mut mgr) = manager_with_empty_sysfs();
+        let iso = parse_usbmon_text_line("ffff0000aaaa0001 200 C Zi:1:004:1 0:1:6672:0 32 27000 =")
+            .unwrap();
+        let bulk_out = parse_usbmon_text_line("ffff0000aaaa0002 300 C Bo:1:004:2 0 512 >").unwrap();
+        mgr.apply_packet(&iso);
+        mgr.apply_packet(&bulk_out);
+
+        let dev = &mgr.buses[&1].devices[&4];
+        let iso_ep = &dev.endpoints[&(1, true)];
+        assert_eq!(iso_ep.transfer_type, TransferType::Isochronous);
+        assert_eq!(iso_ep.total_bytes, 27_000);
+        assert!(iso_ep.counter.bps() > 0.0);
+        let bulk_ep = &dev.endpoints[&(2, false)];
+        assert_eq!(bulk_ep.transfer_type, TransferType::Bulk);
+        assert_eq!(bulk_ep.total_bytes, 512);
+        assert!(dev.has_iso_traffic());
+    }
+
+    #[test]
+    fn submissions_do_not_touch_endpoint_stats() {
+        let (_t, mut mgr) = manager_with_empty_sysfs();
+        let s = parse_usbmon_text_line("ffff0000aaaa0001 100 S Bi:1:003:1 -115 512 <").unwrap();
+        mgr.apply_packet(&s);
+        assert!(mgr.buses[&1].devices[&3].endpoints.is_empty());
     }
 
     #[test]
