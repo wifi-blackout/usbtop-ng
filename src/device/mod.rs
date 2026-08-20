@@ -1,9 +1,27 @@
-use std::time::Instant;
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
-use crate::stats::BandwidthStats;
-use crate::usbmon::parser::UsbSpeed;
+use crate::stats::{BandwidthStats, WindowCounter};
+use crate::usbmon::parser::{TransferType, UsbSpeed};
 
 pub mod manager;
+
+/// One endpoint's traffic: its transfer type, cumulative bytes, and a
+/// windowed rate. Keyed in [`UsbDevice::endpoints`] by (number, IN?).
+///
+/// `transfer_type` is `cfg(test)`-only for now: its only reader,
+/// [`UsbDevice::has_iso_traffic`], is itself unconsumed until the iso
+/// estimate marker lands; still recorded and verified here.
+#[derive(Debug, Clone)]
+pub struct EndpointStats {
+    #[cfg(test)]
+    pub transfer_type: TransferType,
+    pub total_bytes: u64,
+    pub counter: WindowCounter,
+}
+
+/// Same window BandwidthStats uses, so device and endpoint rates agree.
+const ENDPOINT_WINDOW: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct UsbDevice {
@@ -24,6 +42,11 @@ pub struct UsbDevice {
     /// how fast it's actually linked (see `check_speed_mismatch`). Cached at
     /// sysfs read time so mismatch checks never touch the filesystem.
     pub max_capability: Option<UsbSpeed>,
+    /// Per-endpoint traffic, keyed by (endpoint number, IN?). Populated by
+    /// `record_endpoint` as callbacks arrive; a device with no traffic yet
+    /// has an empty map rather than pre-declared rows, since the endpoint
+    /// layout is only knowable from the packets actually seen.
+    pub endpoints: BTreeMap<(u8, bool), EndpointStats>,
 }
 
 impl UsbDevice {
@@ -43,6 +66,7 @@ impl UsbDevice {
             last_seen: Instant::now(),
             sysfs_path: None,
             max_capability: None,
+            endpoints: BTreeMap::new(),
         }
     }
 
@@ -219,6 +243,52 @@ impl UsbDevice {
         } else {
             SpeedIndicator::Normal
         }
+    }
+
+    /// Account `bytes` against one endpoint. The transfer type is fixed by the
+    /// hardware per endpoint, so the first packet's type sticks.
+    ///
+    /// `transfer_type` is bound with a leading underscore: the field it feeds
+    /// is `cfg(test)`-only for now (see `EndpointStats` docs), so nothing in
+    /// production reads it back yet.
+    pub fn record_endpoint(
+        &mut self,
+        endpoint: u8,
+        dir_in: bool,
+        _transfer_type: TransferType,
+        bytes: u64,
+    ) {
+        let entry = self
+            .endpoints
+            .entry((endpoint, dir_in))
+            .or_insert_with(|| EndpointStats {
+                #[cfg(test)]
+                transfer_type: _transfer_type,
+                total_bytes: 0,
+                counter: WindowCounter::new(ENDPOINT_WINDOW),
+            });
+        entry.total_bytes += bytes;
+        entry.counter.add(bytes);
+    }
+
+    /// Decay endpoint rates; called from the manager's per-tick refresh.
+    pub fn refresh_endpoints(&mut self) {
+        for stats in self.endpoints.values_mut() {
+            stats.counter.refresh();
+        }
+    }
+
+    /// True when any isochronous endpoint has carried bytes. Drives the
+    /// text-source estimate marker.
+    ///
+    /// `cfg(test)`-only for now: no production code reads this yet — it
+    /// lands with a later task's iso estimate marker; verified here and
+    /// ready for that wiring.
+    #[cfg(test)]
+    pub fn has_iso_traffic(&self) -> bool {
+        self.endpoints
+            .values()
+            .any(|s| s.transfer_type == TransferType::Isochronous && s.total_bytes > 0)
     }
 }
 
