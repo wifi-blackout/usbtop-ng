@@ -10,7 +10,7 @@ use ratatui::{
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::Receiver,
         Arc,
     },
@@ -19,6 +19,7 @@ use std::{
 
 use crate::device::manager::{DeviceManager, UsbBus};
 use crate::device::UsbDevice;
+use crate::filter::FilterSet;
 use crate::usbmon::parser::{UsbPacket, UsbSpeed};
 
 pub mod colors;
@@ -56,6 +57,31 @@ pub struct BusView {
     /// Aggregate %busy across the bus's devices; `None` when the bus speed
     /// is unknown (see `UsbBus::busy_percentage`).
     pub busy_percentage: Option<f64>,
+    /// Sum of `devices`' `bandwidth_stats.rx_bps`/`tx_bps`. Set by
+    /// `bus_view` and kept in sync by `recompute_rates`, which
+    /// `UsbTopApp::sync_from` calls again after every retention pass
+    /// (hide-idle, `--filter`) so a pruned row's rate never lingers in the
+    /// bus heading's total.
+    pub rx_bps: f64,
+    pub tx_bps: f64,
+}
+
+impl BusView {
+    /// Recompute `rx_bps`/`tx_bps` from the devices currently in `devices`.
+    /// Must be called after any retention step removes rows, or a hidden
+    /// device's rate would keep counting toward the bus heading.
+    fn recompute_rates(&mut self) {
+        self.rx_bps = self
+            .devices
+            .iter()
+            .map(|row| row.device.bandwidth_stats.rx_bps)
+            .sum();
+        self.tx_bps = self
+            .devices
+            .iter()
+            .map(|row| row.device.bandwidth_stats.tx_bps)
+            .sum();
+    }
 }
 
 /// One host controller and its buses in bus-number order.
@@ -97,6 +123,17 @@ pub struct UsbTopApp {
     /// the full preferences snapshot, so the other keys survive the write.
     /// `None` in tests and whenever no config file backs the session.
     idle_persist: Option<(std::path::PathBuf, crate::config::Preferences)>,
+    /// The active `--filter` set. Empty (the default) matches every device;
+    /// see [`Self::retain_filtered_devices`].
+    filter: FilterSet,
+    /// The monitor's text-source-active flag (see
+    /// `usbmon::monitor::MonitorHandle::text_active`): true only while a
+    /// debugfs text source backs the session. Read through the
+    /// `text_source_active()` method to gate the `~` estimate marker on
+    /// isochronous device rows (see `UsbDevice::has_iso_traffic`) and the
+    /// legend line explaining it. `None` in tests and whenever no monitor is
+    /// attached.
+    text_source_active: Option<Arc<AtomicBool>>,
 }
 
 impl UsbTopApp {
@@ -115,6 +152,8 @@ impl UsbTopApp {
             shed_counter: None,
             hide_idle_devices: false,
             idle_persist: None,
+            filter: FilterSet::default(),
+            text_source_active: None,
         }
     }
 
@@ -136,6 +175,21 @@ impl UsbTopApp {
     ) -> Self {
         self.hide_idle_devices = hide;
         self.idle_persist = Some((path, preferences));
+        self
+    }
+
+    /// Attach the active `--filter` set (see [`Self::filter`]). Preserves the
+    /// builder style of [`Self::with_dropped_counter`].
+    pub fn with_filter(mut self, filter: FilterSet) -> Self {
+        self.filter = filter;
+        self
+    }
+
+    /// Attach the monitor's text-source-active flag (see
+    /// [`Self::text_source_active`]). Preserves the builder style of
+    /// [`Self::with_dropped_counter`].
+    pub fn with_text_source_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.text_source_active = Some(flag);
         self
     }
 
@@ -165,6 +219,15 @@ impl UsbTopApp {
             .map_or(0, |counter| counter.load(Ordering::Relaxed))
     }
 
+    /// True only while a debugfs text source backs the session, or `false`
+    /// when no flag is attached. Gates the `~` estimate marker on
+    /// isochronous device rows and the legend line explaining it.
+    fn text_source_active(&self) -> bool {
+        self.text_source_active
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
     /// Rebuild the whole render snapshot from the manager: controller ->
     /// bus -> port-ordered devices, plus totals and selection validity.
     pub fn sync_from(&mut self, manager: &DeviceManager) {
@@ -191,6 +254,10 @@ impl UsbTopApp {
             }))
             .collect();
 
+        if !self.filter.is_empty() {
+            self.retain_filtered_devices();
+        }
+
         self.total_bandwidth = self
             .controllers
             .iter()
@@ -204,6 +271,15 @@ impl UsbTopApp {
 
         if self.hide_idle_devices {
             self.retain_active_devices();
+        }
+
+        // Recomputed last, after every retention pass above (filter,
+        // hide-idle): a row pruned by either one must not keep contributing
+        // to its bus heading's rx/tx totals.
+        for controller in &mut self.controllers {
+            for bus in &mut controller.buses {
+                bus.recompute_rates();
+            }
         }
 
         if let Some(selected) = &self.selected_device {
@@ -233,6 +309,19 @@ impl UsbTopApp {
             for bus in &mut controller.buses {
                 bus.devices
                     .retain(|row| row.device.bandwidth_stats.current_bps > 0.0);
+            }
+            controller.buses.retain(|bus| !bus.devices.is_empty());
+        }
+        self.controllers.retain(|c| !c.buses.is_empty());
+    }
+
+    /// Drop rows the active `--filter` set does not match, then drop any bus
+    /// or controller left empty, mirroring `retain_active_devices`.
+    fn retain_filtered_devices(&mut self) {
+        let filter = self.filter.clone();
+        for controller in &mut self.controllers {
+            for bus in &mut controller.buses {
+                bus.devices.retain(|row| filter.matches_device(&row.device));
             }
             controller.buses.retain(|bus| !bus.devices.is_empty());
         }
@@ -391,13 +480,17 @@ fn bus_view(bus: &UsbBus) -> BusView {
         )
     });
 
-    BusView {
+    let mut view = BusView {
         bus_id: bus.bus_id,
         speed: bus.speed.clone(),
         side_label: side_label(&bus.speed),
         devices,
         busy_percentage: bus.busy_percentage(),
-    }
+        rx_bps: 0.0,
+        tx_bps: 0.0,
+    };
+    view.recompute_rates();
+    view
 }
 
 /// Which physical side of a shared xHCI controller a bus lives on: USB2 root
@@ -464,7 +557,7 @@ pub(crate) fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
     draw_bandwidth_graph(f, chart_chunks[0], app);
     draw_device_chart(f, chart_chunks[1], app);
     draw_device_list(f, chunks[2], app);
-    draw_color_reference(f, chunks[3]);
+    draw_color_reference(f, chunks[3], app);
 }
 
 /// Bytes per second as MB/s, floored at zero. Bandwidth is never negative, so
@@ -740,6 +833,29 @@ fn speed_style(speed: &UsbSpeed) -> Style {
     Style::default().fg(Color::Rgb(r, g, b))
 }
 
+/// Bytes per second as a fixed-precision "X.Y KB/s" string. Shared by device
+/// rows' Bw↓/Bw↑ cells and the bus heading's rx/tx totals, so the two never
+/// drift onto different units.
+fn format_rate(bytes_per_second: f64) -> String {
+    format!("{:.1} KB/s", bytes_per_second / 1000.0)
+}
+
+/// Device row's Bw↓/Bw↑ cell text: the formatted rate, `~`-prefixed when
+/// `estimated` is set. The text interface reports isochronous buffer sizes,
+/// not bytes moved, so a device with iso traffic under a text source has its
+/// rate flagged as an estimate rather than an exact measurement (see
+/// `UsbTopApp::text_source_active`,
+/// `UsbDevice::has_iso_traffic`, and the same convention in
+/// `headless::render_text`).
+fn rate_cell(bytes_per_second: f64, estimated: bool) -> String {
+    let rate = format_rate(bytes_per_second);
+    if estimated {
+        format!("~{rate}")
+    } else {
+        rate
+    }
+}
+
 /// %busy cell text for a device row: a numeric percentage normally, or a
 /// width-matched "--" when the device's speed is unknown and therefore has
 /// no meaningful bandwidth denominator. Mirrors `BusView::busy_percentage`'s
@@ -821,6 +937,11 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
                     speed_style(&bus.speed),
                 ),
                 Span::raw(busy_suffix),
+                Span::raw(format!(
+                    "  rx {} tx {}",
+                    format_rate(bus.rx_bps),
+                    format_rate(bus.tx_bps)
+                )),
             ]));
 
             for row in &bus.devices {
@@ -840,14 +961,19 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
                     Style::default().fg(TEXT_COLOR)
                 };
 
+                // The debugfs text interface can't report exact byte counts
+                // for isochronous transfers (see `rate_cell`), so a device
+                // carrying iso traffic under a text source has both its rate
+                // cells marked `~` rather than presented as exact.
+                let estimated = app.text_source_active() && device.has_iso_traffic();
                 let mut spans = device_columns([
                     &port_label(row.port_chain.as_ref()),
                     &format!("{:03}:{:03}", device.bus_id, device.device_id),
                     &format!("{:.1} Mbps", device.speed.to_mbps()),
                     device.vendor.as_deref().unwrap_or("Unknown"),
                     device.product.as_deref().unwrap_or("Unknown"),
-                    &format!("{:.1} KB/s", device.bandwidth_stats.rx_bps / 1000.0),
-                    &format!("{:.1} KB/s", device.bandwidth_stats.tx_bps / 1000.0),
+                    &rate_cell(device.bandwidth_stats.rx_bps, estimated),
+                    &rate_cell(device.bandwidth_stats.tx_bps, estimated),
                     &busy_cell(device),
                     indicator.get_symbol(),
                 ]);
@@ -873,23 +999,31 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
     (lines, selected_line)
 }
 
-fn draw_color_reference(f: &mut Frame, area: Rect) {
+fn draw_color_reference(f: &mut Frame, area: Rect, app: &UsbTopApp) {
+    let mut legend_spans = vec![
+        Span::raw("Legend: "),
+        Span::styled("●", speed_style(&UsbSpeed::Low)),
+        Span::raw(" 1.5M  "),
+        Span::styled("●", speed_style(&UsbSpeed::Full)),
+        Span::raw(" 12M  "),
+        Span::styled("●", speed_style(&UsbSpeed::High)),
+        Span::raw(" 480M  "),
+        Span::styled("●", speed_style(&UsbSpeed::SuperSpeed)),
+        Span::raw(" 5G  "),
+        Span::styled("●", speed_style(&UsbSpeed::SuperSpeedPlus)),
+        Span::raw(" 10G+  "),
+        Span::styled("●", speed_style(&UsbSpeed::Unknown)),
+        Span::raw(" ?"),
+    ];
+    // Only true while a debugfs text source backs the session: the `~`
+    // marker cannot appear under a binary source, so a legend entry for it
+    // then would describe a marker no row could ever show.
+    if app.text_source_active() {
+        legend_spans.push(Span::raw("  ~ = estimated rate (text source)"));
+    }
+
     let reference_text = vec![
-        Line::from(vec![
-            Span::raw("Legend: "),
-            Span::styled("●", speed_style(&UsbSpeed::Low)),
-            Span::raw(" 1.5M  "),
-            Span::styled("●", speed_style(&UsbSpeed::Full)),
-            Span::raw(" 12M  "),
-            Span::styled("●", speed_style(&UsbSpeed::High)),
-            Span::raw(" 480M  "),
-            Span::styled("●", speed_style(&UsbSpeed::SuperSpeed)),
-            Span::raw(" 5G  "),
-            Span::styled("●", speed_style(&UsbSpeed::SuperSpeedPlus)),
-            Span::raw(" 10G+  "),
-            Span::styled("●", speed_style(&UsbSpeed::Unknown)),
-            Span::raw(" ?"),
-        ]),
+        Line::from(legend_spans),
         Line::from(vec![
             Span::raw("Controls: "),
             Span::styled(
@@ -965,6 +1099,9 @@ fn draw_help_overlay(f: &mut Frame) {
             Span::styled("  Ctrl-C", Style::default().fg(ACCENT_COLOR)),
             Span::raw("   Quit application"),
         ]),
+        Line::from(
+            "  ~ marks estimated rates. The text interface reports isochronous buffer sizes, not bytes moved.",
+        ),
         Line::from(""),
         Line::from("Features:"),
         Line::from("  • Controller-grouped, port-ordered device list (USB2/USB3 sibling buses)"),
@@ -1223,6 +1360,94 @@ mod tests {
     }
 
     #[test]
+    fn filter_hides_non_matching_buses_and_prunes_empty_controllers() {
+        let (_t, mut mgr) = manager_with_rates(&[]);
+
+        // Bus 1, alone on its controller, matches the filter.
+        let matching_bus = mgr.get_or_create_bus(1);
+        matching_bus.controller = Some("matching-controller".to_string());
+        matching_bus.devices.insert(3, UsbDevice::new(1, 3));
+
+        // Bus 2, on a different controller, does not match: both the bus and
+        // its now-empty controller must be pruned.
+        let other_bus = mgr.get_or_create_bus(2);
+        other_bus.controller = Some("other-controller".to_string());
+        other_bus.devices.insert(5, UsbDevice::new(2, 5));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100))
+            .with_filter(FilterSet::parse(&["bus=1".into()]).unwrap());
+        app.sync_from(&mgr);
+
+        assert_eq!(
+            app.controllers.len(),
+            1,
+            "the non-matching controller is pruned, not left as a bare header"
+        );
+        assert_eq!(app.controllers[0].id, "matching-controller");
+        assert_eq!(app.controllers[0].buses.len(), 1);
+        assert_eq!(app.controllers[0].buses[0].bus_id, 1);
+        assert_eq!(app.device_keys(), vec!["1:3".to_string()]);
+    }
+
+    #[test]
+    fn bus_view_sums_device_rates() {
+        let mut bus = UsbBus::new(1);
+        let mut d1 = UsbDevice::new(1, 3);
+        d1.bandwidth_stats.rx_bps = 100.0;
+        d1.bandwidth_stats.tx_bps = 25.0;
+        let mut d2 = UsbDevice::new(1, 4);
+        d2.bandwidth_stats.rx_bps = 50.0;
+        bus.devices.insert(3, d1);
+        bus.devices.insert(4, d2);
+        let view = bus_view(&bus);
+        assert_eq!(view.rx_bps, 150.0);
+        assert_eq!(view.tx_bps, 25.0);
+    }
+
+    /// Pins the ordering `sync_from` must follow: `bus_view` sums every
+    /// device present at snapshot time, but hide-idle retention prunes rows
+    /// afterwards, so the bus totals have to be recomputed post-retention or
+    /// a hidden device's rate would silently keep counting.
+    #[test]
+    fn bus_rates_only_reflect_devices_that_survive_hide_idle_retention() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+
+        let mut idle = UsbDevice::new(1, 3);
+        idle.bandwidth_stats.current_bps = 0.0; // hidden once hide-idle is on
+        idle.bandwidth_stats.rx_bps = 999.0; // must not leak into the bus sum
+        idle.bandwidth_stats.tx_bps = 999.0;
+
+        let mut active = UsbDevice::new(1, 4);
+        active.bandwidth_stats.current_bps = 500.0;
+        active.bandwidth_stats.rx_bps = 300.0;
+        active.bandwidth_stats.tx_bps = 200.0;
+
+        let bus = mgr.get_or_create_bus(1);
+        bus.devices.insert(3, idle);
+        bus.devices.insert(4, active);
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.hide_idle_devices = true;
+        app.sync_from(&mgr);
+
+        assert_eq!(
+            app.device_keys(),
+            vec!["1:4".to_string()],
+            "idle device 1:3 hidden"
+        );
+        let bus_view = &app.controllers[0].buses[0];
+        assert_eq!(
+            bus_view.rx_bps, 300.0,
+            "the hidden device's rx_bps must not survive into the bus sum"
+        );
+        assert_eq!(
+            bus_view.tx_bps, 200.0,
+            "the hidden device's tx_bps must not survive into the bus sum"
+        );
+    }
+
+    #[test]
     fn pressing_i_toggles_and_saves_the_preference() {
         use crossterm::event::{KeyCode, KeyEvent};
         let temp = tempfile::tempdir().unwrap();
@@ -1471,6 +1696,11 @@ mod tests {
         // The one platform claim the overlay makes, and the only one it may:
         // the binary does not build anywhere else.
         assert!(screen.contains("Linux only"), "{screen}");
+        // The `~` marker's meaning is documented unconditionally, unlike the
+        // legend line below (see `legend_only_mentions_the_estimate_marker_
+        // when_a_text_source_is_active`): the help overlay is static
+        // reference text, not a claim about the current session.
+        assert!(screen.contains("marks estimated rates"), "{screen}");
 
         assert_eq!(
             apply_key(&mut app, ctrl(KeyCode::Char('l'))),
@@ -1479,6 +1709,34 @@ mod tests {
         assert_eq!(
             apply_key(&mut app, ctrl(KeyCode::Char('c'))),
             KeyOutcome::Quit
+        );
+    }
+
+    /// The legend must never mention a marker that cannot appear: under a
+    /// binary source (or no monitor attached at all, as in most tests) the
+    /// `~` estimate marker can never show up on a device row, so claiming
+    /// otherwise in the legend would be false.
+    #[test]
+    fn legend_only_mentions_the_estimate_marker_when_a_text_source_is_active() {
+        let render = |app: &UsbTopApp| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 6)).unwrap();
+            terminal
+                .draw(|f| draw_color_reference(f, f.area(), app))
+                .unwrap();
+            terminal.backend().to_string()
+        };
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let app =
+            UsbTopApp::new(Duration::from_millis(100)).with_text_source_flag(Arc::clone(&flag));
+        let screen = render(&app);
+        assert!(!screen.contains('~'), "no text source active: {screen}");
+
+        flag.store(true, Ordering::Relaxed);
+        let screen = render(&app);
+        assert!(
+            screen.contains("~ = estimated rate (text source)"),
+            "{screen}"
         );
     }
 
@@ -1627,6 +1885,67 @@ mod tests {
             .join("\n");
         assert!(text.contains("· -- busy"), "{text}");
         assert!(text.contains("· 50.0% busy"), "{text}");
+    }
+
+    #[test]
+    fn bus_heading_line_shows_the_formatted_rx_tx_totals() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let mut device = UsbDevice::new(1, 3);
+        device.bandwidth_stats.rx_bps = 400.0; // -> 0.4 KB/s
+        device.bandwidth_stats.tx_bps = 300.0; // -> 0.3 KB/s
+        mgr.get_or_create_bus(1).devices.insert(3, device);
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let text: String = device_list_lines_with_selection(&app)
+            .0
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("rx 0.4 KB/s tx 0.3 KB/s"), "{text}");
+    }
+
+    /// Mirrors `headless::estimated_marks_iso_devices_only_when_text_is_active`:
+    /// the debugfs text interface reports isochronous buffer sizes, not
+    /// bytes moved, so a device with iso traffic gets its rate cells marked
+    /// `~` only while a text source backs the session — never under a binary
+    /// source, and never for a non-iso device either way.
+    #[test]
+    fn device_row_marks_iso_rate_as_estimated_only_when_a_text_source_is_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        feed(
+            &mut mgr,
+            &["ffff0000aaaa0001 200 C Zi:1:004:1 0:1:6672:0 32 27000 ="],
+        );
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut app =
+            UsbTopApp::new(Duration::from_millis(100)).with_text_source_flag(Arc::clone(&flag));
+        app.sync_from(&mgr);
+
+        // [0] column header, [1] controller heading, [2] bus header, [3] device row.
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        let device_line = lines[3].to_string();
+        assert!(
+            !device_line.contains('~'),
+            "no text source active: {device_line}"
+        );
+
+        flag.store(true, Ordering::Relaxed);
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        let device_line = lines[3].to_string();
+        assert!(
+            device_line.contains("~2.7 KB/s"),
+            "iso device's rx cell must be marked estimated: {device_line}"
+        );
+        assert!(
+            device_line.contains("~0.0 KB/s"),
+            "iso device's tx cell must be marked estimated too: {device_line}"
+        );
     }
 
     #[test]

@@ -189,6 +189,50 @@ fn accumulate(buckets: &mut VecDeque<(Instant, u64)>, sum: &mut u64, now: Instan
     *sum += bytes;
 }
 
+/// Bytes accumulated over a sliding window, published as a rate. The same
+/// bucket accounting as [`BandwidthStats`], for callers that need one
+/// direction-less counter per key (per-endpoint stats) instead of a full
+/// rx/tx/peak/history block.
+#[derive(Debug, Clone)]
+pub struct WindowCounter {
+    buckets: VecDeque<(Instant, u64)>,
+    sum: u64,
+    window: Duration,
+}
+
+impl WindowCounter {
+    pub fn new(window: Duration) -> Self {
+        Self {
+            buckets: VecDeque::new(),
+            sum: 0,
+            window,
+        }
+    }
+
+    /// Account `bytes`. O(1) amortized, like [`BandwidthStats::update_rx`].
+    pub fn add(&mut self, bytes: u64) {
+        let now = Instant::now();
+        evict_expired(&mut self.buckets, &mut self.sum, now, self.window);
+        accumulate(&mut self.buckets, &mut self.sum, now, bytes);
+    }
+
+    /// Re-evaluate the window without new traffic, so idle counters decay.
+    pub fn refresh(&mut self) {
+        let now = Instant::now();
+        evict_expired(&mut self.buckets, &mut self.sum, now, self.window);
+    }
+
+    /// Bytes per second over the window.
+    ///
+    /// `cfg(test)`-only for now: no production code reads a per-endpoint
+    /// rate yet — it lands with a later task's endpoint display; verified
+    /// here and ready for that wiring.
+    #[cfg(test)]
+    pub fn bps(&self) -> f64 {
+        self.sum as f64 / self.window.as_secs_f64()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,5 +383,21 @@ mod tests {
                 .all(|(t, _, _)| t.elapsed() < Duration::from_secs(60)),
             "no sample older than the 60s window survives"
         );
+    }
+
+    #[test]
+    fn window_counter_reports_rate_over_its_window() {
+        let mut c = WindowCounter::new(Duration::from_secs(10));
+        c.add(1_000);
+        assert_eq!(c.bps(), 100.0);
+    }
+
+    #[test]
+    fn window_counter_decays_to_zero_after_refresh() {
+        let mut c = WindowCounter::new(Duration::from_millis(50));
+        c.add(1_000);
+        sleep(Duration::from_millis(80));
+        c.refresh();
+        assert_eq!(c.bps(), 0.0);
     }
 }

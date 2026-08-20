@@ -10,6 +10,7 @@ readme = "README.md"
 keywords = ["usb", "monitoring", "usbmon", "tui"]
 categories = ["command-line-utilities"]
 rust-version = "1.88"
+exclude = ["tmp/", ".claude/", ".github/", "release.sh"]
 
 [features]
 integration = []
@@ -17,12 +18,15 @@ integration = []
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+clap_mangen = "0.2"
 crossterm = "0.29"
 env_logger = "0.11"
 libc = "0.2"
 log = "0.4"
 ratatui = "0.30"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 signal-hook = "0.3"
 toml = "1.1"
 

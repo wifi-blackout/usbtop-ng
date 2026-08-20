@@ -86,12 +86,55 @@ impl UsbSpeed {
     }
 }
 
+/// USB transfer type of one URB, decoded from either usbmon interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferType {
+    Control,
+    Isochronous,
+    Bulk,
+    Interrupt,
+}
+
+impl TransferType {
+    /// Text address-word code: C=Control, Z=Isochronous, B=Bulk, I=Interrupt.
+    pub fn from_text_code(code: char) -> Option<Self> {
+        match code {
+            'C' => Some(Self::Control),
+            'Z' => Some(Self::Isochronous),
+            'B' => Some(Self::Bulk),
+            'I' => Some(Self::Interrupt),
+            _ => None,
+        }
+    }
+
+    /// Binary header `xfer_type` byte: 0=Iso, 1=Interrupt, 2=Control, 3=Bulk.
+    pub fn from_binary_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Isochronous),
+            1 => Some(Self::Interrupt),
+            2 => Some(Self::Control),
+            3 => Some(Self::Bulk),
+            _ => None,
+        }
+    }
+
+    /// Lowercase label used by filters, JSON reports, and docs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Isochronous => "iso",
+            Self::Bulk => "bulk",
+            Self::Interrupt => "interrupt",
+        }
+    }
+}
+
 /// A single parsed usbmon URB event.
 ///
 /// Only the fields the bandwidth aggregator consumes (`urb_type`, `bus_id`,
-/// `device_id`, `direction`, `data_length`) are compiled into production
-/// builds. The remaining fields (`urb_tag`, `endpoint`, `status`,
-/// `setup_packet`, `data`) are still fully parsed and validated by
+/// `device_id`, `direction`, `data_length`, `endpoint`, `transfer_type`) are
+/// compiled into production builds. The remaining fields (`urb_tag`,
+/// `status`, `setup_packet`, `data`) are still fully parsed and validated by
 /// [`parse_usbmon_text_line`] on every build — they are `cfg(test)`-only
 /// because nothing downstream reads them yet, but the parser test suite
 /// relies on them to verify the full usbmon `Nu` text format is decoded
@@ -103,10 +146,10 @@ pub struct UsbPacket {
     pub device_id: u8,
     pub direction: bool, // true = IN (device->host), false = OUT (host->device)
     pub data_length: u32,
+    pub endpoint: u8,
+    pub transfer_type: Option<TransferType>,
     #[cfg(test)]
     pub urb_tag: String,
-    #[cfg(test)]
-    pub endpoint: u8,
     #[cfg(test)]
     pub status: i32,
     #[cfg(test)]
@@ -191,8 +234,7 @@ pub fn parse_usbmon_text_line(line: &str) -> Result<UsbPacket> {
     let device_id: u8 = addr_parts[2]
         .parse()
         .map_err(|_| anyhow!("Invalid device ID: {}", addr_parts[2]))?;
-    // cfg(test)-only field (see `UsbPacket` docs); still validated on every build.
-    let _endpoint: u8 = addr_parts[3]
+    let endpoint: u8 = addr_parts[3]
         .parse()
         .map_err(|_| anyhow!("Invalid endpoint: {}", addr_parts[3]))?;
 
@@ -272,10 +314,10 @@ pub fn parse_usbmon_text_line(line: &str) -> Result<UsbPacket> {
         device_id,
         direction,
         data_length,
+        endpoint,
+        transfer_type: TransferType::from_text_code(transfer_type),
         #[cfg(test)]
         urb_tag: _urb_tag,
-        #[cfg(test)]
-        endpoint: _endpoint,
         #[cfg(test)]
         status: _status,
         #[cfg(test)]
@@ -451,5 +493,42 @@ mod tests {
         assert_eq!(UsbSpeed::Low.color_code(), (255, 100, 100));
         assert_eq!(UsbSpeed::SuperSpeed.color_code(), (0, 255, 0));
         assert_eq!(UsbSpeed::Unknown.color_code(), (128, 128, 128));
+    }
+
+    #[test]
+    fn transfer_type_maps_text_codes() {
+        assert_eq!(
+            TransferType::from_text_code('C'),
+            Some(TransferType::Control)
+        );
+        assert_eq!(
+            TransferType::from_text_code('Z'),
+            Some(TransferType::Isochronous)
+        );
+        assert_eq!(TransferType::from_text_code('B'), Some(TransferType::Bulk));
+        assert_eq!(
+            TransferType::from_text_code('I'),
+            Some(TransferType::Interrupt)
+        );
+        assert_eq!(TransferType::from_text_code('X'), None);
+    }
+
+    #[test]
+    fn transfer_type_labels_are_lowercase() {
+        assert_eq!(TransferType::Control.label(), "control");
+        assert_eq!(TransferType::Isochronous.label(), "iso");
+        assert_eq!(TransferType::Bulk.label(), "bulk");
+        assert_eq!(TransferType::Interrupt.label(), "interrupt");
+    }
+
+    #[test]
+    fn text_lines_carry_endpoint_and_transfer_type_in_production_fields() {
+        let p = parse_usbmon_text_line("ffff0000aaaa0001 200 C Zi:1:004:1 0:1:6672:0 32 97920 =")
+            .unwrap();
+        assert_eq!(p.endpoint, 1);
+        assert_eq!(p.transfer_type, Some(TransferType::Isochronous));
+        let p = parse_usbmon_text_line("ffff0000aaaa0001 200 C Bi:1:003:2 0 512 = 00").unwrap();
+        assert_eq!(p.endpoint, 2);
+        assert_eq!(p.transfer_type, Some(TransferType::Bulk));
     }
 }

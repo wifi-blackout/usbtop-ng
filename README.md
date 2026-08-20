@@ -54,6 +54,9 @@ The install creates `/usr/local/bin/usbtop` as a symlink to `usbtop-ng`, so
 `usbtop` and `sudo usbtop` both work. A shell alias would not work under
 `sudo`.
 
+`install.sh` also installs a man page, so `man usbtop-ng` works right after
+install.
+
 To install by hand instead, build and copy the binary yourself:
 
 ```bash
@@ -62,8 +65,8 @@ sudo install -m 0755 target/release/usbtop-ng /usr/local/bin/usbtop-ng
 sudo ln -sf usbtop-ng /usr/local/bin/usbtop
 ```
 
-[docs/INSTALL.md](docs/INSTALL.md) covers the usbmon setup, the permission
-checks, and how to remove usbtop-ng again.
+[docs/INSTALL.md](docs/INSTALL.md) covers the usbmon setup, shell completions,
+the permission checks, and how to remove usbtop-ng again.
 
 ## Update
 
@@ -151,6 +154,35 @@ key press and quits through the same teardown as `q`.
   bandwidth until it transfers. Enumeration runs by default.
 - `i` hides devices with no current traffic and saves the choice to
   `~/.usbtop-ng/preferences.toml`.
+
+### Filtering
+
+- `--filter KEY=VALUE[,KEY=VALUE...]` narrows the device table and the traffic
+  it counts. Repeat the flag to add more expressions.
+- Keys within one `--filter` term AND together: every key in the term must
+  match. Separate `--filter` flags OR together: a device or packet counts if
+  any term matches. No `--filter` flag shows and counts everything.
+- Keys: `bus`, `dev`, `vid`, `pid`, `id`, `name`, `ep`, `dir`, `type`.
+- `bus` and `dev` match the USB bus number and device number.
+- `vid` and `pid` match the 4 hex digit vendor and product ID, e.g.
+  `vid=04f2`. `id` is shorthand for both together, e.g. `id=04f2:b71a`.
+- `name` matches a case-insensitive substring of the vendor or product string.
+- `ep` matches the endpoint number, 0 through 15. `dir` matches transfer
+  direction, `in` or `out`. `type` matches transfer type: `control` (or
+  `ctrl`), `iso`, `bulk`, `interrupt` (or `int`).
+- `bus`, `dev`, `vid`, `pid`, and `name` decide which devices show at all.
+  `ep`, `dir`, and `type` narrow which packets on a visible device count,
+  without hiding the device itself.
+
+### Scriptable output
+
+- `--once` samples one window and prints a bandwidth report to stdout, then
+  exits. `--batch` prints one report per window, repeated until `Ctrl-C`.
+  Neither mode opens the TUI or prompts for anything.
+- Add `--json` to either mode for one JSON document per report (NDJSON in
+  `--batch`). `--window SECONDS` sets the sample length.
+- See [docs/SCRIPTING.md](docs/SCRIPTING.md) for the full flag reference, the
+  JSON field list, and an example document.
 
 ### The chart pane
 
@@ -265,7 +297,7 @@ key press and quits through the same teardown as `q`.
 
 ### Tests
 
-- `cargo test --all-targets` runs 200 hermetic tests against fixture files,
+- `cargo test --all-targets` runs 246 hermetic tests against fixture files,
   FIFOs, and temporary paths. They need no `/dev` and no debugfs access.
 - The `integration` cargo feature adds 1 test that reads the real usbmon
   interfaces. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
@@ -302,9 +334,22 @@ Options:
       --force              Force run without usbmon (limited functionality)
       --setup              Show setup instructions for live monitoring
       --create-alias       Create shell alias for 'usbtop' command
+      --filter <KEY=VALUE[,KEY=VALUE...]>
+                           Show only traffic matching KEY=VALUE terms (repeatable, expressions OR)
+      --once               Sample one window, print a report, and exit
+      --batch              Print a report every window until interrupted
+      --json               Print reports as JSON (one document per report)
+      --window <SECONDS>   Sample window in seconds (default: 5 with --once, 1 with --batch)
+      --print-man          Print the man page to stdout
+      --print-completions <SHELL>
+                           Print a completion script to stdout for the named shell (e.g. bash, zsh, fish)
   -h, --help               Print help
   -V, --version            Print version
 ```
+
+`--once` and `--batch` never open the TUI or prompt for anything, which makes
+them safe in a script or a cron job. See
+[docs/SCRIPTING.md](docs/SCRIPTING.md) for details.
 
 ## Limits
 
@@ -335,6 +380,8 @@ Options:
   pull requests.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): modules, data flow, the TUI
   chassis, known limitations.
+- [docs/SCRIPTING.md](docs/SCRIPTING.md): `--once`/`--batch` reports, the
+  `--json` field list, and exit behavior.
 - [docs/ROADMAP.md](docs/ROADMAP.md): feature ideas and follow-up work.
 - [CHANGELOG.md](CHANGELOG.md): what changed per release.
 

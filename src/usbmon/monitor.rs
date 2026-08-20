@@ -32,6 +32,12 @@ pub struct MonitorHandle {
     /// Clone the `Arc` before `stop()` to keep reading it (the UI surfaces the
     /// count in its header so a lossy session is never silently lossy).
     pub dropped: Arc<AtomicU64>,
+    /// Set once any reader ends up on the debugfs text interface — either
+    /// because that is the source it was given, or because a binary source
+    /// fell back to it (see `run_source_with_fallback`). The text interface
+    /// reports isochronous buffer sizes, not bytes moved, so headless reports
+    /// use this to mark iso devices' rates `estimated`.
+    pub text_active: Arc<AtomicBool>,
 }
 
 impl MonitorHandle {
@@ -135,15 +141,17 @@ fn start_sources_with_bound(
     let (tx, rx) = sync_channel(bound);
     let shutdown = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicU64::new(0));
+    let text_active = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
     for source in sources {
         let tx = tx.clone();
         let shutdown = Arc::clone(&shutdown);
         let dropped = Arc::clone(&dropped);
+        let text_active = Arc::clone(&text_active);
         let bus = source.bus_id();
         match thread::Builder::new()
             .name(format!("usbmon-bus-{bus}"))
-            .spawn(move || run_source(source, &shutdown, &tx, &dropped))
+            .spawn(move || run_source(source, &shutdown, &tx, &dropped, &text_active))
         {
             Ok(handle) => threads.push(handle),
             Err(e) => warn!("failed to spawn usbmon reader for bus {bus}: {e}"),
@@ -155,6 +163,7 @@ fn start_sources_with_bound(
             shutdown,
             threads,
             dropped,
+            text_active,
         },
     )
 }
@@ -167,9 +176,10 @@ fn run_source(
     shutdown: &AtomicBool,
     tx: &SyncSender<UsbPacket>,
     dropped: &AtomicU64,
+    text_active: &AtomicBool,
 ) {
     let fallback = UsbmonReader::new(source.bus_id());
-    run_source_with_fallback(source, fallback, shutdown, tx, dropped);
+    run_source_with_fallback(source, fallback, shutdown, tx, dropped, text_active);
 }
 
 /// [`run_source`] with the fallback reader supplied by the caller, so tests can
@@ -180,6 +190,7 @@ fn run_source_with_fallback(
     shutdown: &AtomicBool,
     tx: &SyncSender<UsbPacket>,
     dropped: &AtomicU64,
+    text_active: &AtomicBool,
 ) {
     let bus = source.bus_id();
     // `start_monitoring`'s probe only tried the first target bus, and a
@@ -198,6 +209,9 @@ fn run_source_with_fallback(
         }
         source => source,
     };
+    if matches!(source, PacketSource::Text(_)) {
+        text_active.store(true, Ordering::Relaxed);
+    }
     let send = |packet| match tx.try_send(packet) {
         Ok(()) => Ok(()),
         // The channel is bounded on purpose (see CHANNEL_BOUND) and a reader
@@ -368,12 +382,14 @@ mod tests {
         let missing_device = temp.path().join("usbmon7"); // never created
 
         let (tx, rx) = sync_channel(4);
+        let text_active = AtomicBool::new(false);
         run_source_with_fallback(
             PacketSource::Binary(BinaryReader::with_path(7, missing_device, false)),
             UsbmonReader::with_path(7, text_path, false),
             &AtomicBool::new(false),
             &tx,
             &AtomicU64::new(0),
+            &text_active,
         );
 
         let packets: Vec<_> = rx.try_iter().collect();
@@ -384,6 +400,10 @@ mod tests {
         );
         assert_eq!(packets[0].bus_id, 7);
         assert_eq!(packets[0].data_length, 32);
+        assert!(
+            text_active.load(Ordering::Relaxed),
+            "falling back to the text interface must raise the flag"
+        );
     }
 
     /// The fallback is only for a binary source that cannot be opened; a
@@ -397,18 +417,50 @@ mod tests {
         std::fs::write(&unused_text, "ffff0000dddd0008 500 C Bi:8:009:1 0 32 <\n").unwrap();
 
         let (tx, rx) = sync_channel(4);
+        let text_active = AtomicBool::new(false);
         run_source_with_fallback(
             PacketSource::Binary(BinaryReader::with_path(8, binary_path, false)),
             UsbmonReader::with_path(8, unused_text, false),
             &AtomicBool::new(false),
             &tx,
             &AtomicU64::new(0),
+            &text_active,
         );
 
         let packets: Vec<_> = rx.try_iter().collect();
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].device_id, 3, "read from the binary source");
         assert_eq!(packets[0].data_length, 64);
+        assert!(
+            !text_active.load(Ordering::Relaxed),
+            "an openable binary source must not raise the text flag"
+        );
+    }
+
+    #[test]
+    fn text_sources_raise_the_text_active_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("1u");
+        std::fs::write(&path, "ffff0000dddd0001 500 C Bi:1:003:1 0 32 <\n").unwrap();
+        let (rx, handle) = start_sources(vec![PacketSource::Text(UsbmonReader::with_path(
+            1, path, false,
+        ))]);
+        let _ = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(handle.text_active.load(Ordering::Relaxed));
+        handle.stop();
+    }
+
+    #[test]
+    fn binary_sources_leave_the_text_active_flag_down() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("usbmon1");
+        std::fs::write(&path, binary_event(1, 3, 32)).unwrap();
+        let (rx, handle) = start_sources(vec![PacketSource::Binary(BinaryReader::with_path(
+            1, path, false,
+        ))]);
+        let _ = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!handle.text_active.load(Ordering::Relaxed));
+        handle.stop();
     }
 
     #[test]
