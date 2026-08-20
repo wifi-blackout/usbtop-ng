@@ -123,16 +123,23 @@ fn windowed_rate(baseline_total: Option<u64>, now_total: u64, window_secs: f64) 
 /// Build one report from the manager's current state and a `baseline` taken
 /// at the start of the window. Pure and fully testable: no clock reads other
 /// than the `timestamp` field, no I/O.
+///
+/// `elapsed` is the *measured* time since `baseline` was captured, not the
+/// nominal `--window` value: a SIGINT/SIGTERM can end a window early, and
+/// dividing by the requested length rather than the actual one would both
+/// understate every rate and put a false `window_seconds` in the report.
+/// Floored at 1ms so a pathological zero-elapsed window (e.g. a signal
+/// landing in the same instant as `Baseline::capture`) cannot divide by zero.
 pub fn build_report(
     manager: &DeviceManager,
     baseline: &Baseline,
-    window: Duration,
+    elapsed: Duration,
     source: &'static str,
     dropped: u64,
     text_active: bool,
     filter: &FilterSet,
 ) -> Report {
-    let window_secs = window.as_secs_f64();
+    let window_secs = elapsed.as_secs_f64().max(0.001);
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -316,7 +323,10 @@ pub fn render_text(report: &Report) -> String {
 
 /// Sample the manager's state on `opts.window`-second windows, printing a
 /// report at the end of each. `--once` (`opts.batch == false`) prints one and
-/// returns; `--batch` repeats until SIGINT/SIGTERM or the reader stops.
+/// returns; `--batch` repeats until SIGINT/SIGTERM or the reader stops. A
+/// signal that lands mid-window ends the wait early; the report that follows
+/// carries the true measured elapsed time (see `build_report`), not the
+/// nominal `opts.window`.
 pub fn run(
     mut manager: DeviceManager,
     packets: Receiver<UsbPacket>,
@@ -332,7 +342,8 @@ pub fn run(
     loop {
         manager.enumerate_present_devices();
         let baseline = Baseline::capture(&manager);
-        let deadline = Instant::now() + opts.window;
+        let window_start = Instant::now();
+        let deadline = window_start + opts.window;
         while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
             drain_packets(&mut manager, &packets, crate::ui::DRAIN_BATCH);
             std::thread::sleep(Duration::from_millis(50).min(opts.window));
@@ -340,6 +351,10 @@ pub fn run(
         drain_packets(&mut manager, &packets, crate::ui::DRAIN_BATCH);
         manager.enumerate_present_devices();
         manager.refresh();
+
+        // The true elapsed time, not `opts.window`: a SIGINT/SIGTERM can
+        // break the wait loop above before the deadline (see `build_report`).
+        let elapsed = window_start.elapsed();
 
         let source = if text_active.load(Ordering::Relaxed) {
             "text"
@@ -349,14 +364,17 @@ pub fn run(
         let report = build_report(
             &manager,
             &baseline,
-            opts.window,
+            elapsed,
             source,
             dropped.load(Ordering::Relaxed),
             text_active.load(Ordering::Relaxed),
             &filter,
         );
-        if emit(&report, opts.json).is_err() {
-            return Ok(()); // broken pipe: the reader left, that is not our error
+        if let Err(e) = emit(&report, opts.json) {
+            if is_expected_write_failure(&e) {
+                return Ok(()); // broken pipe: the reader left, that is not our error
+            }
+            return Err(e.into());
         }
         if !opts.batch || stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -365,7 +383,8 @@ pub fn run(
 }
 
 /// Write one report. A `BrokenPipe` comes back as Err for the caller to
-/// treat as a clean end; other write errors do too (stdout is gone).
+/// treat as a clean end (see [`is_expected_write_failure`]); other write
+/// errors come back as Err too, but are propagated as a real failure instead.
 fn emit(report: &Report, json: bool) -> std::io::Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -376,6 +395,16 @@ fn emit(report: &Report, json: bool) -> std::io::Result<()> {
         write!(out, "{}", render_text(report))?;
     }
     out.flush()
+}
+
+/// Whether a stdout write error is expected and should end the run quietly
+/// (`Ok(())`, exit 0) rather than propagate. Only `BrokenPipe` is routine —
+/// the reader left, e.g. `usbtop-ng --batch --json | head -n 1`. Anything
+/// else (ENOSPC, a closed fd that is not a pipe, ...) means the report was
+/// not actually written, which the caller should see as a nonzero exit
+/// rather than silence.
+fn is_expected_write_failure(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::BrokenPipe
 }
 
 #[cfg(test)]
@@ -409,6 +438,59 @@ mod tests {
         assert_eq!(dev.endpoints[0].direction, "in");
         assert_eq!(dev.endpoints[0].transfer_type, "bulk");
         assert_eq!(dev.endpoints[0].bps, 500.0);
+    }
+
+    #[test]
+    fn report_window_seconds_reflects_the_measured_elapsed_time_not_a_nominal_value() {
+        // A window cut short by SIGINT/SIGTERM passes its true measured
+        // duration here, not the `--window` the user asked for: the report's
+        // `window_seconds` must say so too, not the nominal length.
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let baseline = Baseline::capture(&mgr);
+        let cb = parse_usbmon_text_line("ffff0000aaaa0001 200 C Bi:1:004:1 0 1000 <").unwrap();
+        mgr.apply_packet(&cb);
+        let report = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_millis(1500),
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        assert_eq!(report.window_seconds, 1.5);
+        assert_eq!(
+            report.buses[0].devices[0].rx_bps,
+            1000.0 / 1.5,
+            "the rate divides by the same measured elapsed time as window_seconds reports"
+        );
+    }
+
+    #[test]
+    fn build_report_floors_a_zero_elapsed_window_instead_of_dividing_by_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let baseline = Baseline::capture(&mgr);
+        let cb = parse_usbmon_text_line("ffff0000aaaa0001 200 C Bi:1:004:1 0 1000 <").unwrap();
+        mgr.apply_packet(&cb);
+        let report = build_report(
+            &mgr,
+            &baseline,
+            Duration::ZERO,
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        assert!(
+            report.window_seconds > 0.0,
+            "a zero-elapsed window must still report a positive window_seconds"
+        );
+        assert!(
+            report.total_rx_bps.is_finite(),
+            "a zero-elapsed window must not divide by zero into an infinite rate"
+        );
     }
 
     #[test]
@@ -516,5 +598,21 @@ mod tests {
         assert!(text.contains("bus 1"), "{text}");
         assert!(text.contains("1:4"), "{text}");
         assert!(text.contains("rx"), "{text}");
+    }
+
+    #[test]
+    fn broken_pipe_is_the_only_expected_write_failure() {
+        assert!(is_expected_write_failure(&std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe
+        )));
+        assert!(!is_expected_write_failure(&std::io::Error::from(
+            std::io::ErrorKind::WriteZero
+        )));
+        assert!(!is_expected_write_failure(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!is_expected_write_failure(&std::io::Error::from(
+            std::io::ErrorKind::Other
+        )));
     }
 }
