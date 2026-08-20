@@ -183,8 +183,9 @@ sudo usbtop-ng --batch --json | jq -c '.total_rx_bps'
 
 - `Ctrl-C` (`SIGINT`) or `SIGTERM` ends `--batch` after its current window's
   report has printed, and exits 0. `--once` also honors both signals: they
-  end the sample window early, and the (shorter) window's report still
-  prints before exit.
+  end the sample window early, and the report that prints carries the true,
+  shorter `window_seconds` that was actually measured — not the nominal
+  `--window` value — so its rates stay accurate.
 - If the reader on the other end of stdout goes away — the common case is
   piping into `head` or a script that closes early — usbtop-ng exits 0
   instead of reporting a broken-pipe error. A script that only wants the

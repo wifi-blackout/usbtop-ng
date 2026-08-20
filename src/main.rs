@@ -162,11 +162,10 @@ fn main() -> Result<()> {
         eprintln!("error: --json and --window need --once or --batch");
         process::exit(2);
     }
-    let window = Duration::from_secs_f64(
-        cli.window
-            .unwrap_or(if cli.batch { 1.0 } else { 5.0 })
-            .max(0.25),
-    );
+    let window = resolve_window(cli.window, cli.batch).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(2);
+    });
 
     // Check usbmon status
     let mut usbmon_status = match check_usbmon_status() {
@@ -241,7 +240,11 @@ fn main() -> Result<()> {
                             prompt_user_to_unload_module().unwrap_or(false)
                         });
                     } else {
-                        usbmon::unload_without_asking(&preferences, true);
+                        // headless: still unload if the preferences say so,
+                        // but never print the notice — a headless run's
+                        // stdout is either a report stream or silent, per
+                        // `print_remedy_to_stderr`'s doc comment above.
+                        usbmon::unload_without_asking(&preferences, false);
                     }
                     process::exit(1);
                 }
@@ -299,7 +302,10 @@ fn main() -> Result<()> {
         );
         monitor.stop();
         if loaded_usbmon_for_this_run {
-            usbmon::unload_without_asking(&preferences, true);
+            // `terminal_reachable = false`: headless unloads silently. The
+            // automatic-unload notice is stdout prose that would otherwise
+            // land after the report, corrupting `--once --json > file`.
+            usbmon::unload_without_asking(&preferences, false);
         }
         return result;
     }
@@ -403,6 +409,23 @@ fn write_remedy(out: &mut impl Write, permission_denied: bool) -> io::Result<()>
 /// `unload_usbmon_on_exit = true`; it only skips the question).
 fn may_prompt_before_unload(headless: bool) -> bool {
     !headless
+}
+
+/// Resolve `--window` into a [`Duration`], applying the default (5s for
+/// `--once`, 1s for `--batch`) and the 0.25s floor. `Duration::from_secs_f64`
+/// panics on a NaN, an infinity, or a finite value too large for a `Duration`
+/// to represent — `--window inf` reached it directly and turned an argument
+/// error into a panic (exit 101). This validates first and reports a normal
+/// exit-2 error instead, the same way an invalid `--filter` expression does.
+fn resolve_window(window: Option<f64>, batch: bool) -> Result<Duration, String> {
+    let seconds = window.unwrap_or(if batch { 1.0 } else { 5.0 });
+    if !seconds.is_finite() {
+        return Err(format!(
+            "--window must be a finite number of seconds, got {seconds}"
+        ));
+    }
+    let floored = seconds.max(0.25);
+    Duration::try_from_secs_f64(floored).map_err(|_| format!("--window {floored} is out of range"))
 }
 
 fn create_shell_alias() -> Result<()> {
@@ -512,6 +535,54 @@ mod tests {
             may_prompt_before_unload(false),
             "the interactive TUI path keeps asking"
         );
+    }
+
+    #[test]
+    fn resolve_window_applies_the_right_default_per_mode() {
+        assert_eq!(
+            resolve_window(None, false).unwrap(),
+            Duration::from_secs_f64(5.0),
+            "--once defaults to a 5s window"
+        );
+        assert_eq!(
+            resolve_window(None, true).unwrap(),
+            Duration::from_secs_f64(1.0),
+            "--batch defaults to a 1s window"
+        );
+    }
+
+    #[test]
+    fn resolve_window_floors_a_too_small_value() {
+        assert_eq!(
+            resolve_window(Some(0.1), false).unwrap(),
+            Duration::from_secs_f64(0.25)
+        );
+        assert_eq!(
+            resolve_window(Some(-5.0), false).unwrap(),
+            Duration::from_secs_f64(0.25),
+            "a negative window floors the same as a too-small positive one"
+        );
+    }
+
+    #[test]
+    fn resolve_window_passes_through_an_ordinary_value() {
+        assert_eq!(
+            resolve_window(Some(10.0), true).unwrap(),
+            Duration::from_secs_f64(10.0)
+        );
+    }
+
+    #[test]
+    fn resolve_window_rejects_non_finite_values_instead_of_panicking() {
+        assert!(resolve_window(Some(f64::INFINITY), false).is_err());
+        assert!(resolve_window(Some(f64::NEG_INFINITY), false).is_err());
+        assert!(resolve_window(Some(f64::NAN), false).is_err());
+    }
+
+    #[test]
+    fn resolve_window_rejects_a_finite_value_too_large_for_duration() {
+        // Finite, but far beyond what `Duration` (u64 seconds) can hold.
+        assert!(resolve_window(Some(1e300), false).is_err());
     }
 
     #[test]

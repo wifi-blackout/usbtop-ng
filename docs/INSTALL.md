@@ -201,7 +201,7 @@ From the source tree, run the same three checks CI runs:
    ```bash
    cargo test --all-targets
    ```
-   The command reports 238 passed.
+   The command reports 246 passed.
 
 ## Uninstall
 

@@ -297,7 +297,7 @@ key press and quits through the same teardown as `q`.
 
 ### Tests
 
-- `cargo test --all-targets` runs 200 hermetic tests against fixture files,
+- `cargo test --all-targets` runs 246 hermetic tests against fixture files,
   FIFOs, and temporary paths. They need no `/dev` and no debugfs access.
 - The `integration` cargo feature adds 1 test that reads the real usbmon
   interfaces. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
@@ -340,6 +340,9 @@ Options:
       --batch              Print a report every window until interrupted
       --json               Print reports as JSON (one document per report)
       --window <SECONDS>   Sample window in seconds (default: 5 with --once, 1 with --batch)
+      --print-man          Print the man page to stdout
+      --print-completions <SHELL>
+                           Print a completion script to stdout for the named shell (e.g. bash, zsh, fish)
   -h, --help               Print help
   -V, --version            Print version
 ```

@@ -841,10 +841,10 @@ fn format_rate(bytes_per_second: f64) -> String {
 }
 
 /// Device row's Bw↓/Bw↑ cell text: the formatted rate, `~`-prefixed when
-/// `estimated` is set. The debugfs text interface reports isochronous
-/// callback counts, not bytes moved, so a device with iso traffic under a
-/// text source has its rate flagged as an estimate rather than an exact
-/// measurement (see `UsbTopApp::text_source_active`,
+/// `estimated` is set. The text interface reports isochronous buffer sizes,
+/// not bytes moved, so a device with iso traffic under a text source has its
+/// rate flagged as an estimate rather than an exact measurement (see
+/// `UsbTopApp::text_source_active`,
 /// `UsbDevice::has_iso_traffic`, and the same convention in
 /// `headless::render_text`).
 fn rate_cell(bytes_per_second: f64, estimated: bool) -> String {
@@ -1909,7 +1909,7 @@ mod tests {
     }
 
     /// Mirrors `headless::estimated_marks_iso_devices_only_when_text_is_active`:
-    /// the debugfs text interface reports isochronous callback counts, not
+    /// the debugfs text interface reports isochronous buffer sizes, not
     /// bytes moved, so a device with iso traffic gets its rate cells marked
     /// `~` only while a text source backs the session — never under a binary
     /// source, and never for a non-iso device either way.

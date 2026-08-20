@@ -35,8 +35,8 @@ pub struct MonitorHandle {
     /// Set once any reader ends up on the debugfs text interface — either
     /// because that is the source it was given, or because a binary source
     /// fell back to it (see `run_source_with_fallback`). The text interface
-    /// cannot see individual isochronous packets, only aggregate byte counts,
-    /// so headless reports use this to mark iso devices' rates `estimated`.
+    /// reports isochronous buffer sizes, not bytes moved, so headless reports
+    /// use this to mark iso devices' rates `estimated`.
     pub text_active: Arc<AtomicBool>,
 }
 
