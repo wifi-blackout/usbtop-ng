@@ -13,6 +13,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -111,57 +112,85 @@ const DISTRO_PATHS: [&str; 2] = ["/usr/share/misc/usb.ids", "/usr/share/hwdata/u
 /// `--update-usbids` reads dates from: CLI flag, preferences key, the
 /// downloaded copy, then the distro files. Factored into one function so
 /// resolution and the check/pull table can never drift apart.
+///
+/// `home_copy` is `None` when `~/.usbtop-ng/usb.ids` could not be located
+/// (typically HOME is unset) -- that chain entry is simply omitted rather
+/// than the whole call failing, so `--config` still works in a HOME-less
+/// environment. `--update-usbids`, which needs a home to write its own
+/// download to, resolves that path itself and propagates the error instead
+/// of calling this with `None`.
 pub fn source_chain(
     cli_path: Option<&Path>,
     pref_path: Option<&Path>,
-    home_copy: &Path,
+    home_copy: Option<&Path>,
 ) -> Vec<PathBuf> {
     let mut chain: Vec<PathBuf> = Vec::new();
     chain.extend(cli_path.map(Path::to_path_buf));
     chain.extend(pref_path.map(Path::to_path_buf));
-    chain.push(home_copy.to_path_buf());
+    chain.extend(home_copy.map(Path::to_path_buf));
     chain.extend(DISTRO_PATHS.map(PathBuf::from));
     chain
 }
 
 /// First source that loads wins: CLI flag, preferences key, the downloaded
 /// copy, then the distro files. A source that exists but cannot be read or
-/// parsed logs one warning and falls through. None when nothing loads.
+/// parsed logs one warning and falls through. None when nothing loads. See
+/// `source_chain` for what a `None` `home_copy` means.
 pub fn resolve_database(
     cli_path: Option<&Path>,
     pref_path: Option<&Path>,
-    home_copy: &Path,
+    home_copy: Option<&Path>,
 ) -> Option<UsbIds> {
     let chain = source_chain(cli_path, pref_path, home_copy);
     let refs: Vec<&Path> = chain.iter().map(PathBuf::as_path).collect();
     resolve_from_chain(&refs)
 }
 
+/// One chain entry's load attempt, shared by `resolve_from_chain` and
+/// `active_source` so the two literally cannot disagree about which source
+/// wins: a missing path is silently skipped, a path that fails to open or
+/// parse logs one warning and falls through, and a path that opens and
+/// parses but yields zero vendors -- an empty or garbage file -- also warns
+/// and falls through rather than silently winning the chain as an empty
+/// database.
+fn load_source(path: &Path) -> Option<UsbIds> {
+    if !path.exists() {
+        return None;
+    }
+    match UsbIds::load(path) {
+        Ok(db) if db.vendor_count() == 0 => {
+            log::warn!(
+                "{} parsed but has no vendors; treating it as unusable and falling through",
+                path.display()
+            );
+            None
+        }
+        Ok(db) => Some(db),
+        Err(e) => {
+            log::warn!("could not read {}: {e}", path.display());
+            None
+        }
+    }
+}
+
 fn resolve_from_chain(paths: &[&Path]) -> Option<UsbIds> {
     for path in paths {
-        if !path.exists() {
-            continue;
-        }
-        match UsbIds::load(path) {
-            Ok(db) => {
-                log::debug!("usb.ids loaded from {}", path.display());
-                return Some(db);
-            }
-            Err(e) => log::warn!("could not read {}: {e}", path.display()),
+        if let Some(db) = load_source(path) {
+            log::debug!("usb.ids loaded from {}", path.display());
+            return Some(db);
         }
     }
     None
 }
 
 /// The path in `paths` that `resolve_from_chain` would pick: the first one
-/// that exists and parses. Used only for the check/pull table's "(active)"
-/// marker and for reading the diff baseline; resolution itself still goes
-/// through `resolve_from_chain` so the two never disagree.
+/// that exists and parses to a non-empty database. Used only for the
+/// check/pull table's "(active)" marker and for reading the diff baseline;
+/// resolution itself still goes through `resolve_from_chain`, and both call
+/// the same `load_source` predicate, so the two never disagree by
+/// construction rather than by convention.
 fn active_source<'a>(paths: &[&'a Path]) -> Option<&'a Path> {
-    paths
-        .iter()
-        .find(|p| p.exists() && UsbIds::load(p).is_ok())
-        .copied()
+    paths.iter().find(|p| load_source(p).is_some()).copied()
 }
 
 /// The `# Date:` header of the *active* source in `paths` (the one
@@ -219,6 +248,15 @@ pub const UPSTREAM_URL: &str = "https://www.linux-usb.org/usb.ids";
 /// A real usb.ids has ~3000 vendors; far fewer means a truncated or error
 /// payload, and installing it would silently break every lookup.
 const MIN_VENDORS: usize = 1000;
+
+/// Upper bound on a fetched usb.ids payload's raw byte length. The real file
+/// is about 700 KB, so this is generous headroom against a compromised or
+/// misconfigured mirror streaming an unbounded body -- not a tight fit to
+/// the real size. curl enforces this itself via `--max-filesize`; wget has
+/// no size-limiting flag that works with the `-O-` streaming-to-stdout mode
+/// this module uses, so `check_payload_size` enforces the same bound on the
+/// buffered body after either tool returns.
+const MAX_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Result of a payload that passed validation: its own `# Date:` header and
 /// vendor count, printed by `pull_usbids` after the diff summary.
@@ -304,6 +342,11 @@ fn build_command(probe: impl Fn(&str) -> bool, head_only: bool) -> Option<std::p
             .arg("--tlsv1.2");
         if head_only {
             cmd.arg("-I");
+        } else {
+            // Cap the downloaded body so a compromised or misconfigured
+            // mirror cannot stream an unbounded response; see
+            // MAX_PAYLOAD_BYTES.
+            cmd.arg("--max-filesize").arg(MAX_PAYLOAD_BYTES.to_string());
         }
         cmd.arg(UPSTREAM_URL);
         Some(cmd)
@@ -471,9 +514,14 @@ pub fn check_usbids(chain_paths: &[&Path]) -> Result<()> {
             if o.status.success() {
                 Ok(o)
             } else {
+                // Include stderr like the pull fetch path does below: without
+                // it, a TLS failure surfaces as nothing but an exit code
+                // (e.g. "exited with exit status: 60"), hiding the actual
+                // curl/wget message a user would need to diagnose it.
                 Err(anyhow::anyhow!(
-                    "upstream HEAD request exited with {}",
-                    o.status
+                    "upstream HEAD request exited with {}: {}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr)
                 ))
             }
         });
@@ -504,6 +552,38 @@ pub fn check_usbids(chain_paths: &[&Path]) -> Result<()> {
     } else {
         println!("Local copy is up to date; nothing to do.");
     }
+    Ok(())
+}
+
+/// Reject a fetched body before any further processing when its raw byte
+/// length exceeds `MAX_PAYLOAD_BYTES`. See `MAX_PAYLOAD_BYTES` for why this
+/// exists alongside curl's own `--max-filesize`.
+fn check_payload_size(len: usize) -> Result<()> {
+    if len as u64 > MAX_PAYLOAD_BYTES {
+        anyhow::bail!(
+            "fetched usb.ids payload is {len} bytes, exceeding the {MAX_PAYLOAD_BYTES}-byte cap; refusing to process it"
+        );
+    }
+    Ok(())
+}
+
+/// Write `payload` to `quarantine` without ever writing through a
+/// pre-existing symlink there. A leftover tmp file from an earlier,
+/// interrupted pull is removed first (errors ignored -- there may be
+/// nothing to remove), then the file is opened with `create_new` so
+/// anything that exists at that path by the time of the open -- the
+/// original stale file if the remove somehow didn't clear it, a symlink an
+/// attacker planted, or a file an attacker recreated in the gap -- makes the
+/// open fail instead of being written through.
+fn write_quarantine_file(quarantine: &Path, payload: &str) -> Result<()> {
+    let _ = std::fs::remove_file(quarantine);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(quarantine)
+        .with_context(|| format!("creating quarantine file {}", quarantine.display()))?;
+    file.write_all(payload.as_bytes())
+        .with_context(|| format!("writing quarantine file {}", quarantine.display()))?;
     Ok(())
 }
 
@@ -551,6 +631,11 @@ pub fn pull_usbids(dest: &Path, chain_paths: &[&Path]) -> Result<()> {
             String::from_utf8_lossy(&fetch_output.stderr)
         );
     }
+    // curl already enforces MAX_PAYLOAD_BYTES itself via --max-filesize; this
+    // check is the backstop for wget, which has no size limit that works
+    // with the -O- streaming mode used here, and it costs nothing to apply
+    // to both before the body is processed any further.
+    check_payload_size(fetch_output.stdout.len())?;
     let payload = String::from_utf8(fetch_output.stdout)
         .context("upstream usb.ids response was not valid UTF-8")?;
 
@@ -560,8 +645,7 @@ pub fn pull_usbids(dest: &Path, chain_paths: &[&Path]) -> Result<()> {
         crate::config::ensure_private_config_dir(parent)?;
     }
     let quarantine = dest.with_extension("ids.tmp");
-    std::fs::write(&quarantine, &payload)
-        .with_context(|| format!("writing quarantine file {}", quarantine.display()))?;
+    write_quarantine_file(&quarantine, &payload)?;
 
     // The floor is the file about to be replaced, not the chain-wide
     // newest: a payload only has to be no older than what it overwrites.
@@ -668,6 +752,44 @@ C 03  HID (Human Interface Device)
     }
 
     #[test]
+    fn an_empty_file_ahead_of_a_good_file_falls_through_and_the_good_file_wins() {
+        // A file that exists and parses cleanly but yields zero vendors (an
+        // empty file, or one that is all comments) must not silently win the
+        // chain as an empty database -- it has to warn and fall through just
+        // like an unreadable or unparseable file does.
+        let temp = tempfile::tempdir().unwrap();
+        let empty = temp.path().join("empty.ids");
+        std::fs::write(&empty, "").unwrap();
+        let good = temp.path().join("good.ids");
+        std::fs::write(&good, "0430  Fujitsu Component Limited\n").unwrap();
+
+        let db = resolve_from_chain(&[&empty, &good]).expect("good.ids loads after the empty one");
+        assert_eq!(db.vendor_name(0x0430), Some("Fujitsu Component Limited"));
+
+        // active_source must agree: it shares the same load_source predicate,
+        // so it cannot pick the empty file either.
+        let chain: Vec<&Path> = vec![&empty, &good];
+        assert_eq!(active_source(&chain), Some(good.as_path()));
+    }
+
+    #[test]
+    fn a_chain_of_only_empty_files_resolves_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let empty = temp.path().join("empty.ids");
+        std::fs::write(&empty, "").unwrap();
+        let comments_only = temp.path().join("comments.ids");
+        std::fs::write(&comments_only, "# nothing but a header\n").unwrap();
+
+        assert!(resolve_from_chain(&[&empty, &comments_only]).is_none());
+
+        let chain: Vec<&Path> = vec![&empty, &comments_only];
+        assert!(
+            active_source(&chain).is_none(),
+            "active_source must agree with resolve_from_chain"
+        );
+    }
+
+    #[test]
     fn resolve_database_prefers_the_cli_path_over_the_rest_of_the_chain() {
         // A hermetic exercise of the public entry point itself (the chain
         // logic is covered above via resolve_from_chain): the CLI path
@@ -678,7 +800,7 @@ C 03  HID (Human Interface Device)
         std::fs::write(&cli, "0430  Fujitsu Component Limited\n").unwrap();
         let home_copy = temp.path().join("home.ids");
 
-        let db = resolve_database(Some(&cli), None, &home_copy).expect("cli path loads");
+        let db = resolve_database(Some(&cli), None, Some(&home_copy)).expect("cli path loads");
         assert_eq!(db.vendor_name(0x0430), Some("Fujitsu Component Limited"));
     }
 
@@ -690,7 +812,7 @@ C 03  HID (Human Interface Device)
         let home_copy = temp.path().join("home.ids");
         std::fs::write(&home_copy, "0001  Wrong Winner\n").unwrap();
 
-        let db = resolve_database(None, Some(&pref), &home_copy).expect("pref path loads");
+        let db = resolve_database(None, Some(&pref), Some(&home_copy)).expect("pref path loads");
         assert_eq!(db.vendor_name(0x0430), Some("Fujitsu Component Limited"));
         assert_eq!(db.vendor_name(0x0001), None, "home copy must not win");
     }
@@ -705,7 +827,7 @@ C 03  HID (Human Interface Device)
         let home_copy = temp.path().join("home.ids");
         std::fs::write(&home_copy, "0430  Fujitsu Component Limited\n").unwrap();
 
-        let db = resolve_database(None, None, &home_copy).expect("home copy loads");
+        let db = resolve_database(None, None, Some(&home_copy)).expect("home copy loads");
         assert_eq!(db.vendor_name(0x0430), Some("Fujitsu Component Limited"));
     }
 
@@ -714,13 +836,42 @@ C 03  HID (Human Interface Device)
         let cli = Path::new("/cli.ids");
         let pref = Path::new("/pref.ids");
         let home = Path::new("/home/user/.usbtop-ng/usb.ids");
-        let chain = source_chain(Some(cli), Some(pref), home);
+        let chain = source_chain(Some(cli), Some(pref), Some(home));
         assert_eq!(
             chain,
             vec![
                 PathBuf::from(cli),
                 PathBuf::from(pref),
                 PathBuf::from(home),
+                PathBuf::from(DISTRO_PATHS[0]),
+                PathBuf::from(DISTRO_PATHS[1]),
+            ]
+        );
+    }
+
+    #[test]
+    fn source_chain_omits_the_home_copy_entry_when_it_is_none() {
+        // `home_copy` is `None` when `preferences_path()` failed (typically
+        // HOME unset). That must simply drop the entry from the chain, not
+        // fail the whole call -- monitoring with `--config` still has to
+        // work without a home.
+        let cli = Path::new("/cli.ids");
+        let pref = Path::new("/pref.ids");
+        let chain = source_chain(Some(cli), Some(pref), None);
+        assert_eq!(
+            chain,
+            vec![
+                PathBuf::from(cli),
+                PathBuf::from(pref),
+                PathBuf::from(DISTRO_PATHS[0]),
+                PathBuf::from(DISTRO_PATHS[1]),
+            ]
+        );
+
+        // Also true with nothing else in the chain either.
+        assert_eq!(
+            source_chain(None, None, None),
+            vec![
                 PathBuf::from(DISTRO_PATHS[0]),
                 PathBuf::from(DISTRO_PATHS[1]),
             ]
@@ -793,6 +944,11 @@ C 03  HID (Human Interface Device)
         );
         assert!(args.contains(&"--tlsv1.2".to_string()));
         assert!(args.contains(&UPSTREAM_URL.to_string()));
+        assert!(
+            args.contains(&"--max-filesize".to_string())
+                && args.contains(&MAX_PAYLOAD_BYTES.to_string()),
+            "the body fetch must cap the download size: {args:?}"
+        );
 
         let head = head_command_from(|tool| tool == "curl").expect("curl found");
         let head_args: Vec<_> = head
@@ -958,5 +1114,44 @@ C 03  HID (Human Interface Device)
         let err = validate_payload(&payload, replaced_copy_date(&dest))
             .expect_err("payload predates the copy it would replace");
         assert!(err.to_string().contains("backdated") || err.to_string().contains("older"));
+    }
+
+    #[test]
+    fn quarantine_write_does_not_follow_a_pre_existing_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let canary = temp.path().join("canary");
+        std::fs::write(&canary, "untouched").unwrap();
+        let quarantine = temp.path().join("usb.ids.tmp");
+        std::os::unix::fs::symlink(&canary, &quarantine).unwrap();
+
+        write_quarantine_file(&quarantine, "0430  Fujitsu Component Limited\n")
+            .expect("stale symlink is removed and replaced, not written through");
+
+        assert_eq!(
+            std::fs::read_to_string(&canary).unwrap(),
+            "untouched",
+            "the symlink's target must never be written to"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&quarantine)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the quarantine path must now be a real file, not a symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&quarantine).unwrap(),
+            "0430  Fujitsu Component Limited\n"
+        );
+    }
+
+    #[test]
+    fn payload_size_check_rejects_bodies_over_the_cap() {
+        assert!(check_payload_size(1024).is_ok());
+        assert!(check_payload_size(MAX_PAYLOAD_BYTES as usize).is_ok());
+        assert!(
+            check_payload_size(MAX_PAYLOAD_BYTES as usize + 1).is_err(),
+            "one byte over the cap must be rejected before further processing"
+        );
     }
 }

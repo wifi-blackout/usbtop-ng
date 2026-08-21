@@ -204,7 +204,9 @@ key press and quits through the same teardown as `q`.
 - `bus` and `dev` match the USB bus number and device number.
 - `vid` and `pid` match the 4 hex digit vendor and product ID, e.g.
   `vid=04f2`. `id` is shorthand for both together, e.g. `id=04f2:b71a`.
-- `name` matches a case-insensitive substring of the vendor or product string.
+- `name` matches a case-insensitive substring of the vendor or product
+  string as displayed — the usb.ids database name when one resolves,
+  otherwise the device's own string; see [Device names](#device-names).
 - `ep` matches the endpoint number, 0 through 15. `dir` matches transfer
   direction, `in` or `out`. `type` matches transfer type: `control` (or
   `ctrl`), `iso`, `bulk`, `interrupt` (or `int`).
@@ -335,7 +337,7 @@ key press and quits through the same teardown as `q`.
 
 ### Tests
 
-- `cargo test --all-targets` runs 281 hermetic tests against fixture files,
+- `cargo test --all-targets` runs 286 hermetic tests against fixture files,
   FIFOs, and temporary paths. They need no `/dev` and no debugfs access.
 - The `integration` cargo feature adds 1 test that reads the real usbmon
   interfaces. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
