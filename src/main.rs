@@ -22,6 +22,7 @@ mod headless;
 mod stats;
 mod tui;
 mod ui;
+mod usbids;
 mod usbmon;
 
 use std::time::Duration;
