@@ -172,11 +172,15 @@ fn main() -> Result<()> {
     // `preferences_path`, not `--config`, since the download always lands
     // in the standard `~/.usbtop-ng` location), but never touches usbmon.
     if let Some(mode) = &cli.update_usbids {
+        // Unlike the monitoring path below, this genuinely needs a home: the
+        // download always lands at `~/.usbtop-ng/usb.ids`, so a missing HOME
+        // propagates as an error here rather than silently dropping the
+        // source.
         let home_copy = preferences_path()?.with_file_name("usb.ids");
         let chain = usbids::source_chain(
             cli.usbids.as_deref().map(Path::new),
             preferences.usbids_path.as_deref().map(Path::new),
-            &home_copy,
+            Some(&home_copy),
         );
         let chain_refs: Vec<&Path> = chain.iter().map(|p| p.as_path()).collect();
         let result = match mode {
@@ -328,11 +332,17 @@ fn main() -> Result<()> {
     // Resolved once for the whole run and shared by both the headless and
     // TUI managers below; monitoring never re-resolves or touches the
     // network -- that only happens under `--update-usbids`, handled earlier.
-    let usbids_home_copy = preferences_path()?.with_file_name("usb.ids");
+    // Unlike that earlier branch, a missing HOME here must not fail the run:
+    // `--config` points at an explicit preferences file, so monitoring has
+    // to work even when `preferences_path()` cannot locate `~/.usbtop-ng` --
+    // the home-copy source is simply dropped from the chain (see
+    // `usbids::source_chain`), leaving the CLI flag, preferences key, and
+    // distro paths still in play.
+    let usbids_home_copy = preferences_path().ok().map(|p| p.with_file_name("usb.ids"));
     let usbids = usbids::resolve_database(
         cli.usbids.as_deref().map(Path::new),
         preferences.usbids_path.as_deref().map(Path::new),
-        &usbids_home_copy,
+        usbids_home_copy.as_deref(),
     )
     .map(Arc::new);
 
