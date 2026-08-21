@@ -22,6 +22,7 @@ mod headless;
 mod stats;
 mod tui;
 mod ui;
+mod usbids;
 mod usbmon;
 
 use std::time::Duration;
@@ -91,6 +92,22 @@ struct Cli {
     /// Print a completion script to stdout for the named shell (e.g. bash, zsh, fish)
     #[arg(long, value_name = "SHELL")]
     print_completions: Option<clap_complete::Shell>,
+
+    /// usb.ids database file for device names (overrides every other source)
+    #[arg(long, value_name = "PATH")]
+    usbids: Option<String>,
+
+    /// Check for a newer usb.ids ('check', the default) or fetch it ('pull')
+    #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "check")]
+    update_usbids: Option<UpdateUsbidsMode>,
+}
+
+/// `--update-usbids`'s optional mode. Bare `--update-usbids` (no value)
+/// parses as `Check` via `default_missing_value`.
+#[derive(Clone, clap::ValueEnum)]
+enum UpdateUsbidsMode {
+    Check,
+    Pull,
 }
 
 fn main() -> Result<()> {
@@ -149,6 +166,33 @@ fn main() -> Result<()> {
         }
     };
     let preferences = load_or_create_default_at(&config_path)?;
+
+    // `--update-usbids` short-circuits everything else: it needs the
+    // resolution chain and the home-copy destination (both derived from
+    // `preferences_path`, not `--config`, since the download always lands
+    // in the standard `~/.usbtop-ng` location), but never touches usbmon.
+    if let Some(mode) = &cli.update_usbids {
+        // Unlike the monitoring path below, this genuinely needs a home: the
+        // download always lands at `~/.usbtop-ng/usb.ids`, so a missing HOME
+        // propagates as an error here rather than silently dropping the
+        // source.
+        let home_copy = preferences_path()?.with_file_name("usb.ids");
+        let chain = usbids::source_chain(
+            cli.usbids.as_deref().map(Path::new),
+            preferences.usbids_path.as_deref().map(Path::new),
+            Some(&home_copy),
+        );
+        let chain_refs: Vec<&Path> = chain.iter().map(|p| p.as_path()).collect();
+        let result = match mode {
+            UpdateUsbidsMode::Check => usbids::check_usbids(&chain_refs),
+            UpdateUsbidsMode::Pull => usbids::pull_usbids(&home_copy, &chain_refs),
+        };
+        if let Err(e) = result {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+        return Ok(());
+    }
 
     let filter = filter::FilterSet::parse(&cli.filter).unwrap_or_else(|e| {
         eprintln!("error: {e}");
@@ -285,9 +329,27 @@ fn main() -> Result<()> {
 
     let (packets, monitor) = usbmon::monitor::start_monitoring(&usbmon_status.available_buses);
 
+    // Resolved once for the whole run and shared by both the headless and
+    // TUI managers below; monitoring never re-resolves or touches the
+    // network -- that only happens under `--update-usbids`, handled earlier.
+    // Unlike that earlier branch, a missing HOME here must not fail the run:
+    // `--config` points at an explicit preferences file, so monitoring has
+    // to work even when `preferences_path()` cannot locate `~/.usbtop-ng` --
+    // the home-copy source is simply dropped from the chain (see
+    // `usbids::source_chain`), leaving the CLI flag, preferences key, and
+    // distro paths still in play.
+    let usbids_home_copy = preferences_path().ok().map(|p| p.with_file_name("usb.ids"));
+    let usbids = usbids::resolve_database(
+        cli.usbids.as_deref().map(Path::new),
+        preferences.usbids_path.as_deref().map(Path::new),
+        usbids_home_copy.as_deref(),
+    )
+    .map(Arc::new);
+
     if headless {
         let mut manager = device::manager::DeviceManager::new();
         manager.set_filter(filter.clone());
+        manager.set_usbids(usbids.clone());
         let result = headless::run(
             manager,
             packets,
@@ -317,6 +379,7 @@ fn main() -> Result<()> {
 
     let mut manager = device::manager::DeviceManager::new();
     manager.set_filter(filter.clone());
+    manager.set_usbids(usbids.clone());
     // The readers discard packets rather than block when the channel fills, so
     // the UI needs the count to say so in its header.
     let app = UsbTopApp::new(Duration::from_millis(effective_refresh_ms(cli.refresh)))
@@ -528,6 +591,21 @@ mod tests {
         let cli = Cli::try_parse_from(["usbtop-ng", "--print-completions", "bash"]).unwrap();
         assert!(cli.print_completions.is_some());
         assert!(Cli::try_parse_from(["usbtop-ng", "--print-completions", "nosuch"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_update_usbids_modes() {
+        use clap::Parser;
+        let bare = Cli::try_parse_from(["usbtop-ng", "--update-usbids"]).unwrap();
+        assert!(matches!(bare.update_usbids, Some(UpdateUsbidsMode::Check)));
+
+        let pull = Cli::try_parse_from(["usbtop-ng", "--update-usbids", "pull"]).unwrap();
+        assert!(matches!(pull.update_usbids, Some(UpdateUsbidsMode::Pull)));
+
+        assert!(Cli::try_parse_from(["usbtop-ng", "--update-usbids", "bogus"]).is_err());
+
+        let absent = Cli::try_parse_from(["usbtop-ng"]).unwrap();
+        assert!(absent.update_usbids.is_none());
     }
 
     #[test]

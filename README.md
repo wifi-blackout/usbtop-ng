@@ -139,7 +139,9 @@ key press and quits through the same teardown as `q`.
   it: `1.4.2` for a hub chain, `-` for a root hub, `?` when sysfs did not
   resolve the device.
 - Columns: Port, Device, Speed, Vendor, Product, Bw↓, Bw↑, %busy, `!`.
-- Vendor, product, and speed come from sysfs, matched by busnum and devnum.
+- Speed comes from sysfs, matched by busnum and devnum. Vendor and product
+  come from sysfs too, unless a usb.ids database resolves a name for them;
+  see [Device names](#device-names).
 - ⚡ marks the `!` column once a device passes 80% busy.
 - 🔺 marks the `!` column when the device's sysfs `version` reads 3.00 or
   higher and both its bus and its link run slower than SuperSpeed. 🔺 takes
@@ -155,6 +157,42 @@ key press and quits through the same teardown as `q`.
 - `i` hides devices with no current traffic and saves the choice to
   `~/.usbtop-ng/preferences.toml`.
 
+### Device names
+
+- usbtop-ng names devices the way `lsusb` does, by resolving VID:PID against
+  a [usb.ids](https://www.linux-usb.org/usb.ids) database. Applies to the TUI,
+  `--once`/`--batch` reports, and the `vendor`/`product` JSON fields alike.
+- Source order, first that exists and parses wins: `--usbids <PATH>`, the
+  `usbids_path` preferences key, the downloaded copy at
+  `~/.usbtop-ng/usb.ids`, then the distro package
+  (`/usr/share/misc/usb.ids` on Debian and Ubuntu,
+  `/usr/share/hwdata/usb.ids` on Fedora and openSUSE). No source found means
+  names come from device strings alone, exactly as before this feature.
+- Per field, per device: the database name wins when it has one, otherwise
+  usbtop-ng keeps the device's own manufacturer or product string, and
+  vendor and product resolve independently of each other.
+- `--update-usbids` (or `--update-usbids check`, the default) prints the
+  local sources with their `# Date:` and which one is active, checks the
+  upstream date with a single HTTPS HEAD request, and advises how to catch
+  up: the distro package route first (the exact `apt`/`dnf`/`zypper`/`pacman`
+  command for whichever is on PATH), `--update-usbids pull` as the fallback.
+  It never writes a file.
+- `--update-usbids pull` is the explicit, hardened fetch: it skips with
+  "already up to date" when upstream is not newer, otherwise it downloads the
+  payload into a quarantine file next to the destination, validates it with
+  usbtop-ng's own parser (parses, at least 1000 vendors, not older than the
+  copy it replaces), prints a diff summary (dates, vendor and product count
+  deltas), and only then installs it to `~/.usbtop-ng/usb.ids` with an atomic
+  rename. Any failure before that rename leaves every existing file
+  untouched.
+- Security posture: the upstream URL is `https://www.linux-usb.org/usb.ids`,
+  compiled in and https-only. curl runs with `--proto =https --proto-redir
+  =https --tlsv1.2`; wget runs with `--https-only --secure-protocol=PFS`. No
+  redirect may leave https. The fetched payload is never executed and never
+  installed as-is — it sits in quarantine until usbtop-ng's own memory-safe
+  parser (text in, names out, no execution path) validates it, and only a
+  passing, diffed payload gets the atomic install.
+
 ### Filtering
 
 - `--filter KEY=VALUE[,KEY=VALUE...]` narrows the device table and the traffic
@@ -166,7 +204,9 @@ key press and quits through the same teardown as `q`.
 - `bus` and `dev` match the USB bus number and device number.
 - `vid` and `pid` match the 4 hex digit vendor and product ID, e.g.
   `vid=04f2`. `id` is shorthand for both together, e.g. `id=04f2:b71a`.
-- `name` matches a case-insensitive substring of the vendor or product string.
+- `name` matches a case-insensitive substring of the vendor or product
+  string as displayed — the usb.ids database name when one resolves,
+  otherwise the device's own string; see [Device names](#device-names).
 - `ep` matches the endpoint number, 0 through 15. `dir` matches transfer
   direction, `in` or `out`. `type` matches transfer type: `control` (or
   `ctrl`), `iso`, `bulk`, `interrupt` (or `int`).
@@ -297,7 +337,7 @@ key press and quits through the same teardown as `q`.
 
 ### Tests
 
-- `cargo test --all-targets` runs 246 hermetic tests against fixture files,
+- `cargo test --all-targets` runs 286 hermetic tests against fixture files,
   FIFOs, and temporary paths. They need no `/dev` and no debugfs access.
 - The `integration` cargo feature adds 1 test that reads the real usbmon
   interfaces. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
@@ -318,8 +358,12 @@ hide_idle_devices = false
   question. usbtop-ng unloads only when it loaded usbmon for that session.
 - `hide_idle_devices` controls whether idle devices show. Idle devices show by
   default; press `i` to hide them, and usbtop-ng saves the choice here.
+- `usbids_path` points at a usb.ids database file, ahead of the downloaded and
+  distro copies in the [source order](#device-names). Unset by default, so
+  the key is absent from the file above until you add it; the `--usbids`
+  flag overrides it for one run.
 
-`example-config.toml` in the repository root holds the same three keys with
+`example-config.toml` in the repository root holds the same keys with
 comments.
 
 ## Command line options
@@ -343,6 +387,9 @@ Options:
       --print-man          Print the man page to stdout
       --print-completions <SHELL>
                            Print a completion script to stdout for the named shell (e.g. bash, zsh, fish)
+      --usbids <PATH>      usb.ids database file for device names (overrides every other source)
+      --update-usbids [<MODE>]
+                           Check for a newer usb.ids ('check', the default) or fetch it ('pull')
   -h, --help               Print help
   -V, --version            Print version
 ```
