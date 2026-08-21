@@ -164,6 +164,52 @@ fn active_source<'a>(paths: &[&'a Path]) -> Option<&'a Path> {
         .copied()
 }
 
+/// The `# Date:` header of the *active* source in `paths` (the one
+/// `resolve_from_chain` would actually pick), or `None` when there is no
+/// active source or it carries no such header. This is what `check_usbids`
+/// gates its advice on: a stale file elsewhere in the chain that is
+/// shadowed by a newer active source is not worth advice, and a stale
+/// active source is worth advice even when a newer copy sits shadowed
+/// behind it (nobody is using that copy).
+fn active_source_date(paths: &[&Path]) -> Option<(u16, u8, u8)> {
+    let path = active_source(paths)?;
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| parse_header_date(&t))
+}
+
+/// The newest `# Date:` header across every *existing* source in `paths`,
+/// active or not. This is what `pull_usbids`'s "already up to date" gate
+/// uses: a pull is worth skipping the moment any local copy is already
+/// current, since `--usbids`/`usbids_path` could point at whichever one
+/// that is on the next run. Deliberately different from
+/// `active_source_date` above.
+fn newest_local_date(paths: &[&Path]) -> Option<(u16, u8, u8)> {
+    paths
+        .iter()
+        .filter(|p| p.exists())
+        .filter_map(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|t| parse_header_date(&t))
+        })
+        .max()
+}
+
+/// The `# Date:` header of the file `pull_usbids` is about to overwrite, or
+/// `None` when nothing is there yet. This is the floor `validate_payload`
+/// checks a fetched payload against — the copy it replaces, never the
+/// chain-wide newest (some other shadowed source being newer says nothing
+/// about whether the payload about to land on `dest` is backdated).
+fn replaced_copy_date(dest: &Path) -> Option<(u16, u8, u8)> {
+    if !dest.exists() {
+        return None;
+    }
+    std::fs::read_to_string(dest)
+        .ok()
+        .and_then(|t| parse_header_date(&t))
+}
+
 /// The compiled-in upstream URL. https-only, no redirect may leave https
 /// (curl `--proto =https --proto-redir =https`, wget `--https-only`), and
 /// this constant is the only place either tool's target comes from — never
@@ -389,8 +435,8 @@ pub fn advise(probe: impl Fn(&str) -> bool) -> String {
 /// including "nothing is outdated", is `Ok`.
 pub fn check_usbids(chain_paths: &[&Path]) -> Result<()> {
     let active = active_source(chain_paths);
+    let active_date = active_source_date(chain_paths);
     println!("Local usb.ids sources:");
-    let mut newest_local: Option<(u16, u8, u8)> = None;
     let mut any_local = false;
     for path in chain_paths {
         if !path.exists() {
@@ -400,9 +446,6 @@ pub fn check_usbids(chain_paths: &[&Path]) -> Result<()> {
         let date = std::fs::read_to_string(path)
             .ok()
             .and_then(|t| parse_header_date(&t));
-        if let Some(d) = date {
-            newest_local = Some(newest_local.map_or(d, |n| n.max(d)));
-        }
         let marker = if active == Some(*path) {
             "  (active)"
         } else {
@@ -452,7 +495,11 @@ pub fn check_usbids(chain_paths: &[&Path]) -> Result<()> {
     };
     println!("Upstream ({UPSTREAM_URL}): {}", fmt_date(upstream_date));
 
-    if should_pull(upstream_date, newest_local) {
+    // Gated on the active source specifically, not the chain-wide newest: a
+    // stale file shadowed by a newer active source is not worth advice, and
+    // a stale active source is worth advice even with a newer copy shadowed
+    // behind it -- nobody is using that copy.
+    if should_pull(upstream_date, active_date) {
         print!("{}", advise(tool_on_path));
     } else {
         println!("Local copy is up to date; nothing to do.");
@@ -466,15 +513,10 @@ pub fn check_usbids(chain_paths: &[&Path]) -> Result<()> {
 /// atomic rename. Any failure before that rename leaves every existing file
 /// untouched.
 pub fn pull_usbids(dest: &Path, chain_paths: &[&Path]) -> Result<()> {
-    let newest_local = chain_paths
-        .iter()
-        .filter(|p| p.exists())
-        .filter_map(|p| {
-            std::fs::read_to_string(p)
-                .ok()
-                .and_then(|t| parse_header_date(&t))
-        })
-        .max();
+    // The "already up to date" gate looks at every local copy (the reader
+    // could be using any of them); the validation floor below looks only
+    // at the one file this call is about to overwrite.
+    let newest_local = newest_local_date(chain_paths);
 
     let Some(mut head_cmd) = head_command_from(tool_on_path) else {
         anyhow::bail!("neither curl nor wget found on PATH; cannot check the upstream date");
@@ -521,7 +563,10 @@ pub fn pull_usbids(dest: &Path, chain_paths: &[&Path]) -> Result<()> {
     std::fs::write(&quarantine, &payload)
         .with_context(|| format!("writing quarantine file {}", quarantine.display()))?;
 
-    let validated = validate_payload(&payload, newest_local);
+    // The floor is the file about to be replaced, not the chain-wide
+    // newest: a payload only has to be no older than what it overwrites.
+    let replaced_date = replaced_copy_date(dest);
+    let validated = validate_payload(&payload, replaced_date);
     let summary = match validated {
         Ok(s) => s,
         Err(e) => {
@@ -536,8 +581,12 @@ pub fn pull_usbids(dest: &Path, chain_paths: &[&Path]) -> Result<()> {
     println!("{}", diff_summary(&active_text, &payload));
 
     // Same-directory atomic rename: the only way this payload ever reaches
-    // `dest`, and only after the checks above passed.
-    std::fs::rename(&quarantine, dest).with_context(|| format!("installing {}", dest.display()))?;
+    // `dest`, and only after the checks above passed. A failed rename must
+    // not leave the quarantine file behind either.
+    if let Err(e) = std::fs::rename(&quarantine, dest) {
+        let _ = std::fs::remove_file(&quarantine);
+        return Err(e).with_context(|| format!("installing {}", dest.display()));
+    }
     println!("installed {} ({})", dest.display(), fmt_date(summary.date));
     Ok(())
 }
@@ -826,5 +875,88 @@ C 03  HID (Human Interface Device)
         assert!(!should_pull((2024, 3, 18), Some((2024, 3, 18))));
         assert!(should_pull((2024, 3, 19), Some((2024, 3, 18))));
         assert!(should_pull((2024, 3, 18), None));
+    }
+
+    fn write_dated_fixture(path: &Path, date: &str) {
+        std::fs::write(path, format!("# Date:   {date} 00:00:00\n0001  V\n")).unwrap();
+    }
+
+    // --- Three separately pinned staleness gates -----------------------
+    //
+    // check_usbids gates advice on the ACTIVE source's date; pull_usbids's
+    // "already up to date" skip gates on the NEWEST local date across the
+    // whole chain; pull_usbids's validate_payload floor gates on the date
+    // of the file actually being REPLACED. These must not be conflated --
+    // each has its own helper and its own tests below.
+
+    #[test]
+    fn check_gate_advises_when_the_active_source_is_stale_even_with_a_newer_shadowed_file() {
+        // The active (first-in-chain) source is older than upstream; a
+        // later, shadowed source is newer than upstream. Nobody is using
+        // the shadowed copy, so advice must still fire.
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("active.ids");
+        write_dated_fixture(&active, "2020-01-01");
+        let shadowed = temp.path().join("shadowed.ids");
+        write_dated_fixture(&shadowed, "2025-01-01");
+
+        let chain: Vec<&Path> = vec![&active, &shadowed];
+        assert_eq!(active_source_date(&chain), Some((2020, 1, 1)));
+        assert!(should_pull((2024, 3, 18), active_source_date(&chain)));
+    }
+
+    #[test]
+    fn check_gate_stays_quiet_when_the_active_source_is_fresh_despite_a_stale_shadowed_file() {
+        // The active source is newer than upstream; a later, shadowed
+        // source is stale. The shadowed staleness must not trigger advice.
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("active.ids");
+        write_dated_fixture(&active, "2025-01-01");
+        let shadowed = temp.path().join("shadowed.ids");
+        write_dated_fixture(&shadowed, "2020-01-01");
+
+        let chain: Vec<&Path> = vec![&active, &shadowed];
+        assert_eq!(active_source_date(&chain), Some((2025, 1, 1)));
+        assert!(!should_pull((2024, 3, 18), active_source_date(&chain)));
+    }
+
+    #[test]
+    fn pull_gate_uses_the_newest_local_date_across_the_whole_chain() {
+        // Unlike the check gate above, a stale active source shadowing a
+        // newer copy elsewhere in the chain is enough to skip the pull:
+        // any local file being current is grounds to skip re-fetching.
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("active.ids");
+        write_dated_fixture(&active, "2020-01-01");
+        let newer_elsewhere = temp.path().join("newer.ids");
+        write_dated_fixture(&newer_elsewhere, "2025-01-01");
+
+        let chain: Vec<&Path> = vec![&active, &newer_elsewhere];
+        assert_eq!(newest_local_date(&chain), Some((2025, 1, 1)));
+        assert!(!should_pull((2024, 3, 18), newest_local_date(&chain)));
+    }
+
+    #[test]
+    fn validate_floor_is_the_replaced_copy_not_the_chain_newest() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("usb.ids");
+        write_dated_fixture(&dest, "2020-01-01"); // the copy about to be replaced
+
+        assert_eq!(replaced_copy_date(&dest), Some((2020, 1, 1)));
+
+        let missing = temp.path().join("nope.ids");
+        assert_eq!(replaced_copy_date(&missing), None, "nothing to replace yet");
+
+        // A payload dated between the replaced copy and some other newer
+        // chain source must validate: only the replaced copy's date is the
+        // floor.
+        let payload = generate_payload("2022-06-01", 1000);
+        assert!(validate_payload(&payload, replaced_copy_date(&dest)).is_ok());
+        // But it must still fail against the file it actually replaces if
+        // that file is newer than the payload.
+        write_dated_fixture(&dest, "2024-03-18");
+        let err = validate_payload(&payload, replaced_copy_date(&dest))
+            .expect_err("payload predates the copy it would replace");
+        assert!(err.to_string().contains("backdated") || err.to_string().contains("older"));
     }
 }
