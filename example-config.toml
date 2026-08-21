@@ -19,3 +19,8 @@ unload_usbmon_on_exit = false
 # If true, usbtop-ng hides idle devices. Press `i` in the UI to toggle this
 # and save the choice here.
 hide_idle_devices = false
+
+# Path to a usb.ids database file for device names. Overrides the downloaded
+# copy (~/.usbtop-ng/usb.ids) and the distro package; the --usbids flag
+# overrides this in turn. Unset by default (no line here).
+# usbids_path = "/path/to/usb.ids"

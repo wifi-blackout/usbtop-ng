@@ -18,6 +18,10 @@ pub struct Preferences {
     /// connected device shows even at zero bandwidth.
     #[serde(default)]
     pub hide_idle_devices: bool,
+    /// Path to a usb.ids database file. Overrides the downloaded and distro
+    /// copies; the `--usbids` flag overrides this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usbids_path: Option<String>,
 }
 
 pub fn preferences_path() -> Result<PathBuf> {
@@ -186,10 +190,59 @@ mod tests {
             auto_load_usbmon: true,
             unload_usbmon_on_exit: true,
             hide_idle_devices: true,
+            usbids_path: None,
         };
         write_preferences_at(&path, &prefs).unwrap();
 
         let read = load_or_create_default_at(&path).unwrap();
         assert_eq!(read, prefs);
+    }
+
+    #[test]
+    fn file_without_usbids_path_loads_with_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".usbtop-ng/preferences.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "auto_load_usbmon = false\nunload_usbmon_on_exit = false\nhide_idle_devices = false\n",
+        )
+        .unwrap();
+
+        let prefs = load_or_create_default_at(&path).unwrap();
+        assert_eq!(prefs.usbids_path, None);
+    }
+
+    #[test]
+    fn usbids_path_round_trips_when_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.toml");
+        let prefs = Preferences {
+            usbids_path: Some("/opt/custom/usb.ids".to_string()),
+            ..Preferences::default()
+        };
+        write_preferences_at(&path, &prefs).unwrap();
+
+        let read = load_or_create_default_at(&path).unwrap();
+        assert_eq!(read.usbids_path.as_deref(), Some("/opt/custom/usb.ids"));
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("usbids_path"));
+    }
+
+    #[test]
+    fn default_preferences_file_omits_usbids_path_entirely() {
+        // A None Option<String> has no TOML representation, so the key must
+        // be skipped rather than written as some kind of null.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".usbtop-ng/preferences.toml");
+
+        load_or_create_default_at(&path).unwrap();
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(
+            !written.contains("usbids_path"),
+            "a None usbids_path must not appear in the written file: {written}"
+        );
     }
 }
