@@ -278,6 +278,21 @@ impl UsbDevice {
             .values()
             .any(|s| s.transfer_type == TransferType::Isochronous && s.total_bytes > 0)
     }
+
+    /// Overlay usb.ids names. The database wins per field (lsusb parity); the
+    /// device's own strings keep any field the database does not list.
+    pub fn apply_usbids(&mut self, db: &crate::usbids::UsbIds) {
+        if let Some(vid) = self.vendor_id {
+            if let Some(name) = db.vendor_name(vid) {
+                self.vendor = Some(name.to_string());
+            }
+            if let Some(pid) = self.product_id {
+                if let Some(name) = db.product_name(vid, pid) {
+                    self.product = Some(name.to_string());
+                }
+            }
+        }
+    }
 }
 
 /// Best-effort capability signal: a device that declares bcdUSB >= 3.00 in
@@ -600,5 +615,59 @@ mod tests {
         let indicator = SpeedIndicator::LimitedByBus(UsbSpeed::SuperSpeed);
         assert!(indicator.get_description().contains("5 Gbps"));
         assert_eq!(SpeedIndicator::Normal.get_description(), "Normal operation");
+    }
+
+    #[test]
+    fn apply_usbids_overlays_both_fields_when_the_database_has_them() {
+        let db = crate::usbids::UsbIds::parse(
+            "0430  Fujitsu Component Limited\n\t0100  3-button Mouse\n",
+        );
+        let mut d = UsbDevice::new(1, 4);
+        d.vendor_id = Some(0x0430);
+        d.product_id = Some(0x0100);
+        d.vendor = Some("StringVendor".to_string());
+        d.product = Some("StringProduct".to_string());
+
+        d.apply_usbids(&db);
+
+        assert_eq!(d.vendor.as_deref(), Some("Fujitsu Component Limited"));
+        assert_eq!(d.product.as_deref(), Some("3-button Mouse"));
+    }
+
+    #[test]
+    fn apply_usbids_keeps_the_device_string_for_a_field_the_database_lacks() {
+        // vendor 0430 only, no 0a99 product entry.
+        let db = crate::usbids::UsbIds::parse("0430  Fujitsu Component Limited\n");
+        let mut d = UsbDevice::new(1, 4);
+        d.vendor_id = Some(0x0430);
+        d.product_id = Some(0x0a99);
+        d.vendor = Some("StringVendor".to_string());
+        d.product = Some("StringProduct".to_string());
+
+        d.apply_usbids(&db);
+
+        assert_eq!(
+            d.vendor.as_deref(),
+            Some("Fujitsu Component Limited"),
+            "vendor known to the database wins"
+        );
+        assert_eq!(
+            d.product.as_deref(),
+            Some("StringProduct"),
+            "product unknown to the database keeps the device string"
+        );
+    }
+
+    #[test]
+    fn apply_usbids_with_no_vendor_id_leaves_both_strings_alone() {
+        let db = crate::usbids::UsbIds::parse("0430  Fujitsu Component Limited\n");
+        let mut d = UsbDevice::new(1, 4);
+        d.vendor = Some("StringVendor".to_string());
+        d.product = Some("StringProduct".to_string());
+
+        d.apply_usbids(&db);
+
+        assert_eq!(d.vendor.as_deref(), Some("StringVendor"));
+        assert_eq!(d.product.as_deref(), Some("StringProduct"));
     }
 }

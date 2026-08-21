@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-bus rx/tx figures in bus heading rows.
 - `~` estimate markers for isochronous rates on the text interface.
 - A release workflow that attaches Linux x86_64 binaries to tagged releases.
+- Device names resolved from a usb.ids database (`lsusb` parity), with a
+  `--usbids <PATH>` flag, a `usbids_path` preference key, and a source chain
+  falling through to the downloaded copy, then the distro package.
+- `--update-usbids [check|pull]`: `check` prints the local sources and the
+  upstream date and advises the distro package route first; `pull` fetches,
+  validates in quarantine, diffs, and installs by atomic rename.
 
 ### Fixed
 

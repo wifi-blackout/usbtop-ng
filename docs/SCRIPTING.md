@@ -92,8 +92,8 @@ Report, the top-level document:
 | `port` | string? | port chain joined by `.`; `""` for a root hub; `null` if sysfs did not resolve the device |
 | `vendor_id` | string? | 4 hex digit vendor ID, `null` if unread |
 | `product_id` | string? | 4 hex digit product ID, `null` if unread |
-| `vendor` | string? | vendor string from sysfs, `null` if unread |
-| `product` | string? | product string from sysfs, `null` if unread |
+| `vendor` | string? | vendor name, from a usb.ids database if one resolved it, else the sysfs string; `null` if unread |
+| `product` | string? | product name, from a usb.ids database if one resolved it, else the sysfs string; `null` if unread |
 | `speed_mbps` | f64 | device link speed in Mbps |
 | `rx_bps` | f64 | bytes in over the window, divided by `window_seconds` |
 | `tx_bps` | f64 | bytes out over the window, divided by `window_seconds` |
