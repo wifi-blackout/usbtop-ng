@@ -65,6 +65,11 @@ These came out of code review. Each is small and none blocks a release.
 - One constant for the 60-second window. The device chart bounds and
   `RATE_HISTORY_WINDOW` state it separately.
 - Error and log strings brought under the documentation style guide.
+- Text reports round device speeds to whole Mbps, so a 1.5 Mbps low-speed
+  device prints as 2 Mbps. The JSON output carries the exact value.
+- A first pull with no home copy has no date floor, so a replayed
+  older-but-valid usb.ids payload could install and shadow a newer distro
+  copy. A hardening pass could floor on the active source's date instead.
 - The usbmon text fallback overcounts isochronous transfers. Its length
   column holds the buffer size, not the bytes moved. On a camera stream the
   overcount was 3.6x. The text format prints 5 of 32 descriptors per URB, so
