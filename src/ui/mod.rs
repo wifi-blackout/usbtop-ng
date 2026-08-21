@@ -1456,6 +1456,7 @@ mod tests {
             auto_load_usbmon: true,
             unload_usbmon_on_exit: false,
             hide_idle_devices: false,
+            usbids_path: None,
         };
         let mut app = UsbTopApp::new(Duration::from_millis(100)).with_idle_setting(
             false,

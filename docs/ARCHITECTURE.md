@@ -92,8 +92,11 @@ interfaces alike.
   `get_speed_indicator`, and the best-effort capability signal read from sysfs
   `version` (bcdUSB).
 - `manager.rs`: routes usbmon packets into per-device bandwidth stats, and
-  resolves device metadata from sysfs. It groups devices into `UsbBus`es, which
-  resolve their host controller and their aggregate %busy.
+  resolves device metadata from sysfs. When a usb.ids database is set
+  (`set_usbids`), it overlays `UsbDevice::apply_usbids` on every newly
+  populated device, so a resolved name wins over the sysfs string per field.
+  It groups devices into `UsbBus`es, which resolve their host controller and
+  their aggregate %busy.
 
 #### 3. Statistics engine (`stats/`)
 

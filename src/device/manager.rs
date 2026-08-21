@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::device::UsbDevice;
 use crate::filter::FilterSet;
+use crate::usbids::UsbIds;
 use crate::usbmon::parser::{UrbType, UsbPacket, UsbSpeed};
 
 #[derive(Debug, Clone)]
@@ -89,6 +91,7 @@ pub struct DeviceManager {
     pub buses: HashMap<u8, UsbBus>,
     sysfs_base: Option<PathBuf>,
     filter: FilterSet,
+    usbids: Option<Arc<UsbIds>>,
 }
 
 impl DeviceManager {
@@ -97,6 +100,7 @@ impl DeviceManager {
             buses: HashMap::new(),
             sysfs_base: None,
             filter: FilterSet::default(),
+            usbids: None,
         }
     }
 
@@ -108,6 +112,7 @@ impl DeviceManager {
             buses: HashMap::new(),
             sysfs_base: Some(base),
             filter: FilterSet::default(),
+            usbids: None,
         }
     }
 
@@ -117,6 +122,13 @@ impl DeviceManager {
     /// `update_activity` timer still resets.
     pub fn set_filter(&mut self, filter: FilterSet) {
         self.filter = filter;
+    }
+
+    /// Install (or clear) the usb.ids database every newly populated device
+    /// gets overlaid with (see `UsbDevice::apply_usbids`). `None` (the
+    /// default) leaves device/product names exactly as sysfs reported them.
+    pub fn set_usbids(&mut self, db: Option<Arc<UsbIds>>) {
+        self.usbids = db;
     }
 
     /// Get or create a USB bus
@@ -143,10 +155,14 @@ impl DeviceManager {
         // borrowed from `self.buses`, so the handle is cloned up front —
         // same pattern as `sysfs_base` just above.
         let filter = self.filter.clone();
+        let usbids = self.usbids.clone();
         let bus = self.get_or_create_bus(packet.bus_id);
         let device = bus.devices.entry(packet.device_id).or_insert_with(|| {
             let mut d = UsbDevice::new(packet.bus_id, packet.device_id);
             d.populate_from_sysfs(sysfs_base.as_deref());
+            if let Some(db) = &usbids {
+                d.apply_usbids(db);
+            }
             d
         });
         device.update_activity();
@@ -176,6 +192,7 @@ impl DeviceManager {
     /// long enough, refresh bus speeds. Returns removed (bus_id, device_id).
     pub fn refresh(&mut self) -> Vec<(u8, u8)> {
         let sysfs_base = self.sysfs_base.clone();
+        let usbids = self.usbids.clone();
         let mut removed = Vec::new();
         for bus in self.buses.values_mut() {
             for device in bus.devices.values_mut() {
@@ -188,6 +205,9 @@ impl DeviceManager {
                 } else if !device.is_disconnected {
                     // metadata may become readable later (e.g. permissions, race at first sight)
                     device.populate_from_sysfs(sysfs_base.as_deref());
+                    if let Some(db) = &usbids {
+                        device.apply_usbids(db);
+                    }
                 }
             }
             let stale: Vec<u8> = bus
@@ -218,6 +238,7 @@ impl DeviceManager {
             .sysfs_base
             .clone()
             .unwrap_or_else(|| PathBuf::from("/sys/bus/usb/devices"));
+        let usbids = self.usbids.clone();
         let Ok(entries) = std::fs::read_dir(&base) else {
             return;
         };
@@ -242,6 +263,9 @@ impl DeviceManager {
                 .or_insert_with(|| {
                     let mut device = UsbDevice::new(bus, dev);
                     device.populate_from_dir(&dir);
+                    if let Some(db) = &usbids {
+                        device.apply_usbids(db);
+                    }
                     device
                 });
         }
@@ -475,5 +499,116 @@ mod tests {
         std::fs::remove_dir_all(temp.path().join("1-4")).unwrap();
         mgr.refresh();
         assert!(mgr.buses[&1].devices[&4].is_disconnected);
+    }
+
+    #[test]
+    fn usbids_names_win_over_device_strings_per_field() {
+        let temp = tempfile::tempdir().unwrap();
+        write_sysfs_device(temp.path(), "1-4", 1, 4, "480");
+        let dir = temp.path().join("1-4");
+        std::fs::write(dir.join("idVendor"), "0430\n").unwrap();
+        std::fs::write(dir.join("idProduct"), "0100\n").unwrap();
+        std::fs::write(dir.join("manufacturer"), "StringVendor\n").unwrap();
+        std::fs::write(dir.join("product"), "StringProduct\n").unwrap();
+
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.set_usbids(Some(std::sync::Arc::new(crate::usbids::UsbIds::parse(
+            "0430  Fujitsu Component Limited\n\t0100  3-button Mouse\n",
+        ))));
+        mgr.enumerate_present_devices();
+
+        let dev = &mgr.buses[&1].devices[&4];
+        assert_eq!(dev.vendor.as_deref(), Some("Fujitsu Component Limited"));
+        assert_eq!(dev.product.as_deref(), Some("3-button Mouse"));
+    }
+
+    #[test]
+    fn device_strings_fill_the_gaps_the_database_leaves() {
+        // db has the vendor but not this product: vendor from db, product
+        // from the device string. And with no db entry at all, both strings
+        // survive.
+        let temp = tempfile::tempdir().unwrap();
+        write_sysfs_device(temp.path(), "1-4", 1, 4, "480");
+        let dir = temp.path().join("1-4");
+        std::fs::write(dir.join("idVendor"), "0430\n").unwrap();
+        std::fs::write(dir.join("idProduct"), "0a99\n").unwrap();
+        std::fs::write(dir.join("manufacturer"), "StringVendor\n").unwrap();
+        std::fs::write(dir.join("product"), "StringProduct\n").unwrap();
+
+        write_sysfs_device(temp.path(), "1-5", 1, 5, "480");
+        let dir2 = temp.path().join("1-5");
+        std::fs::write(dir2.join("idVendor"), "9999\n").unwrap();
+        std::fs::write(dir2.join("idProduct"), "0001\n").unwrap();
+        std::fs::write(dir2.join("manufacturer"), "OtherVendor\n").unwrap();
+        std::fs::write(dir2.join("product"), "OtherProduct\n").unwrap();
+
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.set_usbids(Some(std::sync::Arc::new(crate::usbids::UsbIds::parse(
+            "0430  Fujitsu Component Limited\n",
+        ))));
+        mgr.enumerate_present_devices();
+
+        let dev = &mgr.buses[&1].devices[&4];
+        assert_eq!(
+            dev.vendor.as_deref(),
+            Some("Fujitsu Component Limited"),
+            "vendor known to the database wins"
+        );
+        assert_eq!(
+            dev.product.as_deref(),
+            Some("StringProduct"),
+            "product unknown to the database keeps the device string"
+        );
+
+        let dev2 = &mgr.buses[&1].devices[&5];
+        assert_eq!(
+            dev2.vendor.as_deref(),
+            Some("OtherVendor"),
+            "no db entry at all: both strings survive"
+        );
+        assert_eq!(dev2.product.as_deref(), Some("OtherProduct"));
+    }
+
+    #[test]
+    fn no_database_keeps_todays_names() {
+        // set_usbids(None) is the default; pinned so the overlay cannot
+        // regress the no-db path.
+        let temp = tempfile::tempdir().unwrap();
+        write_sysfs_device(temp.path(), "1-4", 1, 4, "480");
+        let dir = temp.path().join("1-4");
+        std::fs::write(dir.join("idVendor"), "0430\n").unwrap();
+        std::fs::write(dir.join("idProduct"), "0100\n").unwrap();
+        std::fs::write(dir.join("manufacturer"), "StringVendor\n").unwrap();
+        std::fs::write(dir.join("product"), "StringProduct\n").unwrap();
+
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.enumerate_present_devices();
+
+        let dev = &mgr.buses[&1].devices[&4];
+        assert_eq!(dev.vendor.as_deref(), Some("StringVendor"));
+        assert_eq!(dev.product.as_deref(), Some("StringProduct"));
+    }
+
+    #[test]
+    fn apply_packet_overlays_usbids_names_for_a_newly_seen_device() {
+        // The traffic path (apply_packet's or_insert), not enumeration.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("1-4");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("busnum"), "1\n").unwrap();
+        std::fs::write(dir.join("devnum"), "4\n").unwrap();
+        std::fs::write(dir.join("idVendor"), "0430\n").unwrap();
+        std::fs::write(dir.join("idProduct"), "0100\n").unwrap();
+
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.set_usbids(Some(std::sync::Arc::new(crate::usbids::UsbIds::parse(
+            "0430  Fujitsu Component Limited\n\t0100  3-button Mouse\n",
+        ))));
+        let callback = parse_usbmon_text_line("ffff0000aaaa0001 100 C Bi:1:004:1 0 64 <").unwrap();
+        mgr.apply_packet(&callback);
+
+        let dev = &mgr.buses[&1].devices[&4];
+        assert_eq!(dev.vendor.as_deref(), Some("Fujitsu Component Limited"));
+        assert_eq!(dev.product.as_deref(), Some("3-button Mouse"));
     }
 }
