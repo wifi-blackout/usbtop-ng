@@ -218,6 +218,13 @@ fn main() -> Result<()> {
                 device.product_id.as_deref().unwrap_or("----"),
             );
         }
+        // `write_to` itself does not create directories (see its doc
+        // comment); `~/.usbtop-ng` may not exist yet on a first run that
+        // goes straight for `--snapshot-internal`, the same gap
+        // `--update-usbids pull` closes for its own destination.
+        if let Some(parent) = dest.parent() {
+            ensure_private_config_dir(parent)?;
+        }
         snapshot.write_to(&dest)?;
         println!(
             "{} devices recorded as internal in {}",
