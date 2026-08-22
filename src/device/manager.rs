@@ -138,9 +138,10 @@ impl DeviceManager {
     /// Install (or clear) the internal-device snapshot every device gets
     /// stamped against (see `stamp_internal`). Unlike `set_usbids`, this
     /// also immediately restamps every device already known, so a snapshot
-    /// taken (or a snapshot file that vanished) mid-session takes effect on
-    /// the very next tick instead of waiting for each device to be
-    /// re-populated on its own schedule.
+    /// taken mid-session takes effect on the very next tick instead of
+    /// waiting for each device to be re-populated on its own schedule. A
+    /// `None` here would clear every mark -- today's callers always pass
+    /// `Some`.
     pub fn set_internal_snapshot(&mut self, snapshot: Option<Arc<Snapshot>>) {
         self.internal_snapshot = snapshot;
         for bus in self.buses.values_mut() {
