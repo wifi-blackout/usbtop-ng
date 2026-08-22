@@ -437,7 +437,7 @@ fn main() -> Result<()> {
     manager.set_internal_snapshot(internal_snapshot.clone());
     // The readers discard packets rather than block when the channel fills, so
     // the UI needs the count to say so in its header.
-    let app = UsbTopApp::new(Duration::from_millis(effective_refresh_ms(cli.refresh)))
+    let mut app = UsbTopApp::new(Duration::from_millis(effective_refresh_ms(cli.refresh)))
         .with_dropped_counter(Arc::clone(&monitor.dropped))
         .with_idle_setting(
             preferences.hide_idle_devices,
@@ -446,6 +446,13 @@ fn main() -> Result<()> {
         )
         .with_filter(filter)
         .with_text_source_flag(Arc::clone(&monitor.text_active));
+    // Mirrors the usbids/internal-snapshot home-copy pattern above: a
+    // missing HOME must not fail the TUI, it just means `S`'s `y` has
+    // nowhere to write and lands in `Done` saying so (see
+    // `ui::confirm_snapshot`).
+    if let Ok(dest) = snapshot::snapshot_path() {
+        app = app.with_snapshot_dest(dest);
+    }
     let session = run_ui(app, manager, packets);
 
     // Close the usbmon files before anything tries to unload the module: an
