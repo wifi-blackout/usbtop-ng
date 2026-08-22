@@ -183,6 +183,12 @@ the preferences file — `--config` never moves it. A new snapshot overwrites
 the old one; deleting the file clears it, and every device goes back to
 looking external.
 
+That path resolves against the HOME of whichever user runs the command. If
+you monitor with `sudo usbtop`, snapshot under sudo too — press `S` inside
+`sudo usbtop`, or run `sudo usbtop-ng --snapshot-internal` from a shell. A
+snapshot taken without sudo is invisible to a sudo session, and vice versa,
+unless HOME is preserved with `sudo -E`.
+
 ### Device names
 
 - usbtop-ng names devices the way `lsusb` does, by resolving VID:PID against
@@ -366,7 +372,7 @@ looking external.
 
 ### Tests
 
-- `cargo test --all-targets` runs 319 hermetic tests against fixture files,
+- `cargo test --all-targets` runs 324 hermetic tests against fixture files,
   FIFOs, and temporary paths. They need no `/dev` and no debugfs access.
 - The `integration` cargo feature adds 1 test that reads the real usbmon
   interfaces. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).

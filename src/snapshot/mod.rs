@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::usbids::UsbIds;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SnapshotDevice {
     /// The sysfs directory name: physical port chain (`1-4`, `3-3.1`) or
@@ -115,6 +117,32 @@ fn parse_id(id: &Option<String>) -> Option<u16> {
 /// `--config` moves preferences only, never this.
 pub fn snapshot_path() -> Result<PathBuf> {
     Ok(crate::config::preferences_path()?.with_file_name("internal-devices.toml"))
+}
+
+/// One captured device's vendor+product name, resolved against `db` the same
+/// way `headless::render_text` composes a live device's name: both names
+/// join with a space, a single resolved field stands alone. Unlike that
+/// display, an unresolved field here contributes nothing rather than
+/// "Unknown" -- a snapshot line with no match is unresolved, not unnamed, so
+/// an empty string means the caller appends nothing. Empty whenever `db` is
+/// `None` or the stored hex IDs don't parse or aren't in the database.
+pub fn describe(device: &SnapshotDevice, db: Option<&UsbIds>) -> String {
+    let Some(db) = db else {
+        return String::new();
+    };
+    let vid = parse_id(&device.vendor_id);
+    let pid = parse_id(&device.product_id);
+    let vendor = vid.and_then(|v| db.vendor_name(v));
+    let product = match (vid, pid) {
+        (Some(v), Some(p)) => db.product_name(v, p),
+        _ => None,
+    };
+    match (vendor, product) {
+        (Some(v), Some(p)) => format!("{v} {p}"),
+        (Some(v), None) => v.to_string(),
+        (None, Some(p)) => p.to_string(),
+        (None, None) => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -255,5 +283,54 @@ mod tests {
         };
         assert!(!snap.is_internal("1-4", None, Some(0xb71a)));
         assert!(!snap.is_internal("1-4", Some(0x04f2), Some(0xb71a)));
+    }
+
+    fn device(vid: Option<&str>, pid: Option<&str>) -> SnapshotDevice {
+        SnapshotDevice {
+            port_path: "1-4".into(),
+            vendor_id: vid.map(String::from),
+            product_id: pid.map(String::from),
+        }
+    }
+
+    #[test]
+    fn describe_joins_vendor_and_product_when_both_resolve() {
+        let db = UsbIds::parse("04f2  Chicony Electronics Co., Ltd\n\tb71a  Integrated Camera\n");
+        let d = device(Some("04f2"), Some("b71a"));
+        assert_eq!(
+            describe(&d, Some(&db)),
+            "Chicony Electronics Co., Ltd Integrated Camera"
+        );
+    }
+
+    #[test]
+    fn describe_falls_back_to_the_vendor_alone_when_the_product_is_unknown() {
+        let db = UsbIds::parse("04f2  Chicony Electronics Co., Ltd\n");
+        let d = device(Some("04f2"), Some("b71a"));
+        assert_eq!(describe(&d, Some(&db)), "Chicony Electronics Co., Ltd");
+    }
+
+    #[test]
+    fn describe_is_empty_when_the_vendor_is_unknown() {
+        let db = UsbIds::parse("04f2  Chicony Electronics Co., Ltd\n\tb71a  Integrated Camera\n");
+        let d = device(Some("0fd9"), Some("b71a"));
+        assert_eq!(
+            describe(&d, Some(&db)),
+            "",
+            "unknown vendor resolves nothing, product ignored without it"
+        );
+    }
+
+    #[test]
+    fn describe_is_empty_with_no_database() {
+        let d = device(Some("04f2"), Some("b71a"));
+        assert_eq!(describe(&d, None), "");
+    }
+
+    #[test]
+    fn describe_is_empty_when_ids_are_missing_or_unparsable() {
+        let db = UsbIds::parse("04f2  Chicony Electronics Co., Ltd\n\tb71a  Integrated Camera\n");
+        assert_eq!(describe(&device(None, None), Some(&db)), "");
+        assert_eq!(describe(&device(Some("zzzz"), Some("b71a")), Some(&db)), "");
     }
 }

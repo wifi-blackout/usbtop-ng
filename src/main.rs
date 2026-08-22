@@ -210,12 +210,35 @@ fn main() -> Result<()> {
             process::exit(1);
         }
         let dest = snapshot::snapshot_path()?;
+        // Mirrors the monitoring path's usbids resolution further down (CLI
+        // flag, preferences key, home copy via the same `.ok()` pattern): the
+        // printed lines get the same resolved names a live session would
+        // show. Unlike this handler's own `dest` above, a missing HOME here
+        // just means the printed lines carry no names -- it does not fail
+        // the snapshot.
+        let usbids_home_copy = preferences_path().ok().map(|p| p.with_file_name("usb.ids"));
+        let usbids = usbids::resolve_database(
+            cli.usbids.as_deref().map(Path::new),
+            preferences.usbids_path.as_deref().map(Path::new),
+            usbids_home_copy.as_deref(),
+        );
+        // This loop is the untestable part of the handler (real stdout, and
+        // `snapshot::Snapshot::capture` above already read real sysfs); the
+        // name composition it calls out to is covered on its own in
+        // `snapshot::describe`'s unit tests.
         for device in &snapshot.devices {
+            let name = snapshot::describe(device, usbids.as_ref());
+            let suffix = if name.is_empty() {
+                String::new()
+            } else {
+                format!("  {name}")
+            };
             println!(
-                "  {}  {}:{}",
+                "  {}  {}:{}{}",
                 device.port_path,
                 device.vendor_id.as_deref().unwrap_or("----"),
                 device.product_id.as_deref().unwrap_or("----"),
+                suffix,
             );
         }
         // `write_to` itself does not create directories (see its doc
@@ -240,15 +263,26 @@ fn main() -> Result<()> {
     });
 
     // Mirrors the usbids home-copy pattern just below: a missing HOME must
-    // not fail the monitoring path, it just means no snapshot to load.
-    let internal_snapshot = snapshot::snapshot_path()
+    // not fail the monitoring path, it just means no snapshot to load. Kept
+    // as its own binding (rather than folded straight into
+    // `internal_snapshot` below) so the error path can still name the path
+    // it searched when one was resolved.
+    let snapshot_path_result = snapshot::snapshot_path();
+    let internal_snapshot = snapshot_path_result
+        .as_ref()
         .ok()
-        .and_then(|p| snapshot::Snapshot::load(&p))
+        .and_then(|p| snapshot::Snapshot::load(p))
         .map(Arc::new);
     if filter.uses_internal() && internal_snapshot.is_none() {
-        eprintln!(
-            "error: an internal= filter needs a snapshot. Run usbtop-ng --snapshot-internal first, with external devices unplugged."
-        );
+        match &snapshot_path_result {
+            Ok(path) => eprintln!(
+                "error: an internal= filter needs a snapshot and none was found at {}. Run usbtop-ng --snapshot-internal first, with external devices unplugged.",
+                path.display()
+            ),
+            Err(_) => eprintln!(
+                "error: an internal= filter needs a snapshot. Run usbtop-ng --snapshot-internal first, with external devices unplugged."
+            ),
+        }
         process::exit(2);
     }
 
