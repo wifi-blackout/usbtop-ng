@@ -63,6 +63,10 @@ pub struct DeviceReport {
     pub total_rx_bytes: u64,
     pub total_tx_bytes: u64,
     pub estimated: bool,
+    /// `true`/`false` when an internal-device snapshot was loaded and this
+    /// device did/didn't match it; `null` (`None`) when no snapshot exists,
+    /// so a script can tell "external" apart from "unknown".
+    pub internal: Option<bool>,
     pub endpoints: Vec<EndpointReport>,
 }
 
@@ -143,6 +147,10 @@ pub fn build_report(
     text_active: bool,
     filter: &FilterSet,
 ) -> Report {
+    // Read, not threaded as a parameter: `manager` is already an argument,
+    // and adding an 8th argument alongside it would just duplicate state the
+    // manager already carries (see `set_internal_snapshot`).
+    let snapshot_loaded = manager.has_internal_snapshot();
     let window_secs = elapsed.as_secs_f64().max(0.001);
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -228,6 +236,7 @@ pub fn build_report(
                         total_rx_bytes: device.bandwidth_stats.total_rx_bytes,
                         total_tx_bytes: device.bandwidth_stats.total_tx_bytes,
                         estimated: text_active && device.has_iso_traffic(),
+                        internal: snapshot_loaded.then_some(device.is_internal),
                         endpoints,
                     }
                 })
@@ -307,10 +316,16 @@ pub fn render_text(report: &Report) -> String {
             };
             let rx_prefix = if device.estimated { "~rx" } else { "rx" };
             let tx_prefix = if device.estimated { "~tx" } else { "tx" };
+            let marker = if device.internal == Some(true) {
+                "i"
+            } else {
+                " "
+            };
             out.push_str(&format!(
-                "  {}:{}  {}  {:.0} Mbps  {} {:.2} MB/s  {} {:.2} MB/s  {}\n",
+                "  {}:{}  {}  {}  {:.0} Mbps  {} {:.2} MB/s  {} {:.2} MB/s  {}\n",
                 device.bus,
                 device.address,
+                marker,
                 id,
                 device.speed_mbps,
                 rx_prefix,
@@ -667,6 +682,74 @@ mod tests {
     }
 
     #[test]
+    fn internal_field_is_null_without_a_snapshot_and_true_or_false_with_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let baseline = Baseline::capture(&mgr);
+        let cb = parse_usbmon_text_line("ffff0000aaaa0001 200 C Bi:1:004:1 0 1000 <").unwrap();
+        mgr.apply_packet(&cb);
+
+        let no_snapshot = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        assert_eq!(
+            no_snapshot.buses[0].devices[0].internal, None,
+            "no snapshot loaded: internal is unknown, not false"
+        );
+        let v = serde_json::to_value(&no_snapshot).unwrap();
+        assert!(v["buses"][0]["devices"][0]["internal"].is_null());
+
+        // A snapshot IS now loaded (its contents don't matter here: the
+        // device has no sysfs_path in this fixture, so `stamp_internal`
+        // always stamps it false; only `has_internal_snapshot()` matters
+        // for whether `internal` serializes as `null` or `Some(_)`).
+        mgr.set_internal_snapshot(Some(std::sync::Arc::new(crate::snapshot::Snapshot {
+            captured_unix: 0,
+            devices: vec![],
+        })));
+        let snapshot_loaded_external = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        assert_eq!(
+            snapshot_loaded_external.buses[0].devices[0].internal,
+            Some(false)
+        );
+
+        mgr.buses
+            .get_mut(&1)
+            .unwrap()
+            .devices
+            .get_mut(&4)
+            .unwrap()
+            .is_internal = true;
+        let snapshot_loaded_internal = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        assert_eq!(
+            snapshot_loaded_internal.buses[0].devices[0].internal,
+            Some(true)
+        );
+    }
+
+    #[test]
     fn render_text_lists_buses_and_devices() {
         let temp = tempfile::tempdir().unwrap();
         let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
@@ -686,6 +769,58 @@ mod tests {
         assert!(text.contains("bus 1"), "{text}");
         assert!(text.contains("1:4"), "{text}");
         assert!(text.contains("rx"), "{text}");
+    }
+
+    #[test]
+    fn render_text_marks_internal_devices_with_an_i_cell_and_pads_external_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let baseline = Baseline::capture(&mgr);
+        let cb = parse_usbmon_text_line("ffff0000aaaa0001 200 C Bi:1:004:1 0 1000 <").unwrap();
+        mgr.apply_packet(&cb);
+        mgr.set_internal_snapshot(Some(std::sync::Arc::new(crate::snapshot::Snapshot {
+            captured_unix: 0,
+            devices: vec![],
+        })));
+
+        let external_report = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        let external_text = render_text(&external_report);
+        let external_row = external_text.lines().find(|l| l.contains("1:4")).unwrap();
+        assert!(
+            external_row.contains("1:4     ----:----"),
+            "an external row's marker cell is a space: {external_row}"
+        );
+
+        mgr.buses
+            .get_mut(&1)
+            .unwrap()
+            .devices
+            .get_mut(&4)
+            .unwrap()
+            .is_internal = true;
+        let internal_report = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        let internal_text = render_text(&internal_report);
+        let internal_row = internal_text.lines().find(|l| l.contains("1:4")).unwrap();
+        assert!(
+            internal_row.contains("1:4  i  ----:----"),
+            "an internal row carries the i marker: {internal_row}"
+        );
     }
 
     #[test]
