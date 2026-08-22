@@ -57,6 +57,11 @@ impl Snapshot {
         })
     }
 
+    /// Does not create `path`'s parent directory -- it errors like a plain
+    /// `fs::write` would if that directory does not exist yet. The caller
+    /// owns directory creation (e.g. the CLI handler calls
+    /// `ensure_private_config_dir` first), the same division `--update-usbids
+    /// pull` uses for its own destination.
     pub fn write_to(&self, path: &Path) -> Result<()> {
         let text = toml::to_string(self).context("could not serialize the snapshot")?;
         std::fs::write(path, text).with_context(|| format!("could not write {}", path.display()))
@@ -204,6 +209,43 @@ mod tests {
         assert_eq!(loaded.devices.len(), 1);
         assert!(loaded.is_internal("1-4", Some(0x04f2), Some(0xb71a)));
         assert_eq!(loaded.captured_unix, snap.captured_unix);
+    }
+
+    #[test]
+    fn write_and_load_round_trip_with_missing_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("sysfs");
+        sysfs_device(&base, "3-3.1", None, None);
+        let snap = Snapshot::capture(Some(&base)).unwrap();
+        let file = temp.path().join("internal-devices.toml");
+        snap.write_to(&file).unwrap();
+
+        let loaded = Snapshot::load(&file).expect("file exists and parses");
+        assert_eq!(loaded.devices.len(), 1);
+        assert_eq!(loaded.devices[0].vendor_id, None);
+        assert_eq!(loaded.devices[0].product_id, None);
+        assert!(
+            loaded.is_internal("3-3.1", None, None),
+            "a device with no IDs at capture time must still match after a real write_to/load round trip"
+        );
+    }
+
+    #[test]
+    fn write_to_errors_when_the_parent_directory_does_not_exist() {
+        // `write_to` does not create directories -- callers own that (see
+        // its doc comment). This pins today's plain `fs::write` failure
+        // mode so a caller-side fix (like the CLI handler's
+        // `ensure_private_config_dir` call) never quietly stops mattering.
+        let temp = tempfile::tempdir().unwrap();
+        let snap = Snapshot {
+            captured_unix: 0,
+            devices: vec![],
+        };
+        let dest = temp
+            .path()
+            .join("does-not-exist")
+            .join("internal-devices.toml");
+        assert!(snap.write_to(&dest).is_err());
     }
 
     #[test]
