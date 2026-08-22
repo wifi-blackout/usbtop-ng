@@ -272,7 +272,7 @@ fn run_app(
                 // `ok()` reads a mid-batch disconnect as "nothing more
                 // queued"; the next pass's `recv_timeout` reports it properly.
                 let batch = iter::once(event).chain(iter::from_fn(|| ui_events.try_recv().ok()));
-                let fold = fold_events(app, batch);
+                let fold = fold_events(app, manager, batch);
                 if let Some(reason) = fold.exit {
                     return Ok(reason);
                 }
@@ -352,23 +352,44 @@ struct Fold {
 
 /// Apply a batch of events to `app` in arrival order, stopping at the first
 /// one that ends the session.
-fn fold_events(app: &mut UsbTopApp, batch: impl Iterator<Item = UiEvent>) -> Fold {
+///
+/// `manager` is here only for the snapshot handoff below -- `apply_key`
+/// itself never touches it, `S`'s capture and confirmation live entirely in
+/// `app`. See [`UsbTopApp::pending_internal_snapshot`].
+fn fold_events(
+    app: &mut UsbTopApp,
+    manager: &mut DeviceManager,
+    batch: impl Iterator<Item = UiEvent>,
+) -> Fold {
     let mut fold = Fold::default();
 
     for event in batch {
         match event {
-            UiEvent::Input(Event::Key(key)) => match ui::apply_key(app, key) {
-                KeyOutcome::Quit => {
-                    fold.exit = Some(ExitReason::UserQuit);
-                    return fold;
+            UiEvent::Input(Event::Key(key)) => {
+                let outcome = ui::apply_key(app, key);
+                // A snapshot just written by `y` inside the confirmation
+                // prompt (see `apply_key`'s `confirm_snapshot`) is handed to
+                // the manager right here, so the next tick's `sync_from`
+                // shows the new marks. Checked after every key rather than
+                // only once per batch: nothing but this flag distinguishes
+                // "a snapshot arrived this pass" from "nothing changed", and
+                // taking it immediately is what keeps that check trivial.
+                if let Some(snapshot) = app.pending_internal_snapshot.take() {
+                    manager.set_internal_snapshot(Some(snapshot));
                 }
-                KeyOutcome::ClearAndRedraw => {
-                    fold.clear = true;
-                    fold.dirty = true;
+                match outcome {
+                    KeyOutcome::Quit => {
+                        fold.exit = Some(ExitReason::UserQuit);
+                        return fold;
+                    }
+                    KeyOutcome::ClearAndRedraw => {
+                        fold.clear = true;
+                        fold.dirty = true;
+                    }
+                    KeyOutcome::Redraw => fold.dirty = true,
+                    KeyOutcome::None => {}
                 }
-                KeyOutcome::Redraw => fold.dirty = true,
-                KeyOutcome::None => {}
-            },
+            }
             // A resize invalidates the frame and nothing else: the next draw
             // re-reads the terminal's size on its own, so only the last one in
             // a drag matters and all of them fold into a single repaint. The
@@ -404,6 +425,14 @@ mod tests {
         UsbTopApp::new(Duration::from_millis(100))
     }
 
+    /// A bare manager for tests that don't care about its contents -- only
+    /// that `fold_events` has one to hand a snapshot to (see
+    /// `a_pending_snapshot_is_handed_to_the_manager_after_its_key` below for
+    /// the test that does care).
+    fn test_manager() -> DeviceManager {
+        DeviceManager::new()
+    }
+
     fn key_event(code: KeyCode) -> UiEvent {
         UiEvent::Input(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
     }
@@ -418,14 +447,14 @@ mod tests {
 
     #[test]
     fn an_empty_batch_owes_nothing() {
-        let fold = fold_events(&mut test_app(), iter::empty());
+        let fold = fold_events(&mut test_app(), &mut test_manager(), iter::empty());
         assert_eq!(fold, Fold::default());
     }
 
     #[test]
     fn a_resize_burst_folds_into_one_repaint() {
         let burst = (1..=5).map(|n| UiEvent::Input(Event::Resize(80 + n, 24)));
-        let fold = fold_events(&mut test_app(), burst);
+        let fold = fold_events(&mut test_app(), &mut test_manager(), burst);
         assert_eq!(
             fold,
             Fold {
@@ -441,7 +470,11 @@ mod tests {
 
     #[test]
     fn quit_key_stops_the_loop() {
-        let fold = fold_events(&mut test_app(), iter::once(key_event(KeyCode::Char('q'))));
+        let fold = fold_events(
+            &mut test_app(),
+            &mut test_manager(),
+            iter::once(key_event(KeyCode::Char('q'))),
+        );
         assert_eq!(fold.exit, Some(ExitReason::UserQuit));
     }
 
@@ -449,7 +482,7 @@ mod tests {
     fn events_after_a_quit_are_not_applied() {
         let mut app = test_app();
         let batch = [key_event(KeyCode::Char('q')), key_event(KeyCode::Char('h'))];
-        let fold = fold_events(&mut app, batch.into_iter());
+        let fold = fold_events(&mut app, &mut test_manager(), batch.into_iter());
         assert_eq!(fold.exit, Some(ExitReason::UserQuit));
         assert!(!app.show_help, "the loop is leaving; state stops mattering");
     }
@@ -460,7 +493,7 @@ mod tests {
             KeyCode::Char('l'),
             KeyModifiers::CONTROL,
         )));
-        let fold = fold_events(&mut test_app(), iter::once(ctrl_l));
+        let fold = fold_events(&mut test_app(), &mut test_manager(), iter::once(ctrl_l));
         assert_eq!(
             fold,
             Fold {
@@ -474,13 +507,21 @@ mod tests {
 
     #[test]
     fn terminal_death_stops_the_loop() {
-        let fold = fold_events(&mut test_app(), iter::once(UiEvent::TerminalDead));
+        let fold = fold_events(
+            &mut test_app(),
+            &mut test_manager(),
+            iter::once(UiEvent::TerminalDead),
+        );
         assert_eq!(fold.exit, Some(ExitReason::TerminalDead));
     }
 
     #[test]
     fn a_signal_stops_the_loop_and_carries_its_number() {
-        let fold = fold_events(&mut test_app(), iter::once(UiEvent::from(15)));
+        let fold = fold_events(
+            &mut test_app(),
+            &mut test_manager(),
+            iter::once(UiEvent::from(15)),
+        );
         assert_eq!(fold.exit, Some(ExitReason::Signal(15)));
     }
 
@@ -490,7 +531,44 @@ mod tests {
             key_event(KeyCode::Char('x')),
             UiEvent::Input(Event::FocusGained),
         ];
-        let fold = fold_events(&mut test_app(), batch.into_iter());
+        let fold = fold_events(&mut test_app(), &mut test_manager(), batch.into_iter());
         assert_eq!(fold, Fold::default());
+    }
+
+    /// `apply_key`'s own tests (see `ui::tests::confirm_then_y_writes_...`)
+    /// cover *how* `pending_internal_snapshot` gets set; this one covers the
+    /// other half of the seam -- that `fold_events` notices it after a key
+    /// and hands it to the manager, which is the step that makes the next
+    /// tick's `sync_from` show the new marks.
+    #[test]
+    fn a_pending_snapshot_is_handed_to_the_manager_after_its_key() {
+        use std::sync::Arc;
+
+        let mut app = test_app();
+        let mut manager = test_manager();
+        assert!(!manager.has_internal_snapshot());
+
+        // Set directly rather than via `apply_key`'s 'y' path: that path is
+        // `ui`'s own to test, and reading real `/sys` here would break the
+        // hermetic rule this whole feature is built around.
+        app.pending_internal_snapshot = Some(Arc::new(crate::snapshot::Snapshot {
+            captured_unix: 0,
+            devices: vec![],
+        }));
+
+        // Any bound key exercises the handoff: it fires after every key
+        // event, not only after 'S'/'y'.
+        let fold = fold_events(
+            &mut app,
+            &mut manager,
+            iter::once(key_event(KeyCode::Char('h'))),
+        );
+
+        assert!(fold.dirty, "'h' still toggles help and asks for a redraw");
+        assert!(
+            app.pending_internal_snapshot.is_none(),
+            "taken, not just read"
+        );
+        assert!(manager.has_internal_snapshot(), "handed to the manager");
     }
 }

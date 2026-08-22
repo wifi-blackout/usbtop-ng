@@ -15,15 +15,18 @@ anything, so both are safe inside a script or a cron job.
    ```
    ts=1787199783.511 window=5.00s source=binary dropped=0
    bus 1 (480 Mbps) rx 0.00 MB/s tx 0.00 MB/s
-     1:1  1d6b:0002  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  Linux 7.0.0-29-generic xhci-hcd xHCI Host Controller
-     1:3  05e3:0610  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  GenesysLogic USB2.1 Hub
-     1:4  04f2:b71a  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  SunplusIT Inc HD Webcam
+     1:1     1d6b:0002  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  Linux 7.0.0-29-generic xhci-hcd xHCI Host Controller
+     1:3     05e3:0610  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  GenesysLogic USB2.1 Hub
+     1:4  i  04f2:b71a  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  SunplusIT Inc HD Webcam
    ```
    The first line carries the window's timestamp, length, packet source, and
    drop count. One bus header follows per bus, then one indented row per
-   device: `bus:address`, `vendor_id:product_id`, link speed, rx and tx rate,
-   and the vendor/product string. This capture ran on an idle bus, hence the
-   all-zero rates; a device moving data reports its rate here instead.
+   device: `bus:address`, a 1-wide origin cell (`i` when the device matches
+   an internal-device snapshot, blank otherwise — see
+   [The `internal` field](#the-internal-field)), `vendor_id:product_id`, link
+   speed, rx and tx rate, and the vendor/product string. This capture ran on
+   an idle bus, hence the all-zero rates; a device moving data reports its
+   rate here instead.
 
 ## `--batch`: one report per window, repeated
 
@@ -100,6 +103,7 @@ Report, the top-level document:
 | `total_rx_bytes` | u64 | cumulative bytes received this session |
 | `total_tx_bytes` | u64 | cumulative bytes transmitted this session |
 | `estimated` | bool | see [The `estimated` field](#the-estimated-field), below |
+| `internal` | bool? | `true` when the device matches the internal-device snapshot, `false` when it doesn't, `null` when no snapshot exists |
 | `endpoints` | array | one entry per endpoint seen, ordered by (number, direction) |
 
 `buses[].devices[].endpoints[]`, one entry per endpoint the device has carried traffic on:
@@ -154,6 +158,7 @@ readability. `--once --json` prints each report as a single compact line:
           "total_rx_bytes": 20480,
           "total_tx_bytes": 0,
           "estimated": false,
+          "internal": true,
           "endpoints": [
             {
               "endpoint": 1,
@@ -212,6 +217,18 @@ interface for exactly this reason and only falls back to text when the
 binary nodes cannot be opened; `estimated` says so in the report rather than
 publishing an inflated rate silently. Non-isochronous devices are never
 marked `estimated`, on either interface.
+
+## The `internal` field
+
+`internal` reflects the internal-device snapshot recorded by
+`--snapshot-internal`: `true` when a device's sysfs port and IDs match a
+snapshot entry, `false` when a snapshot exists but the device doesn't match
+it, and `null` when no snapshot file exists at all — so a script can tell
+"known external" apart from "origin unknown". The text report's row carries
+the same information as a 1-wide cell between the address and the
+`vendor_id:product_id` columns: `i` for internal, blank otherwise (see the
+example row above). `--filter internal=yes` (or `no`) narrows on this field;
+see the README's Filtering section.
 
 ## Filters apply the same way
 

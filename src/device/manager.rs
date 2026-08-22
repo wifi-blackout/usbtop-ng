@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::device::UsbDevice;
 use crate::filter::FilterSet;
+use crate::snapshot::Snapshot;
 use crate::usbids::UsbIds;
 use crate::usbmon::parser::{UrbType, UsbPacket, UsbSpeed};
 
@@ -92,6 +93,7 @@ pub struct DeviceManager {
     sysfs_base: Option<PathBuf>,
     filter: FilterSet,
     usbids: Option<Arc<UsbIds>>,
+    internal_snapshot: Option<Arc<Snapshot>>,
 }
 
 impl DeviceManager {
@@ -101,6 +103,7 @@ impl DeviceManager {
             sysfs_base: None,
             filter: FilterSet::default(),
             usbids: None,
+            internal_snapshot: None,
         }
     }
 
@@ -113,6 +116,7 @@ impl DeviceManager {
             sysfs_base: Some(base),
             filter: FilterSet::default(),
             usbids: None,
+            internal_snapshot: None,
         }
     }
 
@@ -129,6 +133,30 @@ impl DeviceManager {
     /// default) leaves device/product names exactly as sysfs reported them.
     pub fn set_usbids(&mut self, db: Option<Arc<UsbIds>>) {
         self.usbids = db;
+    }
+
+    /// Install (or clear) the internal-device snapshot every device gets
+    /// stamped against (see `stamp_internal`). Unlike `set_usbids`, this
+    /// also immediately restamps every device already known, so a snapshot
+    /// taken mid-session takes effect on the very next tick instead of
+    /// waiting for each device to be re-populated on its own schedule. A
+    /// `None` here would clear every mark -- today's callers always pass
+    /// `Some`.
+    pub fn set_internal_snapshot(&mut self, snapshot: Option<Arc<Snapshot>>) {
+        self.internal_snapshot = snapshot;
+        for bus in self.buses.values_mut() {
+            for device in bus.devices.values_mut() {
+                stamp_internal(device, &self.internal_snapshot);
+            }
+        }
+    }
+
+    /// Whether an internal-device snapshot is currently installed. Lets a
+    /// reader (e.g. `headless::build_report`) tell "no snapshot, so origin
+    /// is unknown" apart from "a snapshot says this device is external"
+    /// without needing its own copy of the flag.
+    pub fn has_internal_snapshot(&self) -> bool {
+        self.internal_snapshot.is_some()
     }
 
     /// Get or create a USB bus
@@ -156,6 +184,7 @@ impl DeviceManager {
         // same pattern as `sysfs_base` just above.
         let filter = self.filter.clone();
         let usbids = self.usbids.clone();
+        let internal_snapshot = self.internal_snapshot.clone();
         let bus = self.get_or_create_bus(packet.bus_id);
         let device = bus.devices.entry(packet.device_id).or_insert_with(|| {
             let mut d = UsbDevice::new(packet.bus_id, packet.device_id);
@@ -163,6 +192,7 @@ impl DeviceManager {
             if let Some(db) = &usbids {
                 d.apply_usbids(db);
             }
+            stamp_internal(&mut d, &internal_snapshot);
             d
         });
         device.update_activity();
@@ -193,6 +223,7 @@ impl DeviceManager {
     pub fn refresh(&mut self) -> Vec<(u8, u8)> {
         let sysfs_base = self.sysfs_base.clone();
         let usbids = self.usbids.clone();
+        let internal_snapshot = self.internal_snapshot.clone();
         let mut removed = Vec::new();
         for bus in self.buses.values_mut() {
             for device in bus.devices.values_mut() {
@@ -208,6 +239,7 @@ impl DeviceManager {
                     if let Some(db) = &usbids {
                         device.apply_usbids(db);
                     }
+                    stamp_internal(device, &internal_snapshot);
                 }
             }
             let stale: Vec<u8> = bus
@@ -239,6 +271,7 @@ impl DeviceManager {
             .clone()
             .unwrap_or_else(|| PathBuf::from("/sys/bus/usb/devices"));
         let usbids = self.usbids.clone();
+        let internal_snapshot = self.internal_snapshot.clone();
         let Ok(entries) = std::fs::read_dir(&base) else {
             return;
         };
@@ -266,6 +299,7 @@ impl DeviceManager {
                     if let Some(db) = &usbids {
                         device.apply_usbids(db);
                     }
+                    stamp_internal(&mut device, &internal_snapshot);
                     device
                 });
         }
@@ -274,6 +308,20 @@ impl DeviceManager {
 
 fn read_sysfs_u8(path: &Path) -> Option<u8> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Stamp one device's `is_internal` against `snapshot`: matches when the
+/// device's sysfs directory name and IDs are in the snapshot (see
+/// `Snapshot::is_internal`). No snapshot, or no resolved `sysfs_path`,
+/// always stamps `false`.
+fn stamp_internal(device: &mut UsbDevice, snapshot: &Option<Arc<Snapshot>>) {
+    device.is_internal = match (snapshot, &device.sysfs_path) {
+        (Some(snap), Some(path)) => path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| snap.is_internal(name, device.vendor_id, device.product_id)),
+        _ => false,
+    };
 }
 
 #[cfg(test)]
@@ -610,5 +658,108 @@ mod tests {
         let dev = &mgr.buses[&1].devices[&4];
         assert_eq!(dev.vendor.as_deref(), Some("Fujitsu Component Limited"));
         assert_eq!(dev.product.as_deref(), Some("3-button Mouse"));
+    }
+
+    fn matching_snapshot() -> crate::snapshot::Snapshot {
+        crate::snapshot::Snapshot {
+            captured_unix: 0,
+            devices: vec![crate::snapshot::SnapshotDevice {
+                port_path: "1-4".into(),
+                vendor_id: Some("04f2".into()),
+                product_id: Some("b71a".into()),
+            }],
+        }
+    }
+
+    #[test]
+    fn enumeration_marks_a_device_matching_the_snapshot_internal() {
+        let temp = tempfile::tempdir().unwrap();
+        write_sysfs_device(temp.path(), "1-4", 1, 4, "480");
+        let dir = temp.path().join("1-4");
+        std::fs::write(dir.join("idVendor"), "04f2\n").unwrap();
+        std::fs::write(dir.join("idProduct"), "b71a\n").unwrap();
+
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.set_internal_snapshot(Some(Arc::new(matching_snapshot())));
+        mgr.enumerate_present_devices();
+
+        assert!(mgr.buses[&1].devices[&4].is_internal);
+    }
+
+    #[test]
+    fn apply_packet_marks_a_newly_seen_device_internal_when_it_matches_the_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("1-4");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("busnum"), "1\n").unwrap();
+        std::fs::write(dir.join("devnum"), "4\n").unwrap();
+        std::fs::write(dir.join("idVendor"), "04f2\n").unwrap();
+        std::fs::write(dir.join("idProduct"), "b71a\n").unwrap();
+
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.set_internal_snapshot(Some(Arc::new(matching_snapshot())));
+        let callback = parse_usbmon_text_line("ffff0000aaaa0001 100 C Bi:1:004:1 0 64 <").unwrap();
+        mgr.apply_packet(&callback);
+
+        assert!(mgr.buses[&1].devices[&4].is_internal);
+    }
+
+    #[test]
+    fn a_different_device_on_a_snapshotted_port_stays_external() {
+        let temp = tempfile::tempdir().unwrap();
+        write_sysfs_device(temp.path(), "1-4", 1, 4, "480");
+        let dir = temp.path().join("1-4");
+        std::fs::write(dir.join("idVendor"), "9999\n").unwrap();
+        std::fs::write(dir.join("idProduct"), "0001\n").unwrap();
+
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.set_internal_snapshot(Some(Arc::new(matching_snapshot())));
+        mgr.enumerate_present_devices();
+
+        assert!(
+            !mgr.buses[&1].devices[&4].is_internal,
+            "same port, different device: external"
+        );
+    }
+
+    #[test]
+    fn a_device_with_no_sysfs_path_stays_external() {
+        let (_t, mut mgr) = manager_with_empty_sysfs();
+        mgr.set_internal_snapshot(Some(Arc::new(matching_snapshot())));
+        let callback = parse_usbmon_text_line("ffff0000aaaa0001 100 C Bi:1:003:1 0 64 <").unwrap();
+        mgr.apply_packet(&callback);
+
+        assert!(
+            !mgr.buses[&1].devices[&3].is_internal,
+            "no sysfs_path resolved, so nothing to match against"
+        );
+    }
+
+    #[test]
+    fn set_internal_snapshot_restamps_existing_devices_in_both_directions() {
+        let temp = tempfile::tempdir().unwrap();
+        write_sysfs_device(temp.path(), "1-4", 1, 4, "480");
+        let dir = temp.path().join("1-4");
+        std::fs::write(dir.join("idVendor"), "04f2\n").unwrap();
+        std::fs::write(dir.join("idProduct"), "b71a\n").unwrap();
+
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.enumerate_present_devices();
+        assert!(
+            !mgr.buses[&1].devices[&4].is_internal,
+            "no snapshot loaded yet"
+        );
+
+        mgr.set_internal_snapshot(Some(Arc::new(matching_snapshot())));
+        assert!(
+            mgr.buses[&1].devices[&4].is_internal,
+            "a snapshot arriving mid-session must restamp existing devices: false -> true"
+        );
+
+        mgr.set_internal_snapshot(None);
+        assert!(
+            !mgr.buses[&1].devices[&4].is_internal,
+            "clearing the snapshot must restamp existing devices back: true -> false"
+        );
     }
 }

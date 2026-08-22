@@ -97,6 +97,7 @@ Run `sudo usbtop` when your account cannot read
 | `↑` / `↓` | Select a device. The device table scrolls to keep it visible. |
 | `h` | Open or close the help overlay. |
 | `i` | Show or hide idle devices. Saves the choice to `~/.usbtop-ng/preferences.toml`. |
+| `S` | Snapshot every attached device as internal, after a confirmation. See [Device origin](#device-origin). |
 | `Ctrl-L` | Wipe the screen and repaint it from scratch. |
 | `q` or `Esc` | Quit. |
 | `Ctrl-C` | Quit. |
@@ -157,6 +158,37 @@ key press and quits through the same teardown as `q`.
 - `i` hides devices with no current traffic and saves the choice to
   `~/.usbtop-ng/preferences.toml`.
 
+### Device origin
+
+usbtop-ng can remember which devices are built into the machine, then mark
+them apart from external gear everywhere a device shows up:
+
+1. Unplug every external hub and device, leaving only what's built in.
+2. Trigger a snapshot: run `usbtop-ng --snapshot-internal` from a shell, or
+   press `S` inside the TUI and confirm with `y`. Either one records every
+   currently attached device, so anything still plugged in gets captured as
+   internal — the TUI's confirmation overlay says so before you commit.
+3. Plug your external gear back in.
+
+From then on, internal devices render their Port cell in blue in the TUI.
+Text reports (`--once`/`--batch`) carry an `i` marker in a fixed-width cell
+next to the address; JSON reports gain an `"internal": true|false|null`
+field per device (`null` means no snapshot exists yet); and `--filter
+internal=yes` (or `no`) narrows either surface to just one origin. See
+[docs/SCRIPTING.md](docs/SCRIPTING.md) for the JSON field and the
+Filtering section below for the filter key.
+
+The snapshot lives at `~/.usbtop-ng/internal-devices.toml`, separate from
+the preferences file — `--config` never moves it. A new snapshot overwrites
+the old one; deleting the file clears it, and every device goes back to
+looking external.
+
+That path resolves against the HOME of whichever user runs the command. If
+you monitor with `sudo usbtop`, snapshot under sudo too — press `S` inside
+`sudo usbtop`, or run `sudo usbtop-ng --snapshot-internal` from a shell. A
+snapshot taken without sudo is invisible to a sudo session, and vice versa,
+unless HOME is preserved with `sudo -E`.
+
 ### Device names
 
 - usbtop-ng names devices the way `lsusb` does, by resolving VID:PID against
@@ -200,7 +232,7 @@ key press and quits through the same teardown as `q`.
 - Keys within one `--filter` term AND together: every key in the term must
   match. Separate `--filter` flags OR together: a device or packet counts if
   any term matches. No `--filter` flag shows and counts everything.
-- Keys: `bus`, `dev`, `vid`, `pid`, `id`, `name`, `ep`, `dir`, `type`.
+- Keys: `bus`, `dev`, `vid`, `pid`, `id`, `name`, `ep`, `dir`, `type`, `internal`.
 - `bus` and `dev` match the USB bus number and device number.
 - `vid` and `pid` match the 4 hex digit vendor and product ID, e.g.
   `vid=04f2`. `id` is shorthand for both together, e.g. `id=04f2:b71a`.
@@ -210,9 +242,12 @@ key press and quits through the same teardown as `q`.
 - `ep` matches the endpoint number, 0 through 15. `dir` matches transfer
   direction, `in` or `out`. `type` matches transfer type: `control` (or
   `ctrl`), `iso`, `bulk`, `interrupt` (or `int`).
-- `bus`, `dev`, `vid`, `pid`, and `name` decide which devices show at all.
-  `ep`, `dir`, and `type` narrow which packets on a visible device count,
-  without hiding the device itself.
+- `internal` matches `yes`/`true` or `no`/`false` against a device's
+  snapshot origin; it requires an internal-device snapshot (`--snapshot-internal`)
+  to already exist, or usbtop-ng exits with an error naming that flag.
+- `bus`, `dev`, `vid`, `pid`, `name`, and `internal` decide which devices show
+  at all. `ep`, `dir`, and `type` narrow which packets on a visible device
+  count, without hiding the device itself.
 
 ### Scriptable output
 
@@ -337,7 +372,7 @@ key press and quits through the same teardown as `q`.
 
 ### Tests
 
-- `cargo test --all-targets` runs 286 hermetic tests against fixture files,
+- `cargo test --all-targets` runs 324 hermetic tests against fixture files,
   FIFOs, and temporary paths. They need no `/dev` and no debugfs access.
 - The `integration` cargo feature adds 1 test that reads the real usbmon
   interfaces. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
@@ -390,6 +425,7 @@ Options:
       --usbids <PATH>      usb.ids database file for device names (overrides every other source)
       --update-usbids [<MODE>]
                            Check for a newer usb.ids ('check', the default) or fetch it ('pull')
+      --snapshot-internal  Record every currently attached device as internal, then exit
   -h, --help               Print help
   -V, --version            Print version
 ```

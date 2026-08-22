@@ -19,6 +19,7 @@ mod config;
 mod device;
 mod filter;
 mod headless;
+mod snapshot;
 mod stats;
 mod tui;
 mod ui;
@@ -100,6 +101,10 @@ struct Cli {
     /// Check for a newer usb.ids ('check', the default) or fetch it ('pull')
     #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "check")]
     update_usbids: Option<UpdateUsbidsMode>,
+
+    /// Record every currently attached device as internal, then exit
+    #[arg(long)]
+    snapshot_internal: bool,
 }
 
 /// `--update-usbids`'s optional mode. Bare `--update-usbids` (no value)
@@ -194,10 +199,92 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `--snapshot-internal` also short-circuits: it needs the home
+    // directory (the snapshot file always lives beside the preferences
+    // file, resolved the same way `--update-usbids`'s home copy is), but
+    // it never touches usbmon or the network -- it only reads sysfs.
+    if cli.snapshot_internal {
+        let snapshot = snapshot::Snapshot::capture(None)?;
+        if snapshot.devices.is_empty() {
+            eprintln!("error: no USB devices found to snapshot");
+            process::exit(1);
+        }
+        let dest = snapshot::snapshot_path()?;
+        // Mirrors the monitoring path's usbids resolution further down (CLI
+        // flag, preferences key, home copy via the same `.ok()` pattern): the
+        // printed lines get the same resolved names a live session would
+        // show. Unlike this handler's own `dest` above, a missing HOME here
+        // just means the printed lines carry no names -- it does not fail
+        // the snapshot.
+        let usbids_home_copy = preferences_path().ok().map(|p| p.with_file_name("usb.ids"));
+        let usbids = usbids::resolve_database(
+            cli.usbids.as_deref().map(Path::new),
+            preferences.usbids_path.as_deref().map(Path::new),
+            usbids_home_copy.as_deref(),
+        );
+        // This loop is the untestable part of the handler (real stdout, and
+        // `snapshot::Snapshot::capture` above already read real sysfs); the
+        // name composition it calls out to is covered on its own in
+        // `snapshot::describe`'s unit tests.
+        for device in &snapshot.devices {
+            let name = snapshot::describe(device, usbids.as_ref());
+            let suffix = if name.is_empty() {
+                String::new()
+            } else {
+                format!("  {name}")
+            };
+            println!(
+                "  {}  {}:{}{}",
+                device.port_path,
+                device.vendor_id.as_deref().unwrap_or("----"),
+                device.product_id.as_deref().unwrap_or("----"),
+                suffix,
+            );
+        }
+        // `write_to` itself does not create directories (see its doc
+        // comment); `~/.usbtop-ng` may not exist yet on a first run that
+        // goes straight for `--snapshot-internal`, the same gap
+        // `--update-usbids pull` closes for its own destination.
+        if let Some(parent) = dest.parent() {
+            ensure_private_config_dir(parent)?;
+        }
+        snapshot.write_to(&dest)?;
+        println!(
+            "{} devices recorded as internal in {}",
+            snapshot.devices.len(),
+            dest.display()
+        );
+        return Ok(());
+    }
+
     let filter = filter::FilterSet::parse(&cli.filter).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         process::exit(2);
     });
+
+    // Mirrors the usbids home-copy pattern just below: a missing HOME must
+    // not fail the monitoring path, it just means no snapshot to load. Kept
+    // as its own binding (rather than folded straight into
+    // `internal_snapshot` below) so the error path can still name the path
+    // it searched when one was resolved.
+    let snapshot_path_result = snapshot::snapshot_path();
+    let internal_snapshot = snapshot_path_result
+        .as_ref()
+        .ok()
+        .and_then(|p| snapshot::Snapshot::load(p))
+        .map(Arc::new);
+    if filter.uses_internal() && internal_snapshot.is_none() {
+        match &snapshot_path_result {
+            Ok(path) => eprintln!(
+                "error: an internal= filter needs a snapshot and none was found at {}. Run usbtop-ng --snapshot-internal first, with external devices unplugged.",
+                path.display()
+            ),
+            Err(_) => eprintln!(
+                "error: an internal= filter needs a snapshot. Run usbtop-ng --snapshot-internal first, with external devices unplugged."
+            ),
+        }
+        process::exit(2);
+    }
 
     // `--once`/`--batch` select a headless report instead of the TUI; `--json`
     // and `--window` only make sense alongside one of them.
@@ -350,6 +437,7 @@ fn main() -> Result<()> {
         let mut manager = device::manager::DeviceManager::new();
         manager.set_filter(filter.clone());
         manager.set_usbids(usbids.clone());
+        manager.set_internal_snapshot(internal_snapshot.clone());
         let result = headless::run(
             manager,
             packets,
@@ -380,9 +468,10 @@ fn main() -> Result<()> {
     let mut manager = device::manager::DeviceManager::new();
     manager.set_filter(filter.clone());
     manager.set_usbids(usbids.clone());
+    manager.set_internal_snapshot(internal_snapshot.clone());
     // The readers discard packets rather than block when the channel fills, so
     // the UI needs the count to say so in its header.
-    let app = UsbTopApp::new(Duration::from_millis(effective_refresh_ms(cli.refresh)))
+    let mut app = UsbTopApp::new(Duration::from_millis(effective_refresh_ms(cli.refresh)))
         .with_dropped_counter(Arc::clone(&monitor.dropped))
         .with_idle_setting(
             preferences.hide_idle_devices,
@@ -391,6 +480,13 @@ fn main() -> Result<()> {
         )
         .with_filter(filter)
         .with_text_source_flag(Arc::clone(&monitor.text_active));
+    // Mirrors the usbids/internal-snapshot home-copy pattern above: a
+    // missing HOME must not fail the TUI, it just means `S`'s `y` has
+    // nowhere to write and lands in `Done` saying so (see
+    // `ui::confirm_snapshot`).
+    if let Ok(dest) = snapshot::snapshot_path() {
+        app = app.with_snapshot_dest(dest);
+    }
     let session = run_ui(app, manager, packets);
 
     // Close the usbmon files before anything tries to unload the module: an
@@ -606,6 +702,16 @@ mod tests {
 
         let absent = Cli::try_parse_from(["usbtop-ng"]).unwrap();
         assert!(absent.update_usbids.is_none());
+    }
+
+    #[test]
+    fn cli_parses_snapshot_internal() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["usbtop-ng", "--snapshot-internal"]).unwrap();
+        assert!(cli.snapshot_internal);
+
+        let absent = Cli::try_parse_from(["usbtop-ng"]).unwrap();
+        assert!(!absent.snapshot_internal);
     }
 
     #[test]

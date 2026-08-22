@@ -20,6 +20,7 @@ use std::{
 use crate::device::manager::{DeviceManager, UsbBus};
 use crate::device::UsbDevice;
 use crate::filter::FilterSet;
+use crate::snapshot::Snapshot;
 use crate::usbmon::parser::{UsbPacket, UsbSpeed};
 
 pub mod colors;
@@ -134,6 +135,37 @@ pub struct UsbTopApp {
     /// legend line explaining it. `None` in tests and whenever no monitor is
     /// attached.
     text_source_active: Option<Arc<AtomicBool>>,
+    /// Open only while the `S` confirmation/result overlay is up. See
+    /// `apply_key`'s prompt-handling branch (which owns every transition)
+    /// and `draw_snapshot_prompt`.
+    pub snapshot_prompt: Option<SnapshotPrompt>,
+    /// A freshly written snapshot waiting for the event loop to hand to the
+    /// manager. `apply_key` sets this from `confirm_snapshot` and never
+    /// clears it itself; `tui::run_app` takes it after every `apply_key`
+    /// call and restamps every device via
+    /// `DeviceManager::set_internal_snapshot`, so the next tick's
+    /// `sync_from` shows the new marks.
+    pub pending_internal_snapshot: Option<Arc<Snapshot>>,
+    /// Where `y` inside the confirmation prompt writes the capture (see
+    /// `confirm_snapshot`). `None` in tests and whenever
+    /// `snapshot::snapshot_path()` could not resolve HOME (see
+    /// `with_snapshot_dest`); `y` then lands straight in `Done` with an
+    /// explanatory message instead of a write.
+    snapshot_dest: Option<std::path::PathBuf>,
+}
+
+/// What the `S` key has open: waiting on `y`/cancel with the captured
+/// snapshot in hand, or showing the result of the last attempt until the
+/// next keypress closes it. See `apply_key`'s prompt-handling branch,
+/// `open_snapshot_prompt`, `confirm_snapshot`, and `draw_snapshot_prompt`.
+#[derive(Debug)]
+pub(crate) enum SnapshotPrompt {
+    /// A snapshot has been captured but not yet written. `y`/`Y` writes it
+    /// (see `confirm_snapshot`); any other key cancels without writing.
+    Confirm(Snapshot),
+    /// The outcome of the last attempt -- a capture error, a write error, or
+    /// a success count -- shown until the next key closes it.
+    Done(String),
 }
 
 impl UsbTopApp {
@@ -154,6 +186,9 @@ impl UsbTopApp {
             idle_persist: None,
             filter: FilterSet::default(),
             text_source_active: None,
+            snapshot_prompt: None,
+            pending_internal_snapshot: None,
+            snapshot_dest: None,
         }
     }
 
@@ -190,6 +225,16 @@ impl UsbTopApp {
     /// [`Self::with_dropped_counter`].
     pub fn with_text_source_flag(mut self, flag: Arc<AtomicBool>) -> Self {
         self.text_source_active = Some(flag);
+        self
+    }
+
+    /// Attach where `y` inside the snapshot confirmation prompt writes the
+    /// capture (see [`Self::snapshot_dest`]). Preserves the builder style of
+    /// [`Self::with_dropped_counter`]. The caller skips this call entirely
+    /// when the destination could not be resolved (see `main.rs`), leaving
+    /// `y` to land in `Done` with an explanatory message instead of a write.
+    pub fn with_snapshot_dest(mut self, dest: std::path::PathBuf) -> Self {
+        self.snapshot_dest = Some(dest);
         self
     }
 
@@ -431,6 +476,26 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
         return KeyOutcome::None;
     }
 
+    // The snapshot prompt takes every key while it's open, ahead of the
+    // ordinary bindings below -- e.g. 'q' during Confirm cancels the prompt
+    // rather than quitting. This is the same "owns the screen while it's up"
+    // precedence `show_help` gets in `draw_ui`, just enforced on the input
+    // side instead of the render side because the prompt (unlike help) has
+    // its own key bindings to intercept.
+    if let Some(prompt) = app.snapshot_prompt.take() {
+        app.snapshot_prompt = match prompt {
+            SnapshotPrompt::Confirm(snapshot) => {
+                if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                    Some(confirm_snapshot(app, snapshot))
+                } else {
+                    None
+                }
+            }
+            SnapshotPrompt::Done(_) => None,
+        };
+        return KeyOutcome::Redraw;
+    }
+
     match key.code {
         // Checked before the bare letters so Ctrl-L stays a redraw request.
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -456,8 +521,59 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
             app.toggle_hide_idle();
             KeyOutcome::Redraw
         }
+        // Crossterm reports Shift-s as `Char('S')`, not `Char('s')` plus a
+        // SHIFT modifier check, so this arm never collides with a lowercase
+        // binding. The real sysfs read stays out of this function's own
+        // tests via `open_snapshot_prompt`, which they call directly with a
+        // fixture result instead.
+        KeyCode::Char('S') => {
+            open_snapshot_prompt(app, Snapshot::capture(None));
+            KeyOutcome::Redraw
+        }
         _ => KeyOutcome::None,
     }
+}
+
+/// Turn a capture attempt into the confirmation prompt, or -- on failure --
+/// straight into the `Done` message. Factored out of `apply_key`'s
+/// `KeyCode::Char('S')` arm so tests can drive the prompt with a fixture
+/// `Result` instead of `Snapshot::capture`'s real `/sys` read.
+fn open_snapshot_prompt(app: &mut UsbTopApp, captured: std::io::Result<Snapshot>) {
+    app.snapshot_prompt = Some(match captured {
+        Ok(snapshot) => SnapshotPrompt::Confirm(snapshot),
+        Err(e) => SnapshotPrompt::Done(format!("could not capture the snapshot: {e}")),
+    });
+}
+
+/// `y`/`Y` inside the confirmation prompt: write `snapshot` to
+/// `app.snapshot_dest` and, on success, hand it to the event loop through
+/// `pending_internal_snapshot` (see `tui::run_app`, which restamps the
+/// manager with it right after this call returns). A missing destination or
+/// a write failure both land in `Done` with an explanatory message instead
+/// of panicking or dropping the capture silently -- per the spec, a write
+/// failure logs a warning and the session keeps running.
+fn confirm_snapshot(app: &mut UsbTopApp, snapshot: Snapshot) -> SnapshotPrompt {
+    let Some(dest) = app.snapshot_dest.clone() else {
+        return SnapshotPrompt::Done(
+            "could not write the snapshot: no destination (HOME could not be resolved)".to_string(),
+        );
+    };
+    // `write_to` does not create its parent directory (see its doc
+    // comment); this mirrors the `--snapshot-internal` CLI handler in
+    // main.rs, the only other caller.
+    if let Some(parent) = dest.parent() {
+        if let Err(e) = crate::config::ensure_private_config_dir(parent) {
+            log::warn!("could not create the snapshot directory: {e}");
+            return SnapshotPrompt::Done(format!("could not write the snapshot: {e}"));
+        }
+    }
+    if let Err(e) = snapshot.write_to(&dest) {
+        log::warn!("could not write the internal-device snapshot: {e}");
+        return SnapshotPrompt::Done(format!("could not write the snapshot: {e}"));
+    }
+    let count = snapshot.devices.len();
+    app.pending_internal_snapshot = Some(Arc::new(snapshot));
+    SnapshotPrompt::Done(format!("{count} devices recorded as internal"))
 }
 
 /// Snapshot one bus: its devices in physical port order.
@@ -529,6 +645,10 @@ pub(crate) fn drain_packets(
 }
 
 pub(crate) fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
+    if app.snapshot_prompt.is_some() {
+        draw_snapshot_prompt(f, app);
+        return;
+    }
     if app.show_help {
         draw_help_overlay(f);
         return;
@@ -788,13 +908,21 @@ const DEVICE_COLUMNS: [usize; 9] = [8, 8, 10, 14, 18, 10, 10, 7, 3];
 /// measured in terminal cells, not chars: a CJK vendor string is twice as wide
 /// as its char count, and padding by chars would shove every later column
 /// rightwards on that row only.
-fn device_columns(cells: [&str; 9]) -> Vec<Span<'static>> {
+///
+/// `port_style`, when given, styles the Port cell (column 0) -- e.g. the
+/// internal-device blue (see `INTERNAL_COLOR`). Heading/header callers pass
+/// `None`.
+fn device_columns(cells: [&str; 9], port_style: Option<Style>) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(DEVICE_COLUMNS.len() * 2 - 1);
     for (index, (cell, width)) in cells.iter().zip(DEVICE_COLUMNS).enumerate() {
         if index > 0 {
             spans.push(Span::raw(" "));
         }
-        spans.push(Span::raw(fit_to_display_width(cell, width)));
+        let text = fit_to_display_width(cell, width);
+        spans.push(match (index, port_style) {
+            (0, Some(style)) => Span::styled(text, style),
+            _ => Span::raw(text),
+        });
     }
     spans
 }
@@ -913,9 +1041,12 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
         .fg(ACCENT_COLOR)
         .add_modifier(Modifier::BOLD);
 
-    let mut lines = vec![Line::from(device_columns([
-        "Port", "Device", "Speed", "Vendor", "Product", "Bw↓", "Bw↑", "%busy", "!",
-    ]))
+    let mut lines = vec![Line::from(device_columns(
+        [
+            "Port", "Device", "Speed", "Vendor", "Product", "Bw↓", "Bw↑", "%busy", "!",
+        ],
+        None,
+    ))
     .style(heading_style)];
     let mut selected_line = None;
 
@@ -966,22 +1097,29 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
                 // carrying iso traffic under a text source has both its rate
                 // cells marked `~` rather than presented as exact.
                 let estimated = app.text_source_active() && device.has_iso_traffic();
-                let mut spans = device_columns([
-                    &port_label(row.port_chain.as_ref()),
-                    &format!("{:03}:{:03}", device.bus_id, device.device_id),
-                    &format!("{:.1} Mbps", device.speed.to_mbps()),
-                    device.vendor.as_deref().unwrap_or("Unknown"),
-                    device.product.as_deref().unwrap_or("Unknown"),
-                    &rate_cell(device.bandwidth_stats.rx_bps, estimated),
-                    &rate_cell(device.bandwidth_stats.tx_bps, estimated),
-                    &busy_cell(device),
-                    indicator.get_symbol(),
-                ]);
-
                 // Selected/disconnected rows stay uniformly styled for
-                // readability; only a plain, connected row gets its Speed
-                // and indicator cells tinted by their reference colors.
-                if !is_selected && !device.is_disconnected {
+                // readability; only a plain, connected row gets its Port,
+                // Speed, and indicator cells tinted by their reference
+                // colors.
+                let plain_row = !is_selected && !device.is_disconnected;
+                let port_style =
+                    (plain_row && device.is_internal).then(|| Style::default().fg(INTERNAL_COLOR));
+                let mut spans = device_columns(
+                    [
+                        &port_label(row.port_chain.as_ref()),
+                        &format!("{:03}:{:03}", device.bus_id, device.device_id),
+                        &format!("{:.1} Mbps", device.speed.to_mbps()),
+                        device.vendor.as_deref().unwrap_or("Unknown"),
+                        device.product.as_deref().unwrap_or("Unknown"),
+                        &rate_cell(device.bandwidth_stats.rx_bps, estimated),
+                        &rate_cell(device.bandwidth_stats.tx_bps, estimated),
+                        &busy_cell(device),
+                        indicator.get_symbol(),
+                    ],
+                    port_style,
+                );
+
+                if plain_row {
                     spans[SPEED_SPAN_INDEX] = spans[SPEED_SPAN_INDEX]
                         .clone()
                         .style(speed_style(&device.speed));
@@ -1092,6 +1230,10 @@ fn draw_help_overlay(f: &mut Frame) {
             Span::raw("        Show or hide idle devices"),
         ]),
         Line::from(vec![
+            Span::styled("  S", Style::default().fg(ACCENT_COLOR)),
+            Span::raw("        Snapshot attached devices as internal"),
+        ]),
+        Line::from(vec![
             Span::styled("  q/Esc", Style::default().fg(ACCENT_COLOR)),
             Span::raw("    Quit application"),
         ]),
@@ -1125,6 +1267,66 @@ fn draw_help_overlay(f: &mut Frame) {
 
     f.render_widget(Clear, area); // Clear background
     f.render_widget(help, area);
+}
+
+/// The `S` overlay: `Confirm` asks before capturing, `Done` reports what
+/// happened. Same Clear-widget overlay pattern as `draw_help_overlay`, and
+/// `draw_ui` gives it precedence over the help overlay for the same reason
+/// `show_help` gets precedence over the base screen -- it owns the input
+/// while it's open (see `apply_key`).
+fn draw_snapshot_prompt(f: &mut Frame, app: &UsbTopApp) {
+    let Some(prompt) = &app.snapshot_prompt else {
+        return;
+    };
+    let area = centered_rect(60, 40, f.area());
+    let title_line = Line::from(vec![Span::styled(
+        "Snapshot internal devices",
+        Style::default()
+            .fg(ACCENT_COLOR)
+            .add_modifier(Modifier::BOLD),
+    )]);
+
+    let text = match prompt {
+        SnapshotPrompt::Confirm(snapshot) => {
+            let dest = app
+                .snapshot_dest
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(no destination -- HOME could not be resolved)".to_string());
+            vec![
+                title_line,
+                Line::from(""),
+                Line::from(format!(
+                    "{} device(s) currently attached will be recorded as internal.",
+                    snapshot.devices.len()
+                )),
+                Line::from(
+                    "Everything plugged in right now is captured, whether it belongs or not.",
+                ),
+                Line::from(""),
+                Line::from(format!("File: {dest}")),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  y", Style::default().fg(ACCENT_COLOR)),
+                    Span::raw(" = snapshot, any other key = cancel"),
+                ]),
+            ]
+        }
+        SnapshotPrompt::Done(message) => vec![
+            title_line,
+            Line::from(""),
+            Line::from(message.clone()),
+            Line::from(""),
+            Line::from("press any key"),
+        ],
+    };
+
+    let prompt_widget = Paragraph::new(text)
+        .block(Block::default().borders(Borders::ALL).title(" Snapshot "))
+        .wrap(Wrap { trim: true });
+
+    f.render_widget(Clear, area); // Clear background
+    f.render_widget(prompt_widget, area);
 }
 
 // Helper function to create centered rectangle
@@ -1777,6 +1979,172 @@ mod tests {
         assert_eq!(app.selected_device.as_deref(), Some("4:2"), "wraps to last");
     }
 
+    /// A snapshot with one entry per given port path, IDs unset -- enough to
+    /// exercise `SnapshotPrompt` without touching the matching logic
+    /// `snapshot::Snapshot::is_internal` already owns its own tests for.
+    fn fixture_snapshot(port_paths: &[&str]) -> Snapshot {
+        Snapshot {
+            captured_unix: 0,
+            devices: port_paths
+                .iter()
+                .map(|p| crate::snapshot::SnapshotDevice {
+                    port_path: (*p).to_string(),
+                    vendor_id: None,
+                    product_id: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// `open_snapshot_prompt` is the seam `apply_key`'s `KeyCode::Char('S')`
+    /// arm calls with `Snapshot::capture(None)`'s real result; tests drive it
+    /// directly with a fixture `Result` instead, per the module's hermetic
+    /// rule against ever touching real `/sys`.
+    #[test]
+    fn open_snapshot_prompt_opens_confirm_with_the_captured_snapshot() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-4", "usb1"])));
+
+        match &app.snapshot_prompt {
+            Some(SnapshotPrompt::Confirm(snapshot)) => assert_eq!(snapshot.devices.len(), 2),
+            other => panic!("expected Confirm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_snapshot_prompt_lands_straight_in_done_on_a_capture_error() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+
+        open_snapshot_prompt(&mut app, Err(err));
+
+        match &app.snapshot_prompt {
+            Some(SnapshotPrompt::Done(message)) => assert!(message.contains("denied"), "{message}"),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirm_then_y_writes_the_file_and_hands_off_the_pending_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        // Nested: the confirm handler must create the parent directory
+        // itself, the same gap `write_to`'s doc comment leaves to its
+        // callers (see `confirm_snapshot`).
+        let dest = temp.path().join("nested").join("internal-devices.toml");
+        let mut app = UsbTopApp::new(Duration::from_millis(100)).with_snapshot_dest(dest.clone());
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-4"])));
+
+        let outcome = apply_key(&mut app, key(KeyCode::Char('y')));
+
+        assert_eq!(outcome, KeyOutcome::Redraw);
+        assert!(dest.exists(), "y must write the file");
+        let pending = app
+            .pending_internal_snapshot
+            .as_ref()
+            .expect("y hands the snapshot to the event loop's handoff seam");
+        assert_eq!(pending.devices.len(), 1);
+        match &app.snapshot_prompt {
+            Some(SnapshotPrompt::Done(message)) => {
+                assert!(message.contains('1'), "{message}");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirm_then_shift_y_also_writes() {
+        // Crossterm reports Shift-Y as `Char('Y')`, not `Char('y')` plus a
+        // modifier -- the spec's "y" is meant case-insensitively.
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("internal-devices.toml");
+        let mut app = UsbTopApp::new(Duration::from_millis(100)).with_snapshot_dest(dest.clone());
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-4"])));
+
+        apply_key(&mut app, key(KeyCode::Char('Y')));
+
+        assert!(dest.exists());
+        assert!(app.pending_internal_snapshot.is_some());
+    }
+
+    #[test]
+    fn confirm_then_any_other_key_cancels_writing_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("internal-devices.toml");
+        let mut app = UsbTopApp::new(Duration::from_millis(100)).with_snapshot_dest(dest.clone());
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-4"])));
+
+        let outcome = apply_key(&mut app, key(KeyCode::Char('n')));
+
+        assert_eq!(outcome, KeyOutcome::Redraw);
+        assert!(
+            app.snapshot_prompt.is_none(),
+            "cancelled, nothing left to show"
+        );
+        assert!(!dest.exists(), "cancel must not write");
+        assert!(app.pending_internal_snapshot.is_none());
+    }
+
+    /// The prompt intercepts every key while it's open, ahead of the
+    /// ordinary bindings -- 'q' during Confirm must cancel the prompt, not
+    /// quit the session.
+    #[test]
+    fn confirm_intercepts_a_key_that_would_otherwise_quit() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-4"])));
+
+        let outcome = apply_key(&mut app, key(KeyCode::Char('q')));
+
+        assert_eq!(outcome, KeyOutcome::Redraw, "the prompt owns the key");
+        assert!(
+            app.snapshot_prompt.is_none(),
+            "q cancels like any other key"
+        );
+    }
+
+    /// A second 'S' while the prompt is already open must not re-trigger a
+    /// capture: the intercept in `apply_key` runs before the `Char('S')`
+    /// binding is ever reached, so it reads as an ordinary cancel.
+    #[test]
+    fn s_while_the_prompt_is_open_cancels_instead_of_recapturing() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-4"])));
+
+        apply_key(&mut app, key(KeyCode::Char('S')));
+
+        assert!(app.snapshot_prompt.is_none());
+    }
+
+    #[test]
+    fn y_with_no_destination_lands_in_done_and_writes_nothing() {
+        // No `with_snapshot_dest`: the default in tests and whenever HOME
+        // could not be resolved.
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-4"])));
+
+        apply_key(&mut app, key(KeyCode::Char('y')));
+
+        assert!(app.pending_internal_snapshot.is_none());
+        match &app.snapshot_prompt {
+            Some(SnapshotPrompt::Done(message)) => {
+                assert!(message.contains("destination"), "{message}");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn done_prompt_closes_on_any_key() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.snapshot_prompt = Some(SnapshotPrompt::Done(
+            "5 devices recorded as internal".to_string(),
+        ));
+
+        let outcome = apply_key(&mut app, key(KeyCode::Char('x')));
+
+        assert_eq!(outcome, KeyOutcome::Redraw);
+        assert!(app.snapshot_prompt.is_none());
+    }
+
     /// Total display width of a device row: every column plus one space between.
     fn device_row_width() -> usize {
         DEVICE_COLUMNS.iter().sum::<usize>() + DEVICE_COLUMNS.len() - 1
@@ -1788,32 +2156,38 @@ mod tests {
         // column takes 2 spaces of padding, not 8. The "⚡" indicator is a
         // 2-cell glyph inside the 3-cell `!` column, exercising the same
         // display-width padding there.
-        let wide = Line::from(device_columns([
-            "?",
-            "001:004",
-            "0.0 Mbps",
-            "東京デバイス",
-            "プローブ",
-            "0.0 KB/s",
-            "0.0 KB/s",
-            " 91.6",
-            "⚡",
-        ]));
+        let wide = Line::from(device_columns(
+            [
+                "?",
+                "001:004",
+                "0.0 Mbps",
+                "東京デバイス",
+                "プローブ",
+                "0.0 KB/s",
+                "0.0 KB/s",
+                " 91.6",
+                "⚡",
+            ],
+            None,
+        ));
         assert_eq!(wide.width(), device_row_width());
 
         // Over-long cells are clipped to their column, again by display width.
         // "🔺" is likewise a 2-cell glyph.
-        let clipped = Line::from(device_columns([
-            "?",
-            "001:004",
-            "0.0 Mbps",
-            "東京デバイスカンパニー",
-            "Product",
-            "0.0 KB/s",
-            "0.0 KB/s",
-            "100.0",
-            "🔺",
-        ]));
+        let clipped = Line::from(device_columns(
+            [
+                "?",
+                "001:004",
+                "0.0 Mbps",
+                "東京デバイスカンパニー",
+                "Product",
+                "0.0 KB/s",
+                "0.0 KB/s",
+                "100.0",
+                "🔺",
+            ],
+            None,
+        ));
         assert_eq!(clipped.width(), device_row_width());
     }
 
@@ -2002,6 +2376,84 @@ mod tests {
             selected_speed.style.fg,
             Some(Color::Rgb(0, 255, 0)), // UsbSpeed::SuperSpeed
             "selected row keeps the uniform highlight instead of the speed color"
+        );
+    }
+
+    /// Mirrors `speed_span_is_colored_unless_the_row_is_selected`: the Port
+    /// cell (column 0, so span index 0) picks up `INTERNAL_COLOR` for a
+    /// device the snapshot marked internal, except on the selected row,
+    /// where the uniform highlight still wins.
+    #[test]
+    fn port_span_is_internal_colored_unless_the_row_is_selected() {
+        // Port is column index 0, so (per SPEED_SPAN_INDEX/INDICATOR_SPAN_INDEX's
+        // `2 * column index` rule above) its content is span index 0 too.
+        const PORT_SPAN_INDEX: usize = 0;
+
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0), (1, 4, 0.0)]);
+        {
+            let bus = mgr.get_or_create_bus(1);
+            bus.devices.get_mut(&3).unwrap().is_internal = true;
+            bus.devices.get_mut(&4).unwrap().is_internal = true;
+        }
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:4".to_string());
+
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        assert_eq!(selected_line, Some(4), "selected row's line index");
+
+        let unselected_port = &lines[3].spans[PORT_SPAN_INDEX];
+        assert_eq!(
+            unselected_port.style.fg,
+            Some(INTERNAL_COLOR),
+            "unselected internal row's Port span carries the internal color"
+        );
+
+        let selected_port = &lines[4].spans[PORT_SPAN_INDEX];
+        assert_ne!(
+            selected_port.style.fg,
+            Some(INTERNAL_COLOR),
+            "selected row keeps the uniform highlight instead of the internal color"
+        );
+    }
+
+    #[test]
+    fn port_span_is_uncolored_for_an_external_device() {
+        // `manager_with_rates` builds devices via `UsbDevice::new`, whose
+        // `is_internal` defaults to false -- no snapshot, nothing marked.
+        let (_t, mgr) = manager_with_rates(&[(1, 3, 0.0)]);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        let port_span = &lines[3].spans[0];
+        assert_ne!(
+            port_span.style.fg,
+            Some(INTERNAL_COLOR),
+            "external device's Port span must not be blue"
+        );
+    }
+
+    /// Disconnected rows stay uniformly grey (see the loop's `plain_row`
+    /// guard); an internal device that just vanished must not show a blue
+    /// Port cell against that grey background.
+    #[test]
+    fn port_span_stays_uniform_for_a_disconnected_internal_device() {
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0)]);
+        {
+            let device = mgr.get_or_create_bus(1).devices.get_mut(&3).unwrap();
+            device.is_internal = true;
+            device.is_disconnected = true;
+        }
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        let port_span = &lines[3].spans[0];
+        assert_ne!(
+            port_span.style.fg,
+            Some(INTERNAL_COLOR),
+            "a disconnected row keeps its uniform grey styling"
         );
     }
 
