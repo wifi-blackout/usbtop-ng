@@ -5,6 +5,14 @@ All notable changes to usbtop-ng are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- TUI: `q`/`Esc` close the help overlay instead of quitting the app while it's open.
+- TUI: the `S` confirmation overlay now names both keys -- `y` records, `n` cancels.
+- TUI: the `S` confirmation overlay lists the devices it will record, not just the count.
+
 ## [1.3.0] - 2026-08-22
 
 ### Added

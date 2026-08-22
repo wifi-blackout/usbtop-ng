@@ -20,7 +20,7 @@ use std::{
 use crate::device::manager::{DeviceManager, UsbBus};
 use crate::device::UsbDevice;
 use crate::filter::FilterSet;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, SnapshotDevice};
 use crate::usbmon::parser::{UsbPacket, UsbSpeed};
 
 pub mod colors;
@@ -502,8 +502,17 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
             KeyOutcome::ClearAndRedraw
         }
         // Raw mode turns off ISIG, so the terminal never turns ^C into a
-        // SIGINT. It arrives as this key event, and it still means quit.
+        // SIGINT. It arrives as this key event, and it still means quit --
+        // even with help open, this is the only way out of raw mode short of
+        // a real signal, so help does not get to intercept it.
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyOutcome::Quit,
+        // Help owns q/Esc while it's open -- they close the overlay instead
+        // of quitting the session, the same "owns the screen while it's up"
+        // precedence the snapshot prompt gets above.
+        KeyCode::Char('q') | KeyCode::Esc if app.show_help => {
+            app.show_help = false;
+            KeyOutcome::Redraw
+        }
         KeyCode::Char('q') | KeyCode::Esc => KeyOutcome::Quit,
         KeyCode::Char('h') => {
             app.show_help = !app.show_help;
@@ -1278,7 +1287,6 @@ fn draw_snapshot_prompt(f: &mut Frame, app: &UsbTopApp) {
     let Some(prompt) = &app.snapshot_prompt else {
         return;
     };
-    let area = centered_rect(60, 40, f.area());
     let title_line = Line::from(vec![Span::styled(
         "Snapshot internal devices",
         Style::default()
@@ -1286,14 +1294,14 @@ fn draw_snapshot_prompt(f: &mut Frame, app: &UsbTopApp) {
             .add_modifier(Modifier::BOLD),
     )]);
 
-    let text = match prompt {
+    let (text, area) = match prompt {
         SnapshotPrompt::Confirm(snapshot) => {
             let dest = app
                 .snapshot_dest
                 .as_deref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "(no destination -- HOME could not be resolved)".to_string());
-            vec![
+            let mut lines = vec![
                 title_line,
                 Line::from(""),
                 Line::from(format!(
@@ -1304,21 +1312,35 @@ fn draw_snapshot_prompt(f: &mut Frame, app: &UsbTopApp) {
                     "Everything plugged in right now is captured, whether it belongs or not.",
                 ),
                 Line::from(""),
-                Line::from(format!("File: {dest}")),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("  y", Style::default().fg(ACCENT_COLOR)),
-                    Span::raw(" = snapshot, any other key = cancel"),
-                ]),
-            ]
+            ];
+            for device_line in snapshot_device_lines(&snapshot.devices) {
+                lines.push(Line::from(format!("  {device_line}")));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!("File: {dest}")));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  y", Style::default().fg(ACCENT_COLOR)),
+                Span::raw(" = record, "),
+                Span::styled("n", Style::default().fg(ACCENT_COLOR)),
+                Span::raw(" = cancel"),
+            ]));
+            // Content-driven, unlike the fixed 60x40 below: the device
+            // listing's own length (capped by `snapshot_device_lines`) is
+            // what decides how tall this popup needs to be.
+            let area = centered_rect_for_lines(60, lines.len() as u16, f.area());
+            (lines, area)
         }
-        SnapshotPrompt::Done(message) => vec![
-            title_line,
-            Line::from(""),
-            Line::from(message.clone()),
-            Line::from(""),
-            Line::from("press any key"),
-        ],
+        SnapshotPrompt::Done(message) => {
+            let lines = vec![
+                title_line,
+                Line::from(""),
+                Line::from(message.clone()),
+                Line::from(""),
+                Line::from("press any key"),
+            ];
+            (lines, centered_rect(60, 40, f.area()))
+        }
     };
 
     let prompt_widget = Paragraph::new(text)
@@ -1329,6 +1351,42 @@ fn draw_snapshot_prompt(f: &mut Frame, app: &UsbTopApp) {
     f.render_widget(prompt_widget, area);
 }
 
+/// Most devices listed by name in the confirmation overlay before the rest
+/// collapse into a single "... and N more" line -- enough to be useful on a
+/// typical machine without letting a hub farm push the prompt off the
+/// bottom of the terminal (see `centered_rect_for_lines`, whose clamp is the
+/// other half of that guarantee).
+const MAX_LISTED_SNAPSHOT_DEVICES: usize = 12;
+
+/// One `port_path  vid:pid` line per device, in the same shape
+/// `--snapshot-internal`'s CLI handler prints (main.rs) minus the resolved
+/// name -- including its "----" placeholder for a missing vendor or product
+/// id, so the confirmation overlay and the CLI never disagree about what a
+/// captured device looks like. Capped at `MAX_LISTED_SNAPSHOT_DEVICES`, with
+/// a summary line for the remainder. Kept free of `ratatui` types so the cap
+/// and the placeholder are testable without a `Frame`.
+fn snapshot_device_lines(devices: &[SnapshotDevice]) -> Vec<String> {
+    let mut lines: Vec<String> = devices
+        .iter()
+        .take(MAX_LISTED_SNAPSHOT_DEVICES)
+        .map(|d| {
+            format!(
+                "{}  {}:{}",
+                d.port_path,
+                d.vendor_id.as_deref().unwrap_or("----"),
+                d.product_id.as_deref().unwrap_or("----"),
+            )
+        })
+        .collect();
+    if devices.len() > MAX_LISTED_SNAPSHOT_DEVICES {
+        lines.push(format!(
+            "\u{2026} and {} more",
+            devices.len() - MAX_LISTED_SNAPSHOT_DEVICES
+        ));
+    }
+    lines
+}
+
 // Helper function to create centered rectangle
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
@@ -1337,6 +1395,37 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_y) / 2),
             Constraint::Percentage(percent_y),
             Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+/// Rectangle centered horizontally at `percent_x`, sized vertically to fit
+/// `content_lines` rows of text plus the border -- unlike `centered_rect`'s
+/// fixed percentage, which is only right for content that never changes
+/// size (as `draw_help_overlay`'s is). Floored at 8 rows so a short prompt
+/// isn't cramped, ceilinged at the terminal's own height (minus a margin)
+/// so a long list can never run off screen; the listing's own cap is what
+/// keeps that ceiling from being hit in the first place.
+fn centered_rect_for_lines(percent_x: u16, content_lines: u16, r: Rect) -> Rect {
+    let ceiling = r.height.saturating_sub(2).max(8);
+    let height = content_lines.saturating_add(2).clamp(8, ceiling);
+    let top = r.height.saturating_sub(height) / 2;
+
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(top),
+            Constraint::Length(height),
+            Constraint::Min(0),
         ])
         .split(r);
 
@@ -1838,6 +1927,50 @@ mod tests {
     }
 
     #[test]
+    fn q_and_esc_close_the_help_overlay_instead_of_quitting() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.show_help = true;
+
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('q'))),
+            KeyOutcome::Redraw
+        );
+        assert!(!app.show_help, "q must close help, not reopen or leave it");
+
+        app.show_help = true;
+        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Redraw);
+        assert!(!app.show_help, "Esc must close help too");
+    }
+
+    #[test]
+    fn q_and_esc_still_quit_once_help_is_closed() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert!(!app.show_help);
+
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('q'))),
+            KeyOutcome::Quit
+        );
+        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Quit);
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_with_help_open() {
+        // The safety valve out of raw mode must not be swallowed by help's
+        // new q/Esc interception -- see the comment on that arm.
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.show_help = true;
+
+        assert_eq!(
+            apply_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
+            KeyOutcome::Quit
+        );
+    }
+
+    #[test]
     fn ctrl_l_asks_for_a_wipe_and_a_repaint() {
         let mut app = UsbTopApp::new(Duration::from_millis(100));
         assert_eq!(
@@ -2143,6 +2276,93 @@ mod tests {
 
         assert_eq!(outcome, KeyOutcome::Redraw);
         assert!(app.snapshot_prompt.is_none());
+    }
+
+    /// A device with both ids set, and one with neither -- exercises the
+    /// "----" placeholder `--snapshot-internal`'s CLI handler in main.rs
+    /// uses for a missing vendor or product id, which this listing mirrors.
+    fn device_with_ids(
+        port_path: &str,
+        vendor_id: Option<&str>,
+        product_id: Option<&str>,
+    ) -> SnapshotDevice {
+        SnapshotDevice {
+            port_path: port_path.to_string(),
+            vendor_id: vendor_id.map(str::to_string),
+            product_id: product_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn snapshot_device_lines_formats_port_path_and_ids() {
+        let devices = vec![
+            device_with_ids("1-4", Some("04f2"), Some("b71a")),
+            device_with_ids("usb1", None, None),
+        ];
+
+        let lines = snapshot_device_lines(&devices);
+
+        assert_eq!(lines, vec!["1-4  04f2:b71a", "usb1  ----:----"]);
+    }
+
+    #[test]
+    fn snapshot_device_lines_caps_the_listing_with_a_summary() {
+        let devices: Vec<SnapshotDevice> = (0..15)
+            .map(|i| device_with_ids(&format!("1-{i}"), None, None))
+            .collect();
+
+        let lines = snapshot_device_lines(&devices);
+
+        assert_eq!(lines.len(), MAX_LISTED_SNAPSHOT_DEVICES + 1);
+        for (i, line) in lines.iter().take(MAX_LISTED_SNAPSHOT_DEVICES).enumerate() {
+            assert_eq!(line, &format!("1-{i}  ----:----"));
+        }
+        assert_eq!(lines.last().unwrap(), "\u{2026} and 3 more");
+    }
+
+    #[test]
+    fn snapshot_device_lines_omits_the_summary_line_at_exactly_the_cap() {
+        let devices: Vec<SnapshotDevice> = (0..MAX_LISTED_SNAPSHOT_DEVICES)
+            .map(|i| device_with_ids(&format!("1-{i}"), None, None))
+            .collect();
+
+        let lines = snapshot_device_lines(&devices);
+
+        assert_eq!(lines.len(), MAX_LISTED_SNAPSHOT_DEVICES);
+        assert!(!lines.last().unwrap().contains("more"));
+    }
+
+    /// The overlay names both keys (per the wording requirement) and lists
+    /// the devices it captured, not just the count.
+    #[test]
+    fn the_confirmation_overlay_lists_devices_and_names_both_keys() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-4", "usb1"])));
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 60)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(screen.contains("1-4  ----:----"), "{screen}");
+        assert!(screen.contains("usb1  ----:----"), "{screen}");
+        assert!(screen.contains('y'), "{screen}");
+        assert!(screen.contains("record"), "{screen}");
+        assert!(screen.contains('n'), "{screen}");
+        assert!(screen.contains("cancel"), "{screen}");
+    }
+
+    /// `centered_rect_for_lines`'s clamp has to hold even when the terminal
+    /// itself is smaller than the popup would like: a hub farm's device
+    /// count must not turn a tiny terminal into a panic.
+    #[test]
+    fn the_confirmation_overlay_does_not_panic_on_a_tiny_terminal_with_many_devices() {
+        let port_paths: Vec<String> = (0..20).map(|i| format!("1-{i}")).collect();
+        let port_paths: Vec<&str> = port_paths.iter().map(String::as_str).collect();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&port_paths)));
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(20, 5)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
     }
 
     /// Total display width of a device row: every column plus one space between.
