@@ -239,6 +239,19 @@ fn main() -> Result<()> {
         process::exit(2);
     });
 
+    // Mirrors the usbids home-copy pattern just below: a missing HOME must
+    // not fail the monitoring path, it just means no snapshot to load.
+    let internal_snapshot = snapshot::snapshot_path()
+        .ok()
+        .and_then(|p| snapshot::Snapshot::load(&p))
+        .map(Arc::new);
+    if filter.uses_internal() && internal_snapshot.is_none() {
+        eprintln!(
+            "error: an internal= filter needs a snapshot. Run usbtop-ng --snapshot-internal first, with external devices unplugged."
+        );
+        process::exit(2);
+    }
+
     // `--once`/`--batch` select a headless report instead of the TUI; `--json`
     // and `--window` only make sense alongside one of them.
     let headless = cli.once || cli.batch;
@@ -390,6 +403,7 @@ fn main() -> Result<()> {
         let mut manager = device::manager::DeviceManager::new();
         manager.set_filter(filter.clone());
         manager.set_usbids(usbids.clone());
+        manager.set_internal_snapshot(internal_snapshot.clone());
         let result = headless::run(
             manager,
             packets,
@@ -420,6 +434,7 @@ fn main() -> Result<()> {
     let mut manager = device::manager::DeviceManager::new();
     manager.set_filter(filter.clone());
     manager.set_usbids(usbids.clone());
+    manager.set_internal_snapshot(internal_snapshot.clone());
     // The readers discard packets rather than block when the channel fills, so
     // the UI needs the count to say so in its header.
     let app = UsbTopApp::new(Duration::from_millis(effective_refresh_ms(cli.refresh)))

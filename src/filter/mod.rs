@@ -18,6 +18,7 @@ pub struct FilterExpr {
     ep: Option<u8>,
     dir_in: Option<bool>,
     transfer: Option<TransferType>,
+    internal: Option<bool>,
 }
 
 impl FilterExpr {
@@ -69,6 +70,16 @@ impl FilterExpr {
                     };
                     set_once(&mut expr.transfer, key, t)?;
                 }
+                "internal" => {
+                    let value = match value {
+                        "yes" | "true" => true,
+                        "no" | "false" => false,
+                        _ => {
+                            return Err(anyhow!("filter internal is 'yes' or 'no', got '{value}'"))
+                        }
+                    };
+                    set_once(&mut expr.internal, key, value)?;
+                }
                 _ => return Err(anyhow!("unknown filter key '{key}'")),
             }
         }
@@ -89,6 +100,7 @@ impl FilterExpr {
                 };
                 hit(&device.vendor) || hit(&device.product)
             })
+            && self.internal.is_none_or(|want| want == device.is_internal)
     }
 
     /// Every key: identity against the device, ep/dir/type against the packet.
@@ -152,6 +164,13 @@ impl FilterSet {
     pub fn matches_packet(&self, packet: &UsbPacket, device: &UsbDevice) -> bool {
         self.exprs.is_empty() || self.exprs.iter().any(|e| e.matches_packet(packet, device))
     }
+
+    /// True iff any expression in this set sets the `internal` key. Callers
+    /// use this to reject an `internal=` filter up front when no snapshot
+    /// file exists, rather than let it silently match nothing.
+    pub fn uses_internal(&self) -> bool {
+        self.exprs.iter().any(|e| e.internal.is_some())
+    }
 }
 
 #[cfg(test)]
@@ -195,6 +214,37 @@ mod tests {
         assert!(FilterSet::parse(&["type=int".into()]).is_ok());
     }
 
+    #[test]
+    fn internal_accepts_yes_no_and_true_false_aliases() {
+        let yes = FilterSet::parse(&["internal=yes".into()]).unwrap();
+        let tru = FilterSet::parse(&["internal=true".into()]).unwrap();
+        assert_eq!(yes.exprs, tru.exprs);
+
+        let no = FilterSet::parse(&["internal=no".into()]).unwrap();
+        let fal = FilterSet::parse(&["internal=false".into()]).unwrap();
+        assert_eq!(no.exprs, fal.exprs);
+    }
+
+    #[test]
+    fn internal_rejects_other_values() {
+        assert!(FilterSet::parse(&["internal=maybe".into()])
+            .unwrap_err()
+            .to_string()
+            .contains("internal"));
+    }
+
+    #[test]
+    fn uses_internal_true_iff_any_expression_sets_the_key() {
+        assert!(!FilterSet::default().uses_internal());
+        assert!(!FilterSet::parse(&["bus=1".into()]).unwrap().uses_internal());
+        assert!(FilterSet::parse(&["internal=yes".into()])
+            .unwrap()
+            .uses_internal());
+        assert!(FilterSet::parse(&["bus=1".into(), "internal=no".into()])
+            .unwrap()
+            .uses_internal());
+    }
+
     fn device(bus: u8, dev: u8, vid: Option<u16>, product: Option<&str>) -> UsbDevice {
         let mut d = UsbDevice::new(bus, dev);
         d.vendor_id = vid;
@@ -223,6 +273,21 @@ mod tests {
         let set = FilterSet::parse(&["vid=04f2".into()]).unwrap();
         assert!(!set.matches_device(&device(1, 4, None, None)));
         assert!(set.matches_device(&device(1, 4, Some(0x04f2), None)));
+    }
+
+    #[test]
+    fn internal_matches_a_device_s_is_internal_flag_both_directions() {
+        let mut internal = device(1, 4, None, None);
+        internal.is_internal = true;
+        let external = device(1, 5, None, None);
+
+        let want_internal = FilterSet::parse(&["internal=yes".into()]).unwrap();
+        assert!(want_internal.matches_device(&internal));
+        assert!(!want_internal.matches_device(&external));
+
+        let want_external = FilterSet::parse(&["internal=no".into()]).unwrap();
+        assert!(!want_external.matches_device(&internal));
+        assert!(want_external.matches_device(&external));
     }
 
     #[test]
