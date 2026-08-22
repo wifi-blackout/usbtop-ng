@@ -337,7 +337,7 @@ key press and quits through the same teardown as `q`.
 
 ### Tests
 
-- `cargo test --all-targets` runs 286 hermetic tests against fixture files,
+- `cargo test --all-targets` runs 292 hermetic tests against fixture files,
   FIFOs, and temporary paths. They need no `/dev` and no debugfs access.
 - The `integration` cargo feature adds 1 test that reads the real usbmon
   interfaces. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
@@ -390,6 +390,7 @@ Options:
       --usbids <PATH>      usb.ids database file for device names (overrides every other source)
       --update-usbids [<MODE>]
                            Check for a newer usb.ids ('check', the default) or fetch it ('pull')
+      --snapshot-internal  Record every currently attached device as internal, then exit
   -h, --help               Print help
   -V, --version            Print version
 ```

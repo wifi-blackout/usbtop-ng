@@ -19,6 +19,7 @@ mod config;
 mod device;
 mod filter;
 mod headless;
+mod snapshot;
 mod stats;
 mod tui;
 mod ui;
@@ -100,6 +101,10 @@ struct Cli {
     /// Check for a newer usb.ids ('check', the default) or fetch it ('pull')
     #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "check")]
     update_usbids: Option<UpdateUsbidsMode>,
+
+    /// Record every currently attached device as internal, then exit
+    #[arg(long)]
+    snapshot_internal: bool,
 }
 
 /// `--update-usbids`'s optional mode. Bare `--update-usbids` (no value)
@@ -191,6 +196,34 @@ fn main() -> Result<()> {
             eprintln!("error: {e}");
             process::exit(1);
         }
+        return Ok(());
+    }
+
+    // `--snapshot-internal` also short-circuits: it needs the home
+    // directory (the snapshot file always lives beside the preferences
+    // file, resolved the same way `--update-usbids`'s home copy is), but
+    // it never touches usbmon or the network -- it only reads sysfs.
+    if cli.snapshot_internal {
+        let snapshot = snapshot::Snapshot::capture(None)?;
+        if snapshot.devices.is_empty() {
+            eprintln!("error: no USB devices found to snapshot");
+            process::exit(1);
+        }
+        let dest = snapshot::snapshot_path()?;
+        for device in &snapshot.devices {
+            println!(
+                "  {}  {}:{}",
+                device.port_path,
+                device.vendor_id.as_deref().unwrap_or("----"),
+                device.product_id.as_deref().unwrap_or("----"),
+            );
+        }
+        snapshot.write_to(&dest)?;
+        println!(
+            "{} devices recorded as internal in {}",
+            snapshot.devices.len(),
+            dest.display()
+        );
         return Ok(());
     }
 
@@ -606,6 +639,16 @@ mod tests {
 
         let absent = Cli::try_parse_from(["usbtop-ng"]).unwrap();
         assert!(absent.update_usbids.is_none());
+    }
+
+    #[test]
+    fn cli_parses_snapshot_internal() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["usbtop-ng", "--snapshot-internal"]).unwrap();
+        assert!(cli.snapshot_internal);
+
+        let absent = Cli::try_parse_from(["usbtop-ng"]).unwrap();
+        assert!(!absent.snapshot_internal);
     }
 
     #[test]
