@@ -28,6 +28,41 @@ schedule. Items move to [CHANGELOG.md](../CHANGELOG.md) when they ship.
   usbtop-ng` and `ssh host sudo usbtop-ng --batch --json` already cover
   the common cases; document those before building a network service.
 
+## Cable and port diagnostics
+
+A diagnostic layer over the Type-C sysfs classes, evaluated 2026-08-22
+against a cable-diagnostic engine study. usbtop-ng's edge: it measures
+delivered throughput, so cable claims can be corroborated by observed
+delivery instead of negotiation state alone.
+
+Worth building, in dependency order:
+
+- Cable identity from `/sys/class/typec/portX-cable/identity`: decode the
+  e-marker VDOs in userspace (passive or active, rated speed, rated
+  current, spec-anomaly flags such as a passive header with active-only
+  bits). Stable sysfs, no root, no new dependencies. Availability is
+  firmware-bound: kernel PD stacks that run the state machine expose the
+  VDOs, firmware-managed ports often expose nothing, and the tool must
+  say which case it found rather than guess.
+- Advertised power capabilities from `/sys/class/usb_power_delivery` and
+  DP-Alt pin assignment from the typec class, as informational rows.
+- Thunderbolt fabric link speed and lanes from `/sys/bus/thunderbolt`,
+  enriching the controller grouping.
+- The distinctive verdict: claim versus measured delivery. A cable rated
+  10 Gbps carrying a sustained measured rate near a slower tier's ceiling
+  is a finding only a traffic monitor can make. Blocked on the
+  exact-speed model fix below. Verdict doctrine: measured beats claimed,
+  exonerate confidently, convict only a uniquely limiting party, and say
+  nothing where attribution is ambiguous.
+
+Out of scope, no stable Linux interface: per-port power-out metering, the
+system DC-in rail, the negotiated PD contract, connector fault counters,
+and liquid detection. Display diagnostics are out of charter.
+
+Prerequisite: none of the typec, power-delivery, or thunderbolt classes
+exist on the current development host, so this work needs hardware that
+exposes them before any of it can be built honestly.
+
 ## eBPF backend
 
 A third packet source built on kprobes, prototyped on 2026-08-19 with
