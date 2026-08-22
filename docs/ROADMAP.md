@@ -55,13 +55,25 @@ Worth building, in dependency order:
   exonerate confidently, convict only a uniquely limiting party, and say
   nothing where attribution is ambiguous.
 
-Out of scope, no stable Linux interface: per-port power-out metering, the
-system DC-in rail, the negotiated PD contract, connector fault counters,
-and liquid detection. Display diagnostics are out of charter.
+Parked until Linux exposes them, not dropped. No stable kernel interface
+carries these today, and each becomes buildable the moment a mainline ABI
+or capable hardware lands:
+
+- Per-port power-out metering (delivered volts and amps per connector).
+- The system DC-in rail, which also unlocks a whole-path resistance
+  estimate from a V over I regression.
+- The negotiated PD contract. Advertised capabilities are readable now,
+  the struck contract is not.
+- Connector fault counters (overcurrent trips, replug storms).
+- Liquid and corrosion detection, defined in the connector spec and
+  implemented in PD controller silicon, with no kernel attribute yet.
+
+Revisit this list on kernel upgrades. Display diagnostics stay out by
+charter, not by gap.
 
 Prerequisite: none of the typec, power-delivery, or thunderbolt classes
-exist on the current development host, so this work needs hardware that
-exposes them before any of it can be built honestly.
+exist on the current development host, so even the buildable tier needs
+hardware that exposes them before any of it can be built honestly.
 
 ## eBPF backend
 
