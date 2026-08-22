@@ -33,6 +33,10 @@ pub struct UsbDevice {
     pub disconnect_time: Option<Instant>,
     pub last_seen: Instant,
     pub sysfs_path: Option<std::path::PathBuf>,
+    /// Whether this device matched the loaded internal-device snapshot at
+    /// its last stamp (see `DeviceManager::stamp_internal`). `false` with no
+    /// snapshot loaded, same as any non-matching device.
+    pub is_internal: bool,
     /// Highest speed this device is electrically capable of, independent of
     /// how fast it's actually linked (see `check_speed_mismatch`). Cached at
     /// sysfs read time so mismatch checks never touch the filesystem.
@@ -60,6 +64,7 @@ impl UsbDevice {
             disconnect_time: None,
             last_seen: Instant::now(),
             sysfs_path: None,
+            is_internal: false,
             max_capability: None,
             endpoints: BTreeMap::new(),
         }
@@ -380,6 +385,11 @@ mod tests {
         for (name, value) in extra {
             std::fs::write(dir.join(name), format!("{value}\n")).unwrap();
         }
+    }
+
+    #[test]
+    fn new_device_defaults_to_not_internal() {
+        assert!(!UsbDevice::new(1, 4).is_internal);
     }
 
     #[test]

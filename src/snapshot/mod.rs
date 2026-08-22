@@ -70,11 +70,6 @@ impl Snapshot {
     /// `None` when the file is absent. A file that exists but does not
     /// parse warns once and reads as no snapshot, so a corrupt file
     /// degrades to today's unmarked display instead of failing startup.
-    ///
-    /// `cfg(test)`-only for now: no production code loads a snapshot back
-    /// yet — that lands with Task 2's manager/filter/headless wiring;
-    /// verified here and ready for that consumer.
-    #[cfg(test)]
     pub fn load(path: &Path) -> Option<Snapshot> {
         let text = std::fs::read_to_string(path).ok()?;
         match toml::from_str(&text) {
@@ -88,11 +83,6 @@ impl Snapshot {
 
     /// Internal means: same physical port AND the same device on it.
     /// An ID the snapshot lacks matches only a device that also lacks it.
-    ///
-    /// `cfg(test)`-only for now: no production code queries device origin
-    /// yet — that lands with Task 2's manager/filter/headless wiring;
-    /// verified here and ready for that consumer.
-    #[cfg(test)]
     pub fn is_internal(
         &self,
         port_path: &str,
@@ -117,10 +107,6 @@ fn read_id(path: &Path) -> Option<String> {
 /// A stored hex ID as a comparable number; an unparsable entry is `None`,
 /// which the `is_some` guards in `is_internal` keep from matching a real
 /// absent ID.
-///
-/// `cfg(test)`-only for now: its only caller, `is_internal`, is itself
-/// gated until Task 2.
-#[cfg(test)]
 fn parse_id(id: &Option<String>) -> Option<u16> {
     u16::from_str_radix(id.as_deref()?, 16).ok()
 }

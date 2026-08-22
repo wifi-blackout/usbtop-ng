@@ -200,7 +200,7 @@ key press and quits through the same teardown as `q`.
 - Keys within one `--filter` term AND together: every key in the term must
   match. Separate `--filter` flags OR together: a device or packet counts if
   any term matches. No `--filter` flag shows and counts everything.
-- Keys: `bus`, `dev`, `vid`, `pid`, `id`, `name`, `ep`, `dir`, `type`.
+- Keys: `bus`, `dev`, `vid`, `pid`, `id`, `name`, `ep`, `dir`, `type`, `internal`.
 - `bus` and `dev` match the USB bus number and device number.
 - `vid` and `pid` match the 4 hex digit vendor and product ID, e.g.
   `vid=04f2`. `id` is shorthand for both together, e.g. `id=04f2:b71a`.
@@ -210,9 +210,12 @@ key press and quits through the same teardown as `q`.
 - `ep` matches the endpoint number, 0 through 15. `dir` matches transfer
   direction, `in` or `out`. `type` matches transfer type: `control` (or
   `ctrl`), `iso`, `bulk`, `interrupt` (or `int`).
-- `bus`, `dev`, `vid`, `pid`, and `name` decide which devices show at all.
-  `ep`, `dir`, and `type` narrow which packets on a visible device count,
-  without hiding the device itself.
+- `internal` matches `yes`/`true` or `no`/`false` against a device's
+  snapshot origin; it requires an internal-device snapshot (`--snapshot-internal`)
+  to already exist, or usbtop-ng exits with an error naming that flag.
+- `bus`, `dev`, `vid`, `pid`, `name`, and `internal` decide which devices show
+  at all. `ep`, `dir`, and `type` narrow which packets on a visible device
+  count, without hiding the device itself.
 
 ### Scriptable output
 
@@ -337,7 +340,7 @@ key press and quits through the same teardown as `q`.
 
 ### Tests
 
-- `cargo test --all-targets` runs 294 hermetic tests against fixture files,
+- `cargo test --all-targets` runs 306 hermetic tests against fixture files,
   FIFOs, and temporary paths. They need no `/dev` and no debugfs access.
 - The `integration` cargo feature adds 1 test that reads the real usbmon
   interfaces. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
