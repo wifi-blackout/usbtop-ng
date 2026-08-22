@@ -65,6 +65,10 @@ These came out of code review. Each is small and none blocks a release.
 - One constant for the 60-second window. The device chart bounds and
   `RATE_HISTORY_WINDOW` state it separately.
 - Error and log strings brought under the documentation style guide.
+- SUDO_USER-aware config-dir resolution, so preferences, the usb.ids home
+  copy, and the internal snapshot follow the invoking user under sudo.
+  Today each resolves against root's home there, and only sudo -E bridges
+  the two. One coherent change across all three files, not a per-file fix.
 - Text reports round device speeds to whole Mbps, so a 1.5 Mbps low-speed
   device prints as 2 Mbps. The JSON output carries the exact value.
 - A first pull with no home copy has no date floor, so a replayed
