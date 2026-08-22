@@ -7,15 +7,26 @@ schedule. Items move to [CHANGELOG.md](../CHANGELOG.md) when they ship.
 
 - Interactive `/` search in the device table. `--filter` covers the
   command-line case; the table itself has no live search yet.
-- Endpoint rows in the TUI device list. The JSON output already carries
-  per-endpoint detail; the table shows only device totals.
-- Export of bandwidth data to a file.
+- Endpoint rows in the TUI device list, expand/collapse on the selected
+  device. The accounting and JSON output already carry per-endpoint
+  detail; the table shows only device totals, and `WindowCounter::bps`
+  waits test-gated for this consumer. Best value-to-effort item on this
+  list (2026-08-22 review).
+- Document file export. `--batch --json > capture.ndjson` already covers
+  it; a native `--output PATH` only earns its place if users ask for
+  append or rotation semantics.
 - One row per physical connector, using the sysfs port `peer` links. Today
   the USB2 side and the USB3 side of one connector list as sibling buses.
+  A connector pairs individual hub ports, not whole buses, and `peer`
+  links can be absent or wrong, so this needs a design investigation and
+  real dock fixtures before code.
 - Bus discovery without debugfs, so the binary interface stands alone. Today
   usbtop-ng finds buses through debugfs even when it reads `/dev/usbmon<bus>`.
-- Plugin system for custom monitors.
-- Monitoring of remote systems over the network.
+- Plugin system for custom monitors. Deferred: the versioned NDJSON
+  stream is already the right boundary for external analysis tools.
+- Monitoring of remote systems over the network. `ssh -t host sudo
+  usbtop-ng` and `ssh host sudo usbtop-ng --batch --json` already cover
+  the common cases; document those before building a network service.
 
 ## eBPF backend
 
@@ -24,7 +35,8 @@ bpftrace 0.20.2 on kernel 7.0.0-29-generic. Two probes cover all USB
 traffic: `usb_submit_urb` and `__usb_hcd_giveback_urb`. The kernel BTF at
 `/sys/kernel/btf/vmlinux` resolved every struct field with no header files.
 In-kernel maps aggregated bytes keyed by bus, device, endpoint, direction,
-and transfer type. usbtop-ng would read the maps once per refresh tick.
+and transfer type. Each consumer polls the maps on its own cadence: the
+TUI tick and a headless window differ.
 
 Prototype numbers, from a 6-second camera stream (Chicony IR camera, bus 1
 device 4, 61 frames of 614,400 bytes each):
@@ -41,8 +53,16 @@ Design notes:
 
 - Startup probes a backend chain: eBPF, then usbmon binary, then usbmon
   text. Any BTF, attach, or lockdown failure degrades to the next source.
-- Headline feature: per-process attribution. `usb_submit_urb` runs with task
-  context, which usbmon never records. The prototype also showed the trap:
+  Kprobe attach points are not a stable kernel interface, so eBPF ships
+  as an explicit opt-in first, not the automatic default.
+- Aggregated maps do not fit the per-packet `PacketSource` contract. The
+  backend needs a delta seam: capture backends emit (key, bytes) updates,
+  the manager accounts them, and `apply_packet` becomes the usbmon
+  adapter. Monotonic per-CPU counters diffed against snapshots, never
+  read-and-clear.
+- Headline feature: per-process attribution, as separate research first.
+  `usb_submit_urb` often has task context, but not always, and usbmon
+  never records it. The prototype also showed the trap:
   drivers resubmit periodic URBs from interrupt context, so the camera
   stream logged 41 submissions under ffmpeg and 1,538 under idle-task and
   kworker contexts. Attribution needs an owner map written at stream start,
@@ -58,29 +78,44 @@ Design notes:
 
 These came out of code review. Each is small and none blocks a release.
 
-- A warning color for the `dropped:` and `shed:` counters. The palette has no
-  warning hue, so both render like ordinary stats.
+- A semantic warning color for the `dropped:` and `shed:` counters. Both
+  already render orange and bold, but they share `SECONDARY_COLOR` with
+  the Peak figure, so warning and statistic look alike.
 - An ellipsis on truncated table cells. Truncation is silent today.
 - No empty parens in the bus header when the bus speed is unknown.
-- One constant for the 60-second window. The device chart bounds and
-  `RATE_HISTORY_WINDOW` state it separately.
+- One constant for the 60-second window. Three places state it today:
+  `RATE_HISTORY_WINDOW` in stats, `HISTORY_WINDOW_SECS` in ui, and the
+  device chart's hard-coded -60.0 axis bound.
 - Error and log strings brought under the documentation style guide.
 - SUDO_USER-aware config-dir resolution, so preferences, the usb.ids home
-  copy, and the internal snapshot follow the invoking user under sudo.
-  Today each resolves against root's home there, and only sudo -E bridges
-  the two. One coherent change across all three files, not a per-file fix.
+  copy, the internal snapshot, and `--create-alias` follow the invoking
+  user under sudo. Today each resolves against root's home there, and
+  only sudo -E bridges the two. One coherent change, and created files
+  must land owned by the invoking user, not root.
+- The exact-speed model. `20000` parses to SuperSpeedPlus, which reports
+  10,000 Mbps everywhere, so a 20 Gbps bus shows half its speed and
+  %busy roughly doubles. Store exact Mbps with a separate display class
+  instead of the lossy enum. A correctness bug, not polish.
+- Built-in usbmon detection. Module status reads /proc/modules only, so a
+  kernel with usbmon compiled in reads as not loaded and can draw a
+  pointless load prompt when debugfs is unmounted.
 - Text reports round device speeds to whole Mbps, so a 1.5 Mbps low-speed
   device prints as 2 Mbps. The JSON output carries the exact value.
 - A first pull with no home copy has no date floor, so a replayed
   older-but-valid usb.ids payload could install and shadow a newer distro
-  copy. A hardening pass could floor on the active source's date instead.
+  copy. A hardening pass could floor on the newer of the replaced copy
+  and the active source.
 - The usbmon text fallback overcounts isochronous transfers. Its length
   column holds the buffer size, not the bytes moved. On a camera stream the
   overcount was 3.6x. The text format prints 5 of 32 descriptors per URB, so
   no exact count exists in text mode. The binary interface reports true
   bytes and is already the preferred source. The UI and the JSON output now
   mark affected rates as estimates. The remaining idea: sum the printed
-  descriptors to tighten the estimate.
+  descriptors to tighten the estimate. Caveat before building it: only up
+  to 5 descriptors print, so a sum can under-estimate as badly as the
+  length over-estimates, and the kernel's usbmon document claims callback
+  lengths are actual values, which the measurement above contradicts on
+  this kernel. Commit a raw trace alongside any fix.
 
 ## Testing follow-ups
 
@@ -88,9 +123,14 @@ These came out of code review. Each is small and none blocks a release.
   hand today and are recorded in review reports only.
 - A pipe-based regression guard proving the terminal-restore bytes bypass
   stdio buffering.
-- Age-based tests that do not assume 2 minutes of machine uptime.
-- Thunderbolt 3 and newer devices are untested.
-- USB 4 and newer devices are untested.
+- Age-based tests that do not assume machine uptime: the 70-second
+  assumption in stats and the 120-second one in ui. Extract eviction
+  helpers that take a caller-supplied now.
+- Thunderbolt and USB4 hardware validation. usbtop-ng observes USB URBs
+  behind such hosts and docks, never PCIe or fabric traffic. A useful
+  matrix covers dock controllers, hub topology, hotplug, suspend and
+  resume, and peer links. Blocked on the exact-speed model fix above for
+  20 Gbps links.
 - Generate a log with a normalized schema of hardware devices that have
   been tested. Ideas for this would include the date the test was performed
   along with the conditions (kernel version, relevant drivers, attached port
