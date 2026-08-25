@@ -30,9 +30,11 @@ pub struct BandwidthStats {
     pub rate_history: VecDeque<(Instant, f64, f64)>,
 }
 
-/// `rate_history` retains samples from this far back (see `refresh`). Matches
-/// the 60-second x-axis the per-device rate chart draws.
-const RATE_HISTORY_WINDOW: Duration = Duration::from_secs(60);
+/// `rate_history` retains samples from this far back (see `refresh`). The
+/// single source of truth for the 60-second window: `ui` derives its
+/// aggregate-history cutoff and both charts' x-axis bounds from this instead
+/// of restating 60 seconds on its own, so the two can't drift apart.
+pub const RATE_HISTORY_WINDOW: Duration = Duration::from_secs(60);
 
 /// Width of one accounting slot in `rx_buckets`/`tx_buckets`. Small enough
 /// that the sliding window's edge is accurate to a quarter second, large
