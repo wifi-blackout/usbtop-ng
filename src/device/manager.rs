@@ -23,7 +23,7 @@ impl UsbBus {
     pub fn new(bus_id: u8) -> Self {
         Self {
             bus_id,
-            speed: UsbSpeed::Unknown,
+            speed: UsbSpeed::UNKNOWN,
             devices: HashMap::new(),
             controller: None,
         }
@@ -58,7 +58,7 @@ impl UsbBus {
             .map(|device| &device.speed)
             .max_by_key(|speed| speed.to_mbps() as u64)
             .cloned()
-            .unwrap_or(UsbSpeed::Unknown);
+            .unwrap_or(UsbSpeed::UNKNOWN);
 
         self.speed = highest_speed;
 
@@ -396,7 +396,7 @@ mod tests {
     fn busy_percentage_none_for_unknown_bus_speed() {
         let (_t, mut mgr) = manager_with_empty_sysfs();
         let bus = mgr.get_or_create_bus(1);
-        assert_eq!(bus.speed, UsbSpeed::Unknown);
+        assert_eq!(bus.speed, UsbSpeed::UNKNOWN);
         assert_eq!(bus.busy_percentage(), None);
     }
 
@@ -404,7 +404,7 @@ mod tests {
     fn busy_percentage_sums_devices_against_bus_practical_max() {
         let (_t, mut mgr) = manager_with_empty_sysfs();
         let bus = mgr.get_or_create_bus(1);
-        bus.speed = UsbSpeed::Full; // practical max = 1_200_000 bytes/s
+        bus.speed = UsbSpeed::from_mbps(12.0); // practical max = 1_200_000 bytes/s
         let mut d1 = UsbDevice::new(1, 3);
         d1.bandwidth_stats.current_bps = 600_000.0;
         let mut d2 = UsbDevice::new(1, 4);
@@ -419,7 +419,7 @@ mod tests {
     fn busy_percentage_clamps_at_100() {
         let (_t, mut mgr) = manager_with_empty_sysfs();
         let bus = mgr.get_or_create_bus(1);
-        bus.speed = UsbSpeed::Full;
+        bus.speed = UsbSpeed::from_mbps(12.0);
         let mut d1 = UsbDevice::new(1, 3);
         d1.bandwidth_stats.current_bps = 10_000_000.0;
         bus.devices.insert(3, d1);
@@ -460,7 +460,7 @@ mod tests {
         assert!(bus.devices.contains_key(&4), "device enumerated");
         assert_eq!(bus.devices.len(), 2, "the interface dir is not a device");
         assert_eq!(bus.devices[&4].bandwidth_stats.current_bps, 0.0);
-        assert_eq!(bus.devices[&4].speed, UsbSpeed::High);
+        assert_eq!(bus.devices[&4].speed, UsbSpeed::from_mbps(480.0));
     }
 
     #[test]
