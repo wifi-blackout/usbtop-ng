@@ -58,7 +58,7 @@ impl UsbDevice {
             vendor: None,
             product: None,
             serial: None,
-            speed: UsbSpeed::Unknown,
+            speed: UsbSpeed::UNKNOWN,
             bandwidth_stats: BandwidthStats::new(),
             is_disconnected: false,
             disconnect_time: None,
@@ -307,7 +307,7 @@ impl UsbDevice {
 fn read_max_capability(dir: &std::path::Path) -> Option<UsbSpeed> {
     let raw = std::fs::read_to_string(dir.join("version")).ok()?;
     let major: u32 = raw.trim().split('.').next()?.parse().ok()?;
-    (major >= 3).then_some(UsbSpeed::SuperSpeed)
+    (major >= 3).then_some(UsbSpeed::from_mbps(5000.0))
 }
 
 /// Visual indicator for a device's speed-capability status, surfaced as the
@@ -364,13 +364,17 @@ impl SpeedIndicator {
 /// `cfg(test)`-only for now; see [`SpeedIndicator::get_description`].
 #[cfg(test)]
 fn format_speed(speed: &UsbSpeed) -> String {
-    match speed {
-        UsbSpeed::Low => "1.5 Mbps (Low Speed)".to_string(),
-        UsbSpeed::Full => "12 Mbps (Full Speed)".to_string(),
-        UsbSpeed::High => "480 Mbps (High Speed)".to_string(),
-        UsbSpeed::SuperSpeed => "5 Gbps (SuperSpeed)".to_string(),
-        UsbSpeed::SuperSpeedPlus => "10+ Gbps (SuperSpeed+)".to_string(),
-        UsbSpeed::Unknown => "Unknown".to_string(),
+    use crate::usbmon::parser::SpeedClass;
+
+    match speed.class() {
+        SpeedClass::Low => "1.5 Mbps (Low Speed)".to_string(),
+        SpeedClass::Full => "12 Mbps (Full Speed)".to_string(),
+        SpeedClass::High => "480 Mbps (High Speed)".to_string(),
+        SpeedClass::SuperSpeed => "5 Gbps (SuperSpeed)".to_string(),
+        SpeedClass::SuperSpeedPlus => {
+            format!("{:.0}+ Gbps (SuperSpeed+)", speed.to_mbps() / 1000.0)
+        }
+        SpeedClass::Unknown => "Unknown".to_string(),
     }
 }
 
@@ -416,7 +420,7 @@ mod tests {
         let mut device = UsbDevice::new(1, 5);
         device.populate_from_sysfs(Some(temp.path()));
 
-        assert_eq!(device.speed, UsbSpeed::High);
+        assert_eq!(device.speed, UsbSpeed::from_mbps(480.0));
         assert_eq!(device.vendor_id, Some(0x1d6b));
         assert_eq!(device.product_id, Some(0x0002));
         assert_eq!(device.vendor.as_deref(), Some("Linux Foundation"));
@@ -462,7 +466,7 @@ mod tests {
         device.populate_from_dir(&dir);
 
         assert_eq!(device.sysfs_path, Some(dir));
-        assert_eq!(device.speed, UsbSpeed::High);
+        assert_eq!(device.speed, UsbSpeed::from_mbps(480.0));
         assert_eq!(device.vendor_id, Some(0x1d6b));
     }
 
@@ -497,26 +501,26 @@ mod tests {
         );
         let mut d = UsbDevice::new(1, 5);
         d.populate_from_sysfs(Some(temp.path()));
-        assert_eq!(d.max_capability, Some(UsbSpeed::SuperSpeed));
+        assert_eq!(d.max_capability, Some(UsbSpeed::from_mbps(5000.0)));
         // 🔺: capable of SuperSpeed, linked High on a High bus
         assert_eq!(
-            d.check_speed_mismatch(&UsbSpeed::High),
-            Some(UsbSpeed::SuperSpeed)
+            d.check_speed_mismatch(&UsbSpeed::from_mbps(480.0)),
+            Some(UsbSpeed::from_mbps(5000.0))
         );
         assert_eq!(
-            d.get_speed_indicator(&UsbSpeed::High),
-            SpeedIndicator::LimitedByBus(UsbSpeed::SuperSpeed)
+            d.get_speed_indicator(&UsbSpeed::from_mbps(480.0)),
+            SpeedIndicator::LimitedByBus(UsbSpeed::from_mbps(5000.0))
         );
     }
 
     #[test]
     fn high_utilization_indicator_above_80_percent() {
         let mut d = UsbDevice::new(1, 3);
-        d.speed = UsbSpeed::Full; // practical 1.2 MB/s
+        d.speed = UsbSpeed::from_mbps(12.0); // practical 1.2 MB/s
         d.bandwidth_stats.current_bps = 1_100_000.0;
         assert!(d.get_busy_percentage() > 80.0);
         assert_eq!(
-            d.get_speed_indicator(&UsbSpeed::Full),
+            d.get_speed_indicator(&UsbSpeed::from_mbps(12.0)),
             SpeedIndicator::HighUtilization
         );
     }
@@ -537,17 +541,17 @@ mod tests {
         d.bandwidth_stats.current_bps = 1_000_000_000.0;
         assert!(d.get_busy_percentage() > 80.0);
         assert_eq!(
-            d.get_speed_indicator(&UsbSpeed::High),
-            SpeedIndicator::LimitedByBus(UsbSpeed::SuperSpeed)
+            d.get_speed_indicator(&UsbSpeed::from_mbps(480.0)),
+            SpeedIndicator::LimitedByBus(UsbSpeed::from_mbps(5000.0))
         );
     }
 
     #[test]
     fn normal_indicator_when_no_mismatch_and_low_utilization() {
         let mut d = UsbDevice::new(1, 9);
-        d.speed = UsbSpeed::High;
+        d.speed = UsbSpeed::from_mbps(480.0);
         assert_eq!(
-            d.get_speed_indicator(&UsbSpeed::High),
+            d.get_speed_indicator(&UsbSpeed::from_mbps(480.0)),
             SpeedIndicator::Normal
         );
     }
@@ -556,7 +560,10 @@ mod tests {
     fn read_max_capability_signals_only_on_declared_usb_3() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("version"), "3.20\n").unwrap();
-        assert_eq!(read_max_capability(temp.path()), Some(UsbSpeed::SuperSpeed));
+        assert_eq!(
+            read_max_capability(temp.path()),
+            Some(UsbSpeed::from_mbps(5000.0))
+        );
 
         // Real sysfs pads the field; 2.x says nothing about SuperSpeed support.
         std::fs::write(temp.path().join("version"), " 2.10\n").unwrap();
@@ -590,16 +597,16 @@ mod tests {
         let mut d = UsbDevice::new(1, 4);
         d.populate_from_sysfs(Some(temp.path()));
         assert_eq!(d.max_capability, None);
-        assert_eq!(d.check_speed_mismatch(&UsbSpeed::High), None);
+        assert_eq!(d.check_speed_mismatch(&UsbSpeed::from_mbps(480.0)), None);
         assert_eq!(
-            d.get_speed_indicator(&UsbSpeed::High),
+            d.get_speed_indicator(&UsbSpeed::from_mbps(480.0)),
             SpeedIndicator::Normal
         );
 
         // Full speed practical max is 1.2 MB/s, so this crosses 80% busy.
         d.bandwidth_stats.current_bps = 1_100_000.0;
         assert_eq!(
-            d.get_speed_indicator(&UsbSpeed::High),
+            d.get_speed_indicator(&UsbSpeed::from_mbps(480.0)),
             SpeedIndicator::HighUtilization
         );
     }
@@ -609,20 +616,20 @@ mod tests {
         assert_eq!(SpeedIndicator::Normal.get_symbol(), "");
         assert_eq!(SpeedIndicator::HighUtilization.get_symbol(), "⚡");
         assert_eq!(
-            SpeedIndicator::LimitedByBus(UsbSpeed::SuperSpeed).get_symbol(),
+            SpeedIndicator::LimitedByBus(UsbSpeed::from_mbps(5000.0)).get_symbol(),
             "🔺"
         );
         assert_eq!(SpeedIndicator::Normal.get_color(), (128, 128, 128));
         assert_eq!(SpeedIndicator::HighUtilization.get_color(), (255, 165, 0));
         assert_eq!(
-            SpeedIndicator::LimitedByBus(UsbSpeed::SuperSpeed).get_color(),
+            SpeedIndicator::LimitedByBus(UsbSpeed::from_mbps(5000.0)).get_color(),
             (255, 255, 0)
         );
     }
 
     #[test]
     fn speed_indicator_description_mentions_capability() {
-        let indicator = SpeedIndicator::LimitedByBus(UsbSpeed::SuperSpeed);
+        let indicator = SpeedIndicator::LimitedByBus(UsbSpeed::from_mbps(5000.0));
         assert!(indicator.get_description().contains("5 Gbps"));
         assert_eq!(SpeedIndicator::Normal.get_description(), "Normal operation");
     }

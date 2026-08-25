@@ -31,9 +31,15 @@ use colors::*;
 const UNKNOWN_CONTROLLER: &str = "unknown";
 
 /// How much of `bandwidth_history` is kept and plotted, in seconds. Eviction
-/// and the chart's x-axis read the same number so the window the chart claims
-/// is the window the data actually covers.
-const HISTORY_WINDOW_SECS: f64 = 60.0;
+/// and both charts' x-axis bounds read the same number so the window a chart
+/// claims is the window the data actually covers. Derived from
+/// `stats::RATE_HISTORY_WINDOW` rather than restated here, so the aggregate
+/// and per-device windows can't drift apart. Not a `const`: `Duration`'s
+/// conversion methods aren't guaranteed `const fn` at this MSRV, and a plain
+/// function is the simplest fix that doesn't gamble on that.
+fn history_window_secs() -> f64 {
+    crate::stats::RATE_HISTORY_WINDOW.as_secs_f64()
+}
 
 /// Most packets applied in one pass of the event loop. The channel's bound is
 /// what caps memory; this caps how long a single frame can spend catching up,
@@ -374,15 +380,23 @@ impl UsbTopApp {
     }
 
     pub fn update_bandwidth_history(&mut self) {
-        let now = self.start_time.elapsed().as_secs_f64();
-        self.bandwidth_history.push((now, self.total_bandwidth));
+        self.update_bandwidth_history_at(self.start_time.elapsed().as_secs_f64());
+    }
+
+    /// `update_bandwidth_history`'s body, taking the session-relative
+    /// timestamp as a parameter so tests can pass a synthetic `now_secs`
+    /// instead of backdating `start_time` (which fails on a host with less
+    /// uptime than the backdate).
+    fn update_bandwidth_history_at(&mut self, now_secs: f64) {
+        self.bandwidth_history
+            .push((now_secs, self.total_bandwidth));
 
         // Keep the last 60 seconds of data, by age rather than by sample
         // count: the tick rate is the user's `--refresh` choice, so a fixed
         // count would mean 15s at 250ms and 120s at 2000ms while the chart
         // keeps claiming a 60-second window. Samples are appended in time
         // order, so the expired ones are exactly the leading run.
-        let cutoff = now - HISTORY_WINDOW_SECS;
+        let cutoff = now_secs - history_window_secs();
         let expired = self.bandwidth_history.partition_point(|(t, _)| *t < cutoff);
         self.bandwidth_history.drain(0..expired);
     }
@@ -700,7 +714,11 @@ fn to_mbps(bytes_per_second: f64) -> f64 {
     }
 }
 
-fn draw_header(f: &mut Frame, area: Rect, app: &UsbTopApp) {
+/// The header's two lines: the title, then the stats line (`Total`, `Peak`,
+/// `Devices`, and the conditional `dropped`/`shed` counters). Split out from
+/// `draw_header` so tests can inspect the spans -- styles included -- without
+/// scraping rendered terminal cells.
+fn header_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
     let mut stats_line = vec![
         Span::raw("Total: "),
         Span::styled(
@@ -726,14 +744,16 @@ fn draw_header(f: &mut Frame, area: Rect, app: &UsbTopApp) {
     ];
 
     // Only shown once something was actually lost: the figures above are then
-    // an undercount, and silence about that would be the real bug.
+    // an undercount, and silence about that would be the real bug. Styled in
+    // WARNING_COLOR, not SECONDARY_COLOR, so this reads as the alert it is
+    // instead of blending in with the Peak figure next to it.
     let dropped = app.dropped_packets();
     if dropped > 0 {
         stats_line.push(Span::raw(" | dropped: "));
         stats_line.push(Span::styled(
             dropped.to_string(),
             Style::default()
-                .fg(SECONDARY_COLOR)
+                .fg(WARNING_COLOR)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -746,12 +766,12 @@ fn draw_header(f: &mut Frame, area: Rect, app: &UsbTopApp) {
         stats_line.push(Span::styled(
             shed.to_string(),
             Style::default()
-                .fg(SECONDARY_COLOR)
+                .fg(WARNING_COLOR)
                 .add_modifier(Modifier::BOLD),
         ));
     }
 
-    let header_text = vec![
+    vec![
         Line::from(vec![
             Span::styled(
                 "usbtop-ng",
@@ -762,9 +782,11 @@ fn draw_header(f: &mut Frame, area: Rect, app: &UsbTopApp) {
             Span::raw(" - live USB bandwidth monitor"),
         ]),
         Line::from(stats_line),
-    ];
+    ]
+}
 
-    let header = Paragraph::new(header_text)
+fn draw_header(f: &mut Frame, area: Rect, app: &UsbTopApp) {
+    let header = Paragraph::new(header_lines(app))
         .block(Block::default().borders(Borders::ALL).title(" usbtop-ng "));
 
     f.render_widget(header, area);
@@ -789,8 +811,8 @@ fn draw_bandwidth_graph(f: &mut Frame, area: Rect, app: &UsbTopApp) {
         .map(|(t, bps)| (*t, bps / 1_000_000.0))
         .collect();
     let latest_t = data.last().map(|(t, _)| *t).unwrap_or(0.0);
-    let x_min = (latest_t - HISTORY_WINDOW_SECS).max(0.0);
-    let x_max = latest_t.max(HISTORY_WINDOW_SECS);
+    let x_min = (latest_t - history_window_secs()).max(0.0);
+    let x_max = latest_t.max(history_window_secs());
     let max_mbps = data.iter().map(|(_, m)| *m).fold(0.0, f64::max).max(1.0);
 
     let datasets = vec![Dataset::default()
@@ -895,7 +917,7 @@ fn draw_device_chart(f: &mut Frame, area: Rect, app: &UsbTopApp) {
             Axis::default()
                 .title("Time (s)")
                 .style(Style::default().fg(TEXT_COLOR))
-                .bounds([-60.0, 0.0]),
+                .bounds([-history_window_secs(), 0.0]),
         )
         .y_axis(
             Axis::default()
@@ -937,22 +959,41 @@ fn device_columns(cells: [&str; 9], port_style: Option<Style>) -> Vec<Span<'stat
 }
 
 /// Clip `text` to at most `width` terminal cells, then pad it to exactly that
-/// many. A wide character that would straddle the edge is dropped in favour of
-/// a padding space, so the column always ends where it should.
+/// many. Truncated text loses its last cell to a `…` marker instead of just
+/// vanishing silently, so the column still says something was cut off; a
+/// zero-width column stays empty since there's no room for even that.
 fn fit_to_display_width(text: &str, width: usize) -> String {
-    let mut fitted = String::with_capacity(width);
+    // Each entry is a fitted char plus its own display width, not just a
+    // char: a popped CJK character frees 2 cells, not 1, and only tracking
+    // per-char widths lets the ellipsis fixup below account for that.
+    let mut fitted: Vec<(char, usize)> = Vec::new();
     let mut used = 0;
     let mut buffer = [0u8; 4];
+    let mut truncated = false;
     for character in text.chars() {
         let cells = Span::raw(&*character.encode_utf8(&mut buffer)).width();
         if used + cells > width {
+            truncated = true;
             break;
         }
-        fitted.push(character);
+        fitted.push((character, cells));
         used += cells;
     }
-    fitted.push_str(&" ".repeat(width - used));
-    fitted
+
+    if truncated && width > 0 {
+        while used > width - 1 {
+            let (_, cells) = fitted
+                .pop()
+                .expect("width > 0 leaves room for at least the ellipsis alone");
+            used -= cells;
+        }
+        fitted.push(('…', 1));
+        used += 1;
+    }
+
+    let mut result: String = fitted.into_iter().map(|(character, _)| character).collect();
+    result.push_str(&" ".repeat(width - used));
+    result
 }
 
 /// Speed is the 3rd column (index 2) of `DEVICE_COLUMNS`; the `!` indicator is
@@ -1000,7 +1041,7 @@ fn rate_cell(bytes_per_second: f64, estimated: bool) -> String {
 /// Unknown-speed device with real traffic renders a misleading "0.0" instead
 /// of the bus row's honest "--".
 fn busy_cell(device: &UsbDevice) -> String {
-    if device.speed == UsbSpeed::Unknown {
+    if device.speed.is_unknown() {
         format!("{:>5}", "--")
     } else {
         format!("{:5.1}", device.get_busy_percentage())
@@ -1070,8 +1111,13 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
                 Some(pct) => format!(" · {pct:.1}% busy"),
                 None => " · -- busy".to_string(),
             };
+            let side_paren = if bus.side_label.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", bus.side_label)
+            };
             lines.push(Line::from(vec![
-                Span::raw(format!("▶ Bus {:02} ({})  ", bus.bus_id, bus.side_label)),
+                Span::raw(format!("▶ Bus {:02}{}  ", bus.bus_id, side_paren)),
                 Span::styled(
                     format!("{:.1} Mbps", bus.speed.to_mbps()),
                     speed_style(&bus.speed),
@@ -1149,17 +1195,17 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
 fn draw_color_reference(f: &mut Frame, area: Rect, app: &UsbTopApp) {
     let mut legend_spans = vec![
         Span::raw("Legend: "),
-        Span::styled("●", speed_style(&UsbSpeed::Low)),
+        Span::styled("●", speed_style(&UsbSpeed::from_mbps(1.5))),
         Span::raw(" 1.5M  "),
-        Span::styled("●", speed_style(&UsbSpeed::Full)),
+        Span::styled("●", speed_style(&UsbSpeed::from_mbps(12.0))),
         Span::raw(" 12M  "),
-        Span::styled("●", speed_style(&UsbSpeed::High)),
+        Span::styled("●", speed_style(&UsbSpeed::from_mbps(480.0))),
         Span::raw(" 480M  "),
-        Span::styled("●", speed_style(&UsbSpeed::SuperSpeed)),
+        Span::styled("●", speed_style(&UsbSpeed::from_mbps(5000.0))),
         Span::raw(" 5G  "),
-        Span::styled("●", speed_style(&UsbSpeed::SuperSpeedPlus)),
+        Span::styled("●", speed_style(&UsbSpeed::from_mbps(20000.0))),
         Span::raw(" 10G+  "),
-        Span::styled("●", speed_style(&UsbSpeed::Unknown)),
+        Span::styled("●", speed_style(&UsbSpeed::UNKNOWN)),
         Span::raw(" ?"),
     ];
     // Only true while a debugfs text source backs the session: the `~`
@@ -2365,6 +2411,42 @@ mod tests {
         terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
     }
 
+    #[test]
+    fn fit_to_display_width_leaves_an_exact_fit_unchanged() {
+        assert_eq!(fit_to_display_width("Acme", 4), "Acme");
+    }
+
+    #[test]
+    fn fit_to_display_width_marks_ascii_truncation_with_an_ellipsis() {
+        let fitted = fit_to_display_width("HelloWorld", 5);
+        assert!(fitted.ends_with('…'), "{fitted}");
+        assert_eq!(Span::raw(&fitted).width(), 5, "{fitted}");
+    }
+
+    #[test]
+    fn fit_to_display_width_keeps_cjk_truncation_width_correct() {
+        // Each CJK char below is 2 display cells (Span::width()), so a naive
+        // "pop one char" fixup would free 2 cells and misalign the column;
+        // the fixup has to track each popped character's own width. Popping
+        // a 2-cell char to make room for the 1-cell ellipsis can leave one
+        // cell of padding after it, so unlike the ASCII case this doesn't
+        // necessarily end with the ellipsis -- only the total width is
+        // guaranteed.
+        let fitted = fit_to_display_width("東京デバイスカンパニー", 14);
+        assert!(fitted.contains('…'), "{fitted}");
+        assert_eq!(Span::raw(&fitted).width(), 14, "{fitted}");
+    }
+
+    #[test]
+    fn fit_to_display_width_of_one_with_oversized_text_is_just_the_ellipsis() {
+        assert_eq!(fit_to_display_width("HelloWorld", 1), "…");
+    }
+
+    #[test]
+    fn fit_to_display_width_of_zero_stays_empty() {
+        assert_eq!(fit_to_display_width("HelloWorld", 0), "");
+    }
+
     /// Total display width of a device row: every column plus one space between.
     fn device_row_width() -> usize {
         DEVICE_COLUMNS.iter().sum::<usize>() + DEVICE_COLUMNS.len() - 1
@@ -2426,7 +2508,7 @@ mod tests {
             // 1.1 MB/s crosses the 80% HighUtilization threshold and renders
             // the 2-cell "⚡" glyph in the `!` column.
             let indicator = bus.devices.get_mut(&5).unwrap();
-            indicator.speed = UsbSpeed::Full;
+            indicator.speed = UsbSpeed::from_mbps(12.0);
         }
         let mut app = UsbTopApp::new(Duration::from_millis(100));
         app.sync_from(&mgr);
@@ -2448,7 +2530,7 @@ mod tests {
         );
 
         // Lock the ASCII geometry so column offsets cannot drift silently.
-        // Device 3 keeps the default UsbSpeed::Unknown (never overridden
+        // Device 3 keeps the default UsbSpeed::UNKNOWN (never overridden
         // above), so its %busy cell is the width-7 "--" fallback, not "0.0".
         assert_eq!(
             lines[3].to_string(),
@@ -2464,10 +2546,10 @@ mod tests {
     fn bus_header_shows_busy_percentage_or_dashes() {
         let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0), (2, 4, 600_000.0)]);
         {
-            // Bus 1 keeps the default UsbSpeed::Unknown -> no meaningful
+            // Bus 1 keeps the default UsbSpeed::UNKNOWN -> no meaningful
             // denominator, so its header shows "-- busy".
             let bus2 = mgr.get_or_create_bus(2);
-            bus2.speed = UsbSpeed::Full; // practical max 1_200_000 bytes/s
+            bus2.speed = UsbSpeed::from_mbps(12.0); // practical max 1_200_000 bytes/s
         }
         let mut app = UsbTopApp::new(Duration::from_millis(100));
         app.sync_from(&mgr);
@@ -2480,6 +2562,35 @@ mod tests {
             .join("\n");
         assert!(text.contains("· -- busy"), "{text}");
         assert!(text.contains("· 50.0% busy"), "{text}");
+    }
+
+    #[test]
+    fn bus_heading_omits_parens_when_the_speed_is_unknown() {
+        // Bus 1 keeps the default UsbSpeed::UNKNOWN, so `side_label` is
+        // empty; the heading must not print a bare, meaningless "()".
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0)]);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let text: String = device_list_lines_with_selection(&app)
+            .0
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("▶ Bus 01  "), "{text}");
+        assert!(!text.contains("Bus 01 ()"), "{text}");
+
+        // A known speed still gets its side label in parens.
+        mgr.get_or_create_bus(1).speed = UsbSpeed::from_mbps(480.0);
+        app.sync_from(&mgr);
+        let text: String = device_list_lines_with_selection(&app)
+            .0
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("▶ Bus 01 (USB2 side)  "), "{text}");
     }
 
     #[test]
@@ -2551,7 +2662,7 @@ mod tests {
         // above for the same pattern).
         const BUSY_SPAN_INDEX: usize = 2 * 7;
 
-        // The device keeps UsbDevice::new's default UsbSpeed::Unknown, but
+        // The device keeps UsbDevice::new's default UsbSpeed::UNKNOWN, but
         // has real traffic (nonzero current_bps): without the fix this
         // renders a misleading "0.0" instead of the bus header's honest "--".
         let (_t, mgr) = manager_with_rates(&[(1, 3, 600_000.0)]);
@@ -2573,8 +2684,8 @@ mod tests {
         let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0), (1, 4, 0.0)]);
         {
             let bus = mgr.get_or_create_bus(1);
-            bus.devices.get_mut(&3).unwrap().speed = UsbSpeed::High;
-            bus.devices.get_mut(&4).unwrap().speed = UsbSpeed::SuperSpeed;
+            bus.devices.get_mut(&3).unwrap().speed = UsbSpeed::from_mbps(480.0);
+            bus.devices.get_mut(&4).unwrap().speed = UsbSpeed::from_mbps(5000.0);
         }
         let mut app = UsbTopApp::new(Duration::from_millis(100));
         app.sync_from(&mgr);
@@ -2587,14 +2698,14 @@ mod tests {
         let unselected_speed = &lines[3].spans[SPEED_SPAN_INDEX];
         assert_eq!(
             unselected_speed.style.fg,
-            Some(Color::Rgb(255, 255, 0)), // UsbSpeed::High
+            Some(Color::Rgb(255, 255, 0)), // SpeedClass::High (480 Mbps)
             "unselected row's Speed span carries its speed color"
         );
 
         let selected_speed = &lines[4].spans[SPEED_SPAN_INDEX];
         assert_ne!(
             selected_speed.style.fg,
-            Some(Color::Rgb(0, 255, 0)), // UsbSpeed::SuperSpeed
+            Some(Color::Rgb(0, 255, 0)), // SpeedClass::SuperSpeed (5000 Mbps)
             "selected row keeps the uniform highlight instead of the speed color"
         );
     }
@@ -2895,6 +3006,39 @@ mod tests {
         assert!(screen.contains("shed: 7"), "{screen}");
     }
 
+    /// `dropped:`/`shed:` are warnings, not measurements like Peak, so they
+    /// carry WARNING_COLOR rather than sharing SECONDARY_COLOR with it.
+    #[test]
+    fn dropped_and_shed_counters_use_warning_color_not_secondary() {
+        let dropped = Arc::new(AtomicU64::new(42));
+        let shed = Arc::new(AtomicU64::new(7));
+        let mut app =
+            UsbTopApp::new(Duration::from_millis(100)).with_dropped_counter(Arc::clone(&dropped));
+        app.shed_counter = Some(Arc::clone(&shed));
+
+        let lines = header_lines(&app);
+        let stats_line = &lines[1];
+
+        let dropped_value = stats_line
+            .spans
+            .iter()
+            .find(|span| span.content == "42")
+            .expect("dropped counter span");
+        assert_eq!(dropped_value.style.fg, Some(WARNING_COLOR));
+        assert_ne!(
+            dropped_value.style.fg,
+            Some(SECONDARY_COLOR),
+            "must not blend in with the Peak figure"
+        );
+
+        let shed_value = stats_line
+            .spans
+            .iter()
+            .find(|span| span.content == "7")
+            .expect("shed counter span");
+        assert_eq!(shed_value.style.fg, Some(WARNING_COLOR));
+    }
+
     /// The two tests above draw the header into a rect of their own choosing,
     /// which is exactly the blind spot this one closes: the header is two
     /// content lines inside a border, so a layout that hands it any less than
@@ -2922,21 +3066,20 @@ mod tests {
 
     /// The chart's x-axis is 60 seconds wide, so the history it plots is
     /// trimmed by age. A 60-sample cap would mean 15s at `--refresh 250`.
+    /// Uses `update_bandwidth_history_at` with a synthetic `now_secs`, so
+    /// this test needs no real machine uptime.
     #[test]
     fn bandwidth_history_keeps_sixty_seconds_not_sixty_samples() {
         let mut app = UsbTopApp::new(Duration::from_millis(250));
-        app.start_time = Instant::now()
-            .checked_sub(Duration::from_secs(120))
-            .expect("monotonic clock has at least 120s of history");
-        app.bandwidth_history.push((0.0, 1.0)); // ~120s before now
-        app.bandwidth_history.push((100.0, 2.0)); // ~20s before now
+        app.bandwidth_history.push((0.0, 1.0)); // 120s before now
+        app.bandwidth_history.push((100.0, 2.0)); // 20s before now
 
-        app.update_bandwidth_history();
+        app.update_bandwidth_history_at(120.0);
 
         let times: Vec<f64> = app.bandwidth_history.iter().map(|(t, _)| *t).collect();
         assert_eq!(times.len(), 2, "only the out-of-window sample is dropped");
         assert_eq!(times[0], 100.0);
-        assert!(times[1] >= 119.0, "this tick's sample, at ~120s: {times:?}");
+        assert_eq!(times[1], 120.0, "this tick's sample, at 120s");
     }
 
     #[test]
@@ -2950,6 +3093,13 @@ mod tests {
             100,
             "samples inside the 60s window are all kept, however fast the tick"
         );
+    }
+
+    #[test]
+    fn history_window_secs_derives_from_the_stats_window_constant() {
+        // Pins the value the charts rely on: the 60-second window, read from
+        // `stats::RATE_HISTORY_WINDOW` rather than a second hard-coded 60.0.
+        assert_eq!(history_window_secs(), 60.0);
     }
 
     #[test]

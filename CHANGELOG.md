@@ -7,11 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Exact 20 Gbps and faster link speeds. The old model halved the displayed speed and doubled `%busy` at 20 Gbps, and read faster links as unknown.
+- 1.5 Mbps text-report speeds no longer round up to "2 Mbps".
+- `usb.ids` first pull now floors on the active source's date too, not just a replaced copy, so a replayed older payload can't shadow a newer distro copy.
+
 ### Changed
 
 - TUI: `q`/`Esc` close the help overlay instead of quitting the app while it's open.
 - TUI: the `S` confirmation overlay now names both keys -- `y` records, `n` cancels.
 - TUI: the `S` confirmation overlay lists the devices it will record, not just the count.
+- TUI: `dropped:`/`shed:` counters get their own warning color instead of sharing the Peak figure's color.
+- Truncated table cells now end in `…` instead of clipping silently.
+- Bus headings no longer show an empty `()` when the bus speed is unknown.
 
 ## [1.3.0] - 2026-08-22
 

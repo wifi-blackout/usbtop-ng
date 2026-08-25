@@ -125,33 +125,15 @@ Design notes:
 
 These came out of code review. Each is small and none blocks a release.
 
-- A semantic warning color for the `dropped:` and `shed:` counters. Both
-  already render orange and bold, but they share `SECONDARY_COLOR` with
-  the Peak figure, so warning and statistic look alike.
-- An ellipsis on truncated table cells. Truncation is silent today.
-- No empty parens in the bus header when the bus speed is unknown.
-- One constant for the 60-second window. Three places state it today:
-  `RATE_HISTORY_WINDOW` in stats, `HISTORY_WINDOW_SECS` in ui, and the
-  device chart's hard-coded -60.0 axis bound.
 - Error and log strings brought under the documentation style guide.
 - SUDO_USER-aware config-dir resolution, so preferences, the usb.ids home
   copy, the internal snapshot, and `--create-alias` follow the invoking
   user under sudo. Today each resolves against root's home there, and
   only sudo -E bridges the two. One coherent change, and created files
   must land owned by the invoking user, not root.
-- The exact-speed model. `20000` parses to SuperSpeedPlus, which reports
-  10,000 Mbps everywhere, so a 20 Gbps bus shows half its speed and
-  %busy roughly doubles. Store exact Mbps with a separate display class
-  instead of the lossy enum. A correctness bug, not polish.
 - Built-in usbmon detection. Module status reads /proc/modules only, so a
   kernel with usbmon compiled in reads as not loaded and can draw a
   pointless load prompt when debugfs is unmounted.
-- Text reports round device speeds to whole Mbps, so a 1.5 Mbps low-speed
-  device prints as 2 Mbps. The JSON output carries the exact value.
-- A first pull with no home copy has no date floor, so a replayed
-  older-but-valid usb.ids payload could install and shadow a newer distro
-  copy. A hardening pass could floor on the newer of the replaced copy
-  and the active source.
 - The usbmon text fallback overcounts isochronous transfers. Its length
   column holds the buffer size, not the bytes moved. On a camera stream the
   overcount was 3.6x. The text format prints 5 of 32 descriptors per URB, so
@@ -200,14 +182,10 @@ device inventory, and pass criteria live in [TESTING.md](TESTING.md).
   hand today and are recorded in review reports only.
 - A pipe-based regression guard proving the terminal-restore bytes bypass
   stdio buffering.
-- Age-based tests that do not assume machine uptime: the 70-second
-  assumption in stats and the 120-second one in ui. Extract eviction
-  helpers that take a caller-supplied now.
 - Thunderbolt and USB4 hardware validation. usbtop-ng observes USB URBs
   behind such hosts and docks, never PCIe or fabric traffic. A useful
   matrix covers dock controllers, hub topology, hotplug, suspend and
-  resume, and peer links. Blocked on the exact-speed model fix above for
-  20 Gbps links.
+  resume, and peer links.
 - Generate a log with a normalized schema of hardware devices that have
   been tested. Ideas for this would include the date the test was performed
   along with the conditions (kernel version, relevant drivers, attached port
