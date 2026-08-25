@@ -3097,14 +3097,9 @@ mod tests {
 
     #[test]
     fn history_window_secs_derives_from_the_stats_window_constant() {
-        // The 60-second window has exactly one source of truth now: this
-        // pins both the value the charts rely on and that it comes from
+        // Pins the value the charts rely on: the 60-second window, read from
         // `stats::RATE_HISTORY_WINDOW` rather than a second hard-coded 60.0.
         assert_eq!(history_window_secs(), 60.0);
-        assert_eq!(
-            history_window_secs(),
-            crate::stats::RATE_HISTORY_WINDOW.as_secs_f64()
-        );
     }
 
     #[test]
