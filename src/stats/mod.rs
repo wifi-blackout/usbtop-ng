@@ -30,9 +30,11 @@ pub struct BandwidthStats {
     pub rate_history: VecDeque<(Instant, f64, f64)>,
 }
 
-/// `rate_history` retains samples from this far back (see `refresh`). Matches
-/// the 60-second x-axis the per-device rate chart draws.
-const RATE_HISTORY_WINDOW: Duration = Duration::from_secs(60);
+/// `rate_history` retains samples from this far back (see `refresh`). The
+/// single source of truth for the 60-second window: `ui` derives its
+/// aggregate-history cutoff and both charts' x-axis bounds from this instead
+/// of restating 60 seconds on its own, so the two can't drift apart.
+pub const RATE_HISTORY_WINDOW: Duration = Duration::from_secs(60);
 
 /// Width of one accounting slot in `rx_buckets`/`tx_buckets`. Small enough
 /// that the sliding window's edge is accurate to a quarter second, large
@@ -125,10 +127,16 @@ impl BandwidthStats {
     /// Also samples the freshly recalculated rates into `rate_history` for
     /// the per-device rate chart.
     pub fn refresh(&mut self) {
+        self.refresh_at(Instant::now());
+    }
+
+    /// `refresh`'s body, taking `now` as a parameter so tests can move time
+    /// forward from a synthetic origin instead of backdating a real
+    /// `Instant` (which fails on a host with less uptime than the backdate).
+    fn refresh_at(&mut self, now: Instant) {
         self.cleanup_old_entries();
         self.recalculate_rates();
 
-        let now = Instant::now();
         self.rate_history.push_back((now, self.rx_bps, self.tx_bps));
         // Age-based, not count-based: the chart's x-axis is 60 seconds, and
         // the tick rate is the user's `--refresh` choice, so a fixed sample
@@ -360,16 +368,19 @@ mod tests {
 
     /// The rate chart claims a 60-second window, so eviction is by age, not by
     /// sample count — at a 250ms refresh a 60-sample cap would only hold 15s.
+    /// Uses `refresh_at` with a synthetic `now` moved forward from a
+    /// captured origin, so this test needs no real machine uptime.
     #[test]
     fn refresh_evicts_rate_history_by_age() {
         let mut stats = BandwidthStats::new();
-        let long_ago = Instant::now()
-            .checked_sub(Duration::from_secs(70))
-            .expect("monotonic clock has at least 70s of history");
-        stats.rate_history.push_back((long_ago, 1.0, 2.0));
-        stats.rate_history.push_back((Instant::now(), 3.0, 4.0));
+        let base = Instant::now();
+        stats.rate_history.push_back((base, 1.0, 2.0));
+        stats
+            .rate_history
+            .push_back((base + Duration::from_secs(65), 3.0, 4.0));
 
-        stats.refresh();
+        let now = base + Duration::from_secs(70);
+        stats.refresh_at(now);
 
         assert_eq!(
             stats.rate_history.len(),
@@ -380,7 +391,7 @@ mod tests {
             stats
                 .rate_history
                 .iter()
-                .all(|(t, _, _)| t.elapsed() < Duration::from_secs(60)),
+                .all(|(t, _, _)| now.duration_since(*t) < Duration::from_secs(60)),
             "no sample older than the 60s window survives"
         );
     }
