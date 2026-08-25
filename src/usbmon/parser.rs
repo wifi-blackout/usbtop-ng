@@ -7,81 +7,117 @@ pub enum UrbType {
     Error,      // 'E' - Error
 }
 
+/// A link rate as sysfs reports it, exact. The old enum collapsed 20000
+/// into a 10000-reporting variant, halving displayed speed and doubling
+/// %busy on 20 Gbps links; the struct keeps the number and derives the
+/// display class instead.
 #[derive(Debug, Clone, PartialEq)]
-pub enum UsbSpeed {
-    Low,            // 1.5 Mbps
-    Full,           // 12 Mbps
-    High,           // 480 Mbps
-    SuperSpeed,     // 5 Gbps
-    SuperSpeedPlus, // 10+ Gbps
+pub struct UsbSpeed {
+    mbps: f64,
+}
+
+/// Display family for a link rate: color and protocol-efficiency factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeedClass {
+    Low,
+    Full,
+    High,
+    SuperSpeed,
+    SuperSpeedPlus,
     Unknown,
 }
 
 impl UsbSpeed {
+    pub const UNKNOWN: UsbSpeed = UsbSpeed { mbps: 0.0 };
+
+    /// Parse a sysfs `speed` value exactly. Non-numeric and non-positive
+    /// read as unknown.
     pub fn from_speed_str(speed: &str) -> Self {
-        match speed {
-            "1.5" => UsbSpeed::Low,
-            "12" => UsbSpeed::Full,
-            "480" => UsbSpeed::High,
-            "5000" => UsbSpeed::SuperSpeed,
-            "10000" | "20000" => UsbSpeed::SuperSpeedPlus,
-            _ => UsbSpeed::Unknown,
+        Self::from_mbps_checked(speed.trim().parse::<f64>().unwrap_or(0.0))
+    }
+
+    /// Build a speed from an exact Mbps value (used by tests and by
+    /// `max_capability`'s "5000 Mbps capable" signal). Non-positive and
+    /// non-finite values read as unknown, same as `from_speed_str`.
+    pub fn from_mbps(mbps: f64) -> Self {
+        Self::from_mbps_checked(mbps)
+    }
+
+    fn from_mbps_checked(mbps: f64) -> Self {
+        if mbps > 0.0 && mbps.is_finite() {
+            UsbSpeed { mbps }
+        } else {
+            UsbSpeed::UNKNOWN
         }
     }
 
     pub fn to_mbps(&self) -> f64 {
-        match self {
-            UsbSpeed::Low => 1.5,
-            UsbSpeed::Full => 12.0,
-            UsbSpeed::High => 480.0,
-            UsbSpeed::SuperSpeed => 5000.0,
-            UsbSpeed::SuperSpeedPlus => 10000.0,
-            UsbSpeed::Unknown => 0.0,
+        self.mbps
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        self.mbps <= 0.0
+    }
+
+    /// Display family this rate falls into, by threshold on the exact mbps.
+    pub fn class(&self) -> SpeedClass {
+        match self.mbps {
+            m if m <= 0.0 => SpeedClass::Unknown,
+            m if m <= 1.5 => SpeedClass::Low,
+            m if m <= 12.0 => SpeedClass::Full,
+            m if m <= 480.0 => SpeedClass::High,
+            m if m <= 5000.0 => SpeedClass::SuperSpeed,
+            _ => SpeedClass::SuperSpeedPlus,
         }
     }
 
     /// Returns theoretical maximum bandwidth in bytes per second
-    /// Note: These are raw theoretical maximums, actual usable bandwidth is lower
-    /// due to protocol overhead, frame structure, etc.
+    /// Note: This is the raw theoretical maximum, actual usable bandwidth is
+    /// lower due to protocol overhead, frame structure, etc.
     ///
     /// Feeds [`to_practical_bytes_per_second`](Self::to_practical_bytes_per_second),
     /// which the %busy / speed-mismatch indicators (`UsbDevice::get_busy_percentage`,
     /// `UsbBus::busy_percentage`) read as their denominator.
     pub fn to_bytes_per_second(&self) -> f64 {
-        match self {
-            UsbSpeed::Low => 1_500_000.0 / 8.0,    // 1.5 Mbps = ~187.5 KB/s
-            UsbSpeed::Full => 12_000_000.0 / 8.0,  // 12 Mbps = 1.5 MB/s
-            UsbSpeed::High => 480_000_000.0 / 8.0, // 480 Mbps = 60 MB/s
-            UsbSpeed::SuperSpeed => 5_000_000_000.0 / 8.0, // 5 Gbps = 625 MB/s
-            UsbSpeed::SuperSpeedPlus => 10_000_000_000.0 / 8.0, // 10 Gbps = 1.25 GB/s
-            UsbSpeed::Unknown => 0.0,
-        }
+        self.mbps * 1_000_000.0 / 8.0
     }
 
-    /// Returns practical maximum bandwidth in bytes per second
-    /// Takes into account typical protocol overhead (~80% efficiency for most speeds)
+    /// Returns practical maximum bandwidth in bytes per second: the exact
+    /// theoretical maximum times the display class's protocol-overhead
+    /// efficiency factor.
     ///
     /// Denominator for `UsbDevice::get_busy_percentage` and
     /// `UsbBus::busy_percentage`; see [`to_bytes_per_second`](Self::to_bytes_per_second).
     pub fn to_practical_bytes_per_second(&self) -> f64 {
+        self.to_bytes_per_second() * self.class().efficiency()
+    }
+
+    pub fn color_code(&self) -> (u8, u8, u8) {
+        self.class().color_code()
+    }
+}
+
+impl SpeedClass {
+    /// The overhead factors the enum carried; unchanged values.
+    pub fn efficiency(&self) -> f64 {
         match self {
-            UsbSpeed::Low => self.to_bytes_per_second() * 0.7, // ~70% for low speed
-            UsbSpeed::Full => self.to_bytes_per_second() * 0.8, // ~80% for full speed
-            UsbSpeed::High => self.to_bytes_per_second() * 0.8, // ~80% for high speed
-            UsbSpeed::SuperSpeed => self.to_bytes_per_second() * 0.85, // ~85% for super speed
-            UsbSpeed::SuperSpeedPlus => self.to_bytes_per_second() * 0.85, // ~85% for super speed+
-            UsbSpeed::Unknown => 0.0,
+            SpeedClass::Low => 0.7,             // ~70% for low speed
+            SpeedClass::Full => 0.8,            // ~80% for full speed
+            SpeedClass::High => 0.8,            // ~80% for high speed
+            SpeedClass::SuperSpeed => 0.85,     // ~85% for super speed
+            SpeedClass::SuperSpeedPlus => 0.85, // ~85% for super speed+
+            SpeedClass::Unknown => 0.0,
         }
     }
 
     pub fn color_code(&self) -> (u8, u8, u8) {
         match self {
-            UsbSpeed::Low => (255, 100, 100),          // Light red
-            UsbSpeed::Full => (255, 165, 0),           // Orange
-            UsbSpeed::High => (255, 255, 0),           // Yellow
-            UsbSpeed::SuperSpeed => (0, 255, 0),       // Green
-            UsbSpeed::SuperSpeedPlus => (0, 255, 255), // Cyan
-            UsbSpeed::Unknown => (128, 128, 128),      // Gray
+            SpeedClass::Low => (255, 100, 100),          // Light red
+            SpeedClass::Full => (255, 165, 0),           // Orange
+            SpeedClass::High => (255, 255, 0),           // Yellow
+            SpeedClass::SuperSpeed => (0, 255, 0),       // Green
+            SpeedClass::SuperSpeedPlus => (0, 255, 255), // Cyan
+            SpeedClass::Unknown => (128, 128, 128),      // Gray
         }
     }
 }
@@ -472,27 +508,58 @@ mod tests {
     }
 
     #[test]
-    fn test_usb_speed_from_str_and_mbps() {
-        assert_eq!(UsbSpeed::from_speed_str("480"), UsbSpeed::High);
-        assert_eq!(UsbSpeed::SuperSpeed.to_mbps(), 5000.0);
+    fn from_speed_str_is_exact_including_20g_and_beyond() {
+        assert_eq!(UsbSpeed::from_speed_str("1.5").to_mbps(), 1.5);
+        assert_eq!(UsbSpeed::from_speed_str("480").to_mbps(), 480.0);
+        assert_eq!(UsbSpeed::from_speed_str("20000").to_mbps(), 20000.0);
+        assert_eq!(UsbSpeed::from_speed_str("80000").to_mbps(), 80000.0);
+        assert!(UsbSpeed::from_speed_str("garbage").is_unknown());
+        assert!(UsbSpeed::from_speed_str("-5").is_unknown());
+        assert!(UsbSpeed::from_speed_str("0").is_unknown());
     }
 
     #[test]
-    fn practical_bandwidth_applies_overhead_factors() {
-        assert_eq!(UsbSpeed::High.to_bytes_per_second(), 60_000_000.0);
-        assert_eq!(UsbSpeed::High.to_practical_bytes_per_second(), 48_000_000.0);
+    fn class_derives_from_exact_mbps() {
+        assert_eq!(UsbSpeed::from_mbps(1.5).class(), SpeedClass::Low);
+        assert_eq!(UsbSpeed::from_mbps(12.0).class(), SpeedClass::Full);
+        assert_eq!(UsbSpeed::from_mbps(480.0).class(), SpeedClass::High);
+        assert_eq!(UsbSpeed::from_mbps(5000.0).class(), SpeedClass::SuperSpeed);
         assert_eq!(
-            UsbSpeed::SuperSpeed.to_practical_bytes_per_second(),
+            UsbSpeed::from_mbps(10000.0).class(),
+            SpeedClass::SuperSpeedPlus
+        );
+        assert_eq!(
+            UsbSpeed::from_mbps(20000.0).class(),
+            SpeedClass::SuperSpeedPlus
+        );
+        assert_eq!(UsbSpeed::UNKNOWN.class(), SpeedClass::Unknown);
+    }
+
+    #[test]
+    fn twenty_gbps_gets_a_twenty_gbps_denominator() {
+        let s = UsbSpeed::from_speed_str("20000");
+        assert_eq!(s.to_bytes_per_second(), 2_500_000_000.0);
+        assert_eq!(s.to_practical_bytes_per_second(), 2_125_000_000.0);
+    }
+
+    #[test]
+    fn practical_bandwidth_keeps_the_class_efficiency_factors() {
+        assert_eq!(
+            UsbSpeed::from_mbps(480.0).to_practical_bytes_per_second(),
+            48_000_000.0
+        );
+        assert_eq!(
+            UsbSpeed::from_mbps(5000.0).to_practical_bytes_per_second(),
             531_250_000.0
         );
-        assert_eq!(UsbSpeed::Unknown.to_practical_bytes_per_second(), 0.0);
+        assert_eq!(UsbSpeed::UNKNOWN.to_practical_bytes_per_second(), 0.0);
     }
 
     #[test]
-    fn speed_colors_are_stable() {
-        assert_eq!(UsbSpeed::Low.color_code(), (255, 100, 100));
-        assert_eq!(UsbSpeed::SuperSpeed.color_code(), (0, 255, 0));
-        assert_eq!(UsbSpeed::Unknown.color_code(), (128, 128, 128));
+    fn speed_colors_come_from_the_class() {
+        assert_eq!(UsbSpeed::from_mbps(1.5).color_code(), (255, 100, 100));
+        assert_eq!(UsbSpeed::from_mbps(20000.0).color_code(), (0, 255, 255));
+        assert_eq!(UsbSpeed::UNKNOWN.color_code(), (128, 128, 128));
     }
 
     #[test]

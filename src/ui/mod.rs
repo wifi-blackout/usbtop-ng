@@ -1000,7 +1000,7 @@ fn rate_cell(bytes_per_second: f64, estimated: bool) -> String {
 /// Unknown-speed device with real traffic renders a misleading "0.0" instead
 /// of the bus row's honest "--".
 fn busy_cell(device: &UsbDevice) -> String {
-    if device.speed == UsbSpeed::Unknown {
+    if device.speed.is_unknown() {
         format!("{:>5}", "--")
     } else {
         format!("{:5.1}", device.get_busy_percentage())
@@ -1149,17 +1149,17 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
 fn draw_color_reference(f: &mut Frame, area: Rect, app: &UsbTopApp) {
     let mut legend_spans = vec![
         Span::raw("Legend: "),
-        Span::styled("●", speed_style(&UsbSpeed::Low)),
+        Span::styled("●", speed_style(&UsbSpeed::from_mbps(1.5))),
         Span::raw(" 1.5M  "),
-        Span::styled("●", speed_style(&UsbSpeed::Full)),
+        Span::styled("●", speed_style(&UsbSpeed::from_mbps(12.0))),
         Span::raw(" 12M  "),
-        Span::styled("●", speed_style(&UsbSpeed::High)),
+        Span::styled("●", speed_style(&UsbSpeed::from_mbps(480.0))),
         Span::raw(" 480M  "),
-        Span::styled("●", speed_style(&UsbSpeed::SuperSpeed)),
+        Span::styled("●", speed_style(&UsbSpeed::from_mbps(5000.0))),
         Span::raw(" 5G  "),
-        Span::styled("●", speed_style(&UsbSpeed::SuperSpeedPlus)),
+        Span::styled("●", speed_style(&UsbSpeed::from_mbps(20000.0))),
         Span::raw(" 10G+  "),
-        Span::styled("●", speed_style(&UsbSpeed::Unknown)),
+        Span::styled("●", speed_style(&UsbSpeed::UNKNOWN)),
         Span::raw(" ?"),
     ];
     // Only true while a debugfs text source backs the session: the `~`
@@ -2426,7 +2426,7 @@ mod tests {
             // 1.1 MB/s crosses the 80% HighUtilization threshold and renders
             // the 2-cell "⚡" glyph in the `!` column.
             let indicator = bus.devices.get_mut(&5).unwrap();
-            indicator.speed = UsbSpeed::Full;
+            indicator.speed = UsbSpeed::from_mbps(12.0);
         }
         let mut app = UsbTopApp::new(Duration::from_millis(100));
         app.sync_from(&mgr);
@@ -2448,7 +2448,7 @@ mod tests {
         );
 
         // Lock the ASCII geometry so column offsets cannot drift silently.
-        // Device 3 keeps the default UsbSpeed::Unknown (never overridden
+        // Device 3 keeps the default UsbSpeed::UNKNOWN (never overridden
         // above), so its %busy cell is the width-7 "--" fallback, not "0.0".
         assert_eq!(
             lines[3].to_string(),
@@ -2464,10 +2464,10 @@ mod tests {
     fn bus_header_shows_busy_percentage_or_dashes() {
         let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0), (2, 4, 600_000.0)]);
         {
-            // Bus 1 keeps the default UsbSpeed::Unknown -> no meaningful
+            // Bus 1 keeps the default UsbSpeed::UNKNOWN -> no meaningful
             // denominator, so its header shows "-- busy".
             let bus2 = mgr.get_or_create_bus(2);
-            bus2.speed = UsbSpeed::Full; // practical max 1_200_000 bytes/s
+            bus2.speed = UsbSpeed::from_mbps(12.0); // practical max 1_200_000 bytes/s
         }
         let mut app = UsbTopApp::new(Duration::from_millis(100));
         app.sync_from(&mgr);
@@ -2551,7 +2551,7 @@ mod tests {
         // above for the same pattern).
         const BUSY_SPAN_INDEX: usize = 2 * 7;
 
-        // The device keeps UsbDevice::new's default UsbSpeed::Unknown, but
+        // The device keeps UsbDevice::new's default UsbSpeed::UNKNOWN, but
         // has real traffic (nonzero current_bps): without the fix this
         // renders a misleading "0.0" instead of the bus header's honest "--".
         let (_t, mgr) = manager_with_rates(&[(1, 3, 600_000.0)]);
@@ -2573,8 +2573,8 @@ mod tests {
         let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0), (1, 4, 0.0)]);
         {
             let bus = mgr.get_or_create_bus(1);
-            bus.devices.get_mut(&3).unwrap().speed = UsbSpeed::High;
-            bus.devices.get_mut(&4).unwrap().speed = UsbSpeed::SuperSpeed;
+            bus.devices.get_mut(&3).unwrap().speed = UsbSpeed::from_mbps(480.0);
+            bus.devices.get_mut(&4).unwrap().speed = UsbSpeed::from_mbps(5000.0);
         }
         let mut app = UsbTopApp::new(Duration::from_millis(100));
         app.sync_from(&mgr);
@@ -2587,14 +2587,14 @@ mod tests {
         let unselected_speed = &lines[3].spans[SPEED_SPAN_INDEX];
         assert_eq!(
             unselected_speed.style.fg,
-            Some(Color::Rgb(255, 255, 0)), // UsbSpeed::High
+            Some(Color::Rgb(255, 255, 0)), // SpeedClass::High (480 Mbps)
             "unselected row's Speed span carries its speed color"
         );
 
         let selected_speed = &lines[4].spans[SPEED_SPAN_INDEX];
         assert_ne!(
             selected_speed.style.fg,
-            Some(Color::Rgb(0, 255, 0)), // UsbSpeed::SuperSpeed
+            Some(Color::Rgb(0, 255, 0)), // SpeedClass::SuperSpeed (5000 Mbps)
             "selected row keeps the uniform highlight instead of the speed color"
         );
     }
