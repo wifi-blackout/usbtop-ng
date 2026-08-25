@@ -164,6 +164,35 @@ These came out of code review. Each is small and none blocks a release.
   lengths are actual values, which the measurement above contradicts on
   this kernel. Commit a raw trace alongside any fix.
 
+## ARM board support
+
+In-depth research and testing of usbtop-ng on small ARM hosts: Raspberry
+Pi Zero, Pi 4, Pi 400, and Pi 5, plus the Radxa ROCK 5C and the SOPHGO
+Fogwise AirBox. usbmon is architecture-independent, so the questions are
+builds, vendor kernels, and controller behavior, not core capture logic.
+
+Research first:
+
+- Build targets. 64-bit boards (Pi 4, Pi 400, Pi 5, ROCK 5C, AirBox on a
+  64-bit OS) need `aarch64-unknown-linux-gnu`. The original Pi Zero is
+  ARMv6 and needs `arm-unknown-linux-gnueabihf` on a 32-bit OS. Verify
+  the MSRV toolchain exists for both, then extend the release workflow
+  with an aarch64 artifact (cross-compile or an ARM runner).
+- Vendor kernels. Confirm each ships usbmon (module or built-in), whether
+  debugfs mounts by default, and whether `/dev/usbmon<N>` nodes appear.
+  The built-in-usbmon detection fix above matters here.
+- Controller matrix. Each board exercises a different host stack: the
+  Zero's single OTG controller, the Pi 4 and Pi 400's PCIe xHCI for the
+  USB3 ports plus the OTG port, the Pi 5's RP1 southbridge, the ROCK 5C's
+  Rockchip RK3588-class OTG plus xHCI mix, and the AirBox's SOPHGO
+  BM1684X. Verify capture, bus numbering, topology, and speeds on each.
+- Small-core behavior. The Zero is a single slow core: measure the reader
+  thread, channel bound, and TUI refresh there, and the TUI over SSH and
+  a serial console.
+
+Then record every board in the tested-hardware log below, with kernel,
+OS image, controller, and capture backend per entry.
+
 ## Testing follow-ups
 
 - A committed pty harness for the wedged-terminal checks. The checks run by
