@@ -65,7 +65,7 @@ pass, and how to send it.
    ```bash
    cargo test
    ```
-   The command reports 332 passed. A failure names the test. Fix it and repeat.
+   The command reports 346 passed. A failure names the test. Fix it and repeat.
 4. To run with debug output, use:
    ```bash
    RUST_LOG=debug cargo run -- --verbose
@@ -181,7 +181,7 @@ cargo test --all-targets
 `cargo test` and `cargo test --all-targets` run the hermetic suite only. Every
 test there works against fixture files, FIFOs, and `tempfile` paths. The suite
 therefore passes on any operating system, with no `/dev` and no debugfs access.
-It reports 332 passed. CI runs this suite and no other.
+It reports 346 passed. CI runs this suite and no other.
 
 ### Live system tests (the `integration` feature)
 
@@ -194,7 +194,7 @@ interfaces instead of fixtures.
    ```bash
    cargo test --features integration
    ```
-   The command reports 333 passed. Without usbmon the extra test prints a skip
+   The command reports 347 passed. Without usbmon the extra test prints a skip
    message and passes.
 
 The live test is gated on the feature, so it compiles to nothing on default
@@ -210,7 +210,8 @@ mod tests {
 
     #[test]
     fn test_usb_speed_parsing() {
-        assert_eq!(UsbSpeed::from_speed_str("480"), UsbSpeed::High);
+        assert_eq!(UsbSpeed::from_speed_str("480").to_mbps(), 480.0);
+        assert_eq!(UsbSpeed::from_mbps(480.0).class(), SpeedClass::High);
     }
 
     #[test]
@@ -261,7 +262,7 @@ Cover these areas first:
    ```bash
    cargo test --all-targets
    ```
-   The command reports 332 passed. A failure names the test. Fix it and repeat.
+   The command reports 346 passed. A failure names the test. Fix it and repeat.
 6. Update the documentation your change affects.
 7. Add tests for new behavior.
 
