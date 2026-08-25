@@ -286,6 +286,17 @@ fn to_mbps(bytes_per_second: f64) -> f64 {
     }
 }
 
+/// Render an exact link speed for a text report: integral values print bare
+/// ("480 Mbps"), fractional ones keep one decimal ("1.5 Mbps"). `{:.0}`
+/// alone would round 1.5 up to "2 Mbps", misreporting Low Speed.
+fn format_speed_mbps(mbps: f64) -> String {
+    if mbps.fract() == 0.0 {
+        format!("{mbps:.0} Mbps")
+    } else {
+        format!("{mbps:.1} Mbps")
+    }
+}
+
 /// Render a report as plain text: a `ts=` line, one header per bus, and one
 /// indented row per device. `~rx`/`~tx` marks a device whose rate is
 /// `estimated` (see [`DeviceReport::estimated`]).
@@ -297,9 +308,9 @@ pub fn render_text(report: &Report) -> String {
     ));
     for bus in &report.buses {
         out.push_str(&format!(
-            "bus {} ({:.0} Mbps) rx {:.2} MB/s tx {:.2} MB/s\n",
+            "bus {} ({}) rx {:.2} MB/s tx {:.2} MB/s\n",
             bus.bus,
-            bus.speed_mbps,
+            format_speed_mbps(bus.speed_mbps),
             to_mbps(bus.rx_bps),
             to_mbps(bus.tx_bps)
         ));
@@ -322,12 +333,12 @@ pub fn render_text(report: &Report) -> String {
                 " "
             };
             out.push_str(&format!(
-                "  {}:{}  {}  {}  {:.0} Mbps  {} {:.2} MB/s  {} {:.2} MB/s  {}\n",
+                "  {}:{}  {}  {}  {}  {} {:.2} MB/s  {} {:.2} MB/s  {}\n",
                 device.bus,
                 device.address,
                 marker,
                 id,
-                device.speed_mbps,
+                format_speed_mbps(device.speed_mbps),
                 rx_prefix,
                 to_mbps(device.rx_bps),
                 tx_prefix,
@@ -821,6 +832,19 @@ mod tests {
             internal_row.contains("1:4  i  ----:----"),
             "an internal row carries the i marker: {internal_row}"
         );
+    }
+
+    #[test]
+    fn format_speed_mbps_keeps_integral_values_bare() {
+        assert_eq!(format_speed_mbps(480.0), "480 Mbps");
+        assert_eq!(format_speed_mbps(10000.0), "10000 Mbps");
+    }
+
+    #[test]
+    fn format_speed_mbps_keeps_one_decimal_for_fractional_values() {
+        // 1.5 Mbps (Low Speed) is the case `{:.0}` used to round away to
+        // "2 Mbps" -- the bug this formatter exists to fix.
+        assert_eq!(format_speed_mbps(1.5), "1.5 Mbps");
     }
 
     #[test]
