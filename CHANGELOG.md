@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Exact 20 Gbps+ link speeds and `%busy`, instead of the old enum halving both.
+- Exact 20 Gbps and faster link speeds. The old model halved the displayed speed and doubled `%busy` at 20 Gbps, and read faster links as unknown.
 - 1.5 Mbps text-report speeds no longer round up to "2 Mbps".
 - `usb.ids` first pull now floors on the active source's date too, not just a replaced copy, so a replayed older payload can't shadow a newer distro copy.
 
