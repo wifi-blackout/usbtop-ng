@@ -50,8 +50,8 @@ Worth building, in dependency order:
   enriching the controller grouping.
 - The distinctive verdict: claim versus measured delivery. A cable rated
   10 Gbps carrying a sustained measured rate near a slower tier's ceiling
-  is a finding only a traffic monitor can make. Blocked on the
-  exact-speed model fix below. Verdict doctrine: measured beats claimed,
+  is a finding only a traffic monitor can make. The exact-speed model it
+  needs shipped in 2026-08. Verdict doctrine: measured beats claimed,
   exonerate confidently, convict only a uniquely limiting party, and say
   nothing where attribution is ambiguous.
 
@@ -126,6 +126,10 @@ Design notes:
 These came out of code review. Each is small and none blocks a release.
 
 - Error and log strings brought under the documentation style guide.
+- The TUI Speed column always prints one decimal, so a 5000.0 Mbps cell
+  overflows its 10-cell width and now shows the truncation ellipsis.
+  Integral-bare formatting, like the text reports use, makes every real
+  speed fit. One locked-geometry test changes deliberately with it.
 - SUDO_USER-aware config-dir resolution, so preferences, the usb.ids home
   copy, the internal snapshot, and `--create-alias` follow the invoking
   user under sudo. Today each resolves against root's home there, and
