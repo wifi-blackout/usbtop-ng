@@ -191,7 +191,8 @@ Research first:
   a serial console.
 
 Then record every board in the tested-hardware log below, with kernel,
-OS image, controller, and capture backend per entry.
+OS image, controller, and capture backend per entry. The procedure,
+device inventory, and pass criteria live in [TESTING.md](TESTING.md).
 
 ## Testing follow-ups
 
