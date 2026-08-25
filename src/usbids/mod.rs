@@ -647,10 +647,15 @@ pub fn pull_usbids(dest: &Path, chain_paths: &[&Path]) -> Result<()> {
     let quarantine = dest.with_extension("ids.tmp");
     write_quarantine_file(&quarantine, &payload)?;
 
-    // The floor is the file about to be replaced, not the chain-wide
-    // newest: a payload only has to be no older than what it overwrites.
-    let replaced_date = replaced_copy_date(dest);
-    let validated = validate_payload(&payload, replaced_date);
+    // The floor is the newer of the file about to be replaced and the
+    // active source in the chain (not the chain-wide newest). On a first
+    // pull there is no replaced copy at all, so without the active
+    // source's date a replayed, older-but-otherwise-valid payload could
+    // install and shadow whatever newer copy (e.g. a distro package) is
+    // actually in use. Option::max orders None below Some, so a missing
+    // replaced copy never lowers a floor the active source provides.
+    let floor = replaced_copy_date(dest).max(active_source_date(chain_paths));
+    let validated = validate_payload(&payload, floor);
     let summary = match validated {
         Ok(s) => s,
         Err(e) => {
@@ -1113,6 +1118,62 @@ C 03  HID (Human Interface Device)
         write_dated_fixture(&dest, "2024-03-18");
         let err = validate_payload(&payload, replaced_copy_date(&dest))
             .expect_err("payload predates the copy it would replace");
+        assert!(err.to_string().contains("backdated") || err.to_string().contains("older"));
+    }
+
+    #[test]
+    fn validate_floor_rises_to_the_active_source_when_there_is_no_home_copy() {
+        // First pull: no home copy exists yet, so `replaced_copy_date` alone
+        // gives no floor at all. The floor must still be the active
+        // source's date (e.g. a distro-installed copy), so a replayed
+        // payload older than it cannot install and shadow it.
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("usb.ids"); // no home copy yet
+        let active = temp.path().join("active.ids");
+        write_dated_fixture(&active, "2024-03-18");
+
+        let chain: Vec<&Path> = vec![&dest, &active];
+        assert_eq!(replaced_copy_date(&dest), None, "no home copy yet");
+        let floor = replaced_copy_date(&dest).max(active_source_date(&chain));
+        assert_eq!(floor, Some((2024, 3, 18)));
+
+        let older_payload = generate_payload("2020-01-01", 1000);
+        let err = validate_payload(&older_payload, floor).expect_err(
+            "older than the active source must fail even with no home copy to floor on",
+        );
+        assert!(err.to_string().contains("backdated") || err.to_string().contains("older"));
+
+        let newer_payload = generate_payload("2025-01-01", 1000);
+        assert!(
+            validate_payload(&newer_payload, floor).is_ok(),
+            "newer than the active source must still validate"
+        );
+    }
+
+    #[test]
+    fn validate_floor_is_the_max_of_replaced_copy_and_active_source() {
+        // The floor can only rise: whichever of the replaced copy and the
+        // active source is newer wins. Here the active source (earlier in
+        // the chain, e.g. a --usbids override) is newer than the home copy
+        // pull_usbids is about to replace.
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("active.ids");
+        write_dated_fixture(&active, "2024-03-18"); // active source: newer
+        let dest = temp.path().join("usb.ids");
+        write_dated_fixture(&dest, "2020-01-01"); // replaced copy: older
+
+        let chain: Vec<&Path> = vec![&active, &dest];
+        let floor = replaced_copy_date(&dest).max(active_source_date(&chain));
+        assert_eq!(
+            floor,
+            Some((2024, 3, 18)),
+            "the newer of the two dates wins"
+        );
+
+        let between = generate_payload("2022-01-01", 1000);
+        let err = validate_payload(&between, floor).expect_err(
+            "newer than the replaced copy but older than the active source must still fail",
+        );
         assert!(err.to_string().contains("backdated") || err.to_string().contains("older"));
     }
 

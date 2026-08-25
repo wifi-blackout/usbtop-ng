@@ -380,15 +380,23 @@ impl UsbTopApp {
     }
 
     pub fn update_bandwidth_history(&mut self) {
-        let now = self.start_time.elapsed().as_secs_f64();
-        self.bandwidth_history.push((now, self.total_bandwidth));
+        self.update_bandwidth_history_at(self.start_time.elapsed().as_secs_f64());
+    }
+
+    /// `update_bandwidth_history`'s body, taking the session-relative
+    /// timestamp as a parameter so tests can pass a synthetic `now_secs`
+    /// instead of backdating `start_time` (which fails on a host with less
+    /// uptime than the backdate).
+    fn update_bandwidth_history_at(&mut self, now_secs: f64) {
+        self.bandwidth_history
+            .push((now_secs, self.total_bandwidth));
 
         // Keep the last 60 seconds of data, by age rather than by sample
         // count: the tick rate is the user's `--refresh` choice, so a fixed
         // count would mean 15s at 250ms and 120s at 2000ms while the chart
         // keeps claiming a 60-second window. Samples are appended in time
         // order, so the expired ones are exactly the leading run.
-        let cutoff = now - history_window_secs();
+        let cutoff = now_secs - history_window_secs();
         let expired = self.bandwidth_history.partition_point(|(t, _)| *t < cutoff);
         self.bandwidth_history.drain(0..expired);
     }
@@ -3058,21 +3066,20 @@ mod tests {
 
     /// The chart's x-axis is 60 seconds wide, so the history it plots is
     /// trimmed by age. A 60-sample cap would mean 15s at `--refresh 250`.
+    /// Uses `update_bandwidth_history_at` with a synthetic `now_secs`, so
+    /// this test needs no real machine uptime.
     #[test]
     fn bandwidth_history_keeps_sixty_seconds_not_sixty_samples() {
         let mut app = UsbTopApp::new(Duration::from_millis(250));
-        app.start_time = Instant::now()
-            .checked_sub(Duration::from_secs(120))
-            .expect("monotonic clock has at least 120s of history");
-        app.bandwidth_history.push((0.0, 1.0)); // ~120s before now
-        app.bandwidth_history.push((100.0, 2.0)); // ~20s before now
+        app.bandwidth_history.push((0.0, 1.0)); // 120s before now
+        app.bandwidth_history.push((100.0, 2.0)); // 20s before now
 
-        app.update_bandwidth_history();
+        app.update_bandwidth_history_at(120.0);
 
         let times: Vec<f64> = app.bandwidth_history.iter().map(|(t, _)| *t).collect();
         assert_eq!(times.len(), 2, "only the out-of-window sample is dropped");
         assert_eq!(times[0], 100.0);
-        assert!(times[1] >= 119.0, "this tick's sample, at ~120s: {times:?}");
+        assert_eq!(times[1], 120.0, "this tick's sample, at 120s");
     }
 
     #[test]
