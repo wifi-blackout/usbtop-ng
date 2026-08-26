@@ -97,10 +97,11 @@ Run `sudo usbtop` when your account cannot read
 | `↑` / `↓` | Select a device. The device table scrolls to keep it visible. |
 | `h` | Open or close the help overlay. |
 | `i` | Show or hide idle devices. Saves the choice to `~/.usbtop-ng/preferences.toml`. |
+| `/` | Open search input, prefilled with the active query if one is committed. See [Search](#search). |
 | `S` | Snapshot every attached device as internal, after a confirmation. See [Device origin](#device-origin). |
 | `Ctrl-L` | Wipe the screen and repaint it from scratch. |
-| `q` or `Esc` | Quit. |
-| `Ctrl-C` | Quit. |
+| `q` or `Esc` | Quit. `q` types into the search query instead while search input is open; `Esc` clears a committed query instead of quitting when one is active. |
+| `Ctrl-C` | Quit, even while typing a search query. |
 
 Raw mode turns off ISIG, so `Ctrl-C` never becomes a `SIGINT`. It arrives as a
 key press and quits through the same teardown as `q`.
@@ -160,6 +161,8 @@ key press and quits through the same teardown as `q`.
 - Selecting a device expands its endpoints as dimmed, non-selectable rows
   directly below it: transfer type, and rate in Bw↓ for IN or Bw↑ for OUT.
   Collapses when the selection moves away.
+- `/` narrows the table to devices matching a typed query. See
+  [Search](#search).
 
 ### Device origin
 
@@ -251,6 +254,21 @@ unless HOME is preserved with `sudo -E`.
 - `bus`, `dev`, `vid`, `pid`, `name`, and `internal` decide which devices show
   at all. `ep`, `dir`, and `type` narrow which packets on a visible device
   count, without hiding the device itself.
+
+### Search
+
+- `/` opens search input; typed characters build the query and the device
+  table filters live as it changes. Backspace edits, Enter keeps the filter
+  and closes input, Esc clears the query (while editing) or the active
+  filter (once committed).
+- A device matches if a case-insensitive substring of the query hits its
+  vendor name, product name, `vid:pid`, port chain, or `bus:address` — the
+  same text and format the table itself shows.
+- Composes with `--filter` and hide-idle: both narrow the table first. A
+  committed query that matches nothing shows an empty table, not an error.
+- Display-only: accounting, header totals, and reports are unaffected.
+- The controls bar shows the query while typing and, once committed, how to
+  clear it.
 
 ### Scriptable output
 
