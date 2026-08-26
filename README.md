@@ -100,7 +100,7 @@ Run `sudo usbtop` when your account cannot read
 | `/` | Open search input, prefilled with the active query if one is committed. See [Search](#search). |
 | `S` | Snapshot every attached device as internal, after a confirmation. See [Device origin](#device-origin). |
 | `Ctrl-L` | Wipe the screen and repaint it from scratch. |
-| `q` or `Esc` | Quit. `q` types into the search query instead while search input is open; `Esc` clears a committed query instead of quitting when one is active. |
+| `q` or `Esc` | Quit. A committed search query is normal browsing, so `q` still quits; only while search input is open does `q` type into the query instead. `Esc` clears a committed query instead of quitting when one is active. |
 | `Ctrl-C` | Quit, even while typing a search query. |
 
 Raw mode turns off ISIG, so `Ctrl-C` never becomes a `SIGINT`. It arrives as a
