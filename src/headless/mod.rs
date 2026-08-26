@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use crate::device::manager::DeviceManager;
 use crate::filter::FilterSet;
-use crate::usbmon::parser::UsbPacket;
+use crate::usbmon::parser::{format_mbps, UsbPacket};
 
 pub struct HeadlessOptions {
     pub json: bool,
@@ -286,17 +286,6 @@ fn to_mbps(bytes_per_second: f64) -> f64 {
     }
 }
 
-/// Render an exact link speed for a text report: integral values print bare
-/// ("480 Mbps"), fractional ones keep one decimal ("1.5 Mbps"). `{:.0}`
-/// alone would round 1.5 up to "2 Mbps", misreporting Low Speed.
-fn format_speed_mbps(mbps: f64) -> String {
-    if mbps.fract() == 0.0 {
-        format!("{mbps:.0} Mbps")
-    } else {
-        format!("{mbps:.1} Mbps")
-    }
-}
-
 /// Render a report as plain text: a `ts=` line, one header per bus, and one
 /// indented row per device. `~rx`/`~tx` marks a device whose rate is
 /// `estimated` (see [`DeviceReport::estimated`]).
@@ -310,7 +299,7 @@ pub fn render_text(report: &Report) -> String {
         out.push_str(&format!(
             "bus {} ({}) rx {:.2} MB/s tx {:.2} MB/s\n",
             bus.bus,
-            format_speed_mbps(bus.speed_mbps),
+            format_mbps(bus.speed_mbps),
             to_mbps(bus.rx_bps),
             to_mbps(bus.tx_bps)
         ));
@@ -338,7 +327,7 @@ pub fn render_text(report: &Report) -> String {
                 device.address,
                 marker,
                 id,
-                format_speed_mbps(device.speed_mbps),
+                format_mbps(device.speed_mbps),
                 rx_prefix,
                 to_mbps(device.rx_bps),
                 tx_prefix,
@@ -835,16 +824,66 @@ mod tests {
     }
 
     #[test]
-    fn format_speed_mbps_keeps_integral_values_bare() {
-        assert_eq!(format_speed_mbps(480.0), "480 Mbps");
-        assert_eq!(format_speed_mbps(10000.0), "10000 Mbps");
+    fn render_text_uses_the_shared_integral_bare_speed_format() {
+        // format_mbps itself (integral bare, one-decimal fractional) is
+        // covered in usbmon::parser; this pins that render_text actually
+        // calls the shared function rather than a local reimplementation.
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let cb = parse_usbmon_text_line("ffff0000aaaa0001 200 C Bi:1:004:1 0 1000 <").unwrap();
+        mgr.apply_packet(&cb);
+        mgr.buses.get_mut(&1).unwrap().speed = crate::usbmon::parser::UsbSpeed::from_mbps(480.0);
+
+        let baseline = Baseline::capture(&mgr);
+        let report = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        let text = render_text(&report);
+        let bus_row = text.lines().find(|l| l.starts_with("bus 1")).unwrap();
+        assert!(
+            bus_row.contains("480 Mbps"),
+            "bus row must use the shared bare-integral format: {bus_row}"
+        );
     }
 
     #[test]
-    fn format_speed_mbps_keeps_one_decimal_for_fractional_values() {
-        // 1.5 Mbps (Low Speed) is the case `{:.0}` used to round away to
-        // "2 Mbps" -- the bug this formatter exists to fix.
-        assert_eq!(format_speed_mbps(1.5), "1.5 Mbps");
+    fn render_text_keeps_one_decimal_for_a_fractional_device_speed() {
+        // 1.5 Mbps (Low Speed) is the case a bare `{:.0}` would round away
+        // to "2 Mbps"; render_text must keep the fractional digit.
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let cb = parse_usbmon_text_line("ffff0000aaaa0001 200 C Bi:1:004:1 0 1000 <").unwrap();
+        mgr.apply_packet(&cb);
+        mgr.buses
+            .get_mut(&1)
+            .unwrap()
+            .devices
+            .get_mut(&4)
+            .unwrap()
+            .speed = crate::usbmon::parser::UsbSpeed::from_mbps(1.5);
+
+        let baseline = Baseline::capture(&mgr);
+        let report = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        let text = render_text(&report);
+        let device_row = text.lines().find(|l| l.contains("1:4")).unwrap();
+        assert!(
+            device_row.contains("1.5 Mbps"),
+            "device row must keep the fractional digit: {device_row}"
+        );
     }
 
     #[test]
