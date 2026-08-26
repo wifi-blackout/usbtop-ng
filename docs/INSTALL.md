@@ -140,7 +140,12 @@ auto_load_usbmon = false
 unload_usbmon_on_exit = false
 ```
 
-### 2. Mount debugfs
+### 2. Mount debugfs (needed only when the binary interface is unavailable)
+
+usbtop-ng discovers USB buses from sysfs and prefers the binary
+`/dev/usbmon*` interface when it can be opened, so a host where that works
+needs no debugfs at all. This step is a fallback for when it does not: mount
+debugfs to make the text interface available instead.
 
 1. Check whether debugfs is mounted, and mount it if it is not:
    ```bash
