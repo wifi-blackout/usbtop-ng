@@ -21,7 +21,7 @@ use crate::device::manager::{DeviceManager, UsbBus};
 use crate::device::UsbDevice;
 use crate::filter::FilterSet;
 use crate::snapshot::{Snapshot, SnapshotDevice};
-use crate::usbmon::parser::{UsbPacket, UsbSpeed};
+use crate::usbmon::parser::{format_mbps, UsbPacket, UsbSpeed};
 
 pub mod colors;
 
@@ -1118,10 +1118,7 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
             };
             lines.push(Line::from(vec![
                 Span::raw(format!("▶ Bus {:02}{}  ", bus.bus_id, side_paren)),
-                Span::styled(
-                    format!("{:.1} Mbps", bus.speed.to_mbps()),
-                    speed_style(&bus.speed),
-                ),
+                Span::styled(format_mbps(bus.speed.to_mbps()), speed_style(&bus.speed)),
                 Span::raw(busy_suffix),
                 Span::raw(format!(
                     "  rx {} tx {}",
@@ -1163,7 +1160,7 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
                     [
                         &port_label(row.port_chain.as_ref()),
                         &format!("{:03}:{:03}", device.bus_id, device.device_id),
-                        &format!("{:.1} Mbps", device.speed.to_mbps()),
+                        &format_mbps(device.speed.to_mbps()),
                         device.vendor.as_deref().unwrap_or("Unknown"),
                         device.product.as_deref().unwrap_or("Unknown"),
                         &rate_cell(device.bandwidth_stats.rx_bps, estimated),
@@ -2531,10 +2528,12 @@ mod tests {
 
         // Lock the ASCII geometry so column offsets cannot drift silently.
         // Device 3 keeps the default UsbSpeed::UNKNOWN (never overridden
-        // above), so its %busy cell is the width-7 "--" fallback, not "0.0".
+        // above), so its %busy cell is the width-7 "--" fallback, not "0.0",
+        // and its Speed cell is the integral-bare "0 Mbps" (format_mbps),
+        // not the old `{:.1}` rounding's "0.0 Mbps".
         assert_eq!(
             lines[3].to_string(),
-            "?        001:003  0.0 Mbps   Acme           Widget             0.0 KB/s   0.0 KB/s      --      "
+            "?        001:003  0 Mbps     Acme           Widget             0.0 KB/s   0.0 KB/s      --      "
         );
 
         // The wide (2-cell) "⚡" indicator glyph must not push the row's
@@ -2680,6 +2679,25 @@ mod tests {
     }
 
     #[test]
+    fn device_row_speed_cell_for_unknown_speed_is_bare_zero() {
+        // The device keeps UsbDevice::new's default UsbSpeed::UNKNOWN
+        // (to_mbps() == 0.0). format_mbps's integral-bare rule renders that
+        // "0 Mbps", not the old `{:.1}` rounding's "0.0 Mbps".
+        let (_t, mgr) = manager_with_rates(&[(1, 3, 0.0)]);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        // [0] column header, [1] controller heading, [2] bus header, [3] device row.
+        let speed_span = &lines[3].spans[SPEED_SPAN_INDEX];
+        assert_eq!(
+            speed_span.content, "0 Mbps    ",
+            "unknown-speed device's Speed cell must be bare '0 Mbps', not '{}'",
+            lines[3]
+        );
+    }
+
+    #[test]
     fn speed_span_is_colored_unless_the_row_is_selected() {
         let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0), (1, 4, 0.0)]);
         {
@@ -2814,7 +2832,7 @@ mod tests {
 
         assert!(screen.contains("═ 0000:00:14.0 ═"), "{screen}");
         assert!(
-            screen.contains("▶ Bus 03 (USB2 side)  480.0 Mbps"),
+            screen.contains("▶ Bus 03 (USB2 side)  480 Mbps"),
             "{screen}"
         );
         // First column of every device row, top to bottom.

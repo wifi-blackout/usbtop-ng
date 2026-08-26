@@ -97,6 +97,19 @@ impl UsbSpeed {
     }
 }
 
+/// Render an exact link-rate Mbps value the one way every speed display
+/// uses: integral values print bare ("480 Mbps"), fractional ones keep one
+/// decimal ("1.5 Mbps"). `{:.0}` alone would round 1.5 up to "2 Mbps",
+/// misreporting Low Speed; `{:.1}` alone renders "480.0 Mbps", which
+/// overflows the TUI's fixed-width Speed cell at high link rates.
+pub fn format_mbps(mbps: f64) -> String {
+    if mbps.fract() == 0.0 {
+        format!("{mbps:.0} Mbps")
+    } else {
+        format!("{mbps:.1} Mbps")
+    }
+}
+
 impl SpeedClass {
     /// The overhead factors the enum carried; unchanged values.
     pub fn efficiency(&self) -> f64 {
@@ -560,6 +573,20 @@ mod tests {
         assert_eq!(UsbSpeed::from_mbps(1.5).color_code(), (255, 100, 100));
         assert_eq!(UsbSpeed::from_mbps(20000.0).color_code(), (0, 255, 255));
         assert_eq!(UsbSpeed::UNKNOWN.color_code(), (128, 128, 128));
+    }
+
+    #[test]
+    fn format_mbps_keeps_integral_values_bare() {
+        assert_eq!(format_mbps(480.0), "480 Mbps");
+        assert_eq!(format_mbps(20000.0), "20000 Mbps");
+        assert_eq!(format_mbps(0.0), "0 Mbps");
+    }
+
+    #[test]
+    fn format_mbps_keeps_one_decimal_for_fractional_values() {
+        // 1.5 Mbps (Low Speed) is the case `{:.0}` used to round away to
+        // "2 Mbps" -- the bug this formatter exists to fix.
+        assert_eq!(format_mbps(1.5), "1.5 Mbps");
     }
 
     #[test]
