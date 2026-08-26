@@ -428,11 +428,15 @@ impl UsbTopApp {
         let Some(query) = self.search.query() else {
             return;
         };
+        // Lowered once per retention pass (one tick), not once per device --
+        // `device_matches_search` takes the already-folded query rather than
+        // re-lowering the same short string on every row of every bus.
+        let query = query.to_lowercase();
         for controller in &mut self.controllers {
             for bus in &mut controller.buses {
                 let bus_id = bus.bus_id;
                 bus.devices
-                    .retain(|row| device_matches_search(bus_id, row, query));
+                    .retain(|row| device_matches_search(bus_id, row, &query));
             }
             controller.buses.retain(|bus| !bus.devices.is_empty());
         }
@@ -590,7 +594,13 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
         // a state this `if let` never actually matched.
         let mut query = query.clone();
         return match key.code {
-            KeyCode::Char(c) => {
+            // Only plain and shifted characters enter the query (Clarified
+            // 2026-08-25): a control-modified chord other than Ctrl-C (which
+            // quits above) must not insert its bare letter -- Ctrl-L typing
+            // 'l' being the motivating case. `difference` strips a SHIFT bit
+            // if present and leaves the rest; anything left over (CONTROL,
+            // ALT, ...) routes to the no-op catch-all below instead.
+            KeyCode::Char(c) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
                 query.push(c);
                 app.search = SearchState::Editing(query);
                 KeyOutcome::Redraw
@@ -651,13 +661,12 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
             app.search = SearchState::Off;
             KeyOutcome::Redraw
         }
-        // `q` means quit only while search is inactive (`Off`); with a
-        // committed query it falls through to the catch-all below instead
-        // (Esc, just above, is what clears that). `Editing` never reaches
-        // here -- it's consumed above.
-        KeyCode::Char('q') | KeyCode::Esc if matches!(app.search, SearchState::Off) => {
-            KeyOutcome::Quit
-        }
+        // A committed query is normal browsing, so `q` quits here same as
+        // `Off` -- only `Editing` captures `q` as a letter, and it's
+        // consumed above before this arm is ever reached. An `Esc` reaching
+        // this arm is always `Off`: `Esc` while `Committed` was already
+        // claimed by the clearing arm just above.
+        KeyCode::Char('q') | KeyCode::Esc => KeyOutcome::Quit,
         KeyCode::Char('h') => {
             app.show_help = !app.show_help;
             KeyOutcome::Redraw
@@ -1243,50 +1252,53 @@ fn port_label(port_chain: Option<&Vec<u32>>) -> String {
     }
 }
 
-/// True if `query` is a case-insensitive substring of any of `row`'s
-/// searchable fields: the vendor name, the product name, `vid:pid` hex, the
-/// port chain joined with `.` (see `port_label`), or `bus:address` in the
-/// same zero-padded `{:03}:{:03}` form the Device column prints (see
+/// True if `query_lower` is a substring of any of `row`'s searchable fields:
+/// the vendor name, the product name, `vid:pid` hex, the port chain joined
+/// with `.` (see `port_label`), or `bus:address` in the same zero-padded
+/// `{:03}:{:03}` form the Device column prints (see
 /// `device_list_lines_with_selection`) -- so what the table shows is what
 /// `/` searches. `bus_id` comes from the caller's `BusView` rather than
 /// `row.device.bus_id`, the same source the Device column itself reads.
 ///
-/// An empty `query` matches every device (every string contains the empty
-/// substring). A field the device has no value for -- no vendor string, no
-/// vendor/product ID pair, no resolved port chain -- simply cannot match
-/// through that field; it is never treated as matching or non-matching text
-/// of its own.
-fn device_matches_search(bus_id: u8, row: &DeviceRow, query: &str) -> bool {
-    let query = query.to_lowercase();
+/// `query_lower` must already be lower-cased -- by the caller
+/// (`UsbTopApp::retain_searched_devices` folds it once per retention pass,
+/// not once per device here) -- this function only folds the case of each
+/// field's own text before comparing. An empty `query_lower` matches every
+/// device (every string contains the empty substring). A field the device
+/// has no value for -- no vendor string, no vendor/product ID pair, no
+/// resolved port chain -- simply cannot match through that field; it is
+/// never treated as matching or non-matching text of its own.
+fn device_matches_search(bus_id: u8, row: &DeviceRow, query_lower: &str) -> bool {
     let device = &row.device;
 
     let field_hit = |field: &Option<String>| {
         field
             .as_ref()
-            .is_some_and(|s| s.to_lowercase().contains(&query))
+            .is_some_and(|s| s.to_lowercase().contains(query_lower))
     };
     if field_hit(&device.vendor) || field_hit(&device.product) {
         return true;
     }
 
     if let (Some(vid), Some(pid)) = (device.vendor_id, device.product_id) {
-        if format!("{vid:04x}:{pid:04x}").contains(&query) {
+        if format!("{vid:04x}:{pid:04x}").contains(query_lower) {
             return true;
         }
     }
 
     if let Some(chain) = &row.port_chain {
+        // Digits and dots only, so no case-folding is needed here.
         let joined = chain
             .iter()
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(".");
-        if joined.to_lowercase().contains(&query) {
+        if joined.contains(query_lower) {
             return true;
         }
     }
 
-    format!("{bus_id:03}:{:03}", device.device_id).contains(&query)
+    format!("{bus_id:03}:{:03}", device.device_id).contains(query_lower)
 }
 
 /// Rendered lines minus the block's top and bottom border rows.
@@ -3750,21 +3762,32 @@ mod tests {
     }
 
     #[test]
-    fn q_quits_only_while_search_is_off() {
+    fn q_quits_in_off_and_committed_but_types_while_editing() {
+        // A committed query is normal browsing (Clarified 2026-08-25): `q`
+        // quits there exactly as it does with no search active. Only
+        // `Editing` captures `q` as a letter (see
+        // q_types_into_the_query_while_editing_instead_of_quitting).
         let mut app = UsbTopApp::new(Duration::from_millis(100));
         app.search = SearchState::Committed("ab".to_string());
         assert_eq!(
             apply_key(&mut app, key(KeyCode::Char('q'))),
-            KeyOutcome::None,
-            "a committed query leaves q unbound; Esc is what clears it"
+            KeyOutcome::Quit,
+            "a committed query is normal browsing; q quits as usual"
         );
-        assert_eq!(app.search, SearchState::Committed("ab".to_string()));
 
         app.search = SearchState::Off;
         assert_eq!(
             apply_key(&mut app, key(KeyCode::Char('q'))),
             KeyOutcome::Quit
         );
+
+        app.search = SearchState::Editing("ab".to_string());
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('q'))),
+            KeyOutcome::Redraw,
+            "editing still captures q as a letter"
+        );
+        assert_eq!(app.search, SearchState::Editing("abq".to_string()));
     }
 
     #[test]
@@ -3785,6 +3808,32 @@ mod tests {
 
         assert_eq!(apply_key(&mut app, key(KeyCode::Up)), KeyOutcome::None);
         assert_eq!(app.search, SearchState::Editing("ab".to_string()));
+    }
+
+    /// Clarified 2026-08-25: a control-modified chord other than Ctrl-C must
+    /// not insert its bare letter while editing -- Ctrl-L typing a literal
+    /// 'l' into the query was the motivating bug.
+    #[test]
+    fn ctrl_l_while_editing_is_consumed_without_changing_the_query() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+
+        assert_eq!(
+            apply_key(&mut app, ctrl(KeyCode::Char('l'))),
+            KeyOutcome::None,
+            "consumed with no effect, not a screen wipe and not a typed 'l'"
+        );
+        assert_eq!(app.search, SearchState::Editing("ab".to_string()));
+    }
+
+    #[test]
+    fn a_shifted_letter_still_types_while_editing() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing(String::new());
+
+        let shifted = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
+        assert_eq!(apply_key(&mut app, shifted), KeyOutcome::Redraw);
+        assert_eq!(app.search, SearchState::Editing("A".to_string()));
     }
 
     #[test]
@@ -3825,12 +3874,14 @@ mod tests {
 
     #[test]
     fn matches_by_vendor_name_case_insensitively() {
+        // device_matches_search takes an already-lowered query (see
+        // retain_searched_devices, which folds it once per retention pass);
+        // the field's own mixed-case text is what it still folds here.
         let row = DeviceRow {
             port_chain: Some(vec![]),
             device: named_device(1, 3, Some("Kingston Technology"), None, None, None),
         };
         assert!(device_matches_search(1, &row, "kingston"));
-        assert!(device_matches_search(1, &row, "KINGSTON"));
         assert!(!device_matches_search(1, &row, "logitech"));
     }
 
@@ -3851,10 +3902,6 @@ mod tests {
             device: named_device(1, 3, None, None, Some(0x04f2), Some(0xb71a)),
         };
         assert!(device_matches_search(1, &row, "04f2:b71a"));
-        assert!(
-            device_matches_search(1, &row, "04F2:B71A"),
-            "case-insensitive"
-        );
         assert!(
             device_matches_search(1, &row, "b71a"),
             "either half matches"
@@ -3933,6 +3980,27 @@ mod tests {
 
         let mut app = UsbTopApp::new(Duration::from_millis(100));
         app.search = SearchState::Committed("kingston".to_string());
+        app.sync_from(&mgr);
+
+        assert_eq!(app.device_keys(), vec!["1:3".to_string()]);
+    }
+
+    /// Query-side case-insensitivity now lives in `retain_searched_devices`
+    /// (it lowers the query once per retention pass -- see the MINOR fix in
+    /// the fix-round-1 report), not in `device_matches_search` itself. This
+    /// pins it end to end: an upper-case query still hits a title-cased
+    /// vendor string.
+    #[test]
+    fn a_committed_query_matches_regardless_of_its_own_case() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1).devices.insert(
+            3,
+            named_device(1, 3, Some("Kingston Technology"), None, None, None),
+        );
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("KINGSTON".to_string());
         app.sync_from(&mgr);
 
         assert_eq!(app.device_keys(), vec!["1:3".to_string()]);
