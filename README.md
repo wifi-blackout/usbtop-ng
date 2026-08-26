@@ -157,6 +157,9 @@ key press and quits through the same teardown as `q`.
   bandwidth until it transfers. Enumeration runs by default.
 - `i` hides devices with no current traffic and saves the choice to
   `~/.usbtop-ng/preferences.toml`.
+- Selecting a device expands its endpoints as dimmed, non-selectable rows
+  directly below it: transfer type, and rate in Bw↓ for IN or Bw↑ for OUT.
+  Collapses when the selection moves away.
 
 ### Device origin
 
