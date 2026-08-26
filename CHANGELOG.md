@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - TUI: the selected device's endpoints auto-expand into dimmed rows directly below it, one per endpoint and direction, each showing its transfer type and rate in Bw↓ (IN) or Bw↑ (OUT). Collapses when the selection moves away.
-- TUI: `/` opens a live search over the device table. Typed characters filter the table as you type, matching vendor, product, `vid:pid`, port chain, or `bus:address`; Enter commits the filter and closes input, Esc clears the query while editing or the committed filter once one is active.
+- TUI: `/` opens a live search over the device table. Typed characters filter the table as you type, matching vendor, product, `vid:pid`, port chain, or `bus:address`. Enter commits the filter and closes input. Esc clears the query while editing, or the committed filter once one is active.
 - Bus discovery and interface availability no longer require debugfs. usbtop-ng discovers buses from sysfs and starts on a binary-only host (usbmon loaded, debugfs never mounted), and it now detects a kernel with usbmon built in even though `/proc/modules` never lists it.
 
 ### Fixed
