@@ -21,7 +21,7 @@ use crate::device::manager::{DeviceManager, UsbBus};
 use crate::device::UsbDevice;
 use crate::filter::FilterSet;
 use crate::snapshot::{Snapshot, SnapshotDevice};
-use crate::usbmon::parser::{format_mbps, UsbPacket, UsbSpeed};
+use crate::usbmon::parser::{format_mbps, TransferType, UsbPacket, UsbSpeed};
 
 pub mod colors;
 
@@ -1034,6 +1034,57 @@ fn rate_cell(bytes_per_second: f64, estimated: bool) -> String {
     }
 }
 
+/// Style every endpoint row gets, so the hierarchy under the selected device
+/// reads at a glance: dimmed relative to the device row above it, the same
+/// whole-line `Line::style` idiom the heading and device rows use.
+fn endpoint_row_style() -> Style {
+    Style::default().add_modifier(Modifier::DIM)
+}
+
+/// One row per (endpoint number, direction) on `row`'s device, in
+/// `UsbDevice::endpoints`' order -- OUT before IN per endpoint number, since
+/// the map is keyed `(number, is_in)`. Called by
+/// `device_list_lines_with_selection` right after it pushes the selected
+/// device's own row, so these lines sit directly under it; the device is not
+/// selectable through them.
+///
+/// `text_active` is `UsbTopApp::text_source_active()`. Unlike the device
+/// row's `estimated` flag (which also checks `UsbDevice::has_iso_traffic`),
+/// each endpoint carries its own transfer type, so the per-row check needs
+/// no such indirection: the `~` marker applies exactly when a text source is
+/// active and this endpoint is isochronous.
+fn endpoint_lines(row: &DeviceRow, text_active: bool) -> Vec<Line<'static>> {
+    row.device
+        .endpoints
+        .iter()
+        .map(|(&(number, dir_in), stats)| {
+            let dir = if dir_in { "in" } else { "out" };
+            let estimated = text_active && stats.transfer_type == TransferType::Isochronous;
+            let rate = rate_cell(stats.counter.bps(), estimated);
+            let (rx_cell, tx_cell): (&str, &str) = if dir_in {
+                (rate.as_str(), "")
+            } else {
+                ("", rate.as_str())
+            };
+            let spans = device_columns(
+                [
+                    "",
+                    &format!("ep{number} {dir}"),
+                    stats.transfer_type.label(),
+                    "",
+                    "",
+                    rx_cell,
+                    tx_cell,
+                    "",
+                    "",
+                ],
+                None,
+            );
+            Line::from(spans).style(endpoint_row_style())
+        })
+        .collect()
+}
+
 /// %busy cell text for a device row: a numeric percentage normally, or a
 /// width-matched "--" when the device's speed is unknown and therefore has
 /// no meaningful bandwidth denominator. Mirrors `BusView::busy_percentage`'s
@@ -1182,6 +1233,10 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
                 }
 
                 lines.push(Line::from(spans).style(status_style));
+
+                if is_selected {
+                    lines.extend(endpoint_lines(row, app.text_source_active()));
+                }
             }
         }
     }
@@ -1269,6 +1324,9 @@ fn draw_help_overlay(f: &mut Frame) {
             Span::styled("  ↑/↓", Style::default().fg(ACCENT_COLOR)),
             Span::raw("      Select a device (list scrolls to keep it visible)"),
         ]),
+        Line::from(
+            "  Selecting a device expands its endpoints below it, dimmed and not selectable",
+        ),
         Line::from(vec![
             Span::styled("  h", Style::default().fg(ACCENT_COLOR)),
             Span::raw("        Toggle this help"),
@@ -2650,6 +2708,245 @@ mod tests {
         assert!(
             device_line.contains("~0.0 KB/s"),
             "iso device's tx cell must be marked estimated too: {device_line}"
+        );
+    }
+
+    /// The brief's fixture: `record_endpoint` twice, ep1 IN isochronous
+    /// (1000 bytes -> 100 bytes/s over the 10s endpoint window -> "0.1
+    /// KB/s"), ep2 OUT bulk (2000 bytes -> "0.2 KB/s"). `endpoints`' keys
+    /// sort `(1, true)` before `(2, false)`, so ep1's row comes first.
+    fn device_with_two_endpoints(bus_id: u8, device_id: u8) -> UsbDevice {
+        let mut device = UsbDevice::new(bus_id, device_id);
+        device.record_endpoint(1, true, TransferType::Isochronous, 1_000);
+        device.record_endpoint(2, false, TransferType::Bulk, 2_000);
+        device
+    }
+
+    #[test]
+    fn selected_device_expands_into_its_endpoint_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        // [0] header, [1] controller heading, [2] bus header, [3] device
+        // row, [4] ep1 (IN, iso), [5] ep2 (OUT, bulk).
+        assert_eq!(
+            selected_line,
+            Some(3),
+            "the endpoint rows must not shift the device's own line index"
+        );
+        assert_eq!(
+            lines.len(),
+            6,
+            "one line per endpoint appended right after the device row"
+        );
+
+        let ep1 = &lines[4];
+        assert_eq!(ep1.spans[0].content, "        ", "Port cell is blank");
+        assert_eq!(ep1.spans[2].content, "ep1 in  ", "Device cell");
+        assert_eq!(ep1.spans[4].content, "iso       ", "Speed cell");
+        assert_eq!(ep1.spans[10].content, "0.1 KB/s  ", "rate lands in Bw down");
+        assert_eq!(ep1.spans[12].content, "          ", "Bw up stays blank");
+        assert_eq!(ep1.spans[14].content, "       ", "%busy is blank");
+        assert_eq!(ep1.spans[16].content, "   ", "! is blank");
+
+        let ep2 = &lines[5];
+        assert_eq!(ep2.spans[2].content, "ep2 out ", "Device cell");
+        assert_eq!(ep2.spans[4].content, "bulk      ", "Speed cell");
+        assert_eq!(ep2.spans[10].content, "          ", "Bw down stays blank");
+        assert_eq!(ep2.spans[12].content, "0.2 KB/s  ", "rate lands in Bw up");
+    }
+
+    #[test]
+    fn unselected_device_with_endpoints_yields_no_endpoint_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        // No selection made.
+
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        assert_eq!(selected_line, None);
+        assert_eq!(
+            lines.len(),
+            4,
+            "header + controller heading + bus header + the device row only"
+        );
+    }
+
+    #[test]
+    fn moving_the_selection_moves_which_devices_endpoint_rows_show() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(4, device_with_two_endpoints(1, 4));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        app.selected_device = Some("1:3".to_string());
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        // [3] device 3 (selected), [4]/[5] its endpoints, [6] device 4.
+        assert_eq!(selected_line, Some(3));
+        assert_eq!(
+            lines.len(),
+            7,
+            "both devices plus only the selected one's two endpoint rows"
+        );
+        assert!(lines[4].to_string().contains("ep1 in"));
+        assert!(lines[5].to_string().contains("ep2 out"));
+        assert!(
+            !lines[6].to_string().contains("ep1"),
+            "device 4's row carries no trailing endpoints while unselected: {}",
+            lines[6]
+        );
+
+        app.selected_device = Some("1:4".to_string());
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        // [3] device 3 (no longer selected), [4] device 4 (selected), [5]/[6] its endpoints.
+        assert_eq!(selected_line, Some(4));
+        assert_eq!(lines.len(), 7);
+        assert!(
+            !lines[3].to_string().contains("ep1"),
+            "device 3's row no longer trails endpoints once deselected: {}",
+            lines[3]
+        );
+        assert!(lines[5].to_string().contains("ep1 in"));
+        assert!(lines[6].to_string().contains("ep2 out"));
+    }
+
+    #[test]
+    fn endpoint_row_marks_only_the_isochronous_endpoint_as_estimated() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut app =
+            UsbTopApp::new(Duration::from_millis(100)).with_text_source_flag(Arc::clone(&flag));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        assert!(
+            !lines[4].to_string().contains('~'),
+            "no text source active yet: {}",
+            lines[4]
+        );
+        assert!(!lines[5].to_string().contains('~'));
+
+        flag.store(true, Ordering::Relaxed);
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        assert!(
+            lines[4].to_string().contains("~0.1 KB/s"),
+            "the iso endpoint's rate must be marked estimated: {}",
+            lines[4]
+        );
+        assert!(
+            !lines[5].to_string().contains('~'),
+            "the bulk endpoint must never be marked estimated: {}",
+            lines[5]
+        );
+    }
+
+    #[test]
+    fn endpoint_row_width_matches_the_device_row_width() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        assert_eq!(lines[4].width(), device_row_width());
+        assert_eq!(lines[5].width(), device_row_width());
+    }
+
+    #[test]
+    fn endpoint_rows_render_dimmed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        assert!(
+            lines[4].style.add_modifier.contains(Modifier::DIM),
+            "endpoint rows render dimmed relative to device rows"
+        );
+        assert!(lines[5].style.add_modifier.contains(Modifier::DIM));
+    }
+
+    /// A bus of `count` devices (as `manager_with_n_devices`), with the last
+    /// one also carrying the two-endpoint fixture.
+    fn manager_with_n_devices_last_has_endpoints(count: u8) -> (tempfile::TempDir, DeviceManager) {
+        let (temp, mut mgr) = manager_with_n_devices(count);
+        let bus = mgr.get_or_create_bus(1);
+        let device = bus.devices.get_mut(&count).unwrap();
+        device.record_endpoint(1, true, TransferType::Isochronous, 1_000);
+        device.record_endpoint(2, false, TransferType::Bulk, 2_000);
+        (temp, mgr)
+    }
+
+    /// Mirrors `selecting_last_device_scrolls_it_into_view`, but with a
+    /// stale scroll offset from further down than the total content: the
+    /// selection lands at the top of the visible window (the
+    /// `index < list_scroll` branch), so its endpoint rows -- which flow
+    /// through `follow_selection_in_list` as ordinary lines, no special
+    /// casing -- fall right below it in the same window rather than
+    /// scrolling out.
+    #[test]
+    fn endpoint_rows_stay_visible_with_the_selected_device_near_the_bottom() {
+        let (_t, mgr) = manager_with_n_devices_last_has_endpoints(5);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = app.device_keys().last().cloned();
+        app.list_scroll = 9; // stale, as if scrolled well past the selection already
+
+        // inner height 4 (backend height 6, minus the block's 2 border rows).
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 6)).unwrap();
+        terminal
+            .draw(|f| draw_device_list(f, f.area(), &mut app))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(
+            screen.contains("001:005"),
+            "selected device's own row: {screen}"
+        );
+        assert!(
+            screen.contains("ep1 in"),
+            "its first endpoint row: {screen}"
+        );
+        assert!(
+            screen.contains("ep2 out"),
+            "its second endpoint row: {screen}"
         );
     }
 
