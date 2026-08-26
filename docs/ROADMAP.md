@@ -5,13 +5,6 @@ schedule. Items move to [CHANGELOG.md](../CHANGELOG.md) when they ship.
 
 ## Feature ideas
 
-- Interactive `/` search in the device table. `--filter` covers the
-  command-line case; the table itself has no live search yet.
-- Endpoint rows in the TUI device list, expand/collapse on the selected
-  device. The accounting and JSON output already carry per-endpoint
-  detail; the table shows only device totals, and `WindowCounter::bps`
-  waits test-gated for this consumer. Best value-to-effort item on this
-  list (2026-08-22 review).
 - Document file export. `--batch --json > capture.ndjson` already covers
   it; a native `--output PATH` only earns its place if users ask for
   append or rotation semantics.
@@ -20,8 +13,6 @@ schedule. Items move to [CHANGELOG.md](../CHANGELOG.md) when they ship.
   A connector pairs individual hub ports, not whole buses, and `peer`
   links can be absent or wrong, so this needs a design investigation and
   real dock fixtures before code.
-- Bus discovery without debugfs, so the binary interface stands alone. Today
-  usbtop-ng finds buses through debugfs even when it reads `/dev/usbmon<bus>`.
 - Plugin system for custom monitors. Deferred: the versioned NDJSON
   stream is already the right boundary for external analysis tools.
 - Monitoring of remote systems over the network. `ssh -t host sudo
@@ -126,18 +117,11 @@ Design notes:
 These came out of code review. Each is small and none blocks a release.
 
 - Error and log strings brought under the documentation style guide.
-- The TUI Speed column always prints one decimal, so a 5000.0 Mbps cell
-  overflows its 10-cell width and now shows the truncation ellipsis.
-  Integral-bare formatting, like the text reports use, makes every real
-  speed fit. One locked-geometry test changes deliberately with it.
 - SUDO_USER-aware config-dir resolution, so preferences, the usb.ids home
   copy, the internal snapshot, and `--create-alias` follow the invoking
   user under sudo. Today each resolves against root's home there, and
   only sudo -E bridges the two. One coherent change, and created files
   must land owned by the invoking user, not root.
-- Built-in usbmon detection. Module status reads /proc/modules only, so a
-  kernel with usbmon compiled in reads as not loaded and can draw a
-  pointless load prompt when debugfs is unmounted.
 - The usbmon text fallback overcounts isochronous transfers. Its length
   column holds the buffer size, not the bytes moved. On a camera stream the
   overcount was 3.6x. The text format prints 5 of 32 descriptors per URB, so
