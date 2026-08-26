@@ -25,7 +25,9 @@ Four blocks fill the window, top to bottom.
 ## What you need
 
 - Linux. usbtop-ng builds on no other platform.
-- The usbmon kernel module, and debugfs mounted at `/sys/kernel/debug`.
+- The usbmon kernel module. Debugfs mounted at `/sys/kernel/debug` matters
+  only as a fallback, for hosts where the binary `/dev/usbmon*` interface
+  usbtop-ng prefers is unavailable.
 - Read access to the usbmon interfaces. Root has that access. Anything short of
   root depends on the distribution.
 - Rust 1.88 or later, to build from source.
@@ -87,8 +89,9 @@ the permission checks, and how to remove usbtop-ng again.
 usbtop
 ```
 
-Run `sudo usbtop` when your account cannot read
-`/sys/kernel/debug/usb/usbmon`.
+Run `sudo usbtop` when your account cannot read the usbmon interfaces. Both
+the binary `/dev/usbmon*` nodes usbtop-ng prefers and the debugfs text
+fallback are root-owned by default.
 
 ## Keys
 
@@ -393,7 +396,7 @@ unless HOME is preserved with `sudo -E`.
 
 ### Tests
 
-- `cargo test --all-targets` runs 347 hermetic tests against fixture files,
+- `cargo test --all-targets` runs 405 hermetic tests against fixture files,
   FIFOs, and temporary paths. They need no `/dev` and no debugfs access.
 - The `integration` cargo feature adds 1 test that reads the real usbmon
   interfaces. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
