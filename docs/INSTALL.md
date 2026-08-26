@@ -157,7 +157,7 @@ debugfs to make the text interface available instead.
 
 ### 3. Grant read access
 
-usbtop-ng prefers the binary `/dev/usbmon*` nodes; debugfs matters only as
+usbtop-ng prefers the binary `/dev/usbmon*` nodes. Debugfs matters only as
 the text-interface fallback covered in the step above. Both are root-owned
 by default, so this needs root, or read access granted some other way,
 depending on the distribution.
