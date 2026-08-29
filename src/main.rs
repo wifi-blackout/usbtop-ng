@@ -446,7 +446,7 @@ fn main() -> Result<()> {
         warn!("No USB buses detected");
     }
 
-    let (packets, monitor) = usbmon::monitor::start_monitoring(&usbmon_status.available_buses);
+    let (capture, monitor) = usbmon::monitor::start_capture(&usbmon_status.available_buses);
 
     // Resolved once for the whole run and shared by both the headless and
     // TUI managers below; monitoring never re-resolves or touches the
@@ -472,7 +472,7 @@ fn main() -> Result<()> {
         manager.set_internal_snapshot(internal_snapshot.clone());
         let result = headless::run(
             manager,
-            packets,
+            capture,
             Arc::clone(&monitor.dropped),
             Arc::clone(&monitor.kernel_dropped),
             Arc::clone(&monitor.text_active),
@@ -524,7 +524,7 @@ fn main() -> Result<()> {
     if let Ok(dest) = snapshot::snapshot_path() {
         app = app.with_snapshot_dest(dest);
     }
-    let session = run_ui(app, manager, packets);
+    let session = run_ui(app, manager, capture);
 
     // Close the usbmon files before anything tries to unload the module: an
     // open debugfs `Nu` file pins usbmon, so `modprobe -r` would fail EBUSY.

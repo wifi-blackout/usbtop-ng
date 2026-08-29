@@ -13,7 +13,7 @@ use std::{
 
 use crate::device::manager::DeviceManager;
 use crate::ui::{self, KeyOutcome, UsbTopApp};
-use crate::usbmon::parser::UsbPacket;
+use crate::usbmon::monitor::CaptureStream;
 
 pub(crate) mod events;
 pub(crate) mod lifecycle;
@@ -74,7 +74,7 @@ impl UiSession {
 pub fn run_ui(
     mut app: UsbTopApp,
     mut manager: DeviceManager,
-    packets: Receiver<UsbPacket>,
+    capture: CaptureStream,
 ) -> Result<UiSession> {
     // First, so that everything below has a way back out of TUI mode even if
     // it dies mid-frame.
@@ -106,7 +106,7 @@ pub fn run_ui(
         &mut terminal,
         &mut app,
         &mut manager,
-        &packets,
+        &capture,
         &ui_events,
         &shed,
     );
@@ -240,7 +240,7 @@ fn run_app(
     terminal: &mut TuiTerminal,
     app: &mut UsbTopApp,
     manager: &mut DeviceManager,
-    packets: &Receiver<UsbPacket>,
+    capture: &CaptureStream,
     ui_events: &Receiver<UiEvent>,
     shed: &ShedHandles,
 ) -> Result<ExitReason> {
@@ -292,7 +292,7 @@ fn run_app(
             Err(RecvTimeoutError::Disconnected) => return Ok(ExitReason::TerminalDead),
         }
 
-        packet_backlog = ui::drain_packets(manager, packets, ui::DRAIN_BATCH) == ui::DRAIN_BATCH;
+        packet_backlog = ui::drain_capture(manager, capture, ui::DRAIN_BATCH) == ui::DRAIN_BATCH;
 
         // The wait above may have consumed the whole timeout, so the clock is
         // re-read before deciding what this pass owes.

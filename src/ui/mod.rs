@@ -17,10 +17,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::device::manager::{DeviceManager, UsbBus};
+use crate::device::manager::{DeviceManager, TrafficDelta, UsbBus};
 use crate::device::UsbDevice;
 use crate::filter::FilterSet;
 use crate::snapshot::{Snapshot, SnapshotDevice};
+use crate::usbmon::monitor::CaptureStream;
 use crate::usbmon::parser::{format_mbps, TransferType, UsbPacket, UsbSpeed};
 
 pub mod colors;
@@ -842,6 +843,42 @@ pub(crate) fn drain_packets(
         match packets.try_recv() {
             Ok(packet) => {
                 manager.apply_packet(&packet);
+                applied += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    applied
+}
+
+/// Apply up to `batch` queued items from `capture` to `manager`, dispatching
+/// on which capture backend produced them: usbmon's `UsbPacket`s via
+/// [`drain_packets`] (unchanged -- this only adds a dispatch in front of
+/// it), the eBPF backend's `TrafficDelta`s via [`drain_deltas`].
+pub(crate) fn drain_capture(
+    manager: &mut DeviceManager,
+    capture: &CaptureStream,
+    batch: usize,
+) -> usize {
+    match capture {
+        CaptureStream::Packets(packets) => drain_packets(manager, packets, batch),
+        CaptureStream::Deltas(deltas) => drain_deltas(manager, deltas, batch),
+    }
+}
+
+/// [`drain_capture`]'s `Deltas` arm: the same bounded-batch shape as
+/// [`drain_packets`], routed through `apply_delta` instead of
+/// `apply_packet`.
+fn drain_deltas(
+    manager: &mut DeviceManager,
+    deltas: &Receiver<TrafficDelta>,
+    batch: usize,
+) -> usize {
+    let mut applied = 0;
+    while applied < batch {
+        match deltas.try_recv() {
+            Ok(delta) => {
+                manager.apply_delta(&delta);
                 applied += 1;
             }
             Err(_) => break,
@@ -4351,5 +4388,83 @@ mod tests {
         terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
         let screen = terminal.backend().to_string();
         assert!(screen.contains("Search devices by name"), "{screen}");
+    }
+}
+
+/// [`drain_capture`]'s dispatch, exercised with fixture receivers of both
+/// [`CaptureStream`] variants.
+///
+/// Gated on the `ebpf` feature -- not because the dispatch itself needs it
+/// (`CaptureStream::Deltas` is always a real, constructible variant, feature
+/// or no) -- but so that adding this backend's tests does not change the
+/// default or `--features integration` test counts: those configs already
+/// cover the `Packets` arm byte-for-byte (see `tests::drain_stops_at_the_batch_limit_and_leaves_the_rest_queued`
+/// above), and this module's job is to additionally prove the `Deltas` arm
+/// and the dispatch between them.
+#[cfg(all(test, feature = "ebpf"))]
+mod capture_dispatch_tests {
+    use super::*;
+    use std::sync::mpsc::sync_channel;
+
+    fn delta(device_id: u8, bytes: u64) -> TrafficDelta {
+        TrafficDelta {
+            bus_id: 1,
+            device_id,
+            endpoint: 1,
+            dir_in: true,
+            transfer_type: Some(TransferType::Bulk),
+            bytes,
+        }
+    }
+
+    #[test]
+    fn drain_capture_dispatches_a_packets_stream_to_apply_packet() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let (tx, rx) = sync_channel(4);
+        tx.send(
+            crate::usbmon::parser::parse_usbmon_text_line(
+                "ffff0000eeee0001 100 C Bi:1:004:1 0 4096 <",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let capture = CaptureStream::Packets(rx);
+
+        assert_eq!(drain_capture(&mut manager, &capture, 8), 1);
+        assert_eq!(
+            manager.buses[&1].devices[&4].bandwidth_stats.total_rx_bytes,
+            4096
+        );
+    }
+
+    #[test]
+    fn drain_capture_dispatches_a_deltas_stream_to_apply_delta() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let (tx, rx) = sync_channel(4);
+        tx.send(delta(4, 4096)).unwrap();
+        let capture = CaptureStream::Deltas(rx);
+
+        assert_eq!(drain_capture(&mut manager, &capture, 8), 1);
+        assert_eq!(
+            manager.buses[&1].devices[&4].bandwidth_stats.total_rx_bytes,
+            4096
+        );
+    }
+
+    #[test]
+    fn drain_capture_on_a_deltas_stream_respects_the_batch_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let (tx, rx) = sync_channel(8);
+        for device_id in 1..=5u8 {
+            tx.send(delta(device_id, 100)).unwrap();
+        }
+        let capture = CaptureStream::Deltas(rx);
+
+        assert_eq!(drain_capture(&mut manager, &capture, 2), 2);
+        assert_eq!(drain_capture(&mut manager, &capture, 8), 3);
+        assert_eq!(drain_capture(&mut manager, &capture, 8), 0, "empty channel");
     }
 }

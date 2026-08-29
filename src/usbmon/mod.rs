@@ -56,11 +56,6 @@ pub struct UsbmonStatus {
 
 pub fn check_usbmon_status() -> Result<UsbmonStatus> {
     debug!("Checking usbmon kernel module status");
-    #[cfg(feature = "ebpf")]
-    debug!(
-        "eBPF backend: skeleton compiled in = {}",
-        ebpf::ebpf_feature_built()
-    );
 
     let sysfs_root = Path::new("/sys/bus/usb/devices");
     let dev_root = Path::new("/dev");
