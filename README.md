@@ -397,10 +397,16 @@ unchanged: it still resolves against `/root`.
 
 ### Tests
 
-- `cargo test --all-targets` runs 408 hermetic tests against fixture files,
-  FIFOs, and temporary paths. They need no `/dev` and no debugfs access.
-- The `integration` cargo feature adds 1 test that reads the real usbmon
-  interfaces. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
+- `cargo test --all-targets` runs the hermetic library suite (421 tests)
+  against fixture files, FIFOs, and temporary paths, needing no `/dev` and
+  no debugfs access, plus two committed harnesses in `tests/`: a pipe-based
+  regression guard for the terminal-restore bytes, and a PTY harness for
+  the wedged-terminal checks (quit, `SIGHUP`, a terminal that stops
+  reading). Both spawn the real binary; neither touches the real
+  `~/.usbtop-ng` or usbmon.
+- The `integration` cargo feature adds 2 tests that need real root or a
+  real usbmon interface, each skipping gracefully without one. See
+  [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
 
 ## Preferences file
 

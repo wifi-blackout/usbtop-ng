@@ -5,6 +5,16 @@ All notable changes to usbtop-ng are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `sudo usbtop` now follows the invoking user's configuration: preferences, the internal-device snapshot, the downloaded usb.ids copy, and `--create-alias`'s rc file all resolve against that user's home instead of root's, and files created there while root belong to that user, not root. Data previously written to `/root/.usbtop-ng` by earlier `sudo` sessions is no longer read under `sudo`; a direct root login is unchanged. `sudo -E` is no longer needed for this.
+
+### Testing
+
+- Two committed integration harnesses join the default suite: a pipe-based regression guard proving the terminal-restore bytes reach the terminal while the process is still alive (not just buffered until exit), and a PTY harness covering the wedged-terminal checks (quit, `SIGHUP`, and a terminal that stops reading) that previously ran by hand.
+
 ## [1.4.0] - 2026-08-28
 
 ### Added

@@ -65,7 +65,9 @@ pass, and how to send it.
    ```bash
    cargo test
    ```
-   The command reports 408 passed. A failure names the test. Fix it and repeat.
+   The library suite reports 421 passed; the `tests/` directory adds the
+   pipe and PTY harnesses alongside it. A failure names the test. Fix it and
+   repeat.
 4. To run with debug output, use:
    ```bash
    RUST_LOG=debug cargo run -- --verbose
@@ -178,15 +180,21 @@ cargo test -- --nocapture
 cargo test --all-targets
 ```
 
-`cargo test` and `cargo test --all-targets` run the hermetic suite only. Every
-test there works against fixture files, FIFOs, and `tempfile` paths. The suite
-therefore passes on any operating system, with no `/dev` and no debugfs access.
-It reports 408 passed. CI runs this suite and no other.
+`cargo test` and `cargo test --all-targets` run the same three suites, all
+hermetic. The library's unit suite reports 421 passed, working against
+fixture files, FIFOs, and `tempfile` paths, with no `/dev` and no debugfs
+access. The `tests/` directory adds two more: `restore_pipe.rs` (2 tests),
+proving the terminal-restore bytes reach a piped stdout while the process is
+still alive, and `pty.rs` (3 tests), the wedged-terminal checks (quit,
+`SIGHUP`, a terminal that stops reading) run against a real `openpty`-backed
+child. Both spawn the real binary and pass on any Linux host; neither
+touches the real `~/.usbtop-ng` or usbmon. CI runs this suite and no other.
 
 ### Live system tests (the `integration` feature)
 
-The opt-in `integration` cargo feature adds 1 test that reads the real usbmon
-interfaces instead of fixtures.
+The opt-in `integration` cargo feature adds 2 tests to the library suite: one
+that reads the real usbmon interfaces instead of fixtures, one that exercises
+the real `chown(2)` call behind `sudo`'s ownership fix-up and needs real root.
 
 1. Confirm that usbmon is loaded and that you can read
    `/sys/kernel/debug/usb/usbmon`. Root access is the usual route.
@@ -194,8 +202,8 @@ interfaces instead of fixtures.
    ```bash
    cargo test --features integration
    ```
-   The command reports 409 passed. Without usbmon the extra test prints a skip
-   message and passes.
+   The library suite reports 423 passed. Without usbmon, or without root,
+   each of the two extra tests prints its own skip message and passes.
 
 The live test is gated on the feature, so it compiles to nothing on default
 builds. CI does not run this feature. It exists for manual checks on a real
@@ -262,7 +270,9 @@ Cover these areas first:
    ```bash
    cargo test --all-targets
    ```
-   The command reports 408 passed. A failure names the test. Fix it and repeat.
+   The library suite reports 421 passed; the `tests/` directory adds the
+   pipe and PTY harnesses alongside it. A failure names the test. Fix it and
+   repeat.
 6. Update the documentation your change affects.
 7. Add tests for new behavior.
 
