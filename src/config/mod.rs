@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -90,19 +93,30 @@ pub fn sudo_invoker() -> Option<Invoker> {
         .clone()
 }
 
-/// The raw `chown(2)` syscall as a testable primitive, separate from the
+/// The raw `fchown(2)` syscall as a testable primitive, separate from the
 /// invoker lookup so the syscall itself can be exercised as root without
-/// needing a real sudo environment. See [`chown_to_invoker`], the production
-/// entry point.
-fn chown_path(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains a NUL byte")
-    })?;
-    // SAFETY: `cstr` is a valid, NUL-terminated C string that outlives this
-    // call; chown(2) only reads it and has no other preconditions.
-    let rc = unsafe { libc::chown(cstr.as_ptr(), uid, gid) };
+/// needing a real sudo environment. See [`chown_created_to_invoker`], the
+/// production entry point.
+///
+/// Deliberately fd-based, not path-based: `chown(2)` re-resolves every path
+/// component (including a trailing symlink) at the moment it runs, so a
+/// path-based chown taken some time after a containment check was passed
+/// can be raced -- swap a component for a symlink in the gap and the chown
+/// lands wherever that symlink points, including outside the checked
+/// directory entirely. `fchown(2)` instead operates on an already-open file
+/// descriptor: the kernel resolved that descriptor's target once, at
+/// `open(2)` time, and nothing about it changes afterwards no matter what
+/// happens to the path that was used to open it. As long as the descriptor
+/// passed in was obtained by *this* process creating the file (not by
+/// re-opening a path handed in from outside), there is nothing left for an
+/// attacker to swap.
+fn fchown_fd(fd: RawFd, uid: u32, gid: u32) -> std::io::Result<()> {
+    // SAFETY: every caller passes the raw fd of a `File`/handle it still
+    // owns and keeps alive at least until this call returns, so `fd` names
+    // a valid, open descriptor for the whole call. `fchown` reads no
+    // pointers and has no other preconditions; a non-zero return only
+    // reflects a kernel-side permission or target error.
+    let rc = unsafe { libc::fchown(fd, uid, gid) };
     if rc == 0 {
         Ok(())
     } else {
@@ -141,9 +155,10 @@ fn is_within(path: &Path, home: &Path) -> bool {
 
 /// Resolve `path` against the real filesystem for a containment check, so a
 /// symlinked ancestor cannot make a path that is lexically inside `home`
-/// actually land somewhere else on disk. Every current [`chown_to_invoker`]
-/// call site invokes it right after creating the exact file or directory
-/// being chowned, so the direct `canonicalize()` below -- which requires the
+/// actually land somewhere else on disk. Every current
+/// [`chown_created_to_invoker`] call site invokes it right after creating
+/// the exact file or directory being chowned, so the direct `canonicalize()`
+/// below -- which requires the
 /// path to exist -- succeeds in practice. The fallback (canonicalize the
 /// parent, which must exist for anything to be about to be created inside
 /// it, and re-append the file name) keeps the function sound for a
@@ -161,16 +176,30 @@ fn resolve_for_containment_check(path: &Path) -> Option<PathBuf> {
     Some(canonical_parent.join(name))
 }
 
-/// Chown `path` to the invoking user's uid:gid; a no-op when [`sudo_invoker`]
-/// is `None`, and, since `--config`/`--usbids` can hand root an arbitrary
-/// system path, also a no-op -- silently skipped, not logged -- when `path`
-/// does not resolve inside the invoker's own home (see
-/// [`resolve_for_containment_check`] and [`is_within`]). Call this on every
-/// file or directory this process CREATES under the invoker's home while
-/// running as root -- appending to an existing, already-user-owned file
-/// needs no call. A chown failure (as opposed to an out-of-home skip) logs
-/// one warning and continues; ownership drift here must never fail the run.
-pub fn chown_to_invoker(path: &Path) {
+/// Chown the already-open `fd` -- the handle this process just used to
+/// CREATE `path` -- to the invoking user's uid:gid; a no-op when
+/// [`sudo_invoker`] is `None`, and, since `--config`/`--usbids` can hand
+/// root an arbitrary system path, also a no-op -- silently skipped, not
+/// logged -- when `path` does not resolve inside the invoker's own home
+/// (see [`resolve_for_containment_check`] and [`is_within`]).
+///
+/// `path` is consulted only to decide *whether* to chown; the chown itself
+/// runs on `fd` via [`fchown_fd`]. That split is what closes the race the
+/// old path-based version had: even if something raced the containment
+/// check's own path resolution (swapping a component between the check and
+/// this call), the worst outcome is a wrong *decision* -- chowning when it
+/// should not have, or not chowning when it should have. It can never
+/// redirect the chown to a *different* file, because `fchown(2)` does not
+/// re-resolve a path -- the check and the act no longer share a
+/// TOCTOU-vulnerable path lookup at all.
+///
+/// Call this on every file or directory this process CREATES under the
+/// invoker's home while running as root, right after creating it and while
+/// still holding the descriptor open -- appending to an existing,
+/// already-user-owned file needs no call. A chown failure (as opposed to an
+/// out-of-home skip) logs one warning and continues; ownership drift here
+/// must never fail the run.
+pub fn chown_created_to_invoker(path: &Path, fd: RawFd) {
     let Some(invoker) = sudo_invoker() else {
         return;
     };
@@ -188,25 +217,34 @@ pub fn chown_to_invoker(path: &Path) {
     if !is_within(&resolved_path, &home) {
         return;
     }
-    // Chown the resolved path, not the original `path`: `chown_path` ->
-    // `libc::chown` follows symlinks and re-resolves every component at
-    // syscall time, so chowning the original text would let an attacker who
-    // controls a component under their own home swap it for a symlink
-    // between the check above and this call, landing the chown outside home
-    // -- the exact race the containment check exists to close.
-    // `resolved_path` has every ancestor already resolved to a real,
-    // symlink-free component (or, for a not-yet-created leaf, a real
-    // canonical parent plus the plain leaf name), so there is nothing left
-    // in it for `chown(2)` to re-resolve elsewhere: the check and the act
-    // now run on the same bytes.
-    if let Err(e) = chown_path(&resolved_path, invoker.uid, invoker.gid) {
+    if let Err(e) = fchown_fd(fd, invoker.uid, invoker.gid) {
         log::warn!(
             "could not set ownership of {} to uid {} gid {}: {e}",
-            resolved_path.display(),
+            path.display(),
             invoker.uid,
             invoker.gid
         );
     }
+}
+
+/// Create (or truncate) `path`, write `bytes` to it, and chown the result to
+/// the invoking user via [`chown_created_to_invoker`] -- open, write, and
+/// chown all act on one file descriptor from a single `open(2)`, so there is
+/// exactly one inode in play throughout and nothing left to re-resolve
+/// between steps. The open passes `O_NOFOLLOW`, so a symlink planted at
+/// `path` ahead of time -- the final component resolving to something this
+/// process does not own -- is refused with an error rather than written
+/// through or (had a path-based chown been used) chowned by way of.
+pub fn write_file_owned(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.write_all(bytes)?;
+    chown_created_to_invoker(path, file.as_raw_fd());
+    Ok(())
 }
 
 /// The home directory per-user data resolves against: the invoking user's
@@ -260,6 +298,16 @@ pub fn load_or_create_default_at(path: &Path) -> Result<Preferences> {
     Ok(prefs)
 }
 
+/// Writes via [`write_file_owned`] (create/truncate, `O_NOFOLLOW`, fchown on
+/// the fd that created the file -- see its doc comment for the race this
+/// closes). Does NOT chown a parent directory it creates here: in
+/// production, every default-path caller creates `.usbtop-ng` first via
+/// [`ensure_private_config_dir`] (which does chown it), so `create_dir_all`
+/// above is a no-op there. It only ever actually creates a directory when
+/// `--config` names a path under a not-yet-existing parent -- a location the
+/// invoker chose, not the documented layout -- and ownership of that is left
+/// to the caller, the same way [`chown_created_to_invoker`]'s containment
+/// gate already leaves anything outside the invoker's home alone.
 pub fn write_preferences_at(path: &Path, prefs: &Preferences) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| {
@@ -271,15 +319,17 @@ pub fn write_preferences_at(path: &Path, prefs: &Preferences) -> Result<()> {
     }
 
     let content = toml::to_string_pretty(prefs).context("failed to serialize preferences")?;
-    fs::write(path, content)
+    write_file_owned(path, content.as_bytes())
         .with_context(|| format!("failed to write preferences to {}", path.display()))?;
-    chown_to_invoker(path);
     Ok(())
 }
 
 /// Create the default config directory with private (0700) permissions.
 /// Only chmods when this call creates the directory; an existing directory
-/// (or a user-supplied custom path) is never re-chmodded.
+/// (or a user-supplied custom path) is never re-chmodded. The freshly
+/// created directory is chowned by reopening it (`O_DIRECTORY | O_NOFOLLOW`)
+/// and calling [`chown_created_to_invoker`] on that fresh handle -- the same
+/// fd-based pattern every creation site in this module uses.
 pub fn ensure_private_config_dir(dir: &Path) -> Result<()> {
     if dir.exists() {
         return Ok(());
@@ -287,8 +337,31 @@ pub fn ensure_private_config_dir(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir)
         .with_context(|| format!("failed to create config directory {}", dir.display()))?;
     set_private_dir_permissions(dir)?;
-    chown_to_invoker(dir);
+    chown_created_dir_to_invoker(dir);
     Ok(())
+}
+
+/// Reopen the directory this call just created purely to get a fresh,
+/// trustworthy fd to chown -- `fs::create_dir_all`/`fs::metadata` never hand
+/// one back. `O_DIRECTORY` refuses anything that is not (by now) actually a
+/// directory; `O_NOFOLLOW` refuses a symlinked final component. A failure to
+/// reopen is logged and skipped, the same best-effort contract
+/// [`chown_created_to_invoker`] itself has -- ownership drift must never
+/// fail the run.
+fn chown_created_dir_to_invoker(dir: &Path) {
+    match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)
+    {
+        Ok(handle) => chown_created_to_invoker(dir, handle.as_raw_fd()),
+        Err(e) => {
+            log::warn!(
+                "could not reopen {} to set its ownership: {e}",
+                dir.display()
+            );
+        }
+    }
 }
 
 fn set_private_dir_permissions(path: &Path) -> Result<()> {
@@ -437,9 +510,9 @@ mod tests {
         // invoking user fully controls the contents of their own home), so
         // a path that is lexically nested under home resolves, on the real
         // filesystem, to a location that is not. This is also the decision
-        // that gates `chown_to_invoker`'s call to `chown_path`: it resolves
-        // the path exactly this way, then returns before ever calling
-        // `chown_path` when `is_within` comes back false here -- so a
+        // that gates `chown_created_to_invoker`'s call to `fchown_fd`: it
+        // resolves the path exactly this way, then returns before ever
+        // calling `fchown_fd` when `is_within` comes back false here -- so a
         // `false` result below is "no chown attempted" for the real
         // function, not just for this pure check in isolation.
         let temp = tempfile::tempdir().unwrap();
@@ -456,7 +529,7 @@ mod tests {
         assert!(
             !is_within(&resolved, &home),
             "a symlinked ancestor must resolve to its real target, escaping home -- \
-             chown_to_invoker returns here without ever calling chown_path"
+             chown_created_to_invoker returns here without ever calling fchown_fd"
         );
     }
 
@@ -627,6 +700,35 @@ mod tests {
             "a None usbids_path must not appear in the written file: {written}"
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_owned_refuses_a_symlinked_final_component() {
+        // The attack `O_NOFOLLOW` exists to stop, hermetically (no root
+        // needed -- `open(2)` refuses the symlink regardless of privilege):
+        // an attacker who fully controls their own home plants a symlink at
+        // the path this process is about to write, pointing somewhere they
+        // do not own. A path-based write (or a path-based chown afterwards)
+        // would follow it; `write_file_owned`'s `open` must instead fail
+        // outright, leaving both the symlink and its target untouched.
+        let temp = tempfile::tempdir().unwrap();
+        let real_target = temp.path().join("real-target");
+        fs::write(&real_target, b"do not touch").unwrap();
+        let trap = temp.path().join("trap.toml");
+        std::os::unix::fs::symlink(&real_target, &trap).unwrap();
+
+        let result = write_file_owned(&trap, b"attacker-controlled content");
+
+        assert!(
+            result.is_err(),
+            "a symlinked final component must be refused, not followed"
+        );
+        let content = fs::read_to_string(&real_target).unwrap();
+        assert_eq!(
+            content, "do not touch",
+            "the symlink's target must be left untouched -- no write, and so no chown of it either"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "integration"))]
@@ -634,27 +736,29 @@ mod integration_tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
 
-    /// Exercises the real `chown(2)` primitive, not the invoker lookup (that
-    /// half is already covered hermetically above). Requires root, since
-    /// only root may chown a file to an arbitrary uid/gid; skips gracefully
-    /// otherwise, matching the pattern at `src/usbmon/mod.rs`'s
+    /// Exercises the real `fchown(2)` primitive, not the invoker lookup
+    /// (that half is already covered hermetically above). Requires root,
+    /// since only root may chown a file to an arbitrary uid/gid; skips
+    /// gracefully otherwise, matching the pattern at `src/usbmon/mod.rs`'s
     /// `debugfs_state_reads_permission_denied`.
     /// Run: cargo test --features integration
     #[test]
-    fn chown_path_sets_the_files_owning_uid_and_gid() {
+    fn fchown_fd_sets_the_files_owning_uid_and_gid() {
         // SAFETY: geteuid() takes no arguments and cannot fail.
         if unsafe { libc::geteuid() } != 0 {
-            eprintln!("not running as root; chown_path integration check skipped");
+            eprintln!("not running as root; fchown_fd integration check skipped");
             return;
         }
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("owned-file");
-        fs::write(&path, b"content").unwrap();
+        let file = fs::File::create(&path).unwrap();
 
         // `daemon` (uid/gid 1) is present on every Linux system and is not
         // the file's current owner (root, from creating it above), so a
-        // successful chown is observable.
-        chown_path(&path, 1, 1).unwrap();
+        // successful chown is observable. Kept open across the call, the
+        // same way every real caller holds its own handle -- `fchown_fd`
+        // never touches the path again.
+        fchown_fd(file.as_raw_fd(), 1, 1).unwrap();
 
         let meta = fs::metadata(&path).unwrap();
         assert_eq!(meta.uid(), 1);

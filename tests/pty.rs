@@ -5,7 +5,13 @@
 //! Each test spawns the real binary with a `libc::openpty`-allocated slave
 //! wired to its stdin, stdout, and stderr, `--force` (so the TUI opens with
 //! no usbmon needed) and `--refresh 100` (so frames keep coming), with `HOME`
-//! pointed at a tempdir so the child never touches the real `~/.usbtop-ng`.
+//! pointed at a tempdir so the child never touches the real `~/.usbtop-ng` --
+//! and, under the root test flow (`sudo cargo test --features
+//! integration`), with `SUDO_UID`/`SUDO_GID` stripped from the child's
+//! environment too, so `sudo_invoker()` (`src/config/mod.rs`) cannot
+//! resolve the real invoking user from this harness's own inherited sudo
+//! context and redirect the child back to their real home despite `HOME`
+//! above (see [`PtySession::spawn`]'s doc comment for the full mechanism).
 //! Every test enforces a bounded exit deadline: that bound is the whole
 //! point, since the thing under test is the terminal-restore path described
 //! in `src/tui/lifecycle.rs` (`restore_with`, `write_within_budget`) staying
@@ -200,6 +206,19 @@ impl PtySession {
     /// Spawn `usbtop-ng --force --refresh 100` on a fresh pty, with `HOME`
     /// pointed at `home` so the run never touches the real
     /// `~/.usbtop-ng`.
+    ///
+    /// `SUDO_UID`/`SUDO_GID` are stripped from the child's environment
+    /// rather than left to inherit from this test process. Without that,
+    /// the documented root test flow (`sudo cargo test --features
+    /// integration`) leaves this harness itself running with euid 0 and
+    /// those two variables set from the real invoking user -- and
+    /// `sudo_invoker()` (`src/config/mod.rs`) has no way to tell that
+    /// inheritance apart from a genuine `sudo usbtop-ng` invocation. Left
+    /// alone, the spawned child would resolve the real invoking user's
+    /// identity and create/chown files under their real `~/.usbtop-ng`,
+    /// despite `HOME` above pointing it at this tempdir -- exactly the
+    /// "never touches the real home" promise this file's own module doc
+    /// makes.
     fn spawn(home: &Path) -> Self {
         let (master_fd, slave_fd, retained_slave) = open_pty();
         let master = File::from(master_fd);
@@ -220,6 +239,13 @@ impl PtySession {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_usbtop-ng"));
         cmd.args(["--force", "--refresh", "100"])
             .env("HOME", home)
+            // See the doc comment above: without this, `sudo cargo test
+            // --features integration` leaves these two set from the real
+            // invoking user, and the child (running as euid 0 like this
+            // harness itself) would resolve them instead of respecting
+            // `HOME` above.
+            .env_remove("SUDO_UID")
+            .env_remove("SUDO_GID")
             .stdin(Stdio::from(stdin_fd))
             .stdout(Stdio::from(stdout_fd))
             .stderr(Stdio::from(slave_fd));
@@ -293,6 +319,8 @@ impl PtySession {
     /// `disable_raw_mode` (called from `restore_with`) is supposed to put
     /// it back to.
     fn slave_is_cooked(&self) -> bool {
+        // SAFETY: termios is plain-old-data; all-zeroes is valid and
+        // tcgetattr overwrites it.
         let mut term: libc::termios = unsafe { std::mem::zeroed() };
         // SAFETY: `self.retained_slave` is the parent's own open copy of
         // the pty slave, valid for the life of `self`; `tcgetattr` writes
@@ -377,8 +405,13 @@ fn sighup_restores_the_terminal_without_a_prompt() {
     );
     assert!(
         !contains(&restore, UNLOAD_QUESTION_MARKER),
-        "a hangup must never print a prompt -- there is nobody left to \
-         answer one (see UnloadPolicy::AutoOnly, src/tui/lifecycle.rs): {text:?}"
+        "no unload prompt should ever print here -- this session runs with \
+         --force, so usbmon is never loaded this run and `unload_policy` \
+         (src/tui/lifecycle.rs) returns Skip unconditionally before the \
+         load-block reasoning (UnloadPolicy::AutoOnly vs. PromptFlow) is \
+         even reached; this assertion is really the broader \"nothing \
+         prints after restore\" contract, not a claim about which policy \
+         a hangup selects: {text:?}"
     );
 
     assert!(

@@ -11,6 +11,8 @@ use log::{error, info, warn};
 use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process;
 use std::sync::Arc;
@@ -29,7 +31,7 @@ mod usbmon;
 use std::time::Duration;
 
 use config::{
-    chown_to_invoker, config_home, ensure_private_config_dir, load_or_create_default_at,
+    chown_created_to_invoker, config_home, ensure_private_config_dir, load_or_create_default_at,
     preferences_path,
 };
 use tui::lifecycle::{unload_policy, UnloadPolicy};
@@ -265,7 +267,6 @@ fn main() -> Result<()> {
             ensure_private_config_dir(parent)?;
         }
         snapshot.write_to(&dest)?;
-        chown_to_invoker(&dest);
         println!(
             "{} devices recorded as internal in {}",
             snapshot.devices.len(),
@@ -698,10 +699,15 @@ fn create_shell_alias() -> Result<()> {
     // Add the alias to the config file. `created` decides whether this run
     // owns the file below: chown a freshly created rc, but leave an
     // existing one's ownership untouched (appending to it needs no call).
+    // `O_NOFOLLOW` refuses a symlinked final component outright rather than
+    // appending through it -- a shell rc managed by a dotfile tool as a
+    // symlink will see this fail instead of being silently written to
+    // (and, had this stayed path-based, silently chowned) by way of.
     let created = !Path::new(&config_file).exists();
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&config_file)?;
 
     writeln!(
@@ -710,7 +716,7 @@ fn create_shell_alias() -> Result<()> {
     )?;
     writeln!(file, "{}", alias_command)?;
     if created {
-        chown_to_invoker(Path::new(&config_file));
+        chown_created_to_invoker(Path::new(&config_file), file.as_raw_fd());
     }
 
     println!("✅ Successfully added alias to {}", config_file);
