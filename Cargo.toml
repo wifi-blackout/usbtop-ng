@@ -14,6 +14,7 @@ exclude = ["tmp/", ".claude/", ".github/", "release.sh"]
 
 [features]
 integration = []
+ebpf = ["dep:libbpf-rs", "dep:libbpf-cargo"]
 
 [dependencies]
 anyhow = "1.0"
@@ -22,6 +23,7 @@ clap_complete = "4.5"
 clap_mangen = "0.2"
 crossterm = "0.29"
 env_logger = "0.11"
+libbpf-rs = { version = "0.27.0", optional = true }
 libc = "0.2"
 log = "0.4"
 ratatui = "0.30"
@@ -32,3 +34,6 @@ toml = "1.1"
 
 [dev-dependencies]
 tempfile = "3.16"
+
+[build-dependencies]
+libbpf-cargo = { version = "0.27.0", optional = true }

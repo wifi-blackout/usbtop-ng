@@ -326,6 +326,24 @@ unchanged: it still resolves against `/root`.
 - usbtop-ng closes the usbmon files before any unload, because an open file
   pins the module and makes `modprobe -r usbmon` fail with `EBUSY`.
 
+### The eBPF capture backend
+
+- An optional `ebpf` cargo feature adds a second capture backend: a kprobe
+  on `__usb_hcd_giveback_urb` that aggregates bytes per bus, device,
+  endpoint, direction, and transfer type in a kernel hash map, polled into
+  the same accounting path usbmon feeds. It measures throughput only; it
+  does not attribute traffic to a process.
+- Opt-in: the default build never compiles it, pulls no libbpf dependency,
+  and needs no BPF toolchain. Building it needs clang (with the BPF
+  target) and libbpf-dev, then `cargo build --release --features ebpf`.
+  See [docs/INSTALL.md](docs/INSTALL.md#building-the-ebpf-backend) for the
+  full requirements.
+- At runtime it needs root (or `CAP_BPF`) and a BTF-enabled kernel
+  (`/sys/kernel/btf/vmlinux`). When the feature is compiled in but the
+  program fails to load or attach, usbtop-ng logs a warning and falls back
+  to the usbmon chain above -- eBPF is never the default, and a failure
+  here never fails the program.
+
 ### Drawing the screen
 
 - usbtop-ng draws only when something changed, and never more often than one
@@ -417,6 +435,11 @@ unchanged: it still resolves against `/root`.
 - The `integration` cargo feature adds 4 tests that need real root, a real
   usbmon interface, or a real mmap-capable `/dev/usbmon0`, each skipping
   gracefully without one. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
+- The `ebpf` cargo feature adds tests covering the eBPF backend's pure
+  delta math and transfer-type mapping, plus a live kprobe load/attach test
+  gated on root and a BTF-enabled kernel that skips gracefully without
+  them; `cargo test --all-targets --features ebpf` reports 470 unit tests.
+  See [docs/INSTALL.md](docs/INSTALL.md#building-the-ebpf-backend).
 
 ## Preferences file
 

@@ -12,6 +12,7 @@ use super::mmap_ring::MmapReader;
 use super::open_nonblocking;
 use super::parser::UsbPacket;
 use super::reader::UsbmonReader;
+use crate::device::manager::TrafficDelta;
 
 /// How many packets may sit unread on the channel before readers start
 /// discarding. A busy bus can outrun a slow consumer (a redraw over SSH, say)
@@ -187,6 +188,122 @@ pub fn start_monitoring(buses: &[u8]) -> (Receiver<UsbPacket>, MonitorHandle) {
         })
         .collect();
     start_sources(sources)
+}
+
+/// One capture backend's output stream: usbmon's per-packet feed, or the
+/// eBPF backend's per-key delta feed (see `usbmon::ebpf::EbpfSource`).
+///
+/// `start_capture` is the only thing that decides which variant a session
+/// gets; everything downstream (the drain seam in `ui::drain_capture` and
+/// its `headless`/`tui` callers) dispatches on this enum instead of caring
+/// which backend is live. usbmon's `Packets` path and its "every packet
+/// marks the device seen" behaviour are unchanged by this enum existing --
+/// `start_monitoring` and `start_sources` below, which produce it, are
+/// untouched.
+pub enum CaptureStream {
+    /// debugfs text, `/dev/usbmonN` read(), or `/dev/usbmonN` mmap ring --
+    /// whichever [`start_monitoring`] picked.
+    Packets(Receiver<UsbPacket>),
+    /// The eBPF backend's per-key cumulative-bytes deltas (see
+    /// `usbmon::ebpf::EbpfSource`).
+    Deltas(Receiver<TrafficDelta>),
+}
+
+/// Start capturing traffic for `buses`, preferring the eBPF backend when the
+/// `ebpf` feature is compiled in and the program actually loads and
+/// attaches (BTF present, the kprobe resolvable, sufficient privilege), and
+/// falling back to [`start_monitoring`]'s usbmon chain otherwise -- eBPF is
+/// opt-in and never the default, and any load/attach failure degrades to
+/// the existing chain rather than failing the program (see
+/// `usbmon::ebpf::EbpfSource::load_and_attach`).
+pub fn start_capture(buses: &[u8]) -> (CaptureStream, MonitorHandle) {
+    if let Some((deltas, handle)) = try_ebpf_capture() {
+        return (CaptureStream::Deltas(deltas), handle);
+    }
+    let (packets, handle) = start_monitoring(buses);
+    (CaptureStream::Packets(packets), handle)
+}
+
+/// The `ebpf`-feature half of [`start_capture`]: load and attach the
+/// `usbrate` skeleton and, on success, spawn its poller thread. `None` when
+/// the backend's load/attach failed -- the caller falls back to the usbmon
+/// chain.
+///
+/// Mirrors [`start_sources_with_bound`]'s shape (a bounded channel, a
+/// shutdown flag, a named thread folded into a [`MonitorHandle`]) with one
+/// source instead of one per bus: the eBPF backend aggregates every bus
+/// itself (the kprobe fires for the whole host), so there is nothing to
+/// spawn per bus here.
+#[cfg(feature = "ebpf")]
+fn try_ebpf_capture() -> Option<(Receiver<TrafficDelta>, MonitorHandle)> {
+    let mut source = match super::ebpf::EbpfSource::load_and_attach() {
+        Ok(source) => source,
+        Err(e) => {
+            warn!("eBPF backend unavailable, falling back to the usbmon chain: {e}");
+            return None;
+        }
+    };
+    info!("using the eBPF capture backend");
+
+    let (tx, rx) = sync_channel(CHANNEL_BOUND);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicU64::new(0));
+    // No kernel-side (MON_IOCG_STATS) or text-estimate concept applies to
+    // the eBPF backend: its counters are exact, and a full kernel map (see
+    // `src/bpf/usbrate.bpf.c`'s `max_entries`) is a silent loss this poller
+    // cannot observe from userspace, distinct from the channel-full drops
+    // `dropped` below counts. Both stay at their zero/false defaults for
+    // the life of the session.
+    let kernel_dropped = Arc::new(AtomicU64::new(0));
+    let text_active = Arc::new(AtomicBool::new(false));
+
+    let poller_shutdown = Arc::clone(&shutdown);
+    let poller_dropped = Arc::clone(&dropped);
+    let spawned = thread::Builder::new()
+        .name("usbmon-ebpf".to_string())
+        .spawn(move || {
+            source.run(&poller_shutdown, |delta| match tx.try_send(delta) {
+                Ok(()) => {}
+                // The receiver has been dropped -- nothing will ever consume
+                // another delta -- so ask the poll loop to stop now instead
+                // of spinning until `stop()`, matching how the packet readers'
+                // `send` closure in `run_source_chain` exits on disconnect.
+                // `run` only holds a shared `&` borrow of the same flag, so
+                // setting it here is sound.
+                Err(TrySendError::Disconnected(_)) => {
+                    poller_shutdown.store(true, Ordering::Relaxed);
+                }
+                // Same bargain as the packet readers' `send` closure in
+                // `run_source_chain`: a reader must never park on a full
+                // channel, so the delta is dropped and counted instead.
+                Err(TrySendError::Full(_)) => {
+                    poller_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        });
+    match spawned {
+        Ok(thread) => Some((
+            rx,
+            MonitorHandle {
+                shutdown,
+                threads: vec![thread],
+                dropped,
+                kernel_dropped,
+                text_active,
+            },
+        )),
+        Err(e) => {
+            warn!("failed to spawn the eBPF poller thread: {e}; falling back to the usbmon chain");
+            None
+        }
+    }
+}
+
+/// [`try_ebpf_capture`] with the feature off: the backend does not exist to
+/// try, so this always falls back to usbmon.
+#[cfg(not(feature = "ebpf"))]
+fn try_ebpf_capture() -> Option<(Receiver<TrafficDelta>, MonitorHandle)> {
+    None
 }
 
 /// Spawn one thread per source, funnelling every packet onto a single channel.

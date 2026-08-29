@@ -64,6 +64,62 @@ sudo install -m 0755 target/release/usbtop-ng /usr/local/bin/usbtop-ng
 sudo ln -sf usbtop-ng /usr/local/bin/usbtop
 ```
 
+## Building the eBPF backend
+
+usbtop-ng's default build reads only usbmon and needs no extra toolchain
+or dependencies. An optional `ebpf` cargo feature adds a second capture
+backend that reads USB traffic through a kernel kprobe instead. It is
+opt-in: building without it is unaffected, at Rust 1.88, with zero libbpf
+dependencies.
+
+Building the feature needs:
+
+- clang, with the BPF target (`clang -print-targets` should list `bpf`).
+- libbpf-dev, for the libbpf headers the BPF program compiles against.
+- An x86-64 host. The committed BPF program hand-writes an x86-64 `pt_regs`
+  for the kprobe entry context, so `--features ebpf` builds on x86-64 only
+  today; other architectures (including the ARM boards in
+  [ROADMAP.md](ROADMAP.md)) need a per-architecture `pt_regs` first, and the
+  build fails loudly rather than miscounting until then. The default,
+  usbmon-only build has no such restriction.
+
+Build it with:
+
+```bash
+cargo build --release --features ebpf
+```
+
+The feature compiles a committed BPF C program (`src/bpf/usbrate.bpf.c`)
+through a `build.rs` step. It adds no Rust-version requirement of its own:
+`libbpf-rs` and `libbpf-cargo` floor at Rust 1.82, below the crate's own
+1.88 MSRV, so the same Rust 1.88 that builds usbtop-ng builds the feature
+too.
+
+At runtime, the eBPF backend needs root (or `CAP_BPF`) and a BTF-enabled
+kernel (`/sys/kernel/btf/vmlinux`). It attaches a kprobe on
+`__usb_hcd_giveback_urb` and aggregates bytes per bus, device, endpoint,
+direction, and transfer type in a kernel hash map, which usbtop-ng polls
+into the same bandwidth accounting usbmon feeds. It measures throughput
+only -- attributing traffic to a process is a separate, unimplemented
+research question; see [ROADMAP.md](ROADMAP.md).
+
+When the feature is compiled in but the program fails to load or attach
+(no BTF, insufficient privilege, an unresolvable kprobe symbol), usbtop-ng
+logs a warning and falls back to the usbmon chain automatically. Without
+the feature, usbtop-ng always uses usbmon -- the eBPF backend is never the
+default.
+
+To test it:
+
+```bash
+cargo test --all-targets --features ebpf
+```
+
+The unit suite reports 470 passed. One test loads and attaches the real
+kprobe; without root and a BTF-enabled kernel it prints its own skip
+message and passes, the same contract the `integration` feature's live
+tests use (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+
 ## Shell completions
 
 usbtop-ng prints a completion script for any shell `clap_complete` supports.

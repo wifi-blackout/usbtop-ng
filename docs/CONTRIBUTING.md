@@ -215,6 +215,27 @@ The live test is gated on the feature, so it compiles to nothing on default
 builds. CI does not run this feature. It exists for manual checks on a real
 machine with real USB traffic.
 
+### Live system tests (the `ebpf` feature)
+
+The opt-in `ebpf` cargo feature builds and tests the eBPF capture backend
+covered in [INSTALL.md](INSTALL.md#building-the-ebpf-backend). Building it
+needs clang (with the BPF target) and libbpf-dev.
+
+1. Run the suite with the feature:
+   ```bash
+   cargo test --all-targets --features ebpf
+   ```
+   The unit suite reports 470 passed. One of those tests loads and attaches
+   the real kprobe, needing real root and a BTF-enabled kernel
+   (`/sys/kernel/btf/vmlinux`); without either, it prints its own skip
+   message and passes, the same contract the `integration` feature's live
+   tests use above.
+
+Unlike the `integration` feature, CI does build and hermetic-test this
+feature: `cargo build --features ebpf` and `cargo test --features ebpf` run
+on every push, because attaching a kprobe unprivileged is the only part
+that needs a real machine.
+
 ### Writing tests
 
 ```rust

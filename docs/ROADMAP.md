@@ -94,14 +94,15 @@ Design notes:
   Kprobe attach points are not a stable kernel interface, so eBPF ships
   as an explicit opt-in first, not the automatic default.
 - Aggregated maps do not fit the per-packet `PacketSource` contract, so
-  the backend needs a delta seam. That seam SHIPPED on 2026-08-29: the
+  the backend needs a delta seam. That seam shipped on 2026-08-29: the
   manager accounts backend-neutral `TrafficDelta { bus, dev, endpoint,
   dir, transfer type, bytes }` values through `apply_delta`, and the
-  usbmon packet path is a thin adapter over it. The eBPF source will read
-  its kernel map (monotonic per-CPU counters diffed against snapshots,
-  never read-and-clear) and feed `apply_delta` directly. Building it needs
-  clang installed for the CO-RE object; the first backend is throughput-
-  only, with per-process attribution deferred to separate research below.
+  usbmon packet path is a thin adapter over it. The eBPF source itself
+  shipped the same day, behind the opt-in `ebpf` cargo feature: it reads
+  its kernel map (monotonic counts diffed against per-key snapshots,
+  never read-and-clear) and feeds `apply_delta` directly. The first
+  backend is throughput-only, with per-process attribution deferred to
+  separate research below.
 - Headline feature: per-process attribution, as separate research first.
   `usb_submit_urb` often has task context, but not always, and usbmon
   never records it. The prototype also showed the trap:
@@ -109,9 +110,15 @@ Design notes:
   stream logged 41 submissions under ffmpeg and 1,538 under idle-task and
   kworker contexts. Attribution needs an owner map written at stream start,
   not the submitter name.
-- Costs: libbpf-rs and libbpf-sys dependencies (libelf, zlib), a clang BPF
-  toolchain at build time, kernel BTF at runtime, and CI that cannot attach
-  kprobes unprivileged.
+- Costs, paid only when the opt-in `ebpf` feature is built, never by the
+  default build: `libbpf-rs` and `libbpf-cargo` dependencies, a clang BPF
+  toolchain, libbpf-dev headers, a Rust ≥ 1.82 floor for the feature
+  (documented, not enforced on the default Rust 1.88 build), kernel BTF at
+  runtime, and CI that builds and hermetic-tests the feature but cannot
+  attach kprobes unprivileged.
+- The kernel hash map that aggregates bytes is bounded at 4096 keys --
+  ample for realistic device and endpoint counts, but a map-full insert is
+  a silent loss today. Noted here as an MVP follow-up, not fixed.
 
 ### The mmap middle path: shipped
 
@@ -141,6 +148,41 @@ listed above. That cost is pre-approved for a later wave, behind an
 optional cargo feature, if and when per-process attribution earns its
 place.
 
+### Shipped: the throughput-only backend
+
+The eBPF backend above shipped as an opt-in `ebpf` cargo feature on
+2026-08-29, ahead of the attribution question the paragraph above leaves
+open: throughput alone earned its place once the controller live-verified
+it against physical ground truth on a high-bandwidth isochronous webcam
+(bus 1). The eBPF backend's measured rate, 0.935 MB/s, tracked the
+camera's own captured MJPEG payload rate, 0.825 MB/s, with the 1.13x
+difference accounted for by the expected UVC/iso packet-header overhead.
+Per-process attribution stays the deferred future work described above;
+this backend is throughput-only. See
+[INSTALL.md](INSTALL.md#building-the-ebpf-backend) for the build and
+runtime requirements.
+
+One known limitation: the BPF program hand-writes an x86-64 `pt_regs` for
+the kprobe entry context, so `--features ebpf` builds on x86-64 only today
+(it fails loudly on other architectures rather than miscounting). A
+per-architecture `pt_regs` is the follow-up that would let it build on the
+ARM boards below; usbmon capture there needs none of this and works now.
+
+### Discovered: the usbmon binary reader undercounts high-bandwidth isochronous transfers
+
+Live-verifying the eBPF backend against ground truth surfaced a separate,
+pre-existing issue, distinct from the text-interface overcount tracked in
+[Engineering follow-ups](#engineering-follow-ups) below: the usbmon binary
+interface -- usbtop-ng's normally preferred, exact-byte source --
+undercounts high-bandwidth isochronous transfers (endpoints with a 2x or
+3x `wMaxPacketSize` transaction multiplier) by roughly 3x, and drops
+packets outright under sustained isochronous load. `src/usbmon/binary.rs`
+is unchanged by this wave (byte-identical against `main`), so the bug
+predates it. Candidate future fix wave: compare the event header's
+`length` field against the sum of the per-iso-packet descriptors, and
+characterize the drop behavior under load. The eBPF backend already
+measures these transfers correctly.
+
 ## Engineering follow-ups
 
 These came out of code review. Each is small and none blocks a release.
@@ -156,8 +198,11 @@ These came out of code review. Each is small and none blocks a release.
   column holds the buffer size, not the bytes moved. On a camera stream the
   overcount was 3.6x. The text format prints 5 of 32 descriptors per URB, so
   no exact count exists in text mode. The binary interface reports true
-  bytes and is already the preferred source. The UI and the JSON output now
-  mark affected rates as estimates. The remaining idea: sum the printed
+  bytes for ordinary transfers and is already the preferred source -- but
+  not for high-bandwidth isochronous ones; see "Discovered: the usbmon
+  binary reader undercounts high-bandwidth isochronous transfers" in the
+  eBPF backend section above, a separate bug. The UI and the JSON output
+  now mark affected rates as estimates. The remaining idea: sum the printed
   descriptors to tighten the estimate. Caveat before building it: only up
   to 5 descriptors print, so a sum can under-estimate as badly as the
   length over-estimates, and the kernel's usbmon document claims callback
@@ -170,6 +215,10 @@ In-depth research and testing of usbtop-ng on small ARM hosts: Raspberry
 Pi Zero, Pi 4, Pi 400, and Pi 5, plus the Radxa ROCK 5C and the SOPHGO
 Fogwise AirBox. usbmon is architecture-independent, so the questions are
 builds, vendor kernels, and controller behavior, not core capture logic.
+(The optional `ebpf` feature is the one exception: its BPF program has an
+x86-64-only `pt_regs` today and needs a per-architecture one before it
+builds on these boards -- see the eBPF backend section above. The default
+usbmon build carries no such restriction.)
 
 Research first:
 

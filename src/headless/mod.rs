@@ -13,7 +13,8 @@ use serde::Serialize;
 
 use crate::device::manager::DeviceManager;
 use crate::filter::FilterSet;
-use crate::usbmon::parser::{format_mbps, UsbPacket};
+use crate::usbmon::monitor::CaptureStream;
+use crate::usbmon::parser::format_mbps;
 
 pub struct HeadlessOptions {
     pub json: bool,
@@ -366,15 +367,49 @@ enum DrainStatus {
     Disconnected,
 }
 
-fn drain(manager: &mut DeviceManager, packets: &Receiver<UsbPacket>) -> DrainStatus {
+/// [`drain`]'s per-channel body, generic over which [`CaptureStream`]
+/// variant it is draining: `apply` is `DeviceManager::apply_packet` for the
+/// `Packets` arm, `DeviceManager::apply_delta` for the `Deltas` arm.
+fn drain_channel<T>(
+    manager: &mut DeviceManager,
+    rx: &Receiver<T>,
+    apply: fn(&mut DeviceManager, &T),
+) -> DrainStatus {
     for _ in 0..crate::ui::DRAIN_BATCH {
-        match packets.try_recv() {
-            Ok(packet) => manager.apply_packet(&packet),
+        match rx.try_recv() {
+            Ok(item) => apply(manager, &item),
             Err(TryRecvError::Empty) => return DrainStatus::Alive,
             Err(TryRecvError::Disconnected) => return DrainStatus::Disconnected,
         }
     }
     DrainStatus::Alive
+}
+
+/// Dispatch on which capture backend `capture` is: usbmon's `Packets` via
+/// `apply_packet`, the eBPF backend's `Deltas` via `apply_delta`. The
+/// `Packets` arm is exactly what this function did before `CaptureStream`
+/// existed -- this only adds the dispatch in front of it.
+fn drain(manager: &mut DeviceManager, capture: &CaptureStream) -> DrainStatus {
+    match capture {
+        CaptureStream::Packets(packets) => {
+            drain_channel(manager, packets, DeviceManager::apply_packet)
+        }
+        CaptureStream::Deltas(deltas) => drain_channel(manager, deltas, DeviceManager::apply_delta),
+    }
+}
+
+/// The `Report::source` label for `capture`: `"ebpf"` for the eBPF
+/// backend's exact byte counts -- never an estimate, so `text_active` is
+/// irrelevant for it -- or usbmon's own `"text"`/`"binary"` split for a
+/// `Packets` session (`text_active` only ever gets set by the debugfs text
+/// reader, see `monitor::run_source_chain`, so it is always `false` for the
+/// life of a `Deltas` session anyway).
+fn capture_source_label(capture: &CaptureStream, text_active: bool) -> &'static str {
+    match capture {
+        CaptureStream::Deltas(_) => "ebpf",
+        CaptureStream::Packets(_) if text_active => "text",
+        CaptureStream::Packets(_) => "binary",
+    }
 }
 
 /// Sample the manager's state on `opts.window`-second windows, printing a
@@ -389,7 +424,7 @@ fn drain(manager: &mut DeviceManager, packets: &Receiver<UsbPacket>) -> DrainSta
 /// it.
 pub fn run(
     mut manager: DeviceManager,
-    packets: Receiver<UsbPacket>,
+    capture: CaptureStream,
     dropped: Arc<AtomicU64>,
     kernel_dropped: Arc<AtomicU64>,
     text_active: Arc<AtomicBool>,
@@ -406,14 +441,14 @@ pub fn run(
         let window_start = Instant::now();
         let deadline = window_start + opts.window;
         while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
-            if drain(&mut manager, &packets) == DrainStatus::Disconnected && opts.expect_capture {
+            if drain(&mut manager, &capture) == DrainStatus::Disconnected && opts.expect_capture {
                 return Err(anyhow!(
                     "every usbmon reader stopped; no capture source remains"
                 ));
             }
             std::thread::sleep(Duration::from_millis(50).min(opts.window));
         }
-        if drain(&mut manager, &packets) == DrainStatus::Disconnected && opts.expect_capture {
+        if drain(&mut manager, &capture) == DrainStatus::Disconnected && opts.expect_capture {
             return Err(anyhow!(
                 "every usbmon reader stopped; no capture source remains"
             ));
@@ -425,11 +460,7 @@ pub fn run(
         // break the wait loop above before the deadline (see `build_report`).
         let elapsed = window_start.elapsed();
 
-        let source = if text_active.load(Ordering::Relaxed) {
-            "text"
-        } else {
-            "binary"
-        };
+        let source = capture_source_label(&capture, text_active.load(Ordering::Relaxed));
         let mut report = build_report(
             &manager,
             &baseline,
@@ -496,7 +527,8 @@ mod tests {
         tx.send(cb).unwrap();
         drop(tx);
 
-        assert_eq!(drain(&mut mgr, &rx), DrainStatus::Disconnected);
+        let capture = CaptureStream::Packets(rx);
+        assert_eq!(drain(&mut mgr, &capture), DrainStatus::Disconnected);
         assert_eq!(
             mgr.buses[&1].devices[&4].bandwidth_stats.total_rx_bytes, 1000,
             "a dying reader's queued packets must land before the disconnect surfaces"
@@ -509,7 +541,8 @@ mod tests {
         let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
         let (tx, rx) = sync_channel::<crate::usbmon::parser::UsbPacket>(4);
 
-        assert_eq!(drain(&mut mgr, &rx), DrainStatus::Alive);
+        let capture = CaptureStream::Packets(rx);
+        assert_eq!(drain(&mut mgr, &capture), DrainStatus::Alive);
         drop(tx);
     }
 
@@ -522,7 +555,7 @@ mod tests {
 
         let err = run(
             mgr,
-            rx,
+            CaptureStream::Packets(rx),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicBool::new(false)),
@@ -950,5 +983,64 @@ mod tests {
         assert!(!is_expected_write_failure(&std::io::Error::from(
             std::io::ErrorKind::Other
         )));
+    }
+}
+
+/// [`drain`]'s `Deltas` arm and its interaction with `expect_capture`,
+/// exercised with a fixture `TrafficDelta` channel. Gated on the `ebpf`
+/// feature for the same reason as `ui::capture_dispatch_tests`: it keeps the
+/// default and `--features integration` test counts unchanged, since those
+/// configs already cover the `Packets` arm in `tests` above.
+#[cfg(all(test, feature = "ebpf"))]
+mod capture_dispatch_tests {
+    use super::*;
+    use crate::usbmon::parser::TransferType;
+    use std::sync::mpsc::sync_channel;
+
+    fn delta(device_id: u8, bytes: u64) -> crate::device::manager::TrafficDelta {
+        crate::device::manager::TrafficDelta {
+            bus_id: 1,
+            device_id,
+            endpoint: 1,
+            dir_in: true,
+            transfer_type: Some(TransferType::Bulk),
+            bytes,
+        }
+    }
+
+    #[test]
+    fn drain_dispatches_a_deltas_stream_to_apply_delta() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let (tx, rx) = sync_channel(4);
+        tx.send(delta(4, 1000)).unwrap();
+        drop(tx);
+
+        let capture = CaptureStream::Deltas(rx);
+        assert_eq!(drain(&mut mgr, &capture), DrainStatus::Disconnected);
+        assert_eq!(
+            mgr.buses[&1].devices[&4].bandwidth_stats.total_rx_bytes, 1000,
+            "a dying eBPF poller's queued deltas must land before the disconnect surfaces"
+        );
+    }
+
+    #[test]
+    fn capture_source_label_reports_ebpf_for_a_deltas_stream_regardless_of_text_active() {
+        let (_tx, rx) = sync_channel::<crate::device::manager::TrafficDelta>(1);
+        let capture = CaptureStream::Deltas(rx);
+        assert_eq!(capture_source_label(&capture, false), "ebpf");
+        assert_eq!(
+            capture_source_label(&capture, true),
+            "ebpf",
+            "the eBPF backend's counts are exact, never an estimate"
+        );
+    }
+
+    #[test]
+    fn capture_source_label_keeps_the_text_binary_split_for_a_packets_stream() {
+        let (_tx, rx) = sync_channel::<crate::usbmon::parser::UsbPacket>(1);
+        let capture = CaptureStream::Packets(rx);
+        assert_eq!(capture_source_label(&capture, false), "binary");
+        assert_eq!(capture_source_label(&capture, true), "text");
     }
 }
