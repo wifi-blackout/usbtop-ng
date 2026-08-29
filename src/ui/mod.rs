@@ -21,7 +21,7 @@ use crate::device::manager::{DeviceManager, UsbBus};
 use crate::device::UsbDevice;
 use crate::filter::FilterSet;
 use crate::snapshot::{Snapshot, SnapshotDevice};
-use crate::usbmon::parser::{UsbPacket, UsbSpeed};
+use crate::usbmon::parser::{format_mbps, TransferType, UsbPacket, UsbSpeed};
 
 pub mod colors;
 
@@ -67,8 +67,8 @@ pub struct BusView {
     /// Sum of `devices`' `bandwidth_stats.rx_bps`/`tx_bps`. Set by
     /// `bus_view` and kept in sync by `recompute_rates`, which
     /// `UsbTopApp::sync_from` calls again after every retention pass
-    /// (hide-idle, `--filter`) so a pruned row's rate never lingers in the
-    /// bus heading's total.
+    /// (hide-idle, `--filter`, search) so a pruned row's rate never lingers
+    /// in the bus heading's total.
     pub rx_bps: f64,
     pub tx_bps: f64,
 }
@@ -158,6 +158,39 @@ pub struct UsbTopApp {
     /// `with_snapshot_dest`); `y` then lands straight in `Done` with an
     /// explanatory message instead of a write.
     snapshot_dest: Option<std::path::PathBuf>,
+    /// State of the `/` search box. Off by default; see `apply_key`'s
+    /// search-interception branch (which owns every transition while
+    /// `Editing`) and [`Self::retain_searched_devices`].
+    pub(crate) search: SearchState,
+}
+
+/// State of the `/` search box (see `UsbTopApp::search`). `/` opens
+/// `Editing` (from `Off` or `Committed`, prefilled with the committed query);
+/// Enter commits; Esc clears back to `Off` from either state; typing filters
+/// live while `Editing`, same as a committed query (see
+/// `UsbTopApp::retain_searched_devices`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SearchState {
+    /// No query, no filter applied.
+    Off,
+    /// The query being typed. The table filters live as it changes.
+    Editing(String),
+    /// Input mode closed, but the query still filters the table until Esc
+    /// clears it or `/` reopens editing.
+    Committed(String),
+}
+
+impl SearchState {
+    /// The active query text, or `None` when search is `Off`. `Editing` and
+    /// `Committed` are treated identically by
+    /// [`UsbTopApp::retain_searched_devices`] -- the live-filtering promise
+    /// for `Editing` means the query need not be committed to take effect.
+    fn query(&self) -> Option<&str> {
+        match self {
+            SearchState::Off => None,
+            SearchState::Editing(q) | SearchState::Committed(q) => Some(q),
+        }
+    }
 }
 
 /// What the `S` key has open: waiting on `y`/cancel with the captured
@@ -195,6 +228,7 @@ impl UsbTopApp {
             snapshot_prompt: None,
             pending_internal_snapshot: None,
             snapshot_dest: None,
+            search: SearchState::Off,
         }
     }
 
@@ -324,9 +358,15 @@ impl UsbTopApp {
             self.retain_active_devices();
         }
 
+        // After filter and hide-idle, same reasoning as hide-idle: a
+        // search-hidden row must not keep contributing to its bus heading's
+        // totals below, but search is display-only, so it runs after the
+        // header's total_bandwidth is already summed above.
+        self.retain_searched_devices();
+
         // Recomputed last, after every retention pass above (filter,
-        // hide-idle): a row pruned by either one must not keep contributing
-        // to its bus heading's rx/tx totals.
+        // hide-idle, search): a row pruned by any of them must not keep
+        // contributing to its bus heading's rx/tx totals.
         for controller in &mut self.controllers {
             for bus in &mut controller.buses {
                 bus.recompute_rates();
@@ -373,6 +413,30 @@ impl UsbTopApp {
         for controller in &mut self.controllers {
             for bus in &mut controller.buses {
                 bus.devices.retain(|row| filter.matches_device(&row.device));
+            }
+            controller.buses.retain(|bus| !bus.devices.is_empty());
+        }
+        self.controllers.retain(|c| !c.buses.is_empty());
+    }
+
+    /// Drop rows the active search query does not match, then drop any bus
+    /// or controller left empty, mirroring `retain_active_devices`. A no-op
+    /// while `search` is `Off`. Runs for `Editing` too, not just
+    /// `Committed`, so the table filters live as the query changes rather
+    /// than only once Enter commits it.
+    fn retain_searched_devices(&mut self) {
+        let Some(query) = self.search.query() else {
+            return;
+        };
+        // Lowered once per retention pass (one tick), not once per device --
+        // `device_matches_search` takes the already-folded query rather than
+        // re-lowering the same short string on every row of every bus.
+        let query = query.to_lowercase();
+        for controller in &mut self.controllers {
+            for bus in &mut controller.buses {
+                let bus_id = bus.bus_id;
+                bus.devices
+                    .retain(|row| device_matches_search(bus_id, row, &query));
             }
             controller.buses.retain(|bus| !bus.devices.is_empty());
         }
@@ -510,6 +574,68 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
         return KeyOutcome::Redraw;
     }
 
+    // While the search box is open for editing, it owns the key entirely --
+    // the same "owns the screen while its state is active" precedence the
+    // snapshot prompt gets above -- except Ctrl-C, which always quits (see
+    // the general Ctrl-C arm below): chars append to the query, Backspace
+    // pops the last one, Enter commits and closes input, Esc clears the
+    // query and closes input. Any other key (arrows, Ctrl-L, `h`...) is
+    // swallowed with no effect rather than falling through to the ordinary
+    // bindings, so e.g. `Up` cannot walk the selection while the query is
+    // still being typed. Every control chord other than Ctrl-C is likewise
+    // swallowed with no effect (Clarified 2026-08-25): Backspace, Enter, and
+    // Esc all carry the same plain-or-shifted guard the char arm uses, so
+    // e.g. Ctrl-Backspace does not silently act like a plain Backspace.
+    if let SearchState::Editing(query) = &app.search {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return KeyOutcome::Quit;
+        }
+        // Cloned out of the borrow rather than taken by `mem::replace`: the
+        // default arm below leaves `app.search` untouched, and touching it
+        // unconditionally first (the way the snapshot prompt's `.take()`
+        // can, since `Option::None` is a safe default) would risk clobbering
+        // a state this `if let` never actually matched.
+        let mut query = query.clone();
+        // Shared by the four arms below: `difference` strips a SHIFT bit if
+        // present and leaves the rest; anything left over (CONTROL, ALT,
+        // ...) routes to the no-op catch-all instead of acting.
+        let plain_or_shifted = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+        return match key.code {
+            // Only plain and shifted characters enter the query (Clarified
+            // 2026-08-25): a control-modified chord other than Ctrl-C (which
+            // quits above) must not insert its bare letter -- Ctrl-L typing
+            // 'l' being the motivating case.
+            KeyCode::Char(c) if plain_or_shifted => {
+                query.push(c);
+                app.search = SearchState::Editing(query);
+                KeyOutcome::Redraw
+            }
+            KeyCode::Backspace if plain_or_shifted => {
+                query.pop();
+                app.search = SearchState::Editing(query);
+                KeyOutcome::Redraw
+            }
+            // An empty query has nothing to filter on, so committing it
+            // would leave `Committed("")` -- a vacuous filter state
+            // indistinguishable in effect from `Off` but requiring an extra
+            // Esc to leave. Enter on an empty query goes straight to `Off`
+            // instead (Clarified 2026-08-25).
+            KeyCode::Enter if plain_or_shifted => {
+                app.search = if query.is_empty() {
+                    SearchState::Off
+                } else {
+                    SearchState::Committed(query)
+                };
+                KeyOutcome::Redraw
+            }
+            KeyCode::Esc if plain_or_shifted => {
+                app.search = SearchState::Off;
+                KeyOutcome::Redraw
+            }
+            _ => KeyOutcome::None,
+        };
+    }
+
     match key.code {
         // Checked before the bare letters so Ctrl-L stays a redraw request.
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -527,6 +653,33 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
             app.show_help = false;
             KeyOutcome::Redraw
         }
+        // Opens search input, prefilled with the last committed query
+        // (empty from `Off`). Also closes help when it was open -- one less
+        // stuck state, rather than making the user close help first. Never
+        // reached while already `Editing`: that state is consumed above, so
+        // `/` there is just another character appended to the query.
+        KeyCode::Char('/') => {
+            let prefill = if let SearchState::Committed(query) = &app.search {
+                query.clone()
+            } else {
+                String::new()
+            };
+            app.search = SearchState::Editing(prefill);
+            app.show_help = false;
+            KeyOutcome::Redraw
+        }
+        // A committed query's Esc clears it outright instead of quitting --
+        // checked ahead of the quit arm below, the same "state owns Esc
+        // while it's active" precedence `show_help` gets just above.
+        KeyCode::Esc if matches!(app.search, SearchState::Committed(_)) => {
+            app.search = SearchState::Off;
+            KeyOutcome::Redraw
+        }
+        // A committed query is normal browsing, so `q` quits here same as
+        // `Off` -- only `Editing` captures `q` as a letter, and it's
+        // consumed above before this arm is ever reached. An `Esc` reaching
+        // this arm is always `Off`: `Esc` while `Committed` was already
+        // claimed by the clearing arm just above.
         KeyCode::Char('q') | KeyCode::Esc => KeyOutcome::Quit,
         KeyCode::Char('h') => {
             app.show_help = !app.show_help;
@@ -1034,6 +1187,57 @@ fn rate_cell(bytes_per_second: f64, estimated: bool) -> String {
     }
 }
 
+/// Style every endpoint row gets, so the hierarchy under the selected device
+/// reads at a glance: dimmed relative to the device row above it, the same
+/// whole-line `Line::style` idiom the heading and device rows use.
+fn endpoint_row_style() -> Style {
+    Style::default().add_modifier(Modifier::DIM)
+}
+
+/// One row per (endpoint number, direction) on `row`'s device, in
+/// `UsbDevice::endpoints`' order -- OUT before IN per endpoint number, since
+/// the map is keyed `(number, is_in)`. Called by
+/// `device_list_lines_with_selection` right after it pushes the selected
+/// device's own row, so these lines sit directly under it; the device is not
+/// selectable through them.
+///
+/// `text_active` is `UsbTopApp::text_source_active()`. Unlike the device
+/// row's `estimated` flag (which also checks `UsbDevice::has_iso_traffic`),
+/// each endpoint carries its own transfer type, so the per-row check needs
+/// no such indirection: the `~` marker applies exactly when a text source is
+/// active and this endpoint is isochronous.
+fn endpoint_lines(row: &DeviceRow, text_active: bool) -> Vec<Line<'static>> {
+    row.device
+        .endpoints
+        .iter()
+        .map(|(&(number, dir_in), stats)| {
+            let dir = if dir_in { "in" } else { "out" };
+            let estimated = text_active && stats.transfer_type == TransferType::Isochronous;
+            let rate = rate_cell(stats.counter.bps(), estimated);
+            let (rx_cell, tx_cell): (&str, &str) = if dir_in {
+                (rate.as_str(), "")
+            } else {
+                ("", rate.as_str())
+            };
+            let spans = device_columns(
+                [
+                    "",
+                    &format!("ep{number} {dir}"),
+                    stats.transfer_type.label(),
+                    "",
+                    "",
+                    rx_cell,
+                    tx_cell,
+                    "",
+                    "",
+                ],
+                None,
+            );
+            Line::from(spans).style(endpoint_row_style())
+        })
+        .collect()
+}
+
 /// %busy cell text for a device row: a numeric percentage normally, or a
 /// width-matched "--" when the device's speed is unknown and therefore has
 /// no meaningful bandwidth denominator. Mirrors `BusView::busy_percentage`'s
@@ -1060,6 +1264,55 @@ fn port_label(port_chain: Option<&Vec<u32>>) -> String {
             .collect::<Vec<_>>()
             .join("."),
     }
+}
+
+/// True if `query_lower` is a substring of any of `row`'s searchable fields:
+/// the vendor name, the product name, `vid:pid` hex, the port chain joined
+/// with `.` (see `port_label`), or `bus:address` in the same zero-padded
+/// `{:03}:{:03}` form the Device column prints (see
+/// `device_list_lines_with_selection`) -- so what the table shows is what
+/// `/` searches. `bus_id` comes from the caller's `BusView` rather than
+/// `row.device.bus_id`, the same source the Device column itself reads.
+///
+/// `query_lower` must already be lower-cased -- by the caller
+/// (`UsbTopApp::retain_searched_devices` folds it once per retention pass,
+/// not once per device here) -- this function only folds the case of each
+/// field's own text before comparing. An empty `query_lower` matches every
+/// device (every string contains the empty substring). A field the device
+/// has no value for -- no vendor string, no vendor/product ID pair, no
+/// resolved port chain -- simply cannot match through that field; it is
+/// never treated as matching or non-matching text of its own.
+fn device_matches_search(bus_id: u8, row: &DeviceRow, query_lower: &str) -> bool {
+    let device = &row.device;
+
+    let field_hit = |field: &Option<String>| {
+        field
+            .as_ref()
+            .is_some_and(|s| s.to_lowercase().contains(query_lower))
+    };
+    if field_hit(&device.vendor) || field_hit(&device.product) {
+        return true;
+    }
+
+    if let (Some(vid), Some(pid)) = (device.vendor_id, device.product_id) {
+        if format!("{vid:04x}:{pid:04x}").contains(query_lower) {
+            return true;
+        }
+    }
+
+    if let Some(chain) = &row.port_chain {
+        // Digits and dots only, so no case-folding is needed here.
+        let joined = chain
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(".");
+        if joined.contains(query_lower) {
+            return true;
+        }
+    }
+
+    format!("{bus_id:03}:{:03}", device.device_id).contains(query_lower)
 }
 
 /// Rendered lines minus the block's top and bottom border rows.
@@ -1118,10 +1371,7 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
             };
             lines.push(Line::from(vec![
                 Span::raw(format!("▶ Bus {:02}{}  ", bus.bus_id, side_paren)),
-                Span::styled(
-                    format!("{:.1} Mbps", bus.speed.to_mbps()),
-                    speed_style(&bus.speed),
-                ),
+                Span::styled(format_mbps(bus.speed.to_mbps()), speed_style(&bus.speed)),
                 Span::raw(busy_suffix),
                 Span::raw(format!(
                     "  rx {} tx {}",
@@ -1163,7 +1413,7 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
                     [
                         &port_label(row.port_chain.as_ref()),
                         &format!("{:03}:{:03}", device.bus_id, device.device_id),
-                        &format!("{:.1} Mbps", device.speed.to_mbps()),
+                        &format_mbps(device.speed.to_mbps()),
                         device.vendor.as_deref().unwrap_or("Unknown"),
                         device.product.as_deref().unwrap_or("Unknown"),
                         &rate_cell(device.bandwidth_stats.rx_bps, estimated),
@@ -1185,6 +1435,10 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
                 }
 
                 lines.push(Line::from(spans).style(status_style));
+
+                if is_selected {
+                    lines.extend(endpoint_lines(row, app.text_source_active()));
+                }
             }
         }
     }
@@ -1192,7 +1446,12 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
     (lines, selected_line)
 }
 
-fn draw_color_reference(f: &mut Frame, area: Rect, app: &UsbTopApp) {
+/// The controls bar's two lines: the speed legend, then either the ordinary
+/// keys line or -- while search is `Editing`/`Committed` -- the search line
+/// in its place, since there is only room for one. Split out from
+/// `draw_color_reference` so tests can inspect the spans without scraping
+/// rendered terminal cells, the same `header_lines` precedent.
+fn color_reference_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
     let mut legend_spans = vec![
         Span::raw("Legend: "),
         Span::styled("●", speed_style(&UsbSpeed::from_mbps(1.5))),
@@ -1215,42 +1474,39 @@ fn draw_color_reference(f: &mut Frame, area: Rect, app: &UsbTopApp) {
         legend_spans.push(Span::raw("  ~ = estimated rate (text source)"));
     }
 
-    let reference_text = vec![
-        Line::from(legend_spans),
-        Line::from(vec![
+    let accent_bold = Style::default()
+        .fg(ACCENT_COLOR)
+        .add_modifier(Modifier::BOLD);
+    let second_line = match &app.search {
+        SearchState::Editing(query) => Line::from(vec![
+            Span::raw("search: "),
+            Span::styled(format!("{query}▏"), accent_bold),
+        ]),
+        SearchState::Committed(query) => Line::from(vec![
+            Span::raw("search: "),
+            Span::styled(query.clone(), accent_bold),
+            Span::raw("  (Esc clears)"),
+        ]),
+        SearchState::Off => Line::from(vec![
             Span::raw("Controls: "),
-            Span::styled(
-                "↑↓",
-                Style::default()
-                    .fg(ACCENT_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("↑↓", accent_bold),
             Span::raw(" Navigate  "),
-            Span::styled(
-                "h",
-                Style::default()
-                    .fg(ACCENT_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("h", accent_bold),
             Span::raw(" Help  "),
-            Span::styled(
-                "i",
-                Style::default()
-                    .fg(ACCENT_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("i", accent_bold),
             Span::raw(" Idle devices  "),
-            Span::styled(
-                "q/Esc",
-                Style::default()
-                    .fg(ACCENT_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("/", accent_bold),
+            Span::raw(" Search  "),
+            Span::styled("q/Esc", accent_bold),
             Span::raw(" Quit"),
         ]),
-    ];
+    };
 
-    let reference = Paragraph::new(reference_text)
+    vec![Line::from(legend_spans), second_line]
+}
+
+fn draw_color_reference(f: &mut Frame, area: Rect, app: &UsbTopApp) {
+    let reference = Paragraph::new(color_reference_lines(app))
         .block(Block::default().borders(Borders::ALL).title(" Controls "));
 
     f.render_widget(reference, area);
@@ -1272,6 +1528,9 @@ fn draw_help_overlay(f: &mut Frame) {
             Span::styled("  ↑/↓", Style::default().fg(ACCENT_COLOR)),
             Span::raw("      Select a device (list scrolls to keep it visible)"),
         ]),
+        Line::from(
+            "  Selecting a device expands its endpoints below it, dimmed and not selectable",
+        ),
         Line::from(vec![
             Span::styled("  h", Style::default().fg(ACCENT_COLOR)),
             Span::raw("        Toggle this help"),
@@ -1283,6 +1542,12 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from(vec![
             Span::styled("  i", Style::default().fg(ACCENT_COLOR)),
             Span::raw("        Show or hide idle devices"),
+        ]),
+        Line::from(vec![
+            Span::styled("  /", Style::default().fg(ACCENT_COLOR)),
+            Span::raw(
+                "        Search devices by name, vid:pid, port, or bus:address; Enter keeps it, Esc clears it",
+            ),
         ]),
         Line::from(vec![
             Span::styled("  S", Style::default().fg(ACCENT_COLOR)),
@@ -2531,10 +2796,12 @@ mod tests {
 
         // Lock the ASCII geometry so column offsets cannot drift silently.
         // Device 3 keeps the default UsbSpeed::UNKNOWN (never overridden
-        // above), so its %busy cell is the width-7 "--" fallback, not "0.0".
+        // above), so its %busy cell is the width-7 "--" fallback, not "0.0",
+        // and its Speed cell is the integral-bare "0 Mbps" (format_mbps),
+        // not the old `{:.1}` rounding's "0.0 Mbps".
         assert_eq!(
             lines[3].to_string(),
-            "?        001:003  0.0 Mbps   Acme           Widget             0.0 KB/s   0.0 KB/s      --      "
+            "?        001:003  0 Mbps     Acme           Widget             0.0 KB/s   0.0 KB/s      --      "
         );
 
         // The wide (2-cell) "⚡" indicator glyph must not push the row's
@@ -2654,6 +2921,245 @@ mod tests {
         );
     }
 
+    /// The brief's fixture: `record_endpoint` twice, ep1 IN isochronous
+    /// (1000 bytes -> 100 bytes/s over the 10s endpoint window -> "0.1
+    /// KB/s"), ep2 OUT bulk (2000 bytes -> "0.2 KB/s"). `endpoints`' keys
+    /// sort `(1, true)` before `(2, false)`, so ep1's row comes first.
+    fn device_with_two_endpoints(bus_id: u8, device_id: u8) -> UsbDevice {
+        let mut device = UsbDevice::new(bus_id, device_id);
+        device.record_endpoint(1, true, TransferType::Isochronous, 1_000);
+        device.record_endpoint(2, false, TransferType::Bulk, 2_000);
+        device
+    }
+
+    #[test]
+    fn selected_device_expands_into_its_endpoint_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        // [0] header, [1] controller heading, [2] bus header, [3] device
+        // row, [4] ep1 (IN, iso), [5] ep2 (OUT, bulk).
+        assert_eq!(
+            selected_line,
+            Some(3),
+            "the endpoint rows must not shift the device's own line index"
+        );
+        assert_eq!(
+            lines.len(),
+            6,
+            "one line per endpoint appended right after the device row"
+        );
+
+        let ep1 = &lines[4];
+        assert_eq!(ep1.spans[0].content, "        ", "Port cell is blank");
+        assert_eq!(ep1.spans[2].content, "ep1 in  ", "Device cell");
+        assert_eq!(ep1.spans[4].content, "iso       ", "Speed cell");
+        assert_eq!(ep1.spans[10].content, "0.1 KB/s  ", "rate lands in Bw down");
+        assert_eq!(ep1.spans[12].content, "          ", "Bw up stays blank");
+        assert_eq!(ep1.spans[14].content, "       ", "%busy is blank");
+        assert_eq!(ep1.spans[16].content, "   ", "! is blank");
+
+        let ep2 = &lines[5];
+        assert_eq!(ep2.spans[2].content, "ep2 out ", "Device cell");
+        assert_eq!(ep2.spans[4].content, "bulk      ", "Speed cell");
+        assert_eq!(ep2.spans[10].content, "          ", "Bw down stays blank");
+        assert_eq!(ep2.spans[12].content, "0.2 KB/s  ", "rate lands in Bw up");
+    }
+
+    #[test]
+    fn unselected_device_with_endpoints_yields_no_endpoint_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        // No selection made.
+
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        assert_eq!(selected_line, None);
+        assert_eq!(
+            lines.len(),
+            4,
+            "header + controller heading + bus header + the device row only"
+        );
+    }
+
+    #[test]
+    fn moving_the_selection_moves_which_devices_endpoint_rows_show() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(4, device_with_two_endpoints(1, 4));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        app.selected_device = Some("1:3".to_string());
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        // [3] device 3 (selected), [4]/[5] its endpoints, [6] device 4.
+        assert_eq!(selected_line, Some(3));
+        assert_eq!(
+            lines.len(),
+            7,
+            "both devices plus only the selected one's two endpoint rows"
+        );
+        assert!(lines[4].to_string().contains("ep1 in"));
+        assert!(lines[5].to_string().contains("ep2 out"));
+        assert!(
+            !lines[6].to_string().contains("ep1"),
+            "device 4's row carries no trailing endpoints while unselected: {}",
+            lines[6]
+        );
+
+        app.selected_device = Some("1:4".to_string());
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        // [3] device 3 (no longer selected), [4] device 4 (selected), [5]/[6] its endpoints.
+        assert_eq!(selected_line, Some(4));
+        assert_eq!(lines.len(), 7);
+        assert!(
+            !lines[3].to_string().contains("ep1"),
+            "device 3's row no longer trails endpoints once deselected: {}",
+            lines[3]
+        );
+        assert!(lines[5].to_string().contains("ep1 in"));
+        assert!(lines[6].to_string().contains("ep2 out"));
+    }
+
+    #[test]
+    fn endpoint_row_marks_only_the_isochronous_endpoint_as_estimated() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut app =
+            UsbTopApp::new(Duration::from_millis(100)).with_text_source_flag(Arc::clone(&flag));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        assert!(
+            !lines[4].to_string().contains('~'),
+            "no text source active yet: {}",
+            lines[4]
+        );
+        assert!(!lines[5].to_string().contains('~'));
+
+        flag.store(true, Ordering::Relaxed);
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        assert!(
+            lines[4].to_string().contains("~0.1 KB/s"),
+            "the iso endpoint's rate must be marked estimated: {}",
+            lines[4]
+        );
+        assert!(
+            !lines[5].to_string().contains('~'),
+            "the bulk endpoint must never be marked estimated: {}",
+            lines[5]
+        );
+    }
+
+    #[test]
+    fn endpoint_row_width_matches_the_device_row_width() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        assert_eq!(lines[4].width(), device_row_width());
+        assert_eq!(lines[5].width(), device_row_width());
+    }
+
+    #[test]
+    fn endpoint_rows_render_dimmed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        assert!(
+            lines[4].style.add_modifier.contains(Modifier::DIM),
+            "endpoint rows render dimmed relative to device rows"
+        );
+        assert!(lines[5].style.add_modifier.contains(Modifier::DIM));
+    }
+
+    /// A bus of `count` devices (as `manager_with_n_devices`), with the last
+    /// one also carrying the two-endpoint fixture.
+    fn manager_with_n_devices_last_has_endpoints(count: u8) -> (tempfile::TempDir, DeviceManager) {
+        let (temp, mut mgr) = manager_with_n_devices(count);
+        let bus = mgr.get_or_create_bus(1);
+        let device = bus.devices.get_mut(&count).unwrap();
+        device.record_endpoint(1, true, TransferType::Isochronous, 1_000);
+        device.record_endpoint(2, false, TransferType::Bulk, 2_000);
+        (temp, mgr)
+    }
+
+    /// Mirrors `selecting_last_device_scrolls_it_into_view`, but with a
+    /// stale scroll offset from further down than the total content: the
+    /// selection lands at the top of the visible window (the
+    /// `index < list_scroll` branch), so its endpoint rows -- which flow
+    /// through `follow_selection_in_list` as ordinary lines, no special
+    /// casing -- fall right below it in the same window rather than
+    /// scrolling out.
+    #[test]
+    fn endpoint_rows_stay_visible_with_the_selected_device_near_the_bottom() {
+        let (_t, mgr) = manager_with_n_devices_last_has_endpoints(5);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = app.device_keys().last().cloned();
+        app.list_scroll = 9; // stale, as if scrolled well past the selection already
+
+        // inner height 4 (backend height 6, minus the block's 2 border rows).
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 6)).unwrap();
+        terminal
+            .draw(|f| draw_device_list(f, f.area(), &mut app))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(
+            screen.contains("001:005"),
+            "selected device's own row: {screen}"
+        );
+        assert!(
+            screen.contains("ep1 in"),
+            "its first endpoint row: {screen}"
+        );
+        assert!(
+            screen.contains("ep2 out"),
+            "its second endpoint row: {screen}"
+        );
+    }
+
     #[test]
     fn device_row_shows_dashes_when_device_speed_is_unknown() {
         // %busy is device-row column index 7; device_columns emits one
@@ -2675,6 +3181,25 @@ mod tests {
         assert_eq!(
             busy_span.content, "   --  ",
             "unknown-speed device's %busy cell must be a width-7 '--', not '{}'",
+            lines[3]
+        );
+    }
+
+    #[test]
+    fn device_row_speed_cell_for_unknown_speed_is_bare_zero() {
+        // The device keeps UsbDevice::new's default UsbSpeed::UNKNOWN
+        // (to_mbps() == 0.0). format_mbps's integral-bare rule renders that
+        // "0 Mbps", not the old `{:.1}` rounding's "0.0 Mbps".
+        let (_t, mgr) = manager_with_rates(&[(1, 3, 0.0)]);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        // [0] column header, [1] controller heading, [2] bus header, [3] device row.
+        let speed_span = &lines[3].spans[SPEED_SPAN_INDEX];
+        assert_eq!(
+            speed_span.content, "0 Mbps    ",
+            "unknown-speed device's Speed cell must be bare '0 Mbps', not '{}'",
             lines[3]
         );
     }
@@ -2814,7 +3339,7 @@ mod tests {
 
         assert!(screen.contains("═ 0000:00:14.0 ═"), "{screen}");
         assert!(
-            screen.contains("▶ Bus 03 (USB2 side)  480.0 Mbps"),
+            screen.contains("▶ Bus 03 (USB2 side)  480 Mbps"),
             "{screen}"
         );
         // First column of every device row, top to bottom.
@@ -3147,5 +3672,595 @@ mod tests {
 
         assert!(screen.contains(" 1:3 rx/tx "), "{screen}");
         assert!(!screen.contains("Select a device with"), "{screen}");
+    }
+
+    // -- interactive search: key transitions ---------------------------
+
+    #[test]
+    fn slash_opens_editing_from_off_with_an_empty_query() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(app.search, SearchState::Off);
+
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('/'))),
+            KeyOutcome::Redraw
+        );
+        assert_eq!(app.search, SearchState::Editing(String::new()));
+    }
+
+    #[test]
+    fn slash_from_committed_prefills_editing_with_the_committed_query() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("widget".to_string());
+
+        apply_key(&mut app, key(KeyCode::Char('/')));
+        assert_eq!(app.search, SearchState::Editing("widget".to_string()));
+    }
+
+    #[test]
+    fn slash_while_help_is_open_closes_help_and_opens_search() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.show_help = true;
+
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('/'))),
+            KeyOutcome::Redraw
+        );
+        assert!(!app.show_help, "help must close when search opens");
+        assert_eq!(app.search, SearchState::Editing(String::new()));
+    }
+
+    #[test]
+    fn typing_while_editing_appends_to_the_query_live() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        apply_key(&mut app, key(KeyCode::Char('/')));
+
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('a'))),
+            KeyOutcome::Redraw
+        );
+        assert_eq!(app.search, SearchState::Editing("a".to_string()));
+        apply_key(&mut app, key(KeyCode::Char('b')));
+        assert_eq!(app.search, SearchState::Editing("ab".to_string()));
+    }
+
+    #[test]
+    fn q_types_into_the_query_while_editing_instead_of_quitting() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        apply_key(&mut app, key(KeyCode::Char('/')));
+
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('q'))),
+            KeyOutcome::Redraw
+        );
+        assert_eq!(app.search, SearchState::Editing("q".to_string()));
+    }
+
+    #[test]
+    fn backspace_pops_the_last_character_while_editing() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Backspace)),
+            KeyOutcome::Redraw
+        );
+        assert_eq!(app.search, SearchState::Editing("a".to_string()));
+    }
+
+    #[test]
+    fn enter_commits_the_query_and_closes_editing() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+
+        assert_eq!(apply_key(&mut app, key(KeyCode::Enter)), KeyOutcome::Redraw);
+        assert_eq!(app.search, SearchState::Committed("ab".to_string()));
+    }
+
+    #[test]
+    fn esc_while_editing_clears_the_query_and_closes_input() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+
+        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Redraw);
+        assert_eq!(app.search, SearchState::Off);
+    }
+
+    #[test]
+    fn esc_with_a_committed_query_clears_it_instead_of_quitting() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("ab".to_string());
+
+        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Redraw);
+        assert_eq!(app.search, SearchState::Off);
+    }
+
+    #[test]
+    fn q_quits_in_off_and_committed_but_types_while_editing() {
+        // A committed query is normal browsing (Clarified 2026-08-25): `q`
+        // quits there exactly as it does with no search active. Only
+        // `Editing` captures `q` as a letter (see
+        // q_types_into_the_query_while_editing_instead_of_quitting).
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("ab".to_string());
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('q'))),
+            KeyOutcome::Quit,
+            "a committed query is normal browsing; q quits as usual"
+        );
+
+        app.search = SearchState::Off;
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('q'))),
+            KeyOutcome::Quit
+        );
+
+        app.search = SearchState::Editing("ab".to_string());
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('q'))),
+            KeyOutcome::Redraw,
+            "editing still captures q as a letter"
+        );
+        assert_eq!(app.search, SearchState::Editing("abq".to_string()));
+    }
+
+    #[test]
+    fn ctrl_c_quits_while_editing() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+
+        assert_eq!(
+            apply_key(&mut app, ctrl(KeyCode::Char('c'))),
+            KeyOutcome::Quit
+        );
+    }
+
+    #[test]
+    fn unrecognized_keys_while_editing_are_swallowed_without_changing_the_query() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+
+        assert_eq!(apply_key(&mut app, key(KeyCode::Up)), KeyOutcome::None);
+        assert_eq!(app.search, SearchState::Editing("ab".to_string()));
+    }
+
+    /// Clarified 2026-08-25: a control-modified chord other than Ctrl-C must
+    /// not insert its bare letter while editing -- Ctrl-L typing a literal
+    /// 'l' into the query was the motivating bug.
+    #[test]
+    fn ctrl_l_while_editing_is_consumed_without_changing_the_query() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+
+        assert_eq!(
+            apply_key(&mut app, ctrl(KeyCode::Char('l'))),
+            KeyOutcome::None,
+            "consumed with no effect, not a screen wipe and not a typed 'l'"
+        );
+        assert_eq!(app.search, SearchState::Editing("ab".to_string()));
+    }
+
+    /// Clarified 2026-08-25: every control chord other than Ctrl-C is
+    /// consumed with no effect while editing, not just the char arm --
+    /// Backspace, Enter, and Esc must not fall back to their plain
+    /// behavior just because `key.code` matches.
+    #[test]
+    fn ctrl_backspace_while_editing_is_consumed_without_changing_the_query() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+
+        assert_eq!(
+            apply_key(&mut app, ctrl(KeyCode::Backspace)),
+            KeyOutcome::None,
+            "consumed with no effect, not a pop of the last character"
+        );
+        assert_eq!(app.search, SearchState::Editing("ab".to_string()));
+    }
+
+    #[test]
+    fn enter_on_an_empty_query_returns_to_off_instead_of_committing_empty() {
+        // Committing "" would leave `Committed("")` -- a vacuous filter
+        // state that still requires an extra Esc to leave even though it
+        // filters nothing (Clarified 2026-08-25).
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing(String::new());
+
+        assert_eq!(apply_key(&mut app, key(KeyCode::Enter)), KeyOutcome::Redraw);
+        assert_eq!(app.search, SearchState::Off);
+    }
+
+    #[test]
+    fn a_shifted_letter_still_types_while_editing() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing(String::new());
+
+        let shifted = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
+        assert_eq!(apply_key(&mut app, shifted), KeyOutcome::Redraw);
+        assert_eq!(app.search, SearchState::Editing("A".to_string()));
+    }
+
+    #[test]
+    fn help_still_owns_esc_over_a_committed_search() {
+        // The precedence the brief pins: prompt, then Editing search input,
+        // then help-close keys, then the rest -- so help closing wins over
+        // clearing a committed query when both are momentarily true.
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.show_help = true;
+        app.search = SearchState::Committed("ab".to_string());
+
+        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Redraw);
+        assert!(!app.show_help, "Esc must close help first");
+        assert_eq!(
+            app.search,
+            SearchState::Committed("ab".to_string()),
+            "the committed query survives; help owned this Esc, not search"
+        );
+    }
+
+    // -- interactive search: match fields --------------------------------
+
+    fn named_device(
+        bus_id: u8,
+        device_id: u8,
+        vendor: Option<&str>,
+        product: Option<&str>,
+        vendor_id: Option<u16>,
+        product_id: Option<u16>,
+    ) -> UsbDevice {
+        let mut device = UsbDevice::new(bus_id, device_id);
+        device.vendor = vendor.map(str::to_string);
+        device.product = product.map(str::to_string);
+        device.vendor_id = vendor_id;
+        device.product_id = product_id;
+        device
+    }
+
+    #[test]
+    fn matches_by_vendor_name_case_insensitively() {
+        // device_matches_search takes an already-lowered query (see
+        // retain_searched_devices, which folds it once per retention pass);
+        // the field's own mixed-case text is what it still folds here.
+        let row = DeviceRow {
+            port_chain: Some(vec![]),
+            device: named_device(1, 3, Some("Kingston Technology"), None, None, None),
+        };
+        assert!(device_matches_search(1, &row, "kingston"));
+        assert!(!device_matches_search(1, &row, "logitech"));
+    }
+
+    #[test]
+    fn matches_by_product_name_case_insensitively() {
+        let row = DeviceRow {
+            port_chain: Some(vec![]),
+            device: named_device(1, 3, None, Some("DataTraveler"), None, None),
+        };
+        assert!(device_matches_search(1, &row, "traveler"));
+        assert!(!device_matches_search(1, &row, "mouse"));
+    }
+
+    #[test]
+    fn matches_by_vid_pid_hex() {
+        let row = DeviceRow {
+            port_chain: Some(vec![]),
+            device: named_device(1, 3, None, None, Some(0x04f2), Some(0xb71a)),
+        };
+        assert!(device_matches_search(1, &row, "04f2:b71a"));
+        assert!(
+            device_matches_search(1, &row, "b71a"),
+            "either half matches"
+        );
+        assert!(!device_matches_search(1, &row, "ffff:ffff"));
+    }
+
+    #[test]
+    fn matches_by_port_chain_joined_with_dots() {
+        let row = DeviceRow {
+            port_chain: Some(vec![1, 4, 2]),
+            device: named_device(1, 3, None, None, None, None),
+        };
+        assert!(device_matches_search(1, &row, "1.4.2"));
+        assert!(device_matches_search(1, &row, "4.2"));
+        assert!(!device_matches_search(1, &row, "1.4.3"));
+    }
+
+    #[test]
+    fn matches_by_bus_and_address_in_the_tables_own_display_form() {
+        let row = DeviceRow {
+            port_chain: Some(vec![]),
+            device: named_device(1, 3, None, None, None, None),
+        };
+        // Same "{:03}:{:03}" form the Device column prints (see
+        // device_list_lines_with_selection), so what you see is what you
+        // search -- a substring of that zero-padded text, not the bare
+        // "1:3" a caller might guess.
+        assert!(device_matches_search(1, &row, "001:003"));
+        assert!(
+            device_matches_search(1, &row, "01:00"),
+            "substring still hits"
+        );
+        assert!(!device_matches_search(1, &row, "002:003"));
+        assert!(
+            !device_matches_search(1, &row, "1:3"),
+            "not a substring of the zero-padded form"
+        );
+    }
+
+    #[test]
+    fn a_device_with_no_metadata_matches_only_through_the_fields_it_has() {
+        let row = DeviceRow {
+            port_chain: None,
+            device: named_device(9, 7, None, None, None, None),
+        };
+        // No vendor, no product, no vid:pid, no resolved port chain -- only
+        // bus:address is always present.
+        assert!(!device_matches_search(9, &row, "unknown"));
+        assert!(!device_matches_search(9, &row, "."));
+        assert!(device_matches_search(9, &row, "009:007"));
+    }
+
+    #[test]
+    fn empty_query_matches_every_device() {
+        let row = DeviceRow {
+            port_chain: None,
+            device: named_device(1, 3, None, None, None, None),
+        };
+        assert!(device_matches_search(1, &row, ""));
+    }
+
+    // -- interactive search: composition with sync_from ------------------
+
+    #[test]
+    fn committed_search_filters_out_non_matching_devices() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1).devices.insert(
+            3,
+            named_device(1, 3, Some("Kingston Technology"), None, None, None),
+        );
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(4, named_device(1, 4, Some("Logitech"), None, None, None));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("kingston".to_string());
+        app.sync_from(&mgr);
+
+        assert_eq!(app.device_keys(), vec!["1:3".to_string()]);
+    }
+
+    /// Query-side case-insensitivity now lives in `retain_searched_devices`
+    /// (it lowers the query once per retention pass -- see the MINOR fix in
+    /// the fix-round-1 report), not in `device_matches_search` itself. This
+    /// pins it end to end: an upper-case query still hits a title-cased
+    /// vendor string.
+    #[test]
+    fn a_committed_query_matches_regardless_of_its_own_case() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1).devices.insert(
+            3,
+            named_device(1, 3, Some("Kingston Technology"), None, None, None),
+        );
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("KINGSTON".to_string());
+        app.sync_from(&mgr);
+
+        assert_eq!(app.device_keys(), vec!["1:3".to_string()]);
+    }
+
+    #[test]
+    fn search_filters_live_while_still_editing_not_only_once_committed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1).devices.insert(
+            3,
+            named_device(1, 3, Some("Kingston Technology"), None, None, None),
+        );
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(4, named_device(1, 4, Some("Logitech"), None, None, None));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("logi".to_string());
+        app.sync_from(&mgr);
+
+        assert_eq!(
+            app.device_keys(),
+            vec!["1:4".to_string()],
+            "the table filters as the query changes, before Enter commits it"
+        );
+    }
+
+    #[test]
+    fn search_composes_with_hide_idle_both_apply() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let mut kingston_idle = named_device(1, 3, Some("Kingston Technology"), None, None, None);
+        kingston_idle.bandwidth_stats.current_bps = 0.0;
+        let mut kingston_active = named_device(1, 4, Some("Kingston Technology"), None, None, None);
+        kingston_active.bandwidth_stats.current_bps = 500.0;
+        mgr.get_or_create_bus(1).devices.insert(3, kingston_idle);
+        mgr.get_or_create_bus(1).devices.insert(4, kingston_active);
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(5, named_device(1, 5, Some("Logitech"), None, None, None));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.hide_idle_devices = true;
+        app.search = SearchState::Committed("kingston".to_string());
+        app.sync_from(&mgr);
+
+        assert_eq!(
+            app.device_keys(),
+            vec!["1:4".to_string()],
+            "idle 1:3 hidden by hide-idle, 1:5 hidden by search"
+        );
+    }
+
+    #[test]
+    fn search_composes_with_the_filter_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1).devices.insert(
+            3,
+            named_device(1, 3, Some("Kingston Technology"), None, None, None),
+        );
+        mgr.get_or_create_bus(2).devices.insert(
+            5,
+            named_device(2, 5, Some("Kingston Technology"), None, None, None),
+        );
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100))
+            .with_filter(FilterSet::parse(&["bus=1".into()]).unwrap());
+        app.search = SearchState::Committed("kingston".to_string());
+        app.sync_from(&mgr);
+
+        assert_eq!(
+            app.device_keys(),
+            vec!["1:3".to_string()],
+            "bus=2 match is excluded by --filter even though the name matches"
+        );
+    }
+
+    #[test]
+    fn a_committed_query_matching_nothing_yields_an_empty_table_not_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1).devices.insert(
+            3,
+            named_device(1, 3, Some("Kingston Technology"), None, None, None),
+        );
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("nothing-matches-this".to_string());
+        app.sync_from(&mgr);
+
+        assert!(app.device_keys().is_empty());
+        assert!(app.controllers.is_empty());
+
+        // Must still render without panicking.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+    }
+
+    /// Pins the ordering `sync_from` must follow for search, mirroring
+    /// `bus_rates_only_reflect_devices_that_survive_hide_idle_retention`:
+    /// search retention has to run before `recompute_rates`, or a
+    /// search-hidden device's rate would keep counting toward its bus
+    /// heading's total.
+    #[test]
+    fn bus_rates_only_reflect_devices_that_survive_search_retention() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+
+        let mut hidden = named_device(1, 3, Some("Logitech"), None, None, None);
+        hidden.bandwidth_stats.rx_bps = 999.0; // must not leak into the bus sum
+        hidden.bandwidth_stats.tx_bps = 999.0;
+
+        let mut kept = named_device(1, 4, Some("Kingston Technology"), None, None, None);
+        kept.bandwidth_stats.rx_bps = 300.0;
+        kept.bandwidth_stats.tx_bps = 200.0;
+
+        let bus = mgr.get_or_create_bus(1);
+        bus.devices.insert(3, hidden);
+        bus.devices.insert(4, kept);
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("kingston".to_string());
+        app.sync_from(&mgr);
+
+        assert_eq!(app.device_keys(), vec!["1:4".to_string()]);
+        let bus_view = &app.controllers[0].buses[0];
+        assert_eq!(bus_view.rx_bps, 300.0);
+        assert_eq!(bus_view.tx_bps, 200.0);
+    }
+
+    #[test]
+    fn search_hiding_the_selected_device_clears_selection_and_its_endpoint_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let mut selected = device_with_two_endpoints(1, 3);
+        selected.vendor = Some("Logitech".to_string());
+        mgr.get_or_create_bus(1).devices.insert(3, selected);
+        mgr.get_or_create_bus(1).devices.insert(
+            4,
+            named_device(1, 4, Some("Kingston Technology"), None, None, None),
+        );
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        app.search = SearchState::Committed("kingston".to_string());
+        app.sync_from(&mgr);
+
+        assert_eq!(
+            app.selected_device, None,
+            "the searched-out device is no longer a valid selection"
+        );
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        assert_eq!(selected_line, None);
+        assert_eq!(
+            lines.len(),
+            4,
+            "header + controller heading + bus header + the one surviving device row"
+        );
+    }
+
+    // -- interactive search: controls bar ---------------------------------
+
+    #[test]
+    fn controls_bar_shows_ordinary_keys_when_search_is_off() {
+        let app = UsbTopApp::new(Duration::from_millis(100));
+        let lines = color_reference_lines(&app);
+        let second_line: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(second_line.contains("Controls:"));
+        assert!(second_line.contains("Search"), "{second_line}");
+        assert!(!second_line.contains("search:"), "{second_line}");
+    }
+
+    #[test]
+    fn controls_bar_shows_the_editing_query_with_a_cursor_mark() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("kingston".to_string());
+
+        let lines = color_reference_lines(&app);
+        let second_line: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(second_line, "search: kingston▏");
+    }
+
+    #[test]
+    fn controls_bar_shows_the_committed_query_and_the_clear_hint() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("kingston".to_string());
+
+        let lines = color_reference_lines(&app);
+        let second_line: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(second_line, "search: kingston  (Esc clears)");
+    }
+
+    #[test]
+    fn controls_bar_renders_the_search_line_on_screen_while_editing() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("kingston".to_string());
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 6)).unwrap();
+        terminal
+            .draw(|f| draw_color_reference(f, f.area(), &app))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("search: kingston"), "{screen}");
+    }
+
+    #[test]
+    fn help_overlay_explains_the_search_key() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.show_help = true;
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 60)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("Search devices by name"), "{screen}");
     }
 }

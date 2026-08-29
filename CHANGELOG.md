@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- TUI: the selected device's endpoints auto-expand into dimmed rows directly below it, one per endpoint and direction, each showing its transfer type and rate in Bw↓ (IN) or Bw↑ (OUT). Collapses when the selection moves away.
+- TUI: `/` opens a live search over the device table. Typed characters filter the table as you type, matching vendor, product, `vid:pid`, port chain, or `bus:address`. Enter commits the filter and closes input. Esc clears the query while editing, or the committed filter once one is active.
+- Bus discovery and interface availability no longer require debugfs. usbtop-ng discovers buses from sysfs and starts on a binary-only host (usbmon loaded, debugfs never mounted), and it now detects a kernel with usbmon built in even though `/proc/modules` never lists it.
+
 ### Fixed
 
 - Exact 20 Gbps and faster link speeds. The old model halved the displayed speed and doubled `%busy` at 20 Gbps, and read faster links as unknown.
@@ -15,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- TUI: speed cells and bus headings print integral values bare ("480 Mbps", "20000 Mbps") and keep one decimal only for fractional values ("1.5 Mbps"), so high speeds no longer overflow into the truncation ellipsis.
 - TUI: `q`/`Esc` close the help overlay instead of quitting the app while it's open.
 - TUI: the `S` confirmation overlay now names both keys -- `y` records, `n` cancels.
 - TUI: the `S` confirmation overlay lists the devices it will record, not just the count.

@@ -311,6 +311,8 @@ fn main() -> Result<()> {
                 module_loaded: false,
                 debugfs_mounted: false,
                 usbmon_available: false,
+                binary_available: false,
+                text_available: false,
                 permission_denied: false,
                 available_buses: Vec::new(),
             }
@@ -351,7 +353,7 @@ fn main() -> Result<()> {
                 usbmon_status = check_usbmon_status()?;
                 if !usbmon_status.usbmon_available {
                     error!(
-                        "usbmon was loaded, but the usbmon debugfs interface is still unavailable"
+                        "usbmon was loaded, but no usbmon interface (binary or text) is available"
                     );
                     if headless {
                         print_remedy_to_stderr(usbmon_status.permission_denied);
@@ -386,8 +388,12 @@ fn main() -> Result<()> {
                 println!("Run with --force to open the UI with limited functionality, or run --setup for manual setup steps.");
                 process::exit(1);
             }
-        } else if !usbmon_status.debugfs_mounted {
-            error!("debugfs is not mounted, so /sys/kernel/debug/usb/usbmon is unavailable");
+        } else if !usbmon_status.debugfs_mounted && !usbmon_status.binary_available {
+            // The debugfs-specific remedy only makes sense when the binary
+            // path is unavailable too -- a binary-only host (debugfs never
+            // mounted) is caught by the `usbmon_available` OR above and never
+            // reaches this block at all.
+            error!("no usbmon interface is available: debugfs is not mounted and no /dev/usbmon* device was found");
             if headless {
                 print_remedy_to_stderr(false);
             } else {
@@ -395,7 +401,10 @@ fn main() -> Result<()> {
             }
             process::exit(1);
         } else {
-            error!("usbmon is loaded, but /sys/kernel/debug/usb/usbmon is unavailable");
+            // debugfs is mounted but its usbmon directory is not usable
+            // (unreadable, or otherwise not present), and the binary
+            // interface is unavailable too -- see the comment above.
+            error!("usbmon is loaded, but no usbmon interface (binary or text) is available");
             if headless {
                 print_remedy_to_stderr(usbmon_status.permission_denied);
             } else if usbmon_status.permission_denied {
@@ -409,7 +418,12 @@ fn main() -> Result<()> {
 
     // Log available buses
     if !usbmon_status.available_buses.is_empty() {
-        info!("Available USB buses: {:?}", usbmon_status.available_buses);
+        info!(
+            "Available USB buses: {:?} (binary interface: {}, text interface: {})",
+            usbmon_status.available_buses,
+            usbmon_status.binary_available,
+            usbmon_status.text_available
+        );
     } else if !cli.force {
         warn!("No USB buses detected");
     }
@@ -448,10 +462,13 @@ fn main() -> Result<()> {
                 json: cli.json,
                 batch: cli.batch,
                 window,
-                // Readers spawn only for detected buses. With none (--force on
-                // a busless host), empty reports are the intended output; with
-                // buses, a dead channel means capture failed and the run must
-                // say so (see headless::run).
+                // Readers spawn only for detected buses, and `available_buses`
+                // is empty both on a genuinely busless host and on one where
+                // usbmon itself is unavailable (see
+                // `usbmon::gate_available_buses`) -- so `--force` on either
+                // gets empty, intended-output reports; with buses, a dead
+                // channel means capture failed and the run must say so (see
+                // headless::run).
                 expect_capture: !usbmon_status.available_buses.is_empty(),
             },
         );
@@ -553,11 +570,14 @@ fn write_remedy(out: &mut impl Write, permission_denied: bool) -> io::Result<()>
         writeln!(out, "Linux setup for live USB monitoring:")?;
         writeln!(out, "1. Make the usbmon kernel module available:")?;
         writeln!(out, "   sudo modprobe usbmon")?;
-        writeln!(out, "2. Make the usbmon debugfs files available:")?;
+        writeln!(
+            out,
+            "2. Needed only if /dev/usbmon* is still unavailable, for the debugfs text interface:"
+        )?;
         writeln!(out, "   sudo mount -t debugfs none /sys/kernel/debug")?;
         writeln!(
             out,
-            "3. Run usbtop-ng with permission to read /sys/kernel/debug/usb/usbmon"
+            "3. Run usbtop-ng with permission to read /dev/usbmon* or /sys/kernel/debug/usb/usbmon"
         )?;
         writeln!(out, "   The simplest test is: sudo usbtop-ng")?;
     }
