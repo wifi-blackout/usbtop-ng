@@ -65,7 +65,7 @@ pass, and how to send it.
    ```bash
    cargo test
    ```
-   The unit suite reports 422 passed; the `tests/` directory adds the
+   The unit suite reports 423 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 4. To run with debug output, use:
@@ -181,7 +181,7 @@ cargo test --all-targets
 ```
 
 `cargo test` and `cargo test --all-targets` run the same three suites, all
-hermetic. The unit suite reports 422 passed, working against
+hermetic. The unit suite reports 423 passed, working against
 fixture files, FIFOs, and `tempfile` paths, with no `/dev` and no debugfs
 access. The `tests/` directory adds two more: `restore_pipe.rs` (2 tests),
 proving the terminal-restore bytes reach a piped stdout while the process is
@@ -202,7 +202,7 @@ the real `fchown(2)` call behind `sudo`'s ownership fix-up and needs real root.
    ```bash
    cargo test --features integration
    ```
-   The unit suite reports 424 passed. Without usbmon, or without root,
+   The unit suite reports 425 passed. Without usbmon, or without root,
    each of the two extra tests prints its own skip message and passes.
 
 The live test is gated on the feature, so it compiles to nothing on default
@@ -270,7 +270,7 @@ Cover these areas first:
    ```bash
    cargo test --all-targets
    ```
-   The unit suite reports 422 passed; the `tests/` directory adds the
+   The unit suite reports 423 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 6. Update the documentation your change affects.
