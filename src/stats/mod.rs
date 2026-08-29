@@ -231,11 +231,6 @@ impl WindowCounter {
     }
 
     /// Bytes per second over the window.
-    ///
-    /// `cfg(test)`-only for now: no production code reads a per-endpoint
-    /// rate yet — it lands with a later task's endpoint display; verified
-    /// here and ready for that wiring.
-    #[cfg(test)]
     pub fn bps(&self) -> f64 {
         self.sum as f64 / self.window.as_secs_f64()
     }

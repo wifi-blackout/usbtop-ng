@@ -140,7 +140,12 @@ auto_load_usbmon = false
 unload_usbmon_on_exit = false
 ```
 
-### 2. Mount debugfs
+### 2. Mount debugfs (needed only when the binary interface is unavailable)
+
+usbtop-ng discovers USB buses from sysfs and prefers the binary
+`/dev/usbmon*` interface when it can be opened, so a host where that works
+needs no debugfs at all. This step is a fallback for when it does not: mount
+debugfs to make the text interface available instead.
 
 1. Check whether debugfs is mounted, and mount it if it is not:
    ```bash
@@ -152,8 +157,10 @@ unload_usbmon_on_exit = false
 
 ### 3. Grant read access
 
-The usbmon interfaces live under `/sys/kernel/debug/usb/usbmon/`. They need
-root, or read access granted some other way, depending on the distribution.
+usbtop-ng prefers the binary `/dev/usbmon*` nodes. Debugfs matters only as
+the text-interface fallback covered in the step above. Both are root-owned
+by default, so this needs root, or read access granted some other way,
+depending on the distribution.
 
 1. Start usbtop-ng as root:
    ```bash
@@ -202,7 +209,7 @@ From the source tree, run the same three checks CI runs:
    ```bash
    cargo test --all-targets
    ```
-   The command reports 347 passed.
+   The command reports 408 passed.
 
 ## Uninstall
 
