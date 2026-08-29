@@ -87,6 +87,44 @@ impl PacketSource {
             PacketSource::Mmap(reader) => reader.bus_id,
         }
     }
+
+    fn kind(&self) -> SourceKind {
+        match self {
+            PacketSource::Text(_) => SourceKind::Text,
+            PacketSource::Binary(_) => SourceKind::Binary,
+            PacketSource::Mmap(_) => SourceKind::Mmap,
+        }
+    }
+}
+
+/// Which usbmon interface a [`PacketSource`] reads, without the reader's own
+/// state — the shape [`next_fallback`] reasons over to walk the same
+/// mmap -> binary -> text chain `run_source_with_fallback`'s pre-probe
+/// already prefers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceKind {
+    Mmap,
+    Binary,
+    Text,
+}
+
+/// Given the source kind whose `read_packets` just returned `Err` and
+/// whether shutdown was requested, decides what to try next: `None` when
+/// nothing is left in the chain (already `Text`), or when shutdown was
+/// requested — the `Err` may just be the close race of the file
+/// disappearing out from under the reader as it stops rather than a real
+/// capture failure, and spinning up another reader only to immediately tell
+/// it to stop again buys nothing. `Some` names the next interface to try,
+/// one step down the chain.
+fn next_fallback(failed: SourceKind, shutdown_requested: bool) -> Option<SourceKind> {
+    if shutdown_requested {
+        return None;
+    }
+    match failed {
+        SourceKind::Mmap => Some(SourceKind::Binary),
+        SourceKind::Binary => Some(SourceKind::Text),
+        SourceKind::Text => None,
+    }
 }
 
 /// Spawn background reader threads for the given buses and return the channel
@@ -231,6 +269,12 @@ fn run_source(
 
 /// [`run_source`] with the fallback reader supplied by the caller, so tests can
 /// point it at a fixture instead of the real debugfs path.
+///
+/// Two fallback checks apply, in order: this pre-probe below, before ever
+/// calling `read_packets`, and [`run_source_chain`]'s post-run cascade,
+/// which handles a source that passed this pre-probe but still failed once
+/// running (a race between the probe and the read, or a fatal mid-run
+/// error).
 fn run_source_with_fallback(
     source: PacketSource,
     fallback: UsbmonReader,
@@ -248,7 +292,14 @@ fn run_source_with_fallback(
     // would exit with a warning and the bus would silently go dark, even
     // though a source further down the chain is right there. Every probe
     // handle here is dropped immediately so it cannot pin usbmon.
-    let source = match source {
+    //
+    // `fallback` is threaded through as the second tuple element: consumed
+    // here (`None` left behind) exactly when a branch already commits to
+    // `PacketSource::Text`, since nothing past `Text` is ever tried again;
+    // kept (`Some`) whenever the source is still `Mmap` or `Binary`, so
+    // `run_source_chain` still has it on hand if that source fails once
+    // running.
+    let (source, fallback) = match source {
         PacketSource::Mmap(reader) if !MmapReader::probe(&reader.path) => {
             warn!(
                 "cannot use the mmap ring at {} for bus {bus}; falling back to the usbmon binary interface",
@@ -260,9 +311,9 @@ fn run_source_with_fallback(
                     "cannot open {} for bus {bus}; falling back to the usbmon text interface",
                     binary.path.display()
                 );
-                PacketSource::Text(fallback)
+                (PacketSource::Text(fallback), None)
             } else {
-                PacketSource::Binary(binary)
+                (PacketSource::Binary(binary), Some(fallback))
             }
         }
         PacketSource::Binary(reader) if open_nonblocking(&reader.path).is_err() => {
@@ -270,33 +321,85 @@ fn run_source_with_fallback(
                 "cannot open {} for bus {bus}; falling back to the usbmon text interface",
                 reader.path.display()
             );
-            PacketSource::Text(fallback)
+            (PacketSource::Text(fallback), None)
         }
-        source => source,
+        source => (source, Some(fallback)),
     };
-    if matches!(source, PacketSource::Text(_)) {
-        text_active.store(true, Ordering::Relaxed);
-    }
-    let send = |packet| match tx.try_send(packet) {
-        Ok(()) => Ok(()),
-        // The channel is bounded on purpose (see CHANNEL_BOUND) and a reader
-        // must never park on it: a parked reader holds the usbmon file open,
-        // which is exactly what `MonitorHandle::stop` exists to prevent. Losing
-        // the packet is the lesser evil, and the count makes the loss visible.
-        Err(TrySendError::Full(_)) => {
-            dropped.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+    run_source_chain(
+        source,
+        fallback,
+        shutdown,
+        tx,
+        dropped,
+        kernel_dropped,
+        text_active,
+    );
+}
+
+/// Runs `source` to completion, and if `read_packets` returns `Err` while
+/// shutdown was not requested, retries the bus one step down the same
+/// mmap -> binary -> text chain [`run_source_with_fallback`]'s pre-probe
+/// already prefers (decided by [`next_fallback`]), each level at most once.
+/// `fallback` is consumed the one time (if any) the chain reaches `Text`;
+/// see [`run_source_with_fallback`]'s doc for why it can already be `None`
+/// on entry.
+///
+/// Split out from `run_source_with_fallback` so this cascade — the part
+/// finding 2 adds — is callable, and testable, on its own: a fixture can
+/// drive it directly with a source whose `read_packets` fails at run time,
+/// without needing a probe that a plain file can never pass.
+fn run_source_chain(
+    mut source: PacketSource,
+    mut fallback: Option<UsbmonReader>,
+    shutdown: &AtomicBool,
+    tx: &SyncSender<UsbPacket>,
+    dropped: &AtomicU64,
+    kernel_dropped: &AtomicU64,
+    text_active: &AtomicBool,
+) {
+    let bus = source.bus_id();
+    loop {
+        if matches!(source, PacketSource::Text(_)) {
+            text_active.store(true, Ordering::Relaxed);
         }
-        Err(TrySendError::Disconnected(_)) => Err(anyhow!("packet channel closed")),
-    };
-    let result = match source {
-        PacketSource::Text(reader) => reader.read_packets(shutdown, send),
-        PacketSource::Binary(reader) => reader.read_packets(shutdown, send),
-        PacketSource::Mmap(reader) => reader.read_packets(shutdown, kernel_dropped, send),
-    };
-    match result {
-        Ok(()) => debug!("usbmon reader for bus {bus} finished"),
-        Err(e) => warn!("usbmon reader for bus {bus} stopped: {e}"),
+        let kind = source.kind();
+        let send = |packet| match tx.try_send(packet) {
+            Ok(()) => Ok(()),
+            // The channel is bounded on purpose (see CHANNEL_BOUND) and a reader
+            // must never park on it: a parked reader holds the usbmon file open,
+            // which is exactly what `MonitorHandle::stop` exists to prevent. Losing
+            // the packet is the lesser evil, and the count makes the loss visible.
+            Err(TrySendError::Full(_)) => {
+                dropped.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(TrySendError::Disconnected(_)) => Err(anyhow!("packet channel closed")),
+        };
+        let result = match source {
+            PacketSource::Text(reader) => reader.read_packets(shutdown, send),
+            PacketSource::Binary(reader) => reader.read_packets(shutdown, send),
+            PacketSource::Mmap(reader) => reader.read_packets(shutdown, kernel_dropped, send),
+        };
+        let Err(e) = result else {
+            debug!("usbmon reader for bus {bus} finished");
+            return;
+        };
+        warn!("usbmon reader for bus {bus} stopped: {e}");
+        let shutdown_requested = shutdown.load(Ordering::Relaxed);
+        match next_fallback(kind, shutdown_requested) {
+            Some(SourceKind::Binary) => {
+                warn!("retrying bus {bus} on the usbmon binary interface after a capture failure");
+                source = PacketSource::Binary(BinaryReader::new(bus));
+            }
+            Some(SourceKind::Text) => {
+                warn!("retrying bus {bus} on the usbmon text interface after a capture failure");
+                source = PacketSource::Text(fallback.take().expect(
+                    "fallback is only None when the chain already started at Text, which \
+                     next_fallback never routes back to",
+                ));
+            }
+            Some(SourceKind::Mmap) | None => return,
+        }
     }
 }
 
@@ -515,6 +618,106 @@ mod tests {
             kernel_dropped.load(Ordering::Relaxed),
             0,
             "a source that fell back before ever reading the ring reports no kernel drops"
+        );
+    }
+
+    #[test]
+    fn next_fallback_walks_mmap_then_binary_then_text() {
+        assert_eq!(
+            next_fallback(SourceKind::Mmap, false),
+            Some(SourceKind::Binary)
+        );
+        assert_eq!(
+            next_fallback(SourceKind::Binary, false),
+            Some(SourceKind::Text)
+        );
+        assert_eq!(
+            next_fallback(SourceKind::Text, false),
+            None,
+            "nothing is left past the text interface"
+        );
+    }
+
+    #[test]
+    fn next_fallback_never_falls_back_once_shutdown_is_requested() {
+        for kind in [SourceKind::Mmap, SourceKind::Binary, SourceKind::Text] {
+            assert_eq!(
+                next_fallback(kind, true),
+                None,
+                "a shutdown-requested Err may just be a close race, not a real failure"
+            );
+        }
+    }
+
+    /// [`run_source_chain`] is the post-run half of the fallback: given a
+    /// source whose `read_packets` fails at run time (not caught by
+    /// `run_source_with_fallback`'s pre-probe, which this test bypasses by
+    /// calling the chain directly — a probe-passes/read-fails fixture needs
+    /// a real device and cannot be built hermetically) and shutdown not
+    /// requested, it must retry down the chain and the fallback's packets
+    /// must arrive.
+    #[test]
+    fn run_source_chain_falls_back_to_text_when_a_source_fails_at_run_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let text_path = temp.path().join("50u");
+        let mut f = std::fs::File::create(&text_path).unwrap();
+        writeln!(f, "ffff0000dddd0032 500 C Bi:50:003:1 0 32 <").unwrap();
+        let missing_device = temp.path().join("usbmon50"); // never created
+
+        let (tx, rx) = sync_channel(4);
+        let text_active = AtomicBool::new(false);
+        run_source_chain(
+            PacketSource::Binary(BinaryReader::with_path(50, missing_device, false)),
+            Some(UsbmonReader::with_path(50, text_path, false)),
+            &AtomicBool::new(false),
+            &tx,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            &text_active,
+        );
+
+        let packets: Vec<_> = rx.try_iter().collect();
+        assert_eq!(packets.len(), 1, "the fallback's packets must arrive");
+        assert_eq!(packets[0].bus_id, 50);
+        assert!(
+            text_active.load(Ordering::Relaxed),
+            "falling back to the text interface must raise the flag"
+        );
+    }
+
+    /// The other half of the same contract: a shutdown-requested `Err` must
+    /// not fall back, even though a fallback with real packets sits right
+    /// there — the error may just be the close race of the file
+    /// disappearing out from under the reader as it stops.
+    #[test]
+    fn run_source_chain_does_not_fall_back_once_shutdown_is_requested() {
+        let temp = tempfile::tempdir().unwrap();
+        let text_path = temp.path().join("51u");
+        let mut f = std::fs::File::create(&text_path).unwrap();
+        writeln!(f, "ffff0000dddd0033 500 C Bi:51:003:1 0 32 <").unwrap();
+        let missing_device = temp.path().join("usbmon51"); // never created
+
+        let (tx, rx) = sync_channel(4);
+        let text_active = AtomicBool::new(false);
+        run_source_chain(
+            PacketSource::Binary(BinaryReader::with_path(51, missing_device, false)),
+            Some(UsbmonReader::with_path(51, text_path, false)),
+            &AtomicBool::new(true), // shutdown already requested
+            &tx,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            &text_active,
+        );
+
+        let packets: Vec<_> = rx.try_iter().collect();
+        assert!(
+            packets.is_empty(),
+            "no fallback must run once shutdown was requested, even though \
+             one was available"
+        );
+        assert!(
+            !text_active.load(Ordering::Relaxed),
+            "the text fallback must never run once shutdown was requested"
         );
     }
 

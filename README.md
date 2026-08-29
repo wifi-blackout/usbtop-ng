@@ -317,7 +317,8 @@ unchanged: it still resolves against `/root`.
   packets. A reader never parks on a full channel. A packet that does not fit
   raises the drop counter, and the header then shows `dropped: N`.
 - The mmap readers also read the kernel's own drop count (`MON_IOCG_STATS`)
-  when they stop, and add it to a separate counter the read() and text
+  periodically while running (bounded to once per 50ms poll interval, plus a
+  final read at exit), and add it to a separate counter the read() and text
   readers never touch. The header shows `kdropped: N` once it rises above
   zero, apart from the channel's `dropped: N`.
 - The event loop applies at most 8192 packets per pass. A pass that fills its
@@ -406,14 +407,14 @@ unchanged: it still resolves against `/root`.
 
 ### Tests
 
-- `cargo test --all-targets` runs the hermetic unit suite (438 tests)
+- `cargo test --all-targets` runs the hermetic unit suite (445 tests)
   against fixture files, FIFOs, and temporary paths, needing no `/dev` and
   no debugfs access, plus two committed harnesses in `tests/`: a pipe-based
   regression guard for the terminal-restore bytes, and a PTY harness for
   the wedged-terminal checks (quit, `SIGHUP`, a terminal that stops
   reading). Both spawn the real binary; neither touches the real
   `~/.usbtop-ng` or usbmon.
-- The `integration` cargo feature adds 3 tests that need real root, a real
+- The `integration` cargo feature adds 4 tests that need real root, a real
   usbmon interface, or a real mmap-capable `/dev/usbmon0`, each skipping
   gracefully without one. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
 

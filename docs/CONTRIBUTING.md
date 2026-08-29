@@ -65,7 +65,7 @@ pass, and how to send it.
    ```bash
    cargo test
    ```
-   The unit suite reports 438 passed; the `tests/` directory adds the
+   The unit suite reports 445 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 4. To run with debug output, use:
@@ -182,7 +182,7 @@ cargo test --all-targets
 ```
 
 `cargo test` and `cargo test --all-targets` run the same three suites, all
-hermetic. The unit suite reports 438 passed, working against
+hermetic. The unit suite reports 445 passed, working against
 fixture files, FIFOs, and `tempfile` paths, with no `/dev` and no debugfs
 access. The `tests/` directory adds two more: `restore_pipe.rs` (2 tests),
 proving the terminal-restore bytes reach a piped stdout while the process is
@@ -193,11 +193,13 @@ touches the real `~/.usbtop-ng` or usbmon. CI runs this suite and no other.
 
 ### Live system tests (the `integration` feature)
 
-The opt-in `integration` cargo feature adds 3 tests to the unit suite: one
+The opt-in `integration` cargo feature adds 4 tests to the unit suite: one
 that reads the real usbmon interfaces instead of fixtures, one that exercises
 the real `fchown(2)` call behind `sudo`'s ownership fix-up and needs real root,
-and one that opens a real `/dev/usbmon0` and walks its mmap ring through the
-real `mmap`, `MON_IOCX_MFETCH`, and `MON_IOCG_STATS` syscalls.
+one that opens a real `/dev/usbmon0` and walks its mmap ring through the real
+`mmap`, `MON_IOCX_MFETCH`, and `MON_IOCG_STATS` syscalls, and one that proves
+`kernel_dropped` is readable while that mmap reader is still running, not
+only after it stops.
 
 1. Confirm that usbmon is loaded and that you can read
    `/sys/kernel/debug/usb/usbmon`. Root access is the usual route.
@@ -205,8 +207,8 @@ real `mmap`, `MON_IOCX_MFETCH`, and `MON_IOCG_STATS` syscalls.
    ```bash
    cargo test --features integration
    ```
-   The unit suite reports 441 passed. Without usbmon, without root, or
-   without a mmap-capable `/dev/usbmon0`, each of the three extra tests
+   The unit suite reports 449 passed. Without usbmon, without root, or
+   without a mmap-capable `/dev/usbmon0`, each of the four extra tests
    prints its own skip message and passes.
 
 The live test is gated on the feature, so it compiles to nothing on default
@@ -274,7 +276,7 @@ Cover these areas first:
    ```bash
    cargo test --all-targets
    ```
-   The unit suite reports 438 passed; the `tests/` directory adds the
+   The unit suite reports 445 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 6. Update the documentation your change affects.
