@@ -582,7 +582,10 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
     // query and closes input. Any other key (arrows, Ctrl-L, `h`...) is
     // swallowed with no effect rather than falling through to the ordinary
     // bindings, so e.g. `Up` cannot walk the selection while the query is
-    // still being typed.
+    // still being typed. Every control chord other than Ctrl-C is likewise
+    // swallowed with no effect (Clarified 2026-08-25): Backspace, Enter, and
+    // Esc all carry the same plain-or-shifted guard the char arm uses, so
+    // e.g. Ctrl-Backspace does not silently act like a plain Backspace.
     if let SearchState::Editing(query) = &app.search {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return KeyOutcome::Quit;
@@ -593,28 +596,39 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
         // can, since `Option::None` is a safe default) would risk clobbering
         // a state this `if let` never actually matched.
         let mut query = query.clone();
+        // Shared by the four arms below: `difference` strips a SHIFT bit if
+        // present and leaves the rest; anything left over (CONTROL, ALT,
+        // ...) routes to the no-op catch-all instead of acting.
+        let plain_or_shifted = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
         return match key.code {
             // Only plain and shifted characters enter the query (Clarified
             // 2026-08-25): a control-modified chord other than Ctrl-C (which
             // quits above) must not insert its bare letter -- Ctrl-L typing
-            // 'l' being the motivating case. `difference` strips a SHIFT bit
-            // if present and leaves the rest; anything left over (CONTROL,
-            // ALT, ...) routes to the no-op catch-all below instead.
-            KeyCode::Char(c) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
+            // 'l' being the motivating case.
+            KeyCode::Char(c) if plain_or_shifted => {
                 query.push(c);
                 app.search = SearchState::Editing(query);
                 KeyOutcome::Redraw
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace if plain_or_shifted => {
                 query.pop();
                 app.search = SearchState::Editing(query);
                 KeyOutcome::Redraw
             }
-            KeyCode::Enter => {
-                app.search = SearchState::Committed(query);
+            // An empty query has nothing to filter on, so committing it
+            // would leave `Committed("")` -- a vacuous filter state
+            // indistinguishable in effect from `Off` but requiring an extra
+            // Esc to leave. Enter on an empty query goes straight to `Off`
+            // instead (Clarified 2026-08-25).
+            KeyCode::Enter if plain_or_shifted => {
+                app.search = if query.is_empty() {
+                    SearchState::Off
+                } else {
+                    SearchState::Committed(query)
+                };
                 KeyOutcome::Redraw
             }
-            KeyCode::Esc => {
+            KeyCode::Esc if plain_or_shifted => {
                 app.search = SearchState::Off;
                 KeyOutcome::Redraw
             }
@@ -3824,6 +3838,35 @@ mod tests {
             "consumed with no effect, not a screen wipe and not a typed 'l'"
         );
         assert_eq!(app.search, SearchState::Editing("ab".to_string()));
+    }
+
+    /// Clarified 2026-08-25: every control chord other than Ctrl-C is
+    /// consumed with no effect while editing, not just the char arm --
+    /// Backspace, Enter, and Esc must not fall back to their plain
+    /// behavior just because `key.code` matches.
+    #[test]
+    fn ctrl_backspace_while_editing_is_consumed_without_changing_the_query() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+
+        assert_eq!(
+            apply_key(&mut app, ctrl(KeyCode::Backspace)),
+            KeyOutcome::None,
+            "consumed with no effect, not a pop of the last character"
+        );
+        assert_eq!(app.search, SearchState::Editing("ab".to_string()));
+    }
+
+    #[test]
+    fn enter_on_an_empty_query_returns_to_off_instead_of_committing_empty() {
+        // Committing "" would leave `Committed("")` -- a vacuous filter
+        // state that still requires an extra Esc to leave even though it
+        // filters nothing (Clarified 2026-08-25).
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing(String::new());
+
+        assert_eq!(apply_key(&mut app, key(KeyCode::Enter)), KeyOutcome::Redraw);
+        assert_eq!(app.search, SearchState::Off);
     }
 
     #[test]
