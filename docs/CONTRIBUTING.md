@@ -65,7 +65,7 @@ pass, and how to send it.
    ```bash
    cargo test
    ```
-   The library suite reports 421 passed; the `tests/` directory adds the
+   The unit suite reports 422 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 4. To run with debug output, use:
@@ -181,7 +181,7 @@ cargo test --all-targets
 ```
 
 `cargo test` and `cargo test --all-targets` run the same three suites, all
-hermetic. The library's unit suite reports 421 passed, working against
+hermetic. The unit suite reports 422 passed, working against
 fixture files, FIFOs, and `tempfile` paths, with no `/dev` and no debugfs
 access. The `tests/` directory adds two more: `restore_pipe.rs` (2 tests),
 proving the terminal-restore bytes reach a piped stdout while the process is
@@ -192,9 +192,9 @@ touches the real `~/.usbtop-ng` or usbmon. CI runs this suite and no other.
 
 ### Live system tests (the `integration` feature)
 
-The opt-in `integration` cargo feature adds 2 tests to the library suite: one
+The opt-in `integration` cargo feature adds 2 tests to the unit suite: one
 that reads the real usbmon interfaces instead of fixtures, one that exercises
-the real `chown(2)` call behind `sudo`'s ownership fix-up and needs real root.
+the real `fchown(2)` call behind `sudo`'s ownership fix-up and needs real root.
 
 1. Confirm that usbmon is loaded and that you can read
    `/sys/kernel/debug/usb/usbmon`. Root access is the usual route.
@@ -202,7 +202,7 @@ the real `chown(2)` call behind `sudo`'s ownership fix-up and needs real root.
    ```bash
    cargo test --features integration
    ```
-   The library suite reports 423 passed. Without usbmon, or without root,
+   The unit suite reports 424 passed. Without usbmon, or without root,
    each of the two extra tests prints its own skip message and passes.
 
 The live test is gated on the feature, so it compiles to nothing on default
@@ -270,7 +270,7 @@ Cover these areas first:
    ```bash
    cargo test --all-targets
    ```
-   The library suite reports 421 passed; the `tests/` directory adds the
+   The unit suite reports 422 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 6. Update the documentation your change affects.

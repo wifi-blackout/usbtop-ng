@@ -62,9 +62,19 @@ impl std::ops::DerefMut for ProbeChild {
 /// stderr are discarded so the harness owns exactly one descriptor's worth of
 /// output; stdout is piped so this test is the terminal the restore bytes
 /// have to reach.
+///
+/// `SUDO_UID`/`SUDO_GID` are stripped from the child's environment the same
+/// way `PtySession::spawn` (`tests/pty.rs`) strips them: this probe never
+/// creates any config file, so under the root test flow (`sudo cargo test
+/// --features integration`) there is no chown-target home for a leaked
+/// invoker identity to redirect -- lower risk than the pty harness, not
+/// zero, so it strips them too for the same reason and to keep both
+/// harnesses' child environments consistent with each other.
 fn spawn_probe() -> ProbeChild {
     let child = Command::new(env!("CARGO_BIN_EXE_usbtop-ng"))
         .env("USBTOP_NG_RESTORE_PROBE", "1")
+        .env_remove("SUDO_UID")
+        .env_remove("SUDO_GID")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

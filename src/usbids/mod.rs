@@ -14,6 +14,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::Write as _;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -596,7 +597,12 @@ fn write_quarantine_file(quarantine: &Path, payload: &str) -> Result<()> {
         .with_context(|| format!("creating quarantine file {}", quarantine.display()))?;
     file.write_all(payload.as_bytes())
         .with_context(|| format!("writing quarantine file {}", quarantine.display()))?;
-    crate::config::chown_to_invoker(quarantine);
+    // Chowns the fd this call itself just created with `create_new`, not a
+    // re-resolved path -- see `chown_created_to_invoker`'s doc comment. The
+    // eventual same-directory rename into `dest` (in `pull_usbids`, below)
+    // preserves this ownership, so nothing needs to chown `dest` again after
+    // the rename.
+    crate::config::chown_created_to_invoker(quarantine, file.as_raw_fd());
     Ok(())
 }
 
@@ -684,11 +690,17 @@ pub fn pull_usbids(dest: &Path, chain_paths: &[&Path]) -> Result<()> {
     // Same-directory atomic rename: the only way this payload ever reaches
     // `dest`, and only after the checks above passed. A failed rename must
     // not leave the quarantine file behind either.
+    // The quarantine file was already chowned to the invoker (in
+    // `write_quarantine_file`, above) before it ever existed at this path;
+    // `rename(2)` changes an entry's name, not its inode's ownership, so
+    // `dest` inherits that ownership as-is and needs no chown of its own
+    // here -- doing one would mean re-resolving `dest` as a path after the
+    // rename, exactly the kind of post-hoc path lookup this module no
+    // longer does.
     if let Err(e) = std::fs::rename(&quarantine, dest) {
         let _ = std::fs::remove_file(&quarantine);
         return Err(e).with_context(|| format!("installing {}", dest.display()));
     }
-    crate::config::chown_to_invoker(dest);
     println!("installed {} ({})", dest.display(), fmt_date(summary.date));
     Ok(())
 }
