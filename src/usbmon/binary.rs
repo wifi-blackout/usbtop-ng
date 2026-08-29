@@ -14,7 +14,11 @@ use super::{open_nonblocking, POLL_INTERVAL};
 /// The kernel struct is 64 bytes, but `Documentation/usb/usbmon.rst` pins the
 /// read side at 48: "the read(2) system call returns the first 48 bytes of the
 /// header". The remaining fields are only reachable through the ioctl API.
-const HEADER_LEN: usize = 48;
+///
+/// `pub(crate)`: the mmap ring reader ([`super::mmap_ring`]) copies the same
+/// 48 bytes out of each ring offset before calling [`parse_binary_header`], so
+/// this length is shared rather than duplicated as a second magic number.
+pub(crate) const HEADER_LEN: usize = 48;
 
 /// Largest chunk read at a time when discarding an event's captured payload.
 const DRAIN_CHUNK: usize = 512;
