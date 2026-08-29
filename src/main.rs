@@ -28,7 +28,10 @@ mod usbmon;
 
 use std::time::Duration;
 
-use config::{ensure_private_config_dir, load_or_create_default_at, preferences_path};
+use config::{
+    chown_to_invoker, config_home, ensure_private_config_dir, load_or_create_default_at,
+    preferences_path,
+};
 use tui::lifecycle::{unload_policy, UnloadPolicy};
 use tui::{effective_refresh_ms, run_ui};
 use ui::UsbTopApp;
@@ -249,6 +252,7 @@ fn main() -> Result<()> {
             ensure_private_config_dir(parent)?;
         }
         snapshot.write_to(&dest)?;
+        chown_to_invoker(&dest);
         println!(
             "{} devices recorded as internal in {}",
             snapshot.devices.len(),
@@ -628,8 +632,10 @@ fn create_shell_alias() -> Result<()> {
 
     println!("Detected shell: {} ({})", shell_name, shell);
 
-    // Determine config file based on shell
-    let home = env::var("HOME")?;
+    // Determine config file based on shell. Under sudo this follows the
+    // invoking user's home (see `config::config_home`), not root's, so the
+    // rc edit lands where that user's shell actually reads it.
+    let home = config_home()?.to_string_lossy().into_owned();
     let config_file = match shell_name.as_ref() {
         "bash" => format!("{}/.bashrc", home),
         "zsh" => format!("{}/.zshrc", home),
@@ -676,7 +682,10 @@ fn create_shell_alias() -> Result<()> {
         }
     }
 
-    // Add the alias to the config file
+    // Add the alias to the config file. `created` decides whether this run
+    // owns the file below: chown a freshly created rc, but leave an
+    // existing one's ownership untouched (appending to it needs no call).
+    let created = !Path::new(&config_file).exists();
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -687,6 +696,9 @@ fn create_shell_alias() -> Result<()> {
         "\n# usbtop-ng alias (added by usbtop-ng --create-alias)"
     )?;
     writeln!(file, "{}", alias_command)?;
+    if created {
+        chown_to_invoker(Path::new(&config_file));
+    }
 
     println!("✅ Successfully added alias to {}", config_file);
     println!("\nTo use the alias in your current session, run:");

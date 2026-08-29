@@ -2,9 +2,148 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub const CONFIG_DIR_NAME: &str = ".usbtop-ng";
 pub const PREFERENCES_FILE_NAME: &str = "preferences.toml";
+
+/// The user a root process is acting on behalf of, resolved from `sudo`'s
+/// environment. Every per-user path (preferences, the usb.ids home copy, the
+/// internal snapshot, `--create-alias`'s rc file) follows this home instead
+/// of root's when it is `Some`.
+#[derive(Debug, Clone)]
+pub struct Invoker {
+    pub uid: u32,
+    pub gid: u32,
+    pub home: PathBuf,
+}
+
+/// Pure decision logic: is this a root process acting on behalf of another
+/// user under `sudo`, and if so, who? `None` unless every one of these holds:
+/// `euid` is 0, both `sudo_uid` and `sudo_gid` are set and parse as `u32`,
+/// `sudo_uid` is not 0 (root sudo-ing to root changes nothing), and `passwd`
+/// is `Some` text with a line whose 3rd colon-separated field equals
+/// `sudo_uid` and whose 6th field (the home directory) is non-empty.
+/// Malformed lines (too few fields) are skipped, not fatal -- the scan keeps
+/// looking rather than aborting on the first bad line.
+fn resolve_invoker(
+    euid: u32,
+    sudo_uid: Option<&str>,
+    sudo_gid: Option<&str>,
+    passwd: Option<&str>,
+) -> Option<Invoker> {
+    if euid != 0 {
+        return None;
+    }
+    let uid: u32 = sudo_uid?.parse().ok()?;
+    let gid: u32 = sudo_gid?.parse().ok()?;
+    if uid == 0 {
+        return None;
+    }
+    let passwd = passwd?;
+
+    for line in passwd.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() < 6 {
+            continue;
+        }
+        let Ok(line_uid) = fields[2].parse::<u32>() else {
+            continue;
+        };
+        if line_uid != uid {
+            continue;
+        }
+        let home = fields[5];
+        if home.is_empty() {
+            continue;
+        }
+        return Some(Invoker {
+            uid,
+            gid,
+            home: PathBuf::from(home),
+        });
+    }
+    None
+}
+
+/// Production wrapper around [`resolve_invoker`]: reads the real effective
+/// uid, the real `SUDO_UID`/`SUDO_GID` environment, and the real
+/// `/etc/passwd` (an unreadable file resolves the same as a missing one --
+/// `None`). These values cannot change mid-process, so the result is cached.
+pub fn sudo_invoker() -> Option<Invoker> {
+    static INVOKER: OnceLock<Option<Invoker>> = OnceLock::new();
+    INVOKER
+        .get_or_init(|| {
+            // SAFETY: geteuid() takes no arguments, performs no memory access,
+            // and cannot fail.
+            let euid = unsafe { libc::geteuid() };
+            let sudo_uid = std::env::var("SUDO_UID").ok();
+            let sudo_gid = std::env::var("SUDO_GID").ok();
+            let passwd = fs::read_to_string("/etc/passwd").ok();
+            resolve_invoker(
+                euid,
+                sudo_uid.as_deref(),
+                sudo_gid.as_deref(),
+                passwd.as_deref(),
+            )
+        })
+        .clone()
+}
+
+/// The raw `chown(2)` syscall as a testable primitive, separate from the
+/// invoker lookup so the syscall itself can be exercised as root without
+/// needing a real sudo environment. See [`chown_to_invoker`], the production
+/// entry point.
+fn chown_path(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains a NUL byte")
+    })?;
+    // SAFETY: `cstr` is a valid, NUL-terminated C string that outlives this
+    // call; chown(2) only reads it and has no other preconditions.
+    let rc = unsafe { libc::chown(cstr.as_ptr(), uid, gid) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Chown `path` to the invoking user's uid:gid; a no-op when [`sudo_invoker`]
+/// is `None`. Call this on every file or directory this process CREATES
+/// under the invoker's home while running as root -- appending to an
+/// existing, already-user-owned file needs no call. A failure logs one
+/// warning and continues; ownership drift here must never fail the run.
+pub fn chown_to_invoker(path: &Path) {
+    let Some(invoker) = sudo_invoker() else {
+        return;
+    };
+    if let Err(e) = chown_path(path, invoker.uid, invoker.gid) {
+        log::warn!(
+            "could not set ownership of {} to uid {} gid {}: {e}",
+            path.display(),
+            invoker.uid,
+            invoker.gid
+        );
+    }
+}
+
+/// The home directory per-user data resolves against: the invoking user's
+/// home under sudo (see [`sudo_invoker`]), else `$HOME` as always.
+pub fn config_home() -> Result<PathBuf> {
+    if let Some(invoker) = sudo_invoker() {
+        return Ok(invoker.home);
+    }
+    let home = std::env::var("HOME").context("HOME is not set; cannot locate ~/.usbtop-ng")?;
+    Ok(PathBuf::from(home))
+}
+
+/// Pure decomposition of [`preferences_path`], kept separate so the join can
+/// be tested without touching the environment.
+fn preferences_path_from(home: &Path) -> PathBuf {
+    home.join(CONFIG_DIR_NAME).join(PREFERENCES_FILE_NAME)
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preferences {
@@ -25,10 +164,7 @@ pub struct Preferences {
 }
 
 pub fn preferences_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME is not set; cannot locate ~/.usbtop-ng")?;
-    Ok(PathBuf::from(home)
-        .join(CONFIG_DIR_NAME)
-        .join(PREFERENCES_FILE_NAME))
+    Ok(preferences_path_from(&config_home()?))
 }
 
 pub fn load_or_create_default_at(path: &Path) -> Result<Preferences> {
@@ -57,6 +193,7 @@ pub fn write_preferences_at(path: &Path, prefs: &Preferences) -> Result<()> {
     let content = toml::to_string_pretty(prefs).context("failed to serialize preferences")?;
     fs::write(path, content)
         .with_context(|| format!("failed to write preferences to {}", path.display()))?;
+    chown_to_invoker(path);
     Ok(())
 }
 
@@ -70,6 +207,7 @@ pub fn ensure_private_config_dir(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir)
         .with_context(|| format!("failed to create config directory {}", dir.display()))?;
     set_private_dir_permissions(dir)?;
+    chown_to_invoker(dir);
     Ok(())
 }
 
@@ -86,6 +224,66 @@ fn set_private_dir_permissions(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PASSWD: &str = "root:x:0:0:root:/root:/bin/bash\n\
+        daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n\
+        malformed line without colons\n\
+        lylem:x:1000:1000:Lyle M:/home/lylem:/bin/bash\n";
+
+    #[test]
+    fn resolver_finds_the_invoking_users_home() {
+        let inv = resolve_invoker(0, Some("1000"), Some("1000"), Some(PASSWD)).unwrap();
+        assert_eq!(inv.uid, 1000);
+        assert_eq!(inv.gid, 1000);
+        assert_eq!(inv.home, PathBuf::from("/home/lylem"));
+    }
+
+    #[test]
+    fn resolver_is_none_without_full_sudo_context() {
+        assert!(
+            resolve_invoker(1000, Some("1000"), Some("1000"), Some(PASSWD)).is_none(),
+            "not root"
+        );
+        assert!(resolve_invoker(0, None, Some("1000"), Some(PASSWD)).is_none());
+        assert!(resolve_invoker(0, Some("1000"), None, Some(PASSWD)).is_none());
+        assert!(
+            resolve_invoker(0, Some("0"), Some("0"), Some(PASSWD)).is_none(),
+            "root sudo root"
+        );
+        assert!(resolve_invoker(0, Some("abc"), Some("1000"), Some(PASSWD)).is_none());
+        assert!(
+            resolve_invoker(0, Some("4242"), Some("4242"), Some(PASSWD)).is_none(),
+            "uid not in passwd"
+        );
+        assert!(
+            resolve_invoker(0, Some("1000"), Some("1000"), None).is_none(),
+            "passwd unreadable"
+        );
+    }
+
+    #[test]
+    fn resolver_skips_malformed_passwd_lines() {
+        let inv = resolve_invoker(0, Some("1000"), Some("1000"), Some(PASSWD));
+        assert!(
+            inv.is_some(),
+            "the malformed line above lylem's must not abort the scan"
+        );
+    }
+
+    #[test]
+    fn resolver_rejects_an_empty_home_field() {
+        let text = "ghost:x:1000:1000:g::/bin/bash\n";
+        assert!(resolve_invoker(0, Some("1000"), Some("1000"), Some(text)).is_none());
+    }
+
+    #[test]
+    fn preferences_path_from_joins_config_dir_and_file_name() {
+        let home = Path::new("/home/lylem");
+        assert_eq!(
+            preferences_path_from(home),
+            PathBuf::from("/home/lylem/.usbtop-ng/preferences.toml")
+        );
+    }
 
     #[test]
     fn creates_default_preferences_file() {
@@ -244,5 +442,38 @@ mod tests {
             !written.contains("usbids_path"),
             "a None usbids_path must not appear in the written file: {written}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "integration"))]
+mod integration_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// Exercises the real `chown(2)` primitive, not the invoker lookup (that
+    /// half is already covered hermetically above). Requires root, since
+    /// only root may chown a file to an arbitrary uid/gid; skips gracefully
+    /// otherwise, matching the pattern at `src/usbmon/mod.rs`'s
+    /// `debugfs_state_reads_permission_denied`.
+    /// Run: cargo test --features integration
+    #[test]
+    fn chown_path_sets_the_files_owning_uid_and_gid() {
+        // SAFETY: geteuid() takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("not running as root; chown_path integration check skipped");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("owned-file");
+        fs::write(&path, b"content").unwrap();
+
+        // `daemon` (uid/gid 1) is present on every Linux system and is not
+        // the file's current owner (root, from creating it above), so a
+        // successful chown is observable.
+        chown_path(&path, 1, 1).unwrap();
+
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.uid(), 1);
+        assert_eq!(meta.gid(), 1);
     }
 }
