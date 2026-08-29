@@ -596,6 +596,7 @@ fn write_quarantine_file(quarantine: &Path, payload: &str) -> Result<()> {
         .with_context(|| format!("creating quarantine file {}", quarantine.display()))?;
     file.write_all(payload.as_bytes())
         .with_context(|| format!("writing quarantine file {}", quarantine.display()))?;
+    crate::config::chown_to_invoker(quarantine);
     Ok(())
 }
 
@@ -687,6 +688,7 @@ pub fn pull_usbids(dest: &Path, chain_paths: &[&Path]) -> Result<()> {
         let _ = std::fs::remove_file(&quarantine);
         return Err(e).with_context(|| format!("installing {}", dest.display()));
     }
+    crate::config::chown_to_invoker(dest);
     println!("installed {} ({})", dest.display(), fmt_date(summary.date));
     Ok(())
 }

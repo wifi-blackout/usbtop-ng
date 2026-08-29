@@ -192,11 +192,12 @@ the preferences file — `--config` never moves it. A new snapshot overwrites
 the old one; deleting the file clears it, and every device goes back to
 looking external.
 
-That path resolves against the HOME of whichever user runs the command. If
-you monitor with `sudo usbtop`, snapshot under sudo too — press `S` inside
-`sudo usbtop`, or run `sudo usbtop-ng --snapshot-internal` from a shell. A
-snapshot taken without sudo is invisible to a sudo session, and vice versa,
-unless HOME is preserved with `sudo -E`.
+That path resolves against the invoking user's home, not root's: `sudo
+usbtop` reads and writes the same `~/.usbtop-ng` a plain `usbtop` session
+would, including this snapshot, the preferences file, and the downloaded
+usb.ids copy, and every file it creates there belongs to that user, not
+root. `sudo -E` is not needed for this. A direct root login (no `sudo`) is
+unchanged: it still resolves against `/root`.
 
 ### Device names
 
