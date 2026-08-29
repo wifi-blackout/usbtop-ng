@@ -119,6 +119,19 @@ enum UpdateUsbidsMode {
 }
 
 fn main() -> Result<()> {
+    // Test seam for tests/restore_pipe.rs: run the terminal-restore path and
+    // park, so the harness can prove the restore bytes reach fd 1 through the
+    // raw write while the process is still alive. Invisible in --help.
+    // `arm_restore` first because `restore_terminal` is a no-op on a terminal
+    // nothing ever armed — this is what a real teardown does too, just with
+    // `enter_terminal` standing in for the arm.
+    if env::var_os("USBTOP_NG_RESTORE_PROBE").is_some() {
+        tui::lifecycle::arm_restore();
+        tui::lifecycle::restore_terminal();
+        std::thread::sleep(Duration::from_secs(60));
+        return Ok(());
+    }
+
     let cli = Cli::parse();
 
     // Initialize logging
