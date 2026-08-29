@@ -117,6 +117,15 @@ pub struct UsbTopApp {
     /// attached; the header surfaces it once it goes above zero, so a lossy
     /// session never reads like a complete one.
     pub dropped_counter: Option<Arc<AtomicU64>>,
+    /// Shared count of kernel-side drops the mmap ring readers'
+    /// `MON_IOCG_STATS` reported (see `usbmon::mmap_ring::MmapReader` and
+    /// `usbmon::monitor::MonitorHandle::kernel_dropped`) — traffic the kernel
+    /// itself discarded before this process ever saw it, distinct from
+    /// [`Self::dropped_counter`]'s full-channel losses. `None` when no
+    /// monitor is attached, or when the session is not on the mmap
+    /// interface; the header surfaces it once it goes above zero, same
+    /// bargain as `dropped_counter`.
+    pub kernel_dropped_counter: Option<Arc<AtomicU64>>,
     /// Shared count of frames the output stage had to discard because the
     /// terminal stopped reading (see `tui::output`). `None` outside a TUI
     /// session. Same bargain as [`Self::dropped_counter`]: a session that is
@@ -220,6 +229,7 @@ impl UsbTopApp {
             peak_bandwidth: 0.0,
             list_scroll: 0,
             dropped_counter: None,
+            kernel_dropped_counter: None,
             shed_counter: None,
             hide_idle_devices: false,
             idle_persist: None,
@@ -236,6 +246,14 @@ impl UsbTopApp {
     /// [`Self::dropped_counter`]).
     pub fn with_dropped_counter(mut self, dropped: Arc<AtomicU64>) -> Self {
         self.dropped_counter = Some(dropped);
+        self
+    }
+
+    /// Attach the mmap ring readers' kernel-side drop counter (see
+    /// [`Self::kernel_dropped_counter`]). Preserves the builder style of
+    /// [`Self::with_dropped_counter`].
+    pub fn with_kernel_dropped_counter(mut self, kernel_dropped: Arc<AtomicU64>) -> Self {
+        self.kernel_dropped_counter = Some(kernel_dropped);
         self
     }
 
@@ -293,6 +311,15 @@ impl UsbTopApp {
     /// Packets discarded so far, or 0 when no counter is attached.
     fn dropped_packets(&self) -> u64 {
         self.dropped_counter
+            .as_ref()
+            .map_or(0, |counter| counter.load(Ordering::Relaxed))
+    }
+
+    /// Kernel-side drops reported so far by the mmap ring readers, or 0 when
+    /// no counter is attached (including every session not on the mmap
+    /// interface).
+    fn kernel_dropped_packets(&self) -> u64 {
+        self.kernel_dropped_counter
             .as_ref()
             .map_or(0, |counter| counter.load(Ordering::Relaxed))
     }
@@ -908,6 +935,22 @@ fn header_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
         stats_line.push(Span::raw(" | dropped: "));
         stats_line.push(Span::styled(
             dropped.to_string(),
+            Style::default()
+                .fg(WARNING_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Kernel-side drops the mmap ring reported through `MON_IOCG_STATS` --
+    // traffic the kernel itself discarded before this process ever saw it,
+    // which is a different loss from `dropped` above (a full channel, after
+    // delivery). Kept as its own counter so the two loss sources never blur
+    // together into one number that can't say which one happened.
+    let kernel_dropped = app.kernel_dropped_packets();
+    if kernel_dropped > 0 {
+        stats_line.push(Span::raw(" | kdropped: "));
+        stats_line.push(Span::styled(
+            kernel_dropped.to_string(),
             Style::default()
                 .fg(WARNING_COLOR)
                 .add_modifier(Modifier::BOLD),
@@ -1574,6 +1617,7 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from("  • ⚡ high-utilization indicator (>80% of practical bandwidth)"),
         Line::from("  • 🔺 device declares USB 3.x support but linked slower — best-effort signal"),
         Line::from("  • Header shows 'dropped: N' if packets were lost to a full queue"),
+        Line::from("  • Header shows 'kdropped: N' if the kernel's usbmon ring dropped packets"),
         Line::from("  • Header shows 'shed: N' if frames were dropped to keep up with a slow"),
         Line::from("    terminal — the numbers are current, the screen is N frames behind"),
         Line::from("  • Color-coded USB link speeds"),
@@ -3503,6 +3547,35 @@ mod tests {
         assert!(screen.contains("dropped: 42"), "{screen}");
     }
 
+    /// Mirrors `header_reports_dropped_packets_only_once_some_were_dropped`
+    /// for the mmap ring's kernel-side counter: a distinct loss source from
+    /// the channel `dropped:` counter, so it needs its own presence/absence
+    /// proof.
+    #[test]
+    fn header_reports_kernel_dropped_packets_only_once_some_were_dropped() {
+        let render = |app: &UsbTopApp| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(90, 4)).unwrap();
+            terminal.draw(|f| draw_header(f, f.area(), app)).unwrap();
+            terminal.backend().to_string()
+        };
+
+        let plain = UsbTopApp::new(Duration::from_millis(100));
+        assert!(!render(&plain).contains("kdropped"), "no counter wired up");
+
+        let counter = Arc::new(AtomicU64::new(0));
+        let app = UsbTopApp::new(Duration::from_millis(100))
+            .with_kernel_dropped_counter(Arc::clone(&counter));
+        let screen = render(&app);
+        assert!(
+            !screen.contains("kdropped"),
+            "nothing dropped yet: {screen}"
+        );
+
+        counter.store(5, Ordering::Relaxed);
+        let screen = render(&app);
+        assert!(screen.contains("kdropped: 5"), "{screen}");
+    }
+
     /// A session whose terminal could not keep up is showing stale numbers,
     /// and the header is the only place that can admit it.
     #[test]
@@ -3534,14 +3607,17 @@ mod tests {
         assert!(screen.contains("shed: 7"), "{screen}");
     }
 
-    /// `dropped:`/`shed:` are warnings, not measurements like Peak, so they
-    /// carry WARNING_COLOR rather than sharing SECONDARY_COLOR with it.
+    /// `dropped:`/`kdropped:`/`shed:` are warnings, not measurements like
+    /// Peak, so they carry WARNING_COLOR rather than sharing SECONDARY_COLOR
+    /// with it.
     #[test]
     fn dropped_and_shed_counters_use_warning_color_not_secondary() {
         let dropped = Arc::new(AtomicU64::new(42));
+        let kernel_dropped = Arc::new(AtomicU64::new(5));
         let shed = Arc::new(AtomicU64::new(7));
-        let mut app =
-            UsbTopApp::new(Duration::from_millis(100)).with_dropped_counter(Arc::clone(&dropped));
+        let mut app = UsbTopApp::new(Duration::from_millis(100))
+            .with_dropped_counter(Arc::clone(&dropped))
+            .with_kernel_dropped_counter(Arc::clone(&kernel_dropped));
         app.shed_counter = Some(Arc::clone(&shed));
 
         let lines = header_lines(&app);
@@ -3559,6 +3635,13 @@ mod tests {
             "must not blend in with the Peak figure"
         );
 
+        let kernel_dropped_value = stats_line
+            .spans
+            .iter()
+            .find(|span| span.content == "5")
+            .expect("kdropped counter span");
+        assert_eq!(kernel_dropped_value.style.fg, Some(WARNING_COLOR));
+
         let shed_value = stats_line
             .spans
             .iter()
@@ -3575,9 +3658,11 @@ mod tests {
     #[test]
     fn the_whole_ui_leaves_room_for_the_header_stats_line() {
         let dropped = Arc::new(AtomicU64::new(42));
+        let kernel_dropped = Arc::new(AtomicU64::new(5));
         let shed = Arc::new(AtomicU64::new(7));
-        let mut app =
-            UsbTopApp::new(Duration::from_millis(100)).with_dropped_counter(Arc::clone(&dropped));
+        let mut app = UsbTopApp::new(Duration::from_millis(100))
+            .with_dropped_counter(Arc::clone(&dropped))
+            .with_kernel_dropped_counter(Arc::clone(&kernel_dropped));
         app.shed_counter = Some(Arc::clone(&shed));
 
         // Drawn through `draw_ui`, not `draw_header`: the layout is the thing
@@ -3589,6 +3674,7 @@ mod tests {
         assert!(screen.contains("Total: "), "{screen}");
         assert!(screen.contains("Peak: "), "{screen}");
         assert!(screen.contains("dropped: 42"), "{screen}");
+        assert!(screen.contains("kdropped: 5"), "{screen}");
         assert!(screen.contains("shed: 7"), "{screen}");
     }
 
