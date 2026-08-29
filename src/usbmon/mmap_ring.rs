@@ -355,7 +355,13 @@ fn mflush(fd: RawFd, count: u32) -> io::Result<()> {
     Ok(())
 }
 
-/// `MON_IOCG_STATS`: the kernel's queued/dropped counters for this ring.
+/// `MON_IOCG_STATS`: the kernel's queued count and dropped count for this
+/// ring. `dropped` is read-and-clear, not cumulative: `mon_bin_ioctl`
+/// (`drivers/usb/mon/mon_bin.c`) copies `cnt_lost` out and zeroes it under
+/// the same lock, every call, so each call's `dropped` is the count of
+/// events lost since the *previous* call on this fd (or since the fd was
+/// opened, on the first call) — never a running total to diff against a
+/// remembered value.
 fn stats(fd: RawFd) -> io::Result<MonBinStats> {
     let mut stats = MonBinStats {
         queued: 0,
@@ -378,21 +384,20 @@ fn stats(fd: RawFd) -> io::Result<MonBinStats> {
     Ok(stats)
 }
 
-/// Folds `MON_IOCG_STATS`'s cumulative `dropped` count into `counter` and
-/// returns the value to track as `last` going forward.
+/// Adds one `MON_IOCG_STATS` read's `dropped` count into the shared
+/// `counter`.
 ///
-/// `dropped` only ever grows (until it wraps at `u32::MAX`, kernel-side), so
-/// `current - last` is exactly what changed since the previous publish; a
-/// `wrapping_sub` gets that right across one wrap too. Each caller — one per
-/// bus, since every [`MmapReader`] tracks its own `last` — folds its own
-/// delta into the same shared `counter` this way, so multiple readers sum
-/// correctly into it without double-counting each other's traffic.
-fn publish_kernel_drops(counter: &AtomicU64, last: u32, current: u32) -> u32 {
-    let delta = current.wrapping_sub(last);
-    if delta != 0 {
-        counter.fetch_add(u64::from(delta), Ordering::Relaxed);
+/// `dropped` is read-and-clear (see [`stats`]'s doc): each call's value is
+/// already just the drops since the previous read on that fd, not a
+/// cumulative total, so summing every read's value over the session — never
+/// diffing it against a remembered value — gives the exact total lost.
+/// `cnt_lost` is per-fd (per-open) kernel-side, so multiple per-bus readers
+/// each summing their own reads into this one shared `counter` cannot
+/// double-count each other's traffic.
+fn add_kernel_drops(counter: &AtomicU64, dropped: u32) {
+    if dropped != 0 {
+        counter.fetch_add(u64::from(dropped), Ordering::Relaxed);
     }
-    current
 }
 
 /// Park for one poll interval unless shutdown was requested. Returns `false`
@@ -473,10 +478,11 @@ impl MmapReader {
     /// `shutdown` is polled whenever a fetch comes back empty, so a caller can
     /// stop the loop within one [`POLL_INTERVAL`] and join the thread.
     /// `MON_IOCG_STATS` is read periodically while the loop runs (at most
-    /// once per [`POLL_INTERVAL`], via [`publish_kernel_drops`]) and once
-    /// more at loop exit, so `kernel_dropped` — kernel-side drops the
-    /// `read()`-based reader has no way to see — is live during a session,
-    /// not just after `stop()`.
+    /// once per [`POLL_INTERVAL`]) and once more at loop exit; each read's
+    /// (read-and-clear, see [`stats`]) `dropped` count is summed into
+    /// `kernel_dropped` via [`add_kernel_drops`], so `kernel_dropped` —
+    /// kernel-side drops the `read()`-based reader has no way to see — is
+    /// live during a session, not just after `stop()`.
     ///
     /// A callback `Err` stops the loop early and still returns `Ok(())`,
     /// matching `BinaryReader`. A fatal `MON_IOCX_MFETCH` error, like a setup
@@ -514,7 +520,6 @@ impl MmapReader {
 
         let mut offsets = [0u32; OFFSETS_CAP];
         let mut nflush = 0u32;
-        let mut last_dropped = 0u32;
         let mut last_stats_at = Instant::now();
         let mut fatal_fetch_error: Option<anyhow::Error> = None;
 
@@ -531,8 +536,7 @@ impl MmapReader {
                 last_stats_at = Instant::now();
                 match stats(fd) {
                     Ok(s) => {
-                        last_dropped =
-                            publish_kernel_drops(kernel_dropped, last_dropped, s.dropped);
+                        add_kernel_drops(kernel_dropped, s.dropped);
                     }
                     Err(e) => {
                         debug!("MON_IOCG_STATS on {}: {}", self.path.display(), e);
@@ -624,12 +628,12 @@ impl MmapReader {
             }
         }
 
-        // One more publish at exit, so whatever changed since the last
-        // periodic read (or the only read, on a session shorter than one
-        // `POLL_INTERVAL`) is not lost.
+        // One more read-and-clear at exit, so whatever the kernel lost since
+        // the last periodic read (or the only read, on a session shorter
+        // than one `POLL_INTERVAL`) is not lost from `kernel_dropped` too.
         match stats(fd) {
             Ok(s) => {
-                publish_kernel_drops(kernel_dropped, last_dropped, s.dropped);
+                add_kernel_drops(kernel_dropped, s.dropped);
             }
             Err(e) => {
                 debug!("MON_IOCG_STATS on {}: {}", self.path.display(), e);
@@ -772,69 +776,76 @@ mod tests {
         );
     }
 
-    /// The four deltas the fix is built around: no change, a first count, an
-    /// unchanged repeat, and a further rise.
+    /// `MON_IOCG_STATS` is read-and-clear (see `stats`'s doc), so repeated
+    /// equal reads are not "no change" — each one is its own independent
+    /// count of drops since the previous read, and must add every time. A
+    /// delta-based fold (treating `dropped` as cumulative) would wrongly
+    /// publish only the first 5 here; summing gets the true total, 10.
     #[test]
-    fn publish_kernel_drops_accumulates_the_delta_since_the_last_publish() {
+    fn add_kernel_drops_sums_every_read_even_when_the_value_repeats() {
         let counter = AtomicU64::new(0);
 
-        let last = publish_kernel_drops(&counter, 0, 0);
-        assert_eq!(last, 0);
-        assert_eq!(counter.load(Ordering::Relaxed), 0, "0 -> 0 adds nothing");
+        add_kernel_drops(&counter, 0);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "a zero read adds nothing"
+        );
 
-        let last = publish_kernel_drops(&counter, last, 5);
-        assert_eq!(last, 5);
-        assert_eq!(counter.load(Ordering::Relaxed), 5, "0 -> 5 adds 5");
+        add_kernel_drops(&counter, 5);
+        assert_eq!(counter.load(Ordering::Relaxed), 5, "first read of 5 adds 5");
 
-        let last = publish_kernel_drops(&counter, last, 5);
-        assert_eq!(last, 5);
-        assert_eq!(counter.load(Ordering::Relaxed), 5, "5 -> 5 adds nothing");
-
-        let last = publish_kernel_drops(&counter, last, 9);
-        assert_eq!(last, 9);
-        assert_eq!(counter.load(Ordering::Relaxed), 9, "5 -> 9 adds 4");
+        add_kernel_drops(&counter, 5);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            10,
+            "a second, equal read of 5 must add 5 more, not 0 — each read is \
+             independent, not a running total to diff against"
+        );
     }
 
-    /// Two independent per-bus readers, each tracking its own `last`, must
-    /// fold their deltas into one shared counter without double-counting or
-    /// clobbering each other's contribution.
+    /// A read-and-clear counter has no notion of "decreasing" — 7 then 3 are
+    /// two unrelated counts, not a rollback. Treating them as cumulative and
+    /// diffing (`3u32.wrapping_sub(7)`) would wrap to a multi-billion
+    /// overcount; summing gets the true total, 10.
     #[test]
-    fn publish_kernel_drops_from_multiple_readers_sums_into_one_counter() {
+    fn add_kernel_drops_handles_a_lower_read_without_wrapping() {
         let counter = AtomicU64::new(0);
 
-        let reader_a_last = publish_kernel_drops(&counter, 0, 3);
-        let reader_b_last = publish_kernel_drops(&counter, 0, 2);
-        assert_eq!(reader_a_last, 3);
-        assert_eq!(reader_b_last, 2);
+        add_kernel_drops(&counter, 7);
+        add_kernel_drops(&counter, 3);
+
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            10,
+            "7 then 3 are two independent counts (10 total), not a decrease \
+             that would underflow a delta"
+        );
+    }
+
+    /// Each bus's `MmapReader` owns its own fd, and `cnt_lost` is per-fd
+    /// kernel-side (see `stats`'s doc), so two readers summing their own
+    /// reads into one shared counter must not clobber or double-count each
+    /// other's contribution.
+    #[test]
+    fn add_kernel_drops_from_multiple_readers_sums_into_one_counter() {
+        let counter = AtomicU64::new(0);
+
+        // Reader A's fd and reader B's fd each report their own drops.
+        add_kernel_drops(&counter, 3); // reader A's first read
+        add_kernel_drops(&counter, 2); // reader B's first read
         assert_eq!(
             counter.load(Ordering::Relaxed),
             5,
-            "two readers' first publishes must sum, not overwrite"
+            "two readers' first reads must sum, not overwrite"
         );
 
-        let reader_a_last = publish_kernel_drops(&counter, reader_a_last, 3);
-        let reader_b_last = publish_kernel_drops(&counter, reader_b_last, 6);
-        assert_eq!(reader_a_last, 3, "unchanged current adds nothing");
-        assert_eq!(reader_b_last, 6);
+        add_kernel_drops(&counter, 3); // reader A's second read
+        add_kernel_drops(&counter, 6); // reader B's second read
         assert_eq!(
             counter.load(Ordering::Relaxed),
-            9,
-            "reader A contributes 0 more, reader B contributes 4 more"
-        );
-    }
-
-    /// `dropped` is a kernel `u32` that can wrap back through 0 on a long
-    /// enough session; `wrapping_sub` must compute the true distance instead
-    /// of underflowing into a huge, wrong delta.
-    #[test]
-    fn publish_kernel_drops_handles_the_kernel_counter_wrapping() {
-        let counter = AtomicU64::new(0);
-        let last = publish_kernel_drops(&counter, u32::MAX, 2);
-        assert_eq!(last, 2);
-        assert_eq!(
-            counter.load(Ordering::Relaxed),
-            3,
-            "u32::MAX -> 2 is 3 drops (MAX -> 0 -> 1 -> 2), not an underflowed huge delta"
+            14,
+            "further reads from both readers keep summing"
         );
     }
 
@@ -957,7 +968,7 @@ mod integration_tests {
     /// Requires: usbmon loaded, `/dev/usbmon0` openable (typically root).
     /// Proves `kernel_dropped` is readable *while the reader thread is still
     /// running*, i.e. that the periodic in-loop publish
-    /// (`publish_kernel_drops`, gated on `POLL_INTERVAL`) is actually wired
+    /// (`add_kernel_drops`, gated on `POLL_INTERVAL`) is actually wired
     /// into the live loop rather than only the final publish at loop exit.
     /// An idle host reports zero drops either way, so this does not prove a
     /// nonzero value crossed the wire mid-run — only that the read happens,
