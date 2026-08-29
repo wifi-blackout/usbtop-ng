@@ -699,16 +699,10 @@ fn create_shell_alias() -> Result<()> {
     // Add the alias to the config file. `created` decides whether this run
     // owns the file below: chown a freshly created rc, but leave an
     // existing one's ownership untouched (appending to it needs no call).
-    // `O_NOFOLLOW` refuses a symlinked final component outright rather than
-    // appending through it -- a shell rc managed by a dotfile tool as a
-    // symlink will see this fail instead of being silently written to
-    // (and, had this stayed path-based, silently chowned) by way of.
+    // See `open_rc_file`'s doc comment for why it refuses a symlinked rc
+    // only under sudo.
     let created = !Path::new(&config_file).exists();
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&config_file)?;
+    let mut file = open_rc_file(&config_file)?;
 
     writeln!(
         file,
@@ -726,6 +720,33 @@ fn create_shell_alias() -> Result<()> {
     println!("\nYou can now run: usbtop");
 
     Ok(())
+}
+
+/// Open `config_file` for appending, creating it if it does not exist yet.
+///
+/// Refuses a symlinked final component (`O_NOFOLLOW`) only when this
+/// process is running under sudo (`config::sudo_invoker().is_some()`), not
+/// in the ordinary case. The symlink-redirect hazard `O_NOFOLLOW` guards
+/// against -- an attacker's symlink getting followed and written through
+/// (and, in the old path-based ownership fix-up, chowned by way of) --
+/// only exists across the root->user privilege boundary: under plain,
+/// non-sudo `--create-alias`, this process runs as the same uid that owns
+/// both the rc path and whatever it might be symlinked to, so following a
+/// self-owned symlink crosses no privilege boundary at all -- it is the
+/// ordinary chezmoi/Stow/yadm workflow of managing dotfiles as symlinks
+/// into a repo, and must keep working. Under sudo, the invoking user does
+/// not necessarily own (or control) everything root's process would
+/// otherwise follow, so `O_NOFOLLOW` stays in force there: a symlinked rc
+/// under `sudo ... --create-alias` fails with a clear error instead of
+/// being appended through -- rare, and the fix is simply to run
+/// `--create-alias` without sudo.
+fn open_rc_file(config_file: &str) -> io::Result<std::fs::File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    if config::sudo_invoker().is_some() {
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(config_file)
 }
 
 #[cfg(test)]
@@ -838,5 +859,36 @@ mod tests {
         let missing = String::from_utf8(missing).unwrap();
         assert!(missing.contains("sudo modprobe usbmon"));
         assert!(missing.contains("sudo mount -t debugfs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rc_file_follows_a_symlink_when_not_under_sudo() {
+        // The sudo-gated branch (`config::sudo_invoker().is_some()` ->
+        // true, which switches this to O_NOFOLLOW) needs a real sudo
+        // environment to exercise and is covered by manual, end-to-end
+        // verification instead (see final-fix-report.md), the same way
+        // this codebase covers its other sudo-only behavior. This test
+        // process is neither root nor running under sudo, so
+        // `sudo_invoker()` is reliably `None` here -- exactly the common,
+        // non-sudo branch this test targets: a symlinked rc (the
+        // chezmoi/Stow/yadm workflow) must still be followed and appended
+        // through, not refused.
+        let temp = tempfile::tempdir().unwrap();
+        let real_target = temp.path().join("real-rc");
+        std::fs::write(&real_target, "# existing content\n").unwrap();
+        let rc_path = temp.path().join(".bashrc");
+        std::os::unix::fs::symlink(&real_target, &rc_path).unwrap();
+
+        let mut file = open_rc_file(rc_path.to_str().unwrap())
+            .expect("a non-sudo open must follow a symlinked rc file, not refuse it");
+        writeln!(file, "appended").unwrap();
+        drop(file);
+
+        let content = std::fs::read_to_string(&real_target).unwrap();
+        assert!(
+            content.contains("appended"),
+            "the write must have gone through the symlink to the real target: {content}"
+        );
     }
 }
