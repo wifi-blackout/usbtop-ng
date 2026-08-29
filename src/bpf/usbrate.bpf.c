@@ -28,11 +28,25 @@ int BPF_KPROBE(on_giveback, struct urb *urb)
         .busnum = BPF_CORE_READ(urb, dev, bus, busnum),
         .devnum = BPF_CORE_READ(urb, dev, devnum),
         .epnum  = (__u8)(ep & 0x0f),
-        .dir_in = (ep & 0x80) ? 1 : 0,
+        /* Direction from the pipe (usb_pipein), not the descriptor's address
+         * bit: endpoint 0's bEndpointAddress is always 0x00, so a descriptor-
+         * bit direction would file every control IN transfer as OUT. The pipe
+         * carries the URB's real direction for every transfer type, matching
+         * what the usbmon backends account. */
+        .dir_in = (__u8)((pipe >> 7) & 0x1),
         .xfer   = (__u8)((pipe >> 30) & 0x3),   /* usb_pipetype: 0 iso 1 int 2 ctrl 3 bulk */
     };
     __u64 *cur = bpf_map_lookup_elem(&bytes, &k);
-    if (cur) __sync_fetch_and_add(cur, (__u64)len);
-    else { __u64 init = len; bpf_map_update_elem(&bytes, &k, &init, BPF_ANY); }
+    if (cur) { __sync_fetch_and_add(cur, (__u64)len); return 0; }
+    /* First sight of this key. BPF_NOEXIST so two CPUs racing the same new
+     * key don't clobber each other's first URB: the loser gets a non-zero
+     * return, re-looks up the now-present entry, and adds to it. A genuine
+     * map-full failure also lands here; the re-lookup misses and the bytes
+     * are dropped -- the same bounded, documented map-full loss. */
+    __u64 init = len;
+    if (bpf_map_update_elem(&bytes, &k, &init, BPF_NOEXIST) != 0) {
+        cur = bpf_map_lookup_elem(&bytes, &k);
+        if (cur) __sync_fetch_and_add(cur, (__u64)len);
+    }
     return 0;
 }

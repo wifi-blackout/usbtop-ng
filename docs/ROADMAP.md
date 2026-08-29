@@ -162,6 +162,12 @@ this backend is throughput-only. See
 [INSTALL.md](INSTALL.md#building-the-ebpf-backend) for the build and
 runtime requirements.
 
+One known limitation: the BPF program hand-writes an x86-64 `pt_regs` for
+the kprobe entry context, so `--features ebpf` builds on x86-64 only today
+(it fails loudly on other architectures rather than miscounting). A
+per-architecture `pt_regs` is the follow-up that would let it build on the
+ARM boards below; usbmon capture there needs none of this and works now.
+
 ### Discovered: the usbmon binary reader undercounts high-bandwidth isochronous transfers
 
 Live-verifying the eBPF backend against ground truth surfaced a separate,
@@ -209,6 +215,10 @@ In-depth research and testing of usbtop-ng on small ARM hosts: Raspberry
 Pi Zero, Pi 4, Pi 400, and Pi 5, plus the Radxa ROCK 5C and the SOPHGO
 Fogwise AirBox. usbmon is architecture-independent, so the questions are
 builds, vendor kernels, and controller behavior, not core capture logic.
+(The optional `ebpf` feature is the one exception: its BPF program has an
+x86-64-only `pt_regs` today and needs a per-architecture one before it
+builds on these boards -- see the eBPF backend section above. The default
+usbmon build carries no such restriction.)
 
 Research first:
 

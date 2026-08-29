@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- An opt-in eBPF capture backend (`ebpf` cargo feature): a kprobe on `__usb_hcd_giveback_urb` aggregates bytes per bus, device, endpoint, direction, and transfer type in a kernel hash map, polled into the same accounting path as usbmon. Throughput only; it does not attribute traffic to a process. The default build is unaffected -- zero libbpf dependencies, no BPF toolchain needed. Building the feature needs clang, libbpf-dev, and Rust ≥ 1.82; running it needs root (or `CAP_BPF`) and a BTF-enabled kernel. A load or attach failure logs a warning and falls back to the usbmon chain. See [docs/INSTALL.md](docs/INSTALL.md#building-the-ebpf-backend).
+- An opt-in eBPF capture backend (`ebpf` cargo feature): a kprobe on `__usb_hcd_giveback_urb` aggregates bytes per bus, device, endpoint, direction, and transfer type in a kernel hash map, polled into the same accounting path as usbmon. Throughput only; it does not attribute traffic to a process. The default build is unaffected -- zero libbpf dependencies, no BPF toolchain needed. Building the feature needs clang and libbpf-dev on an x86-64 host (the BPF program's kprobe context is x86-64-specific for now) and adds no Rust-version requirement beyond the crate's 1.88 MSRV; running it needs root (or `CAP_BPF`) and a BTF-enabled kernel. A load or attach failure logs a warning and falls back to the usbmon chain. See [docs/INSTALL.md](docs/INSTALL.md#building-the-ebpf-backend).
 
 ### Changed
 

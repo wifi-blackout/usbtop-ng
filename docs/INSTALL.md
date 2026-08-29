@@ -76,6 +76,12 @@ Building the feature needs:
 
 - clang, with the BPF target (`clang -print-targets` should list `bpf`).
 - libbpf-dev, for the libbpf headers the BPF program compiles against.
+- An x86-64 host. The committed BPF program hand-writes an x86-64 `pt_regs`
+  for the kprobe entry context, so `--features ebpf` builds on x86-64 only
+  today; other architectures (including the ARM boards in
+  [ROADMAP.md](ROADMAP.md)) need a per-architecture `pt_regs` first, and the
+  build fails loudly rather than miscounting until then. The default,
+  usbmon-only build has no such restriction.
 
 Build it with:
 
@@ -84,10 +90,10 @@ cargo build --release --features ebpf
 ```
 
 The feature compiles a committed BPF C program (`src/bpf/usbrate.bpf.c`)
-through a `build.rs` step. `libbpf-rs` and `libbpf-cargo` set the
-feature's own floor: the `ebpf` feature requires Rust ≥ 1.82. That applies
-only when the feature is enabled -- the default build's Rust 1.88
-requirement is unaffected either way.
+through a `build.rs` step. It adds no Rust-version requirement of its own:
+`libbpf-rs` and `libbpf-cargo` floor at Rust 1.82, below the crate's own
+1.88 MSRV, so the same Rust 1.88 that builds usbtop-ng builds the feature
+too.
 
 At runtime, the eBPF backend needs root (or `CAP_BPF`) and a BTF-enabled
 kernel (`/sys/kernel/btf/vmlinux`). It attaches a kprobe on

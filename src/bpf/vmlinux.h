@@ -124,6 +124,7 @@ enum bpf_map_type {
 
 enum {
 	BPF_ANY = 0,
+	BPF_NOEXIST = 1,
 };
 
 #pragma clang attribute push (__attribute__((preserve_access_index)), apply_to = record)
