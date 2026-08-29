@@ -64,9 +64,14 @@ impl Snapshot {
     /// owns directory creation (e.g. the CLI handler calls
     /// `ensure_private_config_dir` first), the same division `--update-usbids
     /// pull` uses for its own destination.
+    ///
+    /// Writes via [`crate::config::write_file_owned`], which also chowns the
+    /// file to the invoking user under sudo (fd-based, symlink-safe -- see
+    /// its doc comment) -- callers do not need a separate chown call.
     pub fn write_to(&self, path: &Path) -> Result<()> {
         let text = toml::to_string(self).context("could not serialize the snapshot")?;
-        std::fs::write(path, text).with_context(|| format!("could not write {}", path.display()))
+        crate::config::write_file_owned(path, text.as_bytes())
+            .with_context(|| format!("could not write {}", path.display()))
     }
 
     /// `None` when the file is absent. A file that exists but does not

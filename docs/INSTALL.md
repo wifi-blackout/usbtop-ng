@@ -209,7 +209,8 @@ From the source tree, run the same three checks CI runs:
    ```bash
    cargo test --all-targets
    ```
-   The command reports 408 passed.
+   The unit suite reports 423 passed; the `tests/` directory adds the
+   pipe and PTY harnesses alongside it.
 
 ## Uninstall
 

@@ -123,11 +123,6 @@ These came out of code review. Each is small and none blocks a release.
 - Search filtering waits for the next refresh tick, up to 1 second at the
   default rate. Pulling the tick forward on a search keystroke would make
   filter-as-you-type feel immediate.
-- SUDO_USER-aware config-dir resolution, so preferences, the usb.ids home
-  copy, the internal snapshot, and `--create-alias` follow the invoking
-  user under sudo. Today each resolves against root's home there, and
-  only sudo -E bridges the two. One coherent change, and created files
-  must land owned by the invoking user, not root.
 - The usbmon text fallback overcounts isochronous transfers. Its length
   column holds the buffer size, not the bytes moved. On a camera stream the
   overcount was 3.6x. The text format prints 5 of 32 descriptors per URB, so
@@ -173,10 +168,6 @@ device inventory, and pass criteria live in [TESTING.md](TESTING.md).
 
 ## Testing follow-ups
 
-- A committed pty harness for the wedged-terminal checks. The checks run by
-  hand today and are recorded in review reports only.
-- A pipe-based regression guard proving the terminal-restore bytes bypass
-  stdio buffering.
 - Thunderbolt and USB4 hardware validation. usbtop-ng observes USB URBs
   behind such hosts and docks, never PCIe or fabric traffic. A useful
   matrix covers dock controllers, hub topology, hotplug, suspend and

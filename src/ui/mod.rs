@@ -747,6 +747,9 @@ fn confirm_snapshot(app: &mut UsbTopApp, snapshot: Snapshot) -> SnapshotPrompt {
         log::warn!("could not write the internal-device snapshot: {e}");
         return SnapshotPrompt::Done(format!("could not write the snapshot: {e}"));
     }
+    // `write_to` itself chowns the file to the invoking user under sudo
+    // (fd-based, via `crate::config::write_file_owned`); no separate call
+    // needed here.
     let count = snapshot.devices.len();
     app.pending_internal_snapshot = Some(Arc::new(snapshot));
     SnapshotPrompt::Done(format!("{count} devices recorded as internal"))
