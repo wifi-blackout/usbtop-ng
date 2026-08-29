@@ -474,6 +474,7 @@ fn main() -> Result<()> {
             manager,
             packets,
             Arc::clone(&monitor.dropped),
+            Arc::clone(&monitor.kernel_dropped),
             Arc::clone(&monitor.text_active),
             filter,
             headless::HeadlessOptions {
@@ -508,6 +509,7 @@ fn main() -> Result<()> {
     // the UI needs the count to say so in its header.
     let mut app = UsbTopApp::new(Duration::from_millis(effective_refresh_ms(cli.refresh)))
         .with_dropped_counter(Arc::clone(&monitor.dropped))
+        .with_kernel_dropped_counter(Arc::clone(&monitor.kernel_dropped))
         .with_idle_setting(
             preferences.hide_idle_devices,
             config_path,

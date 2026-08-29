@@ -8,6 +8,7 @@ use anyhow::anyhow;
 use log::{debug, info, warn};
 
 use super::binary::BinaryReader;
+use super::mmap_ring::MmapReader;
 use super::open_nonblocking;
 use super::parser::UsbPacket;
 use super::reader::UsbmonReader;
@@ -32,6 +33,14 @@ pub struct MonitorHandle {
     /// Clone the `Arc` before `stop()` to keep reading it (the UI surfaces the
     /// count in its header so a lossy session is never silently lossy).
     pub dropped: Arc<AtomicU64>,
+    /// Kernel-side drops the mmap ring readers' `MON_IOCG_STATS` reported —
+    /// traffic the kernel itself discarded before this process ever saw it,
+    /// distinct from [`Self::dropped`] (a full channel, after delivery).
+    /// Readers on the text or read()-based binary interface never touch this
+    /// counter, so it stays at zero unless the mmap interface is in use.
+    /// Clone the `Arc` before `stop()` to keep reading it, same as
+    /// [`Self::dropped`].
+    pub kernel_dropped: Arc<AtomicU64>,
     /// Set once any reader ends up on the debugfs text interface — either
     /// because that is the source it was given, or because a binary source
     /// fell back to it (see `run_source_with_fallback`). The text interface
@@ -62,8 +71,12 @@ impl MonitorHandle {
 pub enum PacketSource {
     /// debugfs `Nu` text interface.
     Text(UsbmonReader),
-    /// `/dev/usbmonN` binary interface.
+    /// `/dev/usbmonN` binary interface, read via `read(2)`.
     Binary(BinaryReader),
+    /// `/dev/usbmonN` binary interface, read via its mmap ring and
+    /// `MON_IOCX_MFETCH` — no payload copy, and the only source of
+    /// [`MonitorHandle::kernel_dropped`].
+    Mmap(MmapReader),
 }
 
 impl PacketSource {
@@ -71,6 +84,7 @@ impl PacketSource {
         match self {
             PacketSource::Text(reader) => reader.bus_id,
             PacketSource::Binary(reader) => reader.bus_id,
+            PacketSource::Mmap(reader) => reader.bus_id,
         }
     }
 }
@@ -81,10 +95,11 @@ impl PacketSource {
 /// Bus 0 is the kernel's aggregate interface (0u carries every bus), so when
 /// it is available a single reader is used to avoid double-counting.
 ///
-/// The binary `/dev/usbmonN` interface is preferred when it can be opened —
-/// it reports every event as a fixed-size record instead of a formatted line —
-/// and the debugfs text interface is the fallback for kernels or permission
-/// setups where it cannot.
+/// The mmap ring is preferred when it is usable — it hands back event offsets
+/// without ever copying the captured payload — then the read()-based binary
+/// `/dev/usbmonN` interface when it can be opened but the ring cannot, and the
+/// debugfs text interface last, for kernels or permission setups where
+/// neither binary interface can.
 pub fn start_monitoring(buses: &[u8]) -> (Receiver<UsbPacket>, MonitorHandle) {
     let targets: Vec<u8> = if buses.contains(&0) {
         info!("monitoring aggregate usbmon interface 0u for all buses");
@@ -101,20 +116,32 @@ pub fn start_monitoring(buses: &[u8]) -> (Receiver<UsbPacket>, MonitorHandle) {
     }
 
     // Probing the first target is enough: the binary devices are created by the
-    // same module for the same set of buses. The probe handle is dropped right
-    // away so it cannot pin usbmon.
-    let use_binary = targets
+    // same module for the same set of buses. The probe handles are dropped
+    // right away so they cannot pin usbmon.
+    let use_mmap = targets
         .first()
-        .is_some_and(|bus| open_nonblocking(Path::new(&format!("/dev/usbmon{bus}"))).is_ok());
+        .is_some_and(|bus| MmapReader::probe(Path::new(&format!("/dev/usbmon{bus}"))));
+    let use_binary = !use_mmap
+        && targets
+            .first()
+            .is_some_and(|bus| open_nonblocking(Path::new(&format!("/dev/usbmon{bus}"))).is_ok());
     info!(
         "using usbmon {} interface",
-        if use_binary { "binary" } else { "text" }
+        if use_mmap {
+            "mmap-ring"
+        } else if use_binary {
+            "binary"
+        } else {
+            "text"
+        }
     );
 
     let sources = targets
         .iter()
         .map(|&bus| {
-            if use_binary {
+            if use_mmap {
+                PacketSource::Mmap(MmapReader::new(bus))
+            } else if use_binary {
                 PacketSource::Binary(BinaryReader::new(bus))
             } else {
                 PacketSource::Text(UsbmonReader::new(bus))
@@ -141,18 +168,28 @@ fn start_sources_with_bound(
     let (tx, rx) = sync_channel(bound);
     let shutdown = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicU64::new(0));
+    let kernel_dropped = Arc::new(AtomicU64::new(0));
     let text_active = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
     for source in sources {
         let tx = tx.clone();
         let shutdown = Arc::clone(&shutdown);
         let dropped = Arc::clone(&dropped);
+        let kernel_dropped = Arc::clone(&kernel_dropped);
         let text_active = Arc::clone(&text_active);
         let bus = source.bus_id();
         match thread::Builder::new()
             .name(format!("usbmon-bus-{bus}"))
-            .spawn(move || run_source(source, &shutdown, &tx, &dropped, &text_active))
-        {
+            .spawn(move || {
+                run_source(
+                    source,
+                    &shutdown,
+                    &tx,
+                    &dropped,
+                    &kernel_dropped,
+                    &text_active,
+                )
+            }) {
             Ok(handle) => threads.push(handle),
             Err(e) => warn!("failed to spawn usbmon reader for bus {bus}: {e}"),
         }
@@ -163,23 +200,33 @@ fn start_sources_with_bound(
             shutdown,
             threads,
             dropped,
+            kernel_dropped,
             text_active,
         },
     )
 }
 
 /// Read one source to completion on the calling thread, funnelling its packets
-/// onto `tx`, with this bus's text interface standing by if a binary source
-/// turns out to be unusable.
+/// onto `tx`, with this bus's binary and text interfaces standing by if a
+/// preferred source turns out to be unusable.
 fn run_source(
     source: PacketSource,
     shutdown: &AtomicBool,
     tx: &SyncSender<UsbPacket>,
     dropped: &AtomicU64,
+    kernel_dropped: &AtomicU64,
     text_active: &AtomicBool,
 ) {
     let fallback = UsbmonReader::new(source.bus_id());
-    run_source_with_fallback(source, fallback, shutdown, tx, dropped, text_active);
+    run_source_with_fallback(
+        source,
+        fallback,
+        shutdown,
+        tx,
+        dropped,
+        kernel_dropped,
+        text_active,
+    );
 }
 
 /// [`run_source`] with the fallback reader supplied by the caller, so tests can
@@ -190,16 +237,34 @@ fn run_source_with_fallback(
     shutdown: &AtomicBool,
     tx: &SyncSender<UsbPacket>,
     dropped: &AtomicU64,
+    kernel_dropped: &AtomicU64,
     text_active: &AtomicBool,
 ) {
     let bus = source.bus_id();
     // `start_monitoring`'s probe only tried the first target bus, and a
-    // per-bus `/dev/usbmonN` can still be missing or unreadable. Check this
-    // bus's device before committing to it: without this, that one bus's
-    // reader would exit with a warning and the bus would silently go dark,
-    // even though its text interface is right there. The probe handle is
-    // dropped immediately so it cannot pin usbmon.
+    // per-bus `/dev/usbmonN` can still be missing, unreadable, or openable but
+    // not mmap-capable (an older kernel, mmap denied). Check this bus's
+    // device before committing to it: without this, that one bus's reader
+    // would exit with a warning and the bus would silently go dark, even
+    // though a source further down the chain is right there. Every probe
+    // handle here is dropped immediately so it cannot pin usbmon.
     let source = match source {
+        PacketSource::Mmap(reader) if !MmapReader::probe(&reader.path) => {
+            warn!(
+                "cannot use the mmap ring at {} for bus {bus}; falling back to the usbmon binary interface",
+                reader.path.display()
+            );
+            let binary = BinaryReader::new(bus);
+            if open_nonblocking(&binary.path).is_err() {
+                warn!(
+                    "cannot open {} for bus {bus}; falling back to the usbmon text interface",
+                    binary.path.display()
+                );
+                PacketSource::Text(fallback)
+            } else {
+                PacketSource::Binary(binary)
+            }
+        }
         PacketSource::Binary(reader) if open_nonblocking(&reader.path).is_err() => {
             warn!(
                 "cannot open {} for bus {bus}; falling back to the usbmon text interface",
@@ -227,6 +292,7 @@ fn run_source_with_fallback(
     let result = match source {
         PacketSource::Text(reader) => reader.read_packets(shutdown, send),
         PacketSource::Binary(reader) => reader.read_packets(shutdown, send),
+        PacketSource::Mmap(reader) => reader.read_packets(shutdown, kernel_dropped, send),
     };
     match result {
         Ok(()) => debug!("usbmon reader for bus {bus} finished"),
@@ -389,6 +455,7 @@ mod tests {
             &AtomicBool::new(false),
             &tx,
             &AtomicU64::new(0),
+            &AtomicU64::new(0),
             &text_active,
         );
 
@@ -403,6 +470,51 @@ mod tests {
         assert!(
             text_active.load(Ordering::Relaxed),
             "falling back to the text interface must raise the flag"
+        );
+    }
+
+    /// The extended chain from the mmap spec: an `Mmap` source whose ring
+    /// cannot be probed (a fixture path, exactly like a kernel or permission
+    /// setup with no mmap interface) falls all the way through the binary
+    /// interface (also unusable here — no real `/dev/usbmon{bus}` exists at
+    /// this bus number) to the text fixture, and still delivers.
+    #[test]
+    fn mmap_source_that_cannot_be_probed_falls_back_to_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let text_path = temp.path().join("201u");
+        let mut f = std::fs::File::create(&text_path).unwrap();
+        writeln!(f, "ffff0000dddd00c9 500 C Bi:201:003:1 0 32 <").unwrap();
+        let missing_ring = temp.path().join("usbmon201"); // never created
+
+        let (tx, rx) = sync_channel(4);
+        let text_active = AtomicBool::new(false);
+        let kernel_dropped = AtomicU64::new(0);
+        run_source_with_fallback(
+            PacketSource::Mmap(MmapReader::with_path(201, missing_ring, false)),
+            UsbmonReader::with_path(201, text_path, false),
+            &AtomicBool::new(false),
+            &tx,
+            &AtomicU64::new(0),
+            &kernel_dropped,
+            &text_active,
+        );
+
+        let packets: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            packets.len(),
+            1,
+            "the fallback reader's packets must arrive"
+        );
+        assert_eq!(packets[0].bus_id, 201);
+        assert_eq!(packets[0].data_length, 32);
+        assert!(
+            text_active.load(Ordering::Relaxed),
+            "falling back all the way to the text interface must raise the flag"
+        );
+        assert_eq!(
+            kernel_dropped.load(Ordering::Relaxed),
+            0,
+            "a source that fell back before ever reading the ring reports no kernel drops"
         );
     }
 
@@ -423,6 +535,7 @@ mod tests {
             UsbmonReader::with_path(8, unused_text, false),
             &AtomicBool::new(false),
             &tx,
+            &AtomicU64::new(0),
             &AtomicU64::new(0),
             &text_active,
         );
