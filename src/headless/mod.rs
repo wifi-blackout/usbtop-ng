@@ -33,6 +33,15 @@ pub struct Report {
     pub window_seconds: f64,
     pub source: &'static str,
     pub dropped_packets: u64,
+    /// Kernel-side drops the mmap ring readers' `MON_IOCG_STATS` reported
+    /// (see `usbmon::mmap_ring::MmapReader` and
+    /// `usbmon::monitor::MonitorHandle::kernel_dropped`) — distinct from
+    /// [`Self::dropped_packets`] (a full channel, after the kernel already
+    /// delivered the packet). Always 0 on a session not using the mmap
+    /// interface; [`build_report`] leaves it at 0, and [`run`] fills it in
+    /// from the live counter afterward, since it is not part of the
+    /// manager/baseline state `build_report` otherwise diffs.
+    pub kernel_dropped_packets: u64,
     pub total_rx_bps: f64,
     pub total_tx_bps: f64,
     pub buses: Vec<BusReport>,
@@ -269,6 +278,9 @@ pub fn build_report(
         window_seconds: window_secs,
         source,
         dropped_packets: dropped,
+        // Filled in by `run` after this call, from the live kernel-drop
+        // counter -- see the field's own doc comment.
+        kernel_dropped_packets: 0,
         total_rx_bps,
         total_tx_bps,
         buses: bus_reports,
@@ -292,8 +304,12 @@ fn to_mbps(bytes_per_second: f64) -> f64 {
 pub fn render_text(report: &Report) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "ts={:.3} window={:.2}s source={} dropped={}\n",
-        report.timestamp, report.window_seconds, report.source, report.dropped_packets
+        "ts={:.3} window={:.2}s source={} dropped={} kdropped={}\n",
+        report.timestamp,
+        report.window_seconds,
+        report.source,
+        report.dropped_packets,
+        report.kernel_dropped_packets
     ));
     for bus in &report.buses {
         out.push_str(&format!(
@@ -375,6 +391,7 @@ pub fn run(
     mut manager: DeviceManager,
     packets: Receiver<UsbPacket>,
     dropped: Arc<AtomicU64>,
+    kernel_dropped: Arc<AtomicU64>,
     text_active: Arc<AtomicBool>,
     filter: FilterSet,
     opts: HeadlessOptions,
@@ -413,7 +430,7 @@ pub fn run(
         } else {
             "binary"
         };
-        let report = build_report(
+        let mut report = build_report(
             &manager,
             &baseline,
             elapsed,
@@ -422,6 +439,10 @@ pub fn run(
             text_active.load(Ordering::Relaxed),
             &filter,
         );
+        // Not a `build_report` parameter (see the field's doc comment): the
+        // kernel-drop count is read straight from the live counter here,
+        // same source `dropped`/`text_active` load from just above.
+        report.kernel_dropped_packets = kernel_dropped.load(Ordering::Relaxed);
         if let Err(e) = emit(&report, opts.json) {
             if is_expected_write_failure(&e) {
                 return Ok(()); // broken pipe: the reader left, that is not our error
@@ -502,6 +523,7 @@ mod tests {
         let err = run(
             mgr,
             rx,
+            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicBool::new(false)),
             FilterSet::default(),
@@ -747,6 +769,34 @@ mod tests {
             snapshot_loaded_internal.buses[0].devices[0].internal,
             Some(true)
         );
+    }
+
+    /// `build_report` itself never learns about kernel-side drops -- that
+    /// wiring lives in `run`, which reads the live counter and fills the
+    /// field in afterward (see the field's doc comment) -- but `render_text`
+    /// must still surface whatever value the field ends up holding.
+    #[test]
+    fn render_text_includes_kernel_dropped_packets() {
+        let temp = tempfile::tempdir().unwrap();
+        let mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let baseline = Baseline::capture(&mgr);
+        let mut report = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        assert_eq!(
+            report.kernel_dropped_packets, 0,
+            "build_report has no kernel-drop input of its own to report from"
+        );
+
+        report.kernel_dropped_packets = 9;
+        let text = render_text(&report);
+        assert!(text.contains("kdropped=9"), "{text}");
     }
 
     #[test]
