@@ -209,4 +209,71 @@ device inventory, and pass criteria live in [TESTING.md](TESTING.md).
   open at this time.
 
 
+## USB troubleshooting and performance notes
+
+General Linux USB knowledge worth capturing, gathered from working with a
+USB3 Vision / UVC machine-vision camera (an Imaging Source 37UX273-ML).
+The kernel-buffer point below is directly relevant to usbtop-ng: a
+too-small usbfs buffer is exactly what makes a fast device drop frames,
+which is what the `kdropped:` counter now surfaces.
+
+### The usbfs buffer limit (the one that bites)
+
+The kernel caps the usbfs memory a userspace capture can pin at 16 MB
+across all USB devices by default. That is too small for a USB3 Vision
+camera at full rate, and the symptom is dropped frames. Raise it:
+
+```bash
+echo 1000 | sudo tee /sys/module/usbcore/parameters/usbfs_memory_mb   # test now
+```
+
+Make it permanent on the kernel command line with
+`usbcore.usbfs_memory_mb=1000` (`/boot/firmware/cmdline.txt` on a
+Raspberry Pi, `GRUB_CMDLINE_LINUX_DEFAULT` on x86). When usbtop-ng shows
+a rising `kdropped:` under a high-rate device, this limit is the first
+thing to check.
+
+### UVC versus USB3 Vision, and what you install
+
+A UVC-compliant camera is claimed by the in-kernel `uvcvideo` module with
+zero installation: it appears as `/dev/video0` on any current 64-bit
+Raspberry Pi OS or x86 distro, and `cv2.VideoCapture(0, cv2.CAP_V4L2)`
+works immediately. There is no out-of-tree module to build and no DKMS
+package for a modern UVC camera. What you install is userspace, and only
+because a feature like GenICam trigger mode is a camera-side property
+plain UVC cannot reach.
+
+Two userspace stacks for such a camera, pick one:
+
+- **tiscamera** (the vendor Linux SDK): a GStreamer source plus a
+  properties tool and a capture GUI. Prebuilt packages for amd64 and
+  arm64. 32-bit ARM (armhf) is legacy and was dropped as of Ubuntu 24.04,
+  so use a 64-bit Raspberry Pi OS. The vendor has announced end-of-life
+  for tiscamera on 2029-04-01.
+- **IC4 SDK**: a GenTL producer (a `.deb`) plus Python bindings
+  (`pip install imagingcontrol4`), on Ubuntu 22.04+ x64 and ARM64. Its
+  GenTL producer talks to the camera over libusb rather than `uvcvideo`,
+  so the same Python code runs unchanged on a Pi and on x86.
+
+### udev rules for non-root access
+
+Both packages ship udev rules so the device is reachable without root.
+Confirm the rules actually landed after install, or you will be forced to
+run as root — the same non-root-access problem usbtop-ng itself documents
+for the usbmon interfaces.
+
+### Raspberry Pi bandwidth reality
+
+A 1440x1080 Mono8 stream at full rate is about 370 MB/s (roughly 3 Gbps).
+How that lands per board, useful context for the ARM board testing above:
+
+- **Pi 5**: USB 3.0 through the RP1 southbridge, the best option, should
+  sustain near full rate.
+- **Pi 4 / 400**: USB3 sits behind a VL805 on a single PCIe Gen2 lane
+  (about 4 Gbps shared across all ports). Workable, but keep other USB
+  traffic off it.
+- **Pi 3 / Zero**: USB 2.0 only, about 40 MB/s realistic (roughly 25 fps
+  at that resolution). Fine for triggered single-shot capture, not for a
+  camera's full high-frame-rate stream.
+
 ## Notes
