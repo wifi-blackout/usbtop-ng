@@ -188,10 +188,21 @@ pub fn chown_to_invoker(path: &Path) {
     if !is_within(&resolved_path, &home) {
         return;
     }
-    if let Err(e) = chown_path(path, invoker.uid, invoker.gid) {
+    // Chown the resolved path, not the original `path`: `chown_path` ->
+    // `libc::chown` follows symlinks and re-resolves every component at
+    // syscall time, so chowning the original text would let an attacker who
+    // controls a component under their own home swap it for a symlink
+    // between the check above and this call, landing the chown outside home
+    // -- the exact race the containment check exists to close.
+    // `resolved_path` has every ancestor already resolved to a real,
+    // symlink-free component (or, for a not-yet-created leaf, a real
+    // canonical parent plus the plain leaf name), so there is nothing left
+    // in it for `chown(2)` to re-resolve elsewhere: the check and the act
+    // now run on the same bytes.
+    if let Err(e) = chown_path(&resolved_path, invoker.uid, invoker.gid) {
         log::warn!(
             "could not set ownership of {} to uid {} gid {}: {e}",
-            path.display(),
+            resolved_path.display(),
             invoker.uid,
             invoker.gid
         );
@@ -425,7 +436,12 @@ mod tests {
         // inside home is actually a symlink to somewhere outside it (an
         // invoking user fully controls the contents of their own home), so
         // a path that is lexically nested under home resolves, on the real
-        // filesystem, to a location that is not.
+        // filesystem, to a location that is not. This is also the decision
+        // that gates `chown_to_invoker`'s call to `chown_path`: it resolves
+        // the path exactly this way, then returns before ever calling
+        // `chown_path` when `is_within` comes back false here -- so a
+        // `false` result below is "no chown attempted" for the real
+        // function, not just for this pure check in isolation.
         let temp = tempfile::tempdir().unwrap();
         let outside = temp.path().join("outside");
         fs::create_dir_all(&outside).unwrap();
@@ -439,7 +455,8 @@ mod tests {
         let resolved = resolve_for_containment_check(&file).unwrap();
         assert!(
             !is_within(&resolved, &home),
-            "a symlinked ancestor must resolve to its real target, escaping home"
+            "a symlinked ancestor must resolve to its real target, escaping home -- \
+             chown_to_invoker returns here without ever calling chown_path"
         );
     }
 
