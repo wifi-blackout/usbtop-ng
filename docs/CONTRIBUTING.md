@@ -65,7 +65,7 @@ pass, and how to send it.
    ```bash
    cargo test
    ```
-   The unit suite reports 423 passed; the `tests/` directory adds the
+   The unit suite reports 438 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 4. To run with debug output, use:
@@ -113,8 +113,9 @@ src/
 ├── usbmon/           # USB monitoring core
 │   ├── mod.rs        # Module detection, load/unload, setup instructions
 │   ├── monitor.rs    # Interface probe, reader threads, bounded channel
+│   ├── mmap_ring.rs  # Read loop over the usbmon binary interface's mmap ring
 │   ├── reader.rs     # Read loop over the usbmon Nu text interface
-│   ├── binary.rs     # Read loop over the usbmon /dev/usbmonN binary interface
+│   ├── binary.rs     # Read loop over the usbmon /dev/usbmonN binary interface via read()
 │   └── parser.rs     # Nu text-format parsing, UsbSpeed bandwidth/color tables
 ├── device/           # Device management
 │   ├── mod.rs        # Device structure, sysfs metadata, %busy, indicators
@@ -181,7 +182,7 @@ cargo test --all-targets
 ```
 
 `cargo test` and `cargo test --all-targets` run the same three suites, all
-hermetic. The unit suite reports 423 passed, working against
+hermetic. The unit suite reports 438 passed, working against
 fixture files, FIFOs, and `tempfile` paths, with no `/dev` and no debugfs
 access. The `tests/` directory adds two more: `restore_pipe.rs` (2 tests),
 proving the terminal-restore bytes reach a piped stdout while the process is
@@ -192,9 +193,11 @@ touches the real `~/.usbtop-ng` or usbmon. CI runs this suite and no other.
 
 ### Live system tests (the `integration` feature)
 
-The opt-in `integration` cargo feature adds 2 tests to the unit suite: one
+The opt-in `integration` cargo feature adds 3 tests to the unit suite: one
 that reads the real usbmon interfaces instead of fixtures, one that exercises
-the real `fchown(2)` call behind `sudo`'s ownership fix-up and needs real root.
+the real `fchown(2)` call behind `sudo`'s ownership fix-up and needs real root,
+and one that opens a real `/dev/usbmon0` and walks its mmap ring through the
+real `mmap`, `MON_IOCX_MFETCH`, and `MON_IOCG_STATS` syscalls.
 
 1. Confirm that usbmon is loaded and that you can read
    `/sys/kernel/debug/usb/usbmon`. Root access is the usual route.
@@ -202,8 +205,9 @@ the real `fchown(2)` call behind `sudo`'s ownership fix-up and needs real root.
    ```bash
    cargo test --features integration
    ```
-   The unit suite reports 425 passed. Without usbmon, or without root,
-   each of the two extra tests prints its own skip message and passes.
+   The unit suite reports 441 passed. Without usbmon, without root, or
+   without a mmap-capable `/dev/usbmon0`, each of the three extra tests
+   prints its own skip message and passes.
 
 The live test is gated on the feature, so it compiles to nothing on default
 builds. CI does not run this feature. It exists for manual checks on a real
@@ -270,7 +274,7 @@ Cover these areas first:
    ```bash
    cargo test --all-targets
    ```
-   The unit suite reports 423 passed; the `tests/` directory adds the
+   The unit suite reports 438 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 6. Update the documentation your change affects.
@@ -355,11 +359,11 @@ Include:
 ### Data flow
 
 ```
-/dev/usbmonN (binary, preferred) ─┐
-                                  ├─→ Reader thread → Parser → UsbPacket
-usbmon Nu file (text, fallback)  ─┘                              │
-                                                    bounded mpsc channel
-                                                                 ↓
+/dev/usbmonN mmap ring (binary, preferred) ─┐
+/dev/usbmonN via read() (binary, fallback) ─┼─→ Reader thread → Parser → UsbPacket
+usbmon Nu file (text, last resort)         ─┘                              │
+                                                              bounded mpsc channel
+                                                                           ↓
        UI thread ← DeviceManager (sysfs metadata, bandwidth stats, %busy,
                                   controller and port grouping)
 ```
@@ -373,8 +377,9 @@ known limitations.
    metadata under `src/device/`.
 2. **UI components**: new `draw_*` functions in `src/ui/mod.rs`, and colors in
    `src/ui/colors.rs`.
-3. **Packet analysis**: `src/usbmon/parser.rs` for the text interface, and
-   `src/usbmon/binary.rs` for the binary interface.
+3. **Packet analysis**: `src/usbmon/parser.rs` for the text interface,
+   `src/usbmon/binary.rs` for the binary interface via `read()`, and
+   `src/usbmon/mmap_ring.rs` for the binary interface via its mmap ring.
 4. **Statistics**: `src/stats/mod.rs`.
 
 ### Dependencies
@@ -386,7 +391,8 @@ known limitations.
   `~/.usbtop-ng/preferences.toml`.
 - `anyhow`, `log`, and `env_logger`: error handling and logging.
 - `libc`: `fcntl` for the non-blocking descriptor, `write(2)` for the frame
-  drain, and the `EIO` and `SIGHUP` constants.
+  drain, the `EIO` and `SIGHUP` constants, and `mmap`/`munmap`/`ioctl` for the
+  usbmon mmap ring reader.
 - `signal-hook`: the signal thread behind the terminal restore.
 
 ## Linux development
@@ -395,8 +401,9 @@ usbtop-ng builds on Linux only. `src/main.rs` carries a `compile_error!` for
 every other target, so a change never needs a second platform's arm.
 
 - Test against more than one kernel version.
-- Verify parsing on both interfaces: the binary `/dev/usbmonN` device, which
-  usbtop-ng prefers when it opens, and the debugfs `Nu` text fallback.
+- Verify parsing on every interface: the binary `/dev/usbmonN` device's mmap
+  ring, which usbtop-ng prefers when it is usable, the same device via
+  `read()` when the ring is not, and the debugfs `Nu` text fallback.
 - Check the debugfs mount requirements.
 - Test the permission cases, as root and as a plain user.
 

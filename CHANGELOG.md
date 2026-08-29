@@ -5,6 +5,13 @@ All notable changes to usbtop-ng are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- A usbmon mmap-ring reader, preferred when the kernel supports it: it reads event headers through `MON_IOCX_MFETCH` and never copies the captured payload. A bus that cannot use the ring falls back to the read()-based binary interface, then the debugfs text interface.
+- A kernel-side drop counter from `MON_IOCG_STATS`, shown as `kdropped: N` in the header when above zero and as `kernel_dropped_packets` in JSON reports.
+
 ## [1.4.1] - 2026-08-28
 
 ### Fixed

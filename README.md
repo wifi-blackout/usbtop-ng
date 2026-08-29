@@ -14,8 +14,8 @@ up-to-date with modern USB devices.
 Four blocks fill the window, top to bottom.
 
 1. **The header** carries the total bandwidth, the peak total, and the device
-   count. The drop counter and the shed counter join that line once either one
-   rises above zero.
+   count. The drop counter, the kernel-drop counter, and the shed counter join
+   that line once any one of them rises above zero.
 2. **The chart pane** plots the aggregate total over the last 60 seconds on the
    left. The selected device's rx and tx rates fill the right.
 3. **The device table** gives each device one line, grouped under its host
@@ -294,15 +294,20 @@ unchanged: it still resolves against `/root`.
 
 ### Reading usbmon
 
-- usbtop-ng prefers the binary interface, `/dev/usbmonN`. It reads the kernel's
-  48 byte native-endian event header and drains each event's captured payload
-  rather than keeping it.
-- One probe at startup opens the first target bus's binary node. A failure
-  selects the text interface, debugfs `Nu`, for every bus. One `info!` line
-  records the choice.
-- Each reader thread re-opens its own binary node before it starts reading. If
-  that open fails, the thread warns and reads that bus's text interface, so one
-  unreadable node costs one bus rather than the session.
+- usbtop-ng prefers the mmap ring: it maps `/dev/usbmonN`'s ring buffer
+  read-only and fetches batches of event offsets with `MON_IOCX_MFETCH`,
+  copying only each event's 48 byte header and never its captured payload.
+- A bus whose mmap ring is unusable (older kernel, mmap denied) falls back to
+  the read()-based binary interface, which reads the same 48 byte
+  native-endian event header but then drains each event's captured payload
+  rather than keeping it. A bus whose binary node will not open at all falls
+  back further, to the text interface, debugfs `Nu`.
+- One probe at startup checks the first target bus for mmap capability, then
+  for a binary node that opens. That choice applies to every target bus. One
+  `info!` line records it.
+- Each reader thread re-checks its own bus before it starts reading, and
+  degrades to the next interface down the chain on failure, so one bus's
+  unreadable or non-mmap-capable node costs one bus rather than the session.
 - Bus 0 is the kernel's aggregate interface. When it exists, a single reader
   covers every bus, so no traffic counts twice.
 - One thread reads each interface. Every thread opens its file with
@@ -311,6 +316,10 @@ unchanged: it still resolves against `/root`.
 - The readers hand packets to the UI thread over a channel bounded at 16384
   packets. A reader never parks on a full channel. A packet that does not fit
   raises the drop counter, and the header then shows `dropped: N`.
+- The mmap readers also read the kernel's own drop count (`MON_IOCG_STATS`)
+  when they stop, and add it to a separate counter the read() and text
+  readers never touch. The header shows `kdropped: N` once it rises above
+  zero, apart from the channel's `dropped: N`.
 - The event loop applies at most 8192 packets per pass. A pass that fills its
   batch comes straight back for the rest.
 - usbtop-ng closes the usbmon files before any unload, because an open file
@@ -397,16 +406,16 @@ unchanged: it still resolves against `/root`.
 
 ### Tests
 
-- `cargo test --all-targets` runs the hermetic unit suite (423 tests)
+- `cargo test --all-targets` runs the hermetic unit suite (438 tests)
   against fixture files, FIFOs, and temporary paths, needing no `/dev` and
   no debugfs access, plus two committed harnesses in `tests/`: a pipe-based
   regression guard for the terminal-restore bytes, and a PTY harness for
   the wedged-terminal checks (quit, `SIGHUP`, a terminal that stops
   reading). Both spawn the real binary; neither touches the real
   `~/.usbtop-ng` or usbmon.
-- The `integration` cargo feature adds 2 tests that need real root or a
-  real usbmon interface, each skipping gracefully without one. See
-  [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
+- The `integration` cargo feature adds 3 tests that need real root, a real
+  usbmon interface, or a real mmap-capable `/dev/usbmon0`, each skipping
+  gracefully without one. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
 
 ## Preferences file
 

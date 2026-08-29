@@ -24,11 +24,13 @@ single thread reads the aggregate `0u` and `/dev/usbmon0` interface. The
 threads hand parsed packets to the main thread over an `mpsc` channel. No async
 runtime is involved.
 
-`usbmon::monitor::start_monitoring` probes once per process whether it can open
-the binary interface. On success it uses the binary interface for every target
-bus. On failure it falls back to the text interface. Both readers produce the
-same `UsbPacket` type, so everything downstream of the channel treats the two
-interfaces alike.
+`usbmon::monitor::start_monitoring` probes once per process which interface it
+can use: the mmap ring first, then the read()-based binary interface, then the
+text interface. On success with the mmap ring, every target bus reads through
+it; on success with only the binary node, every target bus reads through that
+instead; otherwise every target bus falls back to text. All three readers
+produce the same `UsbPacket` type, so everything downstream of the channel
+treats them alike.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -69,19 +71,26 @@ interfaces alike.
 
 - `mod.rs`: usbmon detection, load and unload, and the printed setup
   instructions.
-- `monitor.rs`: probes for the binary interface and spawns the reader threads,
-  one per bus, or one for the aggregate interface. It owns the shutdown handle.
-  It exposes the bounded `mpsc` receiver and the shared drop counter. Each
-  thread's `run_source` re-checks its own binary node, and falls back to that
-  bus's text interface when it cannot open it.
+- `monitor.rs`: probes for the mmap ring, then the binary interface, and
+  spawns the reader threads, one per bus, or one for the aggregate interface.
+  It owns the shutdown handle. It exposes the bounded `mpsc` receiver, the
+  shared drop counter, and the shared kernel-drop counter. Each thread's
+  `run_source` re-checks its own bus, and falls back down the chain (mmap,
+  then binary, then text) when its preferred interface is not usable there.
+- `mmap_ring.rs`: the blocking read loop over the binary interface's mmap
+  ring. `mmap`s `/dev/usbmonN` read-only and fetches batches of event offsets
+  with `MON_IOCX_MFETCH`. It copies only the 48 byte header at each offset and
+  never reads the captured payload. On stop it reads `MON_IOCG_STATS` once and
+  adds the kernel-side drop count to the shared kernel-drop counter. It honors
+  the same `O_NONBLOCK`, poll, and shutdown contract as `reader.rs`.
 - `reader.rs`: the blocking read loop over the text interface. The file opens
   `O_NONBLOCK` and polls, so a shutdown request lands promptly.
-- `binary.rs`: the blocking read loop over the binary interface. Each event is
-  a fixed 48 byte native-endian header, per `Documentation/usb/usbmon.rst`,
-  followed by `len_cap` bytes of captured payload. The reader drains that
-  payload rather than keeping it, because the next header starts right after
-  it. It honors the same `O_NONBLOCK`, poll, and shutdown contract as
-  `reader.rs`.
+- `binary.rs`: the blocking read loop over the binary interface via `read(2)`,
+  the fallback when the mmap ring is not usable. Each event is a fixed 48 byte
+  native-endian header, per `Documentation/usb/usbmon.rst`, followed by
+  `len_cap` bytes of captured payload. The reader drains that payload rather
+  than keeping it, because the next header starts right after it. It honors
+  the same `O_NONBLOCK`, poll, and shutdown contract as `reader.rs`.
 - `parser.rs`: parses the text interface's `Nu` lines into `UsbPacket`s. It
   also holds `UsbSpeed`'s practical-bandwidth and color tables.
 
@@ -156,7 +165,8 @@ impl UsbmonReader {
     where F: FnMut(UsbPacket) -> Result<()>;
 }
 
-// Binary interface (see src/usbmon/binary.rs). Same shape, same contract.
+// Binary interface via read() (see src/usbmon/binary.rs). Same shape, same
+// contract, and the fallback when the mmap ring below is not usable.
 pub struct BinaryReader {
     pub bus_id: u8,
     pub path: PathBuf,
@@ -167,6 +177,25 @@ impl BinaryReader {
     pub fn read_packets<F>(&self, shutdown: &AtomicBool, callback: F) -> Result<()>
     where F: FnMut(UsbPacket) -> Result<()>;
 }
+
+// Binary interface via its mmap ring (see src/usbmon/mmap_ring.rs), the
+// preferred source. Same shape, plus the shared kernel-drop counter this
+// reader alone can feed from MON_IOCG_STATS.
+pub struct MmapReader {
+    pub bus_id: u8,
+    pub path: PathBuf,
+    follow: bool,
+}
+
+impl MmapReader {
+    pub fn read_packets<F>(
+        &self,
+        shutdown: &AtomicBool,
+        kernel_dropped: &AtomicU64,
+        callback: F,
+    ) -> Result<()>
+    where F: FnMut(UsbPacket) -> Result<()>;
+}
 ```
 
 **Design decisions:**
@@ -175,26 +204,34 @@ impl BinaryReader {
   `usbmon::monitor`, so a blocked or idle interface never blocks the UI thread.
 - The callback interface keeps packet handling flexible. The production
   callback forwards each `UsbPacket` over an `mpsc` channel.
-- Both usbmon interfaces produce the same `UsbPacket` type.
-  `monitor::start_monitoring` probes once per process by opening the first
-  target bus's binary node, `/dev/usbmon<bus>`. Success means every target bus
-  is read through `BinaryReader`. Failure, from a missing node, from
-  permissions, or from an older kernel, falls back to `UsbmonReader` over the
-  text interface for every target bus. One `info!` line states the choice.
+- All three usbmon readers produce the same `UsbPacket` type.
+  `monitor::start_monitoring` probes once per process against the first
+  target bus: `/dev/usbmon<bus>` mmap-capable, then `/dev/usbmon<bus>`
+  openable, then neither. The first case reads every target bus through
+  `MmapReader`, the second through `BinaryReader`, the third through
+  `UsbmonReader` over the text interface. One `info!` line states the choice.
 - That process-wide choice is a starting point rather than a promise. Each
-  reader thread re-opens its own binary node before it enters the read
-  loop. If that open fails, the thread warns and reads this bus's text
-  interface instead. One bus with a missing or unreadable binary node therefore
-  degrades to text rather than going dark.
-- Both readers open their file `O_NONBLOCK` and poll every 50 milliseconds, so
-  `shutdown` is observed within one poll instead of parking inside `read()`.
+  reader thread re-checks its own bus before it enters the read loop, and
+  degrades to the next interface down the chain (mmap, then binary, then
+  text) when the one it was given is not usable there. One bus with a
+  missing, unreadable, or non-mmap-capable node therefore degrades rather
+  than going dark.
+- All three readers open their file `O_NONBLOCK` and poll every 50
+  milliseconds, so `shutdown` is observed within one poll instead of parking
+  inside `read()` or `MON_IOCX_MFETCH`.
+- `MmapReader` never reads the captured payload at all: it copies only the
+  48 byte header at each fetched ring offset. `BinaryReader` reads that same
+  header via `read(2)` and then drains the payload in chunks to stay framed
+  for the next header, real work spent on bytes the caller never wants. Both
+  call the same `parse_binary_header`, so they stay byte-for-byte consistent
+  in what they extract from an event.
 
 **Packet flow:**
 
 ```
-/dev/usbmonN (binary, preferred) ─┐
-                                  ├─→ Reader thread → UsbPacket
-usbmon Nu file (text, fallback)  ─┘         → bounded channel → DeviceManager
+/dev/usbmonN mmap ring (binary, preferred) ─┐
+/dev/usbmonN via read() (binary, fallback) ─┼─→ Reader thread → UsbPacket
+usbmon Nu file (text, last resort)         ─┘      → bounded channel → DeviceManager
 ```
 
 **Backpressure:** the channel is a `sync_channel(16_384)`, and readers hand
@@ -203,7 +240,11 @@ parked reader still holds its usbmon file open, which is exactly what
 `MonitorHandle::stop()` exists to prevent before `modprobe -r usbmon` runs. A
 packet that does not fit is discarded and counted in the `Arc<AtomicU64>` the
 handle exposes as `dropped`. The UI reads that counter and appends `dropped: N`
-to the header once it is non-zero, so lost samples stay visible.
+to the header once it is non-zero, so lost samples stay visible. A separate
+`Arc<AtomicU64>`, `kernel_dropped`, counts a different loss: packets the
+kernel's usbmon ring itself dropped before any reader saw them, reported
+through `MON_IOCG_STATS` and fed only by `MmapReader`. The header shows
+`kdropped: N` for it, apart from `dropped: N`.
 
 ### Device manager module
 
@@ -638,12 +679,15 @@ graph:
 ### Primary data flow
 
 ```
-1. USB activity → usbmon kernel interface: /dev/usbmonN (binary, preferred)
-   or the debugfs `Nu` text file (fallback), chosen once by
-   monitor::start_monitoring's open probe
-2. Reader thread → BinaryReader::read_packets() or UsbmonReader::read_packets()
-   (blocking loop over a non-blocking file, same shutdown contract either way)
-3. Raw bytes or text → UsbPacket parsing (usbmon/binary.rs or usbmon/parser.rs)
+1. USB activity → usbmon kernel interface: /dev/usbmonN's mmap ring (binary,
+   preferred), /dev/usbmonN via read() (binary, fallback), or the debugfs
+   `Nu` text file (last resort), chosen once by monitor::start_monitoring's
+   probe
+2. Reader thread → MmapReader::read_packets(), BinaryReader::read_packets(),
+   or UsbmonReader::read_packets() (blocking loop over a non-blocking file
+   or mmap'd ring, same shutdown contract across all three)
+3. Ring offsets, raw bytes, or text → UsbPacket parsing (usbmon/mmap_ring.rs,
+   usbmon/binary.rs, or usbmon/parser.rs)
 4. UsbPacket → sent over an mpsc channel to the UI thread
 5. UI thread → DeviceManager::apply_packet() aggregates into BandwidthStats,
    resolving new devices' metadata from sysfs by busnum and devnum
@@ -725,9 +769,10 @@ loop {
   disconnect, and a bus with no devices left is dropped with them.
 - **No packet retention.** A `UsbPacket` is parsed per event, moved through the
   bounded channel, folded into `BandwidthStats` by `apply_packet`, and dropped.
-  Nothing accumulates per packet. The binary reader drains each event's
-  captured payload rather than keeping it. The sliding window holds 250
-  millisecond buckets rather than one entry per URB.
+  Nothing accumulates per packet. The mmap reader never reads a captured
+  payload; the read()-based binary reader, its fallback, drains it rather than
+  keeping it. The sliding window holds 250 millisecond buckets rather than one
+  entry per URB.
 - **Per-device metadata.** Vendor, product, and serial are plain owned
   `Option<String>` fields on `UsbDevice`, with no interning and no shared
   table. usbtop-ng reads them from sysfs when it first sees the device. It
@@ -770,8 +815,11 @@ fn get_usbmon_path(bus_id: u8) -> PathBuf {
    adjustment, whatever the packet rate.
 3. **Bounded collections.** The channel holds 16384 packets, and one pass
    applies at most 8192 of them. Both 60 second histories evict by age.
-4. **Payload discarded, not copied.** The binary reader drains each event's
-   captured bytes rather than carrying them into a `UsbPacket`.
+4. **Payload never copied, or discarded promptly.** The mmap reader, the
+   preferred path, never reads a captured payload at all: it copies only the
+   48 byte header at each ring offset. The read()-based binary reader, its
+   fallback, drains each event's captured bytes rather than carrying them
+   into a `UsbPacket`.
 5. **Metadata read once.** usbtop-ng reads a device's sysfs metadata when it
    first sees the device, and retries only while the path is unresolved.
 6. **Dirty-gated drawing.** An idle session repaints once per refresh interval,
@@ -811,9 +859,13 @@ usbtop-ng needs elevated privileges to read usbmon.
    `setuid` nor `setgid`. It runs `sudo modprobe` and `sudo mount` as child
    processes, and it prints the command it wants to run before it asks.
 2. **Parsing that rejects rather than guesses.** A malformed text line returns
-   an error, which the reader logs and skips. The binary reader reads a fixed
-   48 byte header and drains exactly `len_cap` bytes. A truncated capture ends
-   the loop instead of desynchronizing it.
+   an error, which the reader logs and skips. The read()-based binary reader
+   reads a fixed 48 byte header and drains exactly `len_cap` bytes. A
+   truncated capture ends the loop instead of desynchronizing it. The mmap
+   reader bounds-checks every fetched offset against the mapped ring's length
+   before it copies a header, and skips a bad offset rather than reading past
+   the mapping; the mapping itself is `PROT_READ`, so the process can never
+   write it.
 3. **Preferences parsed through `toml` and `serde`.** A file that does not
    parse aborts startup with a message naming the path.
 4. **Directory permissions.** usbtop-ng creates its own `~/.usbtop-ng` with
@@ -877,8 +929,8 @@ to Debug. Every log line goes to stderr.
 
 ### Adding a packet source
 
-1. Follow the `UsbmonReader` and `BinaryReader` shape: a `new(bus_id)`
-   constructor, a `with_path` test seam, and `read_packets`.
+1. Follow the `UsbmonReader`, `BinaryReader`, and `MmapReader` shape: a
+   `new(bus_id)` constructor, a `with_path` test seam, and `read_packets`.
 2. Poll `shutdown` at least once per `POLL_INTERVAL`, so `MonitorHandle::stop`
    returns promptly.
 3. Send through `try_send` and count a full channel rather than parking.

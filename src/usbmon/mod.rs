@@ -7,6 +7,7 @@ use std::process::Command;
 use std::time::Duration;
 
 pub mod binary;
+pub mod mmap_ring;
 pub mod monitor;
 pub mod parser;
 pub mod reader;
