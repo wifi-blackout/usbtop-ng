@@ -75,14 +75,20 @@ treats them alike.
   spawns the reader threads, one per bus, or one for the aggregate interface.
   It owns the shutdown handle. It exposes the bounded `mpsc` receiver, the
   shared drop counter, and the shared kernel-drop counter. Each thread's
-  `run_source` re-checks its own bus, and falls back down the chain (mmap,
-  then binary, then text) when its preferred interface is not usable there.
+  `run_source` re-checks its own bus before it starts reading, and falls
+  back down the chain (mmap, then binary, then text) both then and if the
+  interface it settled on fails once it is actually running, one step at a
+  time, unless shutdown was requested (a running reader's `Err` might just
+  be the close race of the file disappearing as it stops).
 - `mmap_ring.rs`: the blocking read loop over the binary interface's mmap
   ring. `mmap`s `/dev/usbmonN` read-only and fetches batches of event offsets
   with `MON_IOCX_MFETCH`. It copies only the 48 byte header at each offset and
-  never reads the captured payload. On stop it reads `MON_IOCG_STATS` once and
-  adds the kernel-side drop count to the shared kernel-drop counter. It honors
-  the same `O_NONBLOCK`, poll, and shutdown contract as `reader.rs`.
+  never reads the captured payload. It reads `MON_IOCG_STATS` periodically
+  while the loop runs (at most once per 50ms poll interval) and once more at
+  exit, adding the kernel-side drop count to the shared kernel-drop counter
+  each time. It honors the same `O_NONBLOCK`, poll, and shutdown contract as
+  `reader.rs`, and returns `Err` on a setup failure or a fatal
+  `MON_IOCX_MFETCH` error so the monitor can fall back instead of going dark.
 - `reader.rs`: the blocking read loop over the text interface. The file opens
   `O_NONBLOCK` and polls, so a shutdown request lands promptly.
 - `binary.rs`: the blocking read loop over the binary interface via `read(2)`,
@@ -213,9 +219,11 @@ impl MmapReader {
 - That process-wide choice is a starting point rather than a promise. Each
   reader thread re-checks its own bus before it enters the read loop, and
   degrades to the next interface down the chain (mmap, then binary, then
-  text) when the one it was given is not usable there. One bus with a
-  missing, unreadable, or non-mmap-capable node therefore degrades rather
-  than going dark.
+  text) when the one it was given is not usable there. The same chain
+  applies again if `read_packets` itself returns `Err` once the loop is
+  actually running, as long as shutdown was not requested. One bus with a
+  missing, unreadable, or non-mmap-capable node — or one whose capture fails
+  mid-session — therefore degrades rather than going dark.
 - All three readers open their file `O_NONBLOCK` and poll every 50
   milliseconds, so `shutdown` is observed within one poll instead of parking
   inside `read()` or `MON_IOCX_MFETCH`.
