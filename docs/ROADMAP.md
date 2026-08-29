@@ -108,9 +108,34 @@ Design notes:
 - Costs: libbpf-rs and libbpf-sys dependencies (libelf, zlib), a clang BPF
   toolchain at build time, kernel BTF at runtime, and CI that cannot attach
   kprobes unprivileged.
-- A cheaper middle path exists inside usbmon: the mmap ring with
-  MON_IOCX_MFETCH batch header fetches. It would end the payload copies the
-  binary reader makes and discards today, 39 MB over the 6-second stream.
+
+### The mmap middle path: shipped
+
+The cheaper middle path floated above shipped on 2026-08-28. `MmapReader`
+(`src/usbmon/mmap_ring.rs`) reads the usbmon binary interface through its
+mmap ring and `MON_IOCX_MFETCH`, copying only the 48-byte event header per
+packet and never the captured payload. `start_monitoring` prefers it on
+any kernel that supports it, falling back per bus to the read()-based
+binary reader, then the debugfs text reader, logging which interface it
+chose.
+
+Measured on this host over one ~4-second camera stream, 2,500 events: the
+read()-based reader drained and discarded 81,942,719 bytes (81.9 MB) of
+payload it never used; the mmap reader copied 0 payload bytes, headers
+only. Both readers selected correctly at startup and attributed the
+traffic identically.
+
+That changes the eBPF go/no-go. The mmap path already captured the
+throughput win the middle path above targeted, with no new dependencies.
+eBPF's one remaining unique advantage over usbmon (mmap included) is
+per-process attribution: `usb_submit_urb` has task context, at least some of
+the time (see the trap above), and usbmon never records one at all. So eBPF
+is no longer gated on performance; it is gated on whether that attribution
+is worth its cost — the libbpf-rs and libbpf-sys dependencies, the clang
+BPF toolchain, the kernel BTF requirement, and the unprivileged-CI gap
+listed above. That cost is pre-approved for a later wave, behind an
+optional cargo feature, if and when per-process attribution earns its
+place.
 
 ## Engineering follow-ups
 

@@ -13,16 +13,18 @@ anything, so both are safe inside a script or a cron job.
 2. usbtop-ng samples a 5 second window (see [Window length](#window-length)),
    then prints one report to stdout and exits 0:
    ```
-   ts=1787199783.511 window=5.00s source=binary dropped=0
+   ts=1787199783.511 window=5.00s source=binary dropped=0 kdropped=0
    bus 1 (480 Mbps) rx 0.00 MB/s tx 0.00 MB/s
      1:1     1d6b:0002  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  Linux 7.0.0-29-generic xhci-hcd xHCI Host Controller
      1:3     05e3:0610  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  GenesysLogic USB2.1 Hub
      1:4  i  04f2:b71a  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  SunplusIT Inc HD Webcam
    ```
-   The first line carries the window's timestamp, length, packet source, and
-   drop count. One bus header follows per bus, then one indented row per
-   device: `bus:address`, a 1-wide origin cell (`i` when the device matches
-   an internal-device snapshot, blank otherwise — see
+   The first line carries the window's timestamp, length, packet source, the
+   channel drop count, and the kernel-side ring drop count (`kdropped`,
+   nonzero only when the mmap ring reader dropped packets). One bus header
+   follows per bus, then one indented row per device: `bus:address`, a
+   1-wide origin cell (`i` when the device matches an internal-device
+   snapshot, blank otherwise — see
    [The `internal` field](#the-internal-field)), `vendor_id:product_id`, link
    speed, rx and tx rate, and the vendor/product string. This capture ran on
    an idle bus, hence the all-zero rates; a device moving data reports its
@@ -71,6 +73,7 @@ Report, the top-level document:
 | `window_seconds` | f64 | the sample window's length, seconds |
 | `source` | string | `"binary"` or `"text"`, the usbmon interface read |
 | `dropped_packets` | u64 | packets lost to a full channel this session |
+| `kernel_dropped_packets` | u64 | packets the kernel's usbmon ring dropped before a reader saw them, from `MON_IOCG_STATS`; always 0 unless the mmap ring reader is in use |
 | `total_rx_bps` | f64 | sum of every bus's `rx_bps` |
 | `total_tx_bps` | f64 | sum of every bus's `tx_bps` |
 | `buses` | array | one entry per bus, sorted by bus number |
@@ -134,6 +137,7 @@ readability. `--once --json` prints each report as a single compact line:
   "window_seconds": 1.0,
   "source": "binary",
   "dropped_packets": 0,
+  "kernel_dropped_packets": 0,
   "total_rx_bps": 20480.0,
   "total_tx_bps": 0.0,
   "buses": [
