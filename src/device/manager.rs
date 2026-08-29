@@ -7,7 +7,7 @@ use crate::device::UsbDevice;
 use crate::filter::FilterSet;
 use crate::snapshot::Snapshot;
 use crate::usbids::UsbIds;
-use crate::usbmon::parser::{UrbType, UsbPacket, UsbSpeed};
+use crate::usbmon::parser::{TransferType, UrbType, UsbPacket, UsbSpeed};
 
 #[derive(Debug, Clone)]
 pub struct UsbBus {
@@ -85,6 +85,24 @@ impl UsbBus {
             .sum();
         Some((total_usage / max_bandwidth * 100.0).min(100.0))
     }
+}
+
+/// One backend-neutral traffic event: `bytes` moved on `device_id`'s
+/// `endpoint`, in the direction `dir_in` says, over `transfer_type` (or
+/// `None` when the source could not identify the type — usbmon's edge
+/// case; a future eBPF source always supplies `Some`). `apply_packet`
+/// builds one of these per callback carrying data; a future eBPF source
+/// will build one per per-key cumulative delta since the last poll and
+/// feed it to `apply_delta` directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrafficDelta {
+    pub bus_id: u8,
+    pub device_id: u8,
+    pub endpoint: u8,
+    /// true = IN (device to host, rx); false = OUT (host to device, tx).
+    pub dir_in: bool,
+    pub transfer_type: Option<TransferType>,
+    pub bytes: u64,
 }
 
 #[derive(Debug)]
@@ -174,20 +192,19 @@ impl DeviceManager {
         }
     }
 
-    /// Route one parsed usbmon event into per-device stats.
-    /// Only callbacks carry the actual transferred length; submissions would
-    /// double-count every URB.
-    pub fn apply_packet(&mut self, packet: &UsbPacket) {
+    /// Ensure `bus_id`/`device_id` has a row (create + populate sysfs
+    /// metadata + usb.ids overlay + internal-snapshot stamp on first sight)
+    /// and mark it seen. Shared by every path that observes a device,
+    /// whether or not it goes on to account any bytes: `apply_delta`'s
+    /// touch always precedes its filter check, so a filtered-out or
+    /// zero-byte delta still marks the device seen.
+    pub fn touch_device(&mut self, bus_id: u8, device_id: u8) -> &mut UsbDevice {
         let sysfs_base = self.sysfs_base.clone();
-        // `matches_packet` needs `&self.filter` while `device` below is
-        // borrowed from `self.buses`, so the handle is cloned up front —
-        // same pattern as `sysfs_base` just above.
-        let filter = self.filter.clone();
         let usbids = self.usbids.clone();
         let internal_snapshot = self.internal_snapshot.clone();
-        let bus = self.get_or_create_bus(packet.bus_id);
-        let device = bus.devices.entry(packet.device_id).or_insert_with(|| {
-            let mut d = UsbDevice::new(packet.bus_id, packet.device_id);
+        let bus = self.get_or_create_bus(bus_id);
+        let device = bus.devices.entry(device_id).or_insert_with(|| {
+            let mut d = UsbDevice::new(bus_id, device_id);
             d.populate_from_sysfs(sysfs_base.as_deref());
             if let Some(db) = &usbids {
                 d.apply_usbids(db);
@@ -196,25 +213,51 @@ impl DeviceManager {
             d
         });
         device.update_activity();
-        let counts = filter.matches_packet(packet, device);
-        if counts && packet.urb_type == UrbType::Callback && packet.data_length > 0 {
-            if packet.direction {
-                device
-                    .bandwidth_stats
-                    .update_rx(u64::from(packet.data_length));
+        device
+    }
+
+    /// Backend-neutral accounting entry point. Touches the device (see
+    /// `touch_device`), then, when the active filter matches this key and
+    /// `delta.bytes > 0`, adds `delta.bytes` to its rx (`dir_in`) or tx
+    /// stats and, when `delta.transfer_type` is `Some`, records it against
+    /// the endpoint. `apply_packet` is usbmon's adapter onto this; a future
+    /// eBPF source will call this directly with per-key cumulative deltas.
+    pub fn apply_delta(&mut self, delta: &TrafficDelta) {
+        // `matches_traffic` needs `&self.filter` while `device` below is
+        // borrowed from `self.buses`, so the handle is cloned up front —
+        // same pattern `touch_device` uses for its own cloned handles.
+        let filter = self.filter.clone();
+        let device = self.touch_device(delta.bus_id, delta.device_id);
+        let counts =
+            filter.matches_traffic(device, delta.endpoint, delta.dir_in, delta.transfer_type);
+        if counts && delta.bytes > 0 {
+            if delta.dir_in {
+                device.bandwidth_stats.update_rx(delta.bytes);
             } else {
-                device
-                    .bandwidth_stats
-                    .update_tx(u64::from(packet.data_length));
+                device.bandwidth_stats.update_tx(delta.bytes);
             }
-            if let Some(transfer_type) = packet.transfer_type {
-                device.record_endpoint(
-                    packet.endpoint,
-                    packet.direction,
-                    transfer_type,
-                    u64::from(packet.data_length),
-                );
+            if let Some(transfer_type) = delta.transfer_type {
+                device.record_endpoint(delta.endpoint, delta.dir_in, transfer_type, delta.bytes);
             }
+        }
+    }
+
+    /// Route one parsed usbmon event into per-device stats. Only callbacks
+    /// carry the actual transferred length; submissions would double-count
+    /// every URB, so anything else just touches the device (marks it seen)
+    /// with no accounting.
+    pub fn apply_packet(&mut self, packet: &UsbPacket) {
+        if packet.urb_type == UrbType::Callback && packet.data_length > 0 {
+            self.apply_delta(&TrafficDelta {
+                bus_id: packet.bus_id,
+                device_id: packet.device_id,
+                endpoint: packet.endpoint,
+                dir_in: packet.direction,
+                transfer_type: packet.transfer_type,
+                bytes: u64::from(packet.data_length),
+            });
+        } else {
+            self.touch_device(packet.bus_id, packet.device_id);
         }
     }
 
@@ -534,6 +577,80 @@ mod tests {
             "bulk bytes must not count under type=iso"
         );
         assert!(dev.endpoints.is_empty());
+    }
+
+    #[test]
+    fn apply_delta_accounts_rx_tx_and_endpoint_for_a_matching_some_type_delta() {
+        let (_t, mut mgr) = manager_with_empty_sysfs();
+        mgr.apply_delta(&TrafficDelta {
+            bus_id: 1,
+            device_id: 4,
+            endpoint: 2,
+            dir_in: true,
+            transfer_type: Some(TransferType::Bulk),
+            bytes: 256,
+        });
+        mgr.apply_delta(&TrafficDelta {
+            bus_id: 1,
+            device_id: 4,
+            endpoint: 3,
+            dir_in: false,
+            transfer_type: Some(TransferType::Interrupt),
+            bytes: 64,
+        });
+
+        let dev = &mgr.buses[&1].devices[&4];
+        assert_eq!(dev.bandwidth_stats.total_rx_bytes, 256);
+        assert_eq!(dev.bandwidth_stats.total_tx_bytes, 64);
+        let rx_ep = &dev.endpoints[&(2, true)];
+        assert_eq!(rx_ep.transfer_type, TransferType::Bulk);
+        assert_eq!(rx_ep.total_bytes, 256);
+        let tx_ep = &dev.endpoints[&(3, false)];
+        assert_eq!(tx_ep.transfer_type, TransferType::Interrupt);
+        assert_eq!(tx_ep.total_bytes, 64);
+    }
+
+    #[test]
+    fn apply_delta_touches_the_device_but_accounts_nothing_when_filtered_out() {
+        let (_t, mut mgr) = manager_with_empty_sysfs();
+        mgr.set_filter(FilterSet::parse(&["type=iso".into()]).unwrap());
+        mgr.apply_delta(&TrafficDelta {
+            bus_id: 1,
+            device_id: 4,
+            endpoint: 2,
+            dir_in: true,
+            transfer_type: Some(TransferType::Bulk),
+            bytes: 256,
+        });
+
+        assert!(
+            mgr.buses[&1].devices.contains_key(&4),
+            "the device row exists (touched) even though the delta was filtered out"
+        );
+        let dev = &mgr.buses[&1].devices[&4];
+        assert_eq!(dev.bandwidth_stats.total_rx_bytes, 0);
+        assert_eq!(dev.bandwidth_stats.total_tx_bytes, 0);
+        assert!(dev.endpoints.is_empty());
+    }
+
+    #[test]
+    fn apply_delta_with_no_transfer_type_accounts_bytes_but_records_no_endpoint() {
+        let (_t, mut mgr) = manager_with_empty_sysfs();
+        mgr.apply_delta(&TrafficDelta {
+            bus_id: 1,
+            device_id: 4,
+            endpoint: 2,
+            dir_in: true,
+            transfer_type: None,
+            bytes: 256,
+        });
+
+        let dev = &mgr.buses[&1].devices[&4];
+        assert_eq!(dev.bandwidth_stats.total_rx_bytes, 256);
+        assert!(
+            dev.endpoints.is_empty(),
+            "an unrecognized transfer type still accounts rx/tx but records no endpoint"
+        );
     }
 
     #[test]

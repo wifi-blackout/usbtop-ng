@@ -65,7 +65,7 @@ pass, and how to send it.
    ```bash
    cargo test
    ```
-   The unit suite reports 445 passed; the `tests/` directory adds the
+   The unit suite reports 449 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 4. To run with debug output, use:
@@ -182,7 +182,7 @@ cargo test --all-targets
 ```
 
 `cargo test` and `cargo test --all-targets` run the same three suites, all
-hermetic. The unit suite reports 445 passed, working against
+hermetic. The unit suite reports 449 passed, working against
 fixture files, FIFOs, and `tempfile` paths, with no `/dev` and no debugfs
 access. The `tests/` directory adds two more: `restore_pipe.rs` (2 tests),
 proving the terminal-restore bytes reach a piped stdout while the process is
@@ -207,7 +207,7 @@ only after it stops.
    ```bash
    cargo test --features integration
    ```
-   The unit suite reports 449 passed. Without usbmon, without root, or
+   The unit suite reports 453 passed. Without usbmon, without root, or
    without a mmap-capable `/dev/usbmon0`, each of the four extra tests
    prints its own skip message and passes.
 
@@ -276,7 +276,7 @@ Cover these areas first:
    ```bash
    cargo test --all-targets
    ```
-   The unit suite reports 445 passed; the `tests/` directory adds the
+   The unit suite reports 449 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 6. Update the documentation your change affects.

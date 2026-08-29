@@ -93,11 +93,15 @@ Design notes:
   text. Any BTF, attach, or lockdown failure degrades to the next source.
   Kprobe attach points are not a stable kernel interface, so eBPF ships
   as an explicit opt-in first, not the automatic default.
-- Aggregated maps do not fit the per-packet `PacketSource` contract. The
-  backend needs a delta seam: capture backends emit (key, bytes) updates,
-  the manager accounts them, and `apply_packet` becomes the usbmon
-  adapter. Monotonic per-CPU counters diffed against snapshots, never
-  read-and-clear.
+- Aggregated maps do not fit the per-packet `PacketSource` contract, so
+  the backend needs a delta seam. That seam SHIPPED on 2026-08-29: the
+  manager accounts backend-neutral `TrafficDelta { bus, dev, endpoint,
+  dir, transfer type, bytes }` values through `apply_delta`, and the
+  usbmon packet path is a thin adapter over it. The eBPF source will read
+  its kernel map (monotonic per-CPU counters diffed against snapshots,
+  never read-and-clear) and feed `apply_delta` directly. Building it needs
+  clang installed for the CO-RE object; the first backend is throughput-
+  only, with per-process attribution deferred to separate research below.
 - Headline feature: per-process attribution, as separate research first.
   `usb_submit_urb` often has task context, but not always, and usbmon
   never records it. The prototype also showed the trap:

@@ -407,7 +407,7 @@ unchanged: it still resolves against `/root`.
 
 ### Tests
 
-- `cargo test --all-targets` runs the hermetic unit suite (445 tests)
+- `cargo test --all-targets` runs the hermetic unit suite (449 tests)
   against fixture files, FIFOs, and temporary paths, needing no `/dev` and
   no debugfs access, plus two committed harnesses in `tests/`: a pipe-based
   regression guard for the terminal-restore bytes, and a PTY harness for
