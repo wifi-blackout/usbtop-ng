@@ -22,6 +22,7 @@ use std::mem::size_of;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use log::{debug, error};
@@ -377,6 +378,23 @@ fn stats(fd: RawFd) -> io::Result<MonBinStats> {
     Ok(stats)
 }
 
+/// Folds `MON_IOCG_STATS`'s cumulative `dropped` count into `counter` and
+/// returns the value to track as `last` going forward.
+///
+/// `dropped` only ever grows (until it wraps at `u32::MAX`, kernel-side), so
+/// `current - last` is exactly what changed since the previous publish; a
+/// `wrapping_sub` gets that right across one wrap too. Each caller — one per
+/// bus, since every [`MmapReader`] tracks its own `last` — folds its own
+/// delta into the same shared `counter` this way, so multiple readers sum
+/// correctly into it without double-counting each other's traffic.
+fn publish_kernel_drops(counter: &AtomicU64, last: u32, current: u32) -> u32 {
+    let delta = current.wrapping_sub(last);
+    if delta != 0 {
+        counter.fetch_add(u64::from(delta), Ordering::Relaxed);
+    }
+    current
+}
+
 /// Park for one poll interval unless shutdown was requested. Returns `false`
 /// when the caller should stop instead of retrying.
 ///
@@ -453,13 +471,17 @@ impl MmapReader {
     /// a dedicated thread.
     ///
     /// `shutdown` is polled whenever a fetch comes back empty, so a caller can
-    /// stop the loop within one [`POLL_INTERVAL`] and join the thread. Once
-    /// the loop ends (for any reason) `MON_IOCG_STATS` is read once and its
-    /// `dropped` count is added to `kernel_dropped` — kernel-side drops the
-    /// `read()`-based reader has no way to see.
+    /// stop the loop within one [`POLL_INTERVAL`] and join the thread.
+    /// `MON_IOCG_STATS` is read periodically while the loop runs (at most
+    /// once per [`POLL_INTERVAL`], via [`publish_kernel_drops`]) and once
+    /// more at loop exit, so `kernel_dropped` — kernel-side drops the
+    /// `read()`-based reader has no way to see — is live during a session,
+    /// not just after `stop()`.
     ///
     /// A callback `Err` stops the loop early and still returns `Ok(())`,
-    /// matching `BinaryReader`.
+    /// matching `BinaryReader`. A fatal `MON_IOCX_MFETCH` error, like a setup
+    /// failure (open/`MON_IOCQ_RING_SIZE`/`mmap`), returns `Err` instead, so
+    /// a caller can tell a real capture failure from a clean shutdown.
     pub fn read_packets<F>(
         &self,
         shutdown: &AtomicBool,
@@ -492,10 +514,30 @@ impl MmapReader {
 
         let mut offsets = [0u32; OFFSETS_CAP];
         let mut nflush = 0u32;
+        let mut last_dropped = 0u32;
+        let mut last_stats_at = Instant::now();
+        let mut fatal_fetch_error: Option<anyhow::Error> = None;
 
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 break;
+            }
+
+            // Bounded to at most once per `POLL_INTERVAL` regardless of fetch
+            // rate: reading stats on every `MON_IOCX_MFETCH` would double the
+            // ioctl rate on a busy bus for a counter nobody needs updated
+            // that often.
+            if last_stats_at.elapsed() >= POLL_INTERVAL {
+                last_stats_at = Instant::now();
+                match stats(fd) {
+                    Ok(s) => {
+                        last_dropped =
+                            publish_kernel_drops(kernel_dropped, last_dropped, s.dropped);
+                    }
+                    Err(e) => {
+                        debug!("MON_IOCG_STATS on {}: {}", self.path.display(), e);
+                    }
+                }
             }
 
             match mfetch(fd, &mut offsets, nflush) {
@@ -554,7 +596,15 @@ impl MmapReader {
                     // Same flush-before-fetch reasoning as the WouldBlock arm
                     // above: this call's `nflush` is already spent.
                     nflush = next_nflush(None);
-                    error!("MON_IOCX_MFETCH on {}: {}", self.path.display(), e);
+                    let err = anyhow!("MON_IOCX_MFETCH on {}: {}", self.path.display(), e);
+                    error!("{}", err);
+                    // Fatal: stop the loop and, once cleanup below has run,
+                    // report this as `Err` rather than falling through to
+                    // `Ok(())` — a mid-run fetch failure is a real capture
+                    // failure, not a clean shutdown, and the caller (the
+                    // fallback chain in `monitor::run_source_with_fallback`)
+                    // needs to be able to tell the two apart.
+                    fatal_fetch_error = Some(err);
                     break;
                 }
             }
@@ -574,15 +624,21 @@ impl MmapReader {
             }
         }
 
+        // One more publish at exit, so whatever changed since the last
+        // periodic read (or the only read, on a session shorter than one
+        // `POLL_INTERVAL`) is not lost.
         match stats(fd) {
             Ok(s) => {
-                kernel_dropped.fetch_add(u64::from(s.dropped), Ordering::Relaxed);
+                publish_kernel_drops(kernel_dropped, last_dropped, s.dropped);
             }
             Err(e) => {
                 debug!("MON_IOCG_STATS on {}: {}", self.path.display(), e);
             }
         }
 
+        if let Some(err) = fatal_fetch_error {
+            return Err(err);
+        }
         Ok(())
     }
 }
@@ -716,6 +772,72 @@ mod tests {
         );
     }
 
+    /// The four deltas the fix is built around: no change, a first count, an
+    /// unchanged repeat, and a further rise.
+    #[test]
+    fn publish_kernel_drops_accumulates_the_delta_since_the_last_publish() {
+        let counter = AtomicU64::new(0);
+
+        let last = publish_kernel_drops(&counter, 0, 0);
+        assert_eq!(last, 0);
+        assert_eq!(counter.load(Ordering::Relaxed), 0, "0 -> 0 adds nothing");
+
+        let last = publish_kernel_drops(&counter, last, 5);
+        assert_eq!(last, 5);
+        assert_eq!(counter.load(Ordering::Relaxed), 5, "0 -> 5 adds 5");
+
+        let last = publish_kernel_drops(&counter, last, 5);
+        assert_eq!(last, 5);
+        assert_eq!(counter.load(Ordering::Relaxed), 5, "5 -> 5 adds nothing");
+
+        let last = publish_kernel_drops(&counter, last, 9);
+        assert_eq!(last, 9);
+        assert_eq!(counter.load(Ordering::Relaxed), 9, "5 -> 9 adds 4");
+    }
+
+    /// Two independent per-bus readers, each tracking its own `last`, must
+    /// fold their deltas into one shared counter without double-counting or
+    /// clobbering each other's contribution.
+    #[test]
+    fn publish_kernel_drops_from_multiple_readers_sums_into_one_counter() {
+        let counter = AtomicU64::new(0);
+
+        let reader_a_last = publish_kernel_drops(&counter, 0, 3);
+        let reader_b_last = publish_kernel_drops(&counter, 0, 2);
+        assert_eq!(reader_a_last, 3);
+        assert_eq!(reader_b_last, 2);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            5,
+            "two readers' first publishes must sum, not overwrite"
+        );
+
+        let reader_a_last = publish_kernel_drops(&counter, reader_a_last, 3);
+        let reader_b_last = publish_kernel_drops(&counter, reader_b_last, 6);
+        assert_eq!(reader_a_last, 3, "unchanged current adds nothing");
+        assert_eq!(reader_b_last, 6);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            9,
+            "reader A contributes 0 more, reader B contributes 4 more"
+        );
+    }
+
+    /// `dropped` is a kernel `u32` that can wrap back through 0 on a long
+    /// enough session; `wrapping_sub` must compute the true distance instead
+    /// of underflowing into a huge, wrong delta.
+    #[test]
+    fn publish_kernel_drops_handles_the_kernel_counter_wrapping() {
+        let counter = AtomicU64::new(0);
+        let last = publish_kernel_drops(&counter, u32::MAX, 2);
+        assert_eq!(last, 2);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            3,
+            "u32::MAX -> 2 is 3 drops (MAX -> 0 -> 1 -> 2), not an underflowed huge delta"
+        );
+    }
+
     #[test]
     fn ioctl_numbers_match_the_verified_constants() {
         assert_eq!(MON_IOCQ_RING_SIZE, 0x9205);
@@ -830,5 +952,53 @@ mod integration_tests {
 
         // Readable, not necessarily nonzero: an idle host drops nothing.
         let _ = kernel_dropped.load(Ordering::Relaxed);
+    }
+
+    /// Requires: usbmon loaded, `/dev/usbmon0` openable (typically root).
+    /// Proves `kernel_dropped` is readable *while the reader thread is still
+    /// running*, i.e. that the periodic in-loop publish
+    /// (`publish_kernel_drops`, gated on `POLL_INTERVAL`) is actually wired
+    /// into the live loop rather than only the final publish at loop exit.
+    /// An idle host reports zero drops either way, so this does not prove a
+    /// nonzero value crossed the wire mid-run — only that the read happens,
+    /// and succeeds, before `stop()` is ever called, with the reader thread
+    /// confirmed still alive at that point.
+    /// Run: cargo test --features integration
+    #[test]
+    fn kernel_dropped_is_readable_while_the_reader_is_still_running() {
+        let path = Path::new("/dev/usbmon0");
+        if open_nonblocking(path).is_err() {
+            eprintln!("usbmon0 not openable; live mmap ring check skipped");
+            return;
+        }
+
+        if !MmapReader::probe(path) {
+            eprintln!("usbmon0 not mmap-capable; live mmap ring check skipped");
+            return;
+        }
+
+        let reader = MmapReader::with_path(0, path.to_path_buf(), true);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let kernel_dropped = Arc::new(AtomicU64::new(0));
+        let loop_shutdown = Arc::clone(&shutdown);
+        let loop_dropped = Arc::clone(&kernel_dropped);
+        let handle = std::thread::spawn(move || {
+            reader
+                .read_packets(&loop_shutdown, &loop_dropped, |_| Ok(()))
+                .expect("read_packets must not error against a live device")
+        });
+
+        // Several POLL_INTERVALs, so at least one periodic publish had the
+        // chance to run before this read — without ever requesting shutdown.
+        std::thread::sleep(POLL_INTERVAL * 3);
+        assert!(
+            !handle.is_finished(),
+            "the reader must still be running when kernel_dropped is read here, \
+             not have exited on its own"
+        );
+        let _ = kernel_dropped.load(Ordering::Relaxed);
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().expect("reader thread must not panic");
     }
 }
