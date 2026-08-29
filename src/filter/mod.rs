@@ -4,7 +4,9 @@
 use anyhow::{anyhow, Result};
 
 use crate::device::UsbDevice;
-use crate::usbmon::parser::{TransferType, UsbPacket};
+use crate::usbmon::parser::TransferType;
+#[cfg(test)]
+use crate::usbmon::parser::UsbPacket;
 
 /// One `--filter` argument, parsed. Every populated key must hold.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -103,14 +105,35 @@ impl FilterExpr {
             && self.internal.is_none_or(|want| want == device.is_internal)
     }
 
-    /// Every key: identity against the device, ep/dir/type against the packet.
-    fn matches_packet(&self, packet: &UsbPacket, device: &UsbDevice) -> bool {
+    /// Every key: identity against the device, ep/dir/type against the
+    /// backend-neutral traffic key.
+    fn matches_traffic(
+        &self,
+        device: &UsbDevice,
+        endpoint: u8,
+        dir_in: bool,
+        transfer_type: Option<TransferType>,
+    ) -> bool {
         self.matches_device(device)
-            && self.ep.is_none_or(|ep| ep == packet.endpoint)
-            && self.dir_in.is_none_or(|dir| dir == packet.direction)
-            && self
-                .transfer
-                .is_none_or(|t| packet.transfer_type == Some(t))
+            && self.ep.is_none_or(|ep| ep == endpoint)
+            && self.dir_in.is_none_or(|dir| dir == dir_in)
+            && self.transfer.is_none_or(|t| transfer_type == Some(t))
+    }
+
+    /// Every key: identity against the device, ep/dir/type against the
+    /// packet. Delegates to `matches_traffic`; kept only so the existing
+    /// filter tests, and a parity test against `matches_traffic`, still
+    /// exercise the packet-shaped call site directly. Production code
+    /// (`DeviceManager::apply_packet`) builds a `TrafficDelta` and calls
+    /// `matches_traffic` through `apply_delta` instead.
+    #[cfg(test)]
+    fn matches_packet(&self, packet: &UsbPacket, device: &UsbDevice) -> bool {
+        self.matches_traffic(
+            device,
+            packet.endpoint,
+            packet.direction,
+            packet.transfer_type,
+        )
     }
 }
 
@@ -161,8 +184,29 @@ impl FilterSet {
         self.exprs.is_empty() || self.exprs.iter().any(|e| e.matches_device(device))
     }
 
+    /// Delegates to `matches_traffic`; kept only for existing filter tests
+    /// and the packet/traffic parity test. See `FilterExpr::matches_packet`.
+    #[cfg(test)]
     pub fn matches_packet(&self, packet: &UsbPacket, device: &UsbDevice) -> bool {
         self.exprs.is_empty() || self.exprs.iter().any(|e| e.matches_packet(packet, device))
+    }
+
+    /// Every key: identity against the device, ep/dir/type against the
+    /// backend-neutral traffic key. `matches_packet` delegates here with a
+    /// usbmon packet's fields; `apply_delta` calls this directly with a
+    /// `TrafficDelta`'s.
+    pub fn matches_traffic(
+        &self,
+        device: &UsbDevice,
+        endpoint: u8,
+        dir_in: bool,
+        transfer_type: Option<TransferType>,
+    ) -> bool {
+        self.exprs.is_empty()
+            || self
+                .exprs
+                .iter()
+                .any(|e| e.matches_traffic(device, endpoint, dir_in, transfer_type))
     }
 
     /// True iff any expression in this set sets the `internal` key. Callers
@@ -313,5 +357,28 @@ mod tests {
             "second expression is bus=2, first needs iso in ep1"
         );
         assert!(set.matches_packet(&other_bus, &d2), "expressions OR");
+    }
+
+    #[test]
+    fn matches_packet_and_matches_traffic_agree_on_the_same_packets_fields() {
+        // matches_packet is a thin delegation onto matches_traffic; every
+        // combination that decides differently (matching, wrong ep/type,
+        // OR-across-expressions) must return the same verdict either way.
+        let set = FilterSet::parse(&["bus=1,ep=1,dir=in,type=iso".into(), "bus=2".into()]).unwrap();
+        let iso_in =
+            parse_usbmon_text_line("ffff0000aaaa0001 200 C Zi:1:004:1 0:1:6672:0 32 27000 =")
+                .unwrap();
+        let bulk_out = parse_usbmon_text_line("ffff0000aaaa0002 300 C Bo:1:004:2 0 512 >").unwrap();
+        let other_bus = parse_usbmon_text_line("ffff0000aaaa0003 400 C Bi:2:003:1 0 64 <").unwrap();
+        let d1 = device(1, 4, None, None);
+        let d2 = device(2, 3, None, None);
+
+        for (packet, dev) in [(&iso_in, &d1), (&bulk_out, &d1), (&other_bus, &d2)] {
+            assert_eq!(
+                set.matches_packet(packet, dev),
+                set.matches_traffic(dev, packet.endpoint, packet.direction, packet.transfer_type),
+                "matches_packet and matches_traffic disagreed for {packet:?}"
+            );
+        }
     }
 }
