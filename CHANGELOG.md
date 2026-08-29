@@ -5,6 +5,12 @@ All notable changes to usbtop-ng are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Internal: traffic accounting now runs on backend-neutral `(key, bytes)` deltas, and the usbmon packet path is an adapter over that. No user-visible change; it prepares the manager for a future eBPF backend.
+
 ## [1.5.0] - 2026-08-29
 
 ### Added
