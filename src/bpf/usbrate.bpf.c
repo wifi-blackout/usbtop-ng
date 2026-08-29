@@ -22,6 +22,9 @@ int BPF_KPROBE(on_giveback, struct urb *urb)
     __u8 ep = BPF_CORE_READ(urb, ep, desc.bEndpointAddress);
     unsigned int pipe = BPF_CORE_READ(urb, pipe);
     struct key_t k = {
+        /* busnum/devnum are kernel `int`s (see vmlinux.h): CO-RE reads the
+         * full 4 bytes, then this narrows the *value* into key_t's u16/u8 --
+         * endian-safe, unlike declaring the vmlinux.h fields narrow. */
         .busnum = BPF_CORE_READ(urb, dev, bus, busnum),
         .devnum = BPF_CORE_READ(urb, dev, devnum),
         .epnum  = (__u8)(ep & 0x0f),

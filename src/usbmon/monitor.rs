@@ -263,7 +263,16 @@ fn try_ebpf_capture() -> Option<(Receiver<TrafficDelta>, MonitorHandle)> {
         .name("usbmon-ebpf".to_string())
         .spawn(move || {
             source.run(&poller_shutdown, |delta| match tx.try_send(delta) {
-                Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+                Ok(()) => {}
+                // The receiver has been dropped -- nothing will ever consume
+                // another delta -- so ask the poll loop to stop now instead
+                // of spinning until `stop()`, matching how the packet readers'
+                // `send` closure in `run_source_chain` exits on disconnect.
+                // `run` only holds a shared `&` borrow of the same flag, so
+                // setting it here is sound.
+                Err(TrySendError::Disconnected(_)) => {
+                    poller_shutdown.store(true, Ordering::Relaxed);
+                }
                 // Same bargain as the packet readers' `send` closure in
                 // `run_source_chain`: a reader must never park on a full
                 // channel, so the delta is dropped and counted instead.

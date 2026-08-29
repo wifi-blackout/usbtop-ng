@@ -10,9 +10,17 @@
  * kernel produced it). It declares only the structs and fields the BPF
  * program actually reads. CO-RE (`BPF_CORE_READ` / `preserve_access_index`)
  * relocates every access against the *target* kernel's BTF at load time by
- * field name, not by the offsets implied here, so the field layout below
- * does not need to match the real kernel struct layout -- only the field
- * names and types need to match.
+ * field name, so the field *offsets* implied by the layout below need not
+ * match the real kernel struct layout.
+ *
+ * Each field's declared *width* still must, though: `BPF_CORE_READ` reads
+ * exactly `sizeof(the locally declared type)` bytes at the relocated offset.
+ * Declaring a field narrower than the kernel's real field (e.g. `__u16` for
+ * a kernel `int`) reads only its low bytes -- correct only by little-endian
+ * accident, wrong on a big-endian target. So `busnum`/`devnum` are `int`
+ * here because the kernel defines them as `int` (verified against this
+ * host's `/sys/kernel/btf/vmlinux`); the BPF program narrows the read *value*
+ * into `key_t`'s `__u16`/`__u8` fields afterward, which is endian-safe.
  */
 
 typedef signed char __s8;
@@ -129,12 +137,12 @@ struct usb_host_endpoint {
 };
 
 struct usb_bus {
-	__u16 busnum;
+	int busnum;
 };
 
 struct usb_device {
 	struct usb_bus *bus;
-	__u8 devnum;
+	int devnum;
 };
 
 struct urb {

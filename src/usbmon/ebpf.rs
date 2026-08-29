@@ -129,11 +129,13 @@ pub(crate) fn xfer_to_transfer_type(xfer: u8) -> Option<TransferType> {
 fn traffic_delta(key: Key, bytes: u64) -> TrafficDelta {
     TrafficDelta {
         // Every bus number this tool otherwise deals with is a `u8` (see
-        // `UsbPacket::bus_id`, `UsbBus::bus_id`); the BPF struct's `busnum`
-        // is a `u16` only because that is the field width CO-RE reads
-        // against (see `src/bpf/vmlinux.h`), so the values themselves stay
-        // in the same small range every other bus id in this codebase does.
-        bus_id: key.busnum as u8,
+        // `UsbPacket::bus_id`, `UsbBus::bus_id`); the map key carries a `u16`
+        // busnum, so narrow it the same way the usbmon reader does its own
+        // u16->u8 busnum (see `binary.rs`): fall back to 0 (an obviously-
+        // unknown id) for an out-of-range bus rather than silently wrapping
+        // it onto some other real bus's low byte. Realistic hosts never have
+        // >255 buses, so this is defensive, not expected.
+        bus_id: u8::try_from(key.busnum).unwrap_or(0),
         device_id: key.devnum,
         endpoint: key.epnum,
         dir_in: key.dir_in != 0,
@@ -410,6 +412,24 @@ mod tests {
         assert!(delta.dir_in);
         assert_eq!(delta.transfer_type, Some(TransferType::Isochronous));
         assert_eq!(delta.bytes, 67_583_256);
+    }
+
+    /// Mirrors `binary.rs`'s `oversized_busnum_falls_back_to_zero`: a busnum
+    /// past `u8::MAX` becomes bus 0 (obviously-unknown), never a wrapped low
+    /// byte that would misattribute traffic onto a different real bus.
+    #[test]
+    fn traffic_delta_falls_back_to_bus_zero_for_an_oversized_busnum() {
+        let delta = traffic_delta(
+            Key {
+                busnum: 257, // low byte 1 -- a naive `as u8` would say bus 1
+                devnum: 4,
+                epnum: 2,
+                dir_in: 1,
+                xfer: 0,
+            },
+            1024,
+        );
+        assert_eq!(delta.bus_id, 0);
     }
 
     /// The one path that needs a live kernel: BTF, the
