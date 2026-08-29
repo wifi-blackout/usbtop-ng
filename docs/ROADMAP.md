@@ -117,6 +117,12 @@ Design notes:
 These came out of code review. Each is small and none blocks a release.
 
 - Error and log strings brought under the documentation style guide.
+- A root-owned /dev/usbmon node reads as absent for a plain user, so the
+  remedy says no node was found. Distinguishing permission-denied from
+  not-found in the probe would give the sharper sudo remedy.
+- Search filtering waits for the next refresh tick, up to 1 second at the
+  default rate. Pulling the tick forward on a search keystroke would make
+  filter-as-you-type feel immediate.
 - SUDO_USER-aware config-dir resolution, so preferences, the usb.ids home
   copy, the internal snapshot, and `--create-alias` follow the invoking
   user under sudo. Today each resolves against root's home there, and
@@ -150,7 +156,8 @@ Research first:
   with an aarch64 artifact (cross-compile or an ARM runner).
 - Vendor kernels. Confirm each ships usbmon (module or built-in), whether
   debugfs mounts by default, and whether `/dev/usbmon<N>` nodes appear.
-  The built-in-usbmon detection fix above matters here.
+  Built-in detection and debugfs-free startup shipped in 2026-08, so a
+  binary-only vendor kernel is a supported shape to test.
 - Controller matrix. Each board exercises a different host stack: the
   Zero's single OTG controller, the Pi 4 and Pi 400's PCIe xHCI for the
   USB3 ports plus the OTG port, the Pi 5's RP1 southbridge, the ROCK 5C's
