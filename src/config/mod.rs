@@ -110,15 +110,84 @@ fn chown_path(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
     }
 }
 
+/// Resolve `..`/`.` components without touching the filesystem -- the path
+/// need not exist. Used by [`is_within`] so a lexical trick like
+/// `/home/lylem/../root/x` (which shares a literal component prefix with
+/// `/home/lylem` but does not resolve inside it) cannot pass a naive
+/// component-prefix check.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// True when `path` is `home` itself or lexically nested inside it, after
+/// resolving `..`/`.` components. Pure and hermetic -- neither argument need
+/// exist on disk. This alone stops the traversal trick above; it does not by
+/// itself stop a symlink planted on disk (see [`resolve_for_containment_check`],
+/// which callers are expected to run both arguments through first when the
+/// paths might exist).
+fn is_within(path: &Path, home: &Path) -> bool {
+    normalize_lexically(path).starts_with(normalize_lexically(home))
+}
+
+/// Resolve `path` against the real filesystem for a containment check, so a
+/// symlinked ancestor cannot make a path that is lexically inside `home`
+/// actually land somewhere else on disk. Every current [`chown_to_invoker`]
+/// call site invokes it right after creating the exact file or directory
+/// being chowned, so the direct `canonicalize()` below -- which requires the
+/// path to exist -- succeeds in practice. The fallback (canonicalize the
+/// parent, which must exist for anything to be about to be created inside
+/// it, and re-append the file name) keeps the function sound for a
+/// not-yet-existing path too: the parent is where a symlink attack would
+/// have to live, and a bare, not-yet-created leaf name cannot itself be a
+/// symlink. Returns `None` when neither the path nor its parent can be
+/// resolved; callers treat that as "not verified in-home" and skip.
+fn resolve_for_containment_check(path: &Path) -> Option<PathBuf> {
+    if let Ok(canonical) = path.canonicalize() {
+        return Some(canonical);
+    }
+    let parent = path.parent()?;
+    let name = path.file_name()?;
+    let canonical_parent = parent.canonicalize().ok()?;
+    Some(canonical_parent.join(name))
+}
+
 /// Chown `path` to the invoking user's uid:gid; a no-op when [`sudo_invoker`]
-/// is `None`. Call this on every file or directory this process CREATES
-/// under the invoker's home while running as root -- appending to an
-/// existing, already-user-owned file needs no call. A failure logs one
-/// warning and continues; ownership drift here must never fail the run.
+/// is `None`, and, since `--config`/`--usbids` can hand root an arbitrary
+/// system path, also a no-op -- silently skipped, not logged -- when `path`
+/// does not resolve inside the invoker's own home (see
+/// [`resolve_for_containment_check`] and [`is_within`]). Call this on every
+/// file or directory this process CREATES under the invoker's home while
+/// running as root -- appending to an existing, already-user-owned file
+/// needs no call. A chown failure (as opposed to an out-of-home skip) logs
+/// one warning and continues; ownership drift here must never fail the run.
 pub fn chown_to_invoker(path: &Path) {
     let Some(invoker) = sudo_invoker() else {
         return;
     };
+    let Some(resolved_path) = resolve_for_containment_check(path) else {
+        return;
+    };
+    // `invoker.home` comes straight from /etc/passwd and is not guaranteed
+    // canonical (it could itself sit behind a symlinked ancestor); resolve
+    // it the same way so the comparison is apples to apples. A home that
+    // cannot be resolved at all falls back to its lexical form -- still
+    // correct against the `..`-traversal trick, just not against a symlink,
+    // which is the best available answer when the home tree itself does not
+    // exist yet.
+    let home = resolve_for_containment_check(&invoker.home).unwrap_or_else(|| invoker.home.clone());
+    if !is_within(&resolved_path, &home) {
+        return;
+    }
     if let Err(e) = chown_path(path, invoker.uid, invoker.gid) {
         log::warn!(
             "could not set ownership of {} to uid {} gid {}: {e}",
@@ -274,6 +343,104 @@ mod tests {
     fn resolver_rejects_an_empty_home_field() {
         let text = "ghost:x:1000:1000:g::/bin/bash\n";
         assert!(resolve_invoker(0, Some("1000"), Some("1000"), Some(text)).is_none());
+    }
+
+    #[test]
+    fn is_within_accepts_a_path_nested_inside_home() {
+        assert!(is_within(
+            Path::new("/home/lylem/.usbtop-ng/preferences.toml"),
+            Path::new("/home/lylem")
+        ));
+    }
+
+    #[test]
+    fn is_within_accepts_home_itself() {
+        assert!(is_within(
+            Path::new("/home/lylem"),
+            Path::new("/home/lylem")
+        ));
+    }
+
+    #[test]
+    fn is_within_rejects_an_unrelated_path() {
+        assert!(!is_within(
+            Path::new("/etc/cron.d/evil"),
+            Path::new("/home/lylem")
+        ));
+    }
+
+    #[test]
+    fn is_within_rejects_dotdot_traversal_that_escapes_home() {
+        // Lexically normalizes to /home/root/x -- a sibling of /home/lylem
+        // under /home, not a descendant of it. A naive string-prefix check
+        // (`starts_with` on the raw text) would wrongly accept this, since
+        // "/home/lylem/../root/x" literally begins with "/home/lylem".
+        assert!(!is_within(
+            Path::new("/home/lylem/../root/x"),
+            Path::new("/home/lylem")
+        ));
+    }
+
+    #[test]
+    fn is_within_rejects_a_sibling_directory_that_shares_a_name_prefix() {
+        // /home/lylem2 must not count as within /home/lylem: guards against
+        // a naive string-prefix bug (component-wise starts_with, which
+        // Path::starts_with is, gets this right; raw string starts_with
+        // would not).
+        assert!(!is_within(
+            Path::new("/home/lylem2/x"),
+            Path::new("/home/lylem")
+        ));
+    }
+
+    #[test]
+    fn resolve_for_containment_check_accepts_an_existing_in_home_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cfg_dir = home.join(".usbtop-ng");
+        fs::create_dir_all(&cfg_dir).unwrap();
+        let file = cfg_dir.join("preferences.toml");
+        fs::write(&file, b"x").unwrap();
+
+        let resolved = resolve_for_containment_check(&file).unwrap();
+        assert!(is_within(&resolved, &home));
+    }
+
+    #[test]
+    fn resolve_for_containment_check_falls_back_to_the_parent_for_a_not_yet_created_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let file = home.join("not-written-yet.toml");
+        assert!(!file.exists());
+
+        let resolved = resolve_for_containment_check(&file).unwrap();
+        assert!(is_within(&resolved, &home));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_for_containment_check_follows_a_symlinked_ancestor_out_of_home() {
+        // The attack the containment check exists to stop: a directory
+        // inside home is actually a symlink to somewhere outside it (an
+        // invoking user fully controls the contents of their own home), so
+        // a path that is lexically nested under home resolves, on the real
+        // filesystem, to a location that is not.
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let trap = home.join("trap");
+        std::os::unix::fs::symlink(&outside, &trap).unwrap();
+        let file = trap.join("planted.toml");
+        fs::write(&file, b"x").unwrap();
+
+        let resolved = resolve_for_containment_check(&file).unwrap();
+        assert!(
+            !is_within(&resolved, &home),
+            "a symlinked ancestor must resolve to its real target, escaping home"
+        );
     }
 
     #[test]
