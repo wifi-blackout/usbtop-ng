@@ -29,3 +29,29 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-targets
+
+  ebpf:
+    name: eBPF feature (build + hermetic tests)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ebpf
+
+      - name: Install the eBPF build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libbpf-dev linux-tools-common linux-tools-generic
+
+      - name: Build the ebpf feature
+        run: cargo build --features ebpf
+
+      - name: Test the ebpf feature
+        run: cargo test --features ebpf
