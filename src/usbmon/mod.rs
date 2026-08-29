@@ -43,6 +43,11 @@ pub struct UsbmonStatus {
     /// Whether the debugfs `usbmon` directory is present and readable.
     pub text_available: bool,
     pub permission_denied: bool,
+    /// Sysfs-discovered bus numbers, gated to empty whenever
+    /// `usbmon_available` is false (see [`gate_available_buses`]): the
+    /// `--force` contract is that a host with no usbmon interface at all
+    /// gets an empty bus list -- and therefore empty, legitimate reports --
+    /// rather than readers spawned against buses nothing can actually read.
     pub available_buses: Vec<u8>,
 }
 
@@ -53,8 +58,8 @@ pub fn check_usbmon_status() -> Result<UsbmonStatus> {
     let dev_root = Path::new("/dev");
     let debugfs_root = Path::new("/sys/kernel/debug/usb/usbmon");
 
-    let available_buses = discover_buses(sysfs_root, dev_root, debugfs_root);
-    let binary_available = binary_interface_available(dev_root, &available_buses);
+    let discovered_buses = discover_buses(sysfs_root, dev_root, debugfs_root);
+    let binary_available = binary_interface_available(dev_root, &discovered_buses);
     let debugfs_state = classify_debugfs_path(debugfs_root);
     let text_available = debugfs_state == DebugfsState::Present;
     let usbmon_available = binary_available || text_available;
@@ -71,8 +76,24 @@ pub fn check_usbmon_status() -> Result<UsbmonStatus> {
         binary_available,
         text_available,
         permission_denied,
-        available_buses,
+        available_buses: gate_available_buses(usbmon_available, discovered_buses),
     })
+}
+
+/// Restores the `--force` contract: [`discover_buses`] runs unconditionally
+/// (its result feeds [`binary_interface_available`], the probe that decides
+/// `usbmon_available` in the first place), but that discovery must not leak
+/// into `available_buses` when no usbmon interface actually exists. Without
+/// this gate, `--force` on a host with real USB buses but no usbmon spawns
+/// text readers against debugfs files that were never there, and both the
+/// headless report and the TUI's `~`-estimate legend end up lying about
+/// having a source.
+fn gate_available_buses(usbmon_available: bool, discovered: Vec<u8>) -> Vec<u8> {
+    if usbmon_available {
+        discovered
+    } else {
+        Vec::new()
+    }
 }
 
 /// Bus numbers reachable without debugfs: one per `usbN` root-hub directory
@@ -682,6 +703,40 @@ mod tests {
             super::classify_debugfs_path(&debugfs_root) == super::DebugfsState::Present;
         assert!(!binary_available);
         assert!(text_available);
+    }
+
+    /// The `--force` contract this restores: on a host where neither usbmon
+    /// interface is available, `available_buses` must come back empty even
+    /// though sysfs still lists real buses -- otherwise `--force` spawns
+    /// readers against interfaces that were never there, which is the bug
+    /// this pins (see [`super::gate_available_buses`]'s doc comment).
+    #[test]
+    fn available_buses_is_empty_when_neither_interface_is_available_even_with_sysfs_buses() {
+        let temp = tempfile::tempdir().unwrap();
+        let sysfs_root = temp.path().join("sysfs");
+        let dev_root = temp.path().join("dev"); // no usbmon* nodes at all
+        let debugfs_root = temp.path().join("debugfs"); // never mounted
+        std::fs::create_dir_all(sysfs_root.join("usb1")).unwrap();
+        std::fs::create_dir_all(sysfs_root.join("usb3")).unwrap();
+        std::fs::create_dir_all(&dev_root).unwrap();
+
+        let discovered = super::discover_buses(&sysfs_root, &dev_root, &debugfs_root);
+        assert_eq!(discovered, vec![1, 3], "sysfs still lists real buses");
+
+        let binary_available = super::binary_interface_available(&dev_root, &discovered);
+        let text_available =
+            super::classify_debugfs_path(&debugfs_root) == super::DebugfsState::Present;
+        let usbmon_available = binary_available || text_available;
+        assert!(
+            !usbmon_available,
+            "neither interface is available in this scenario"
+        );
+
+        let available_buses = super::gate_available_buses(usbmon_available, discovered);
+        assert!(
+            available_buses.is_empty(),
+            "an unavailable host must report an empty bus list, not a stale discovery result"
+        );
     }
 
     #[test]
