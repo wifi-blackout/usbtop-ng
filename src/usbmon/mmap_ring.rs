@@ -53,6 +53,10 @@ const USBMON_IOC_MAGIC: u32 = 0x92;
 /// request, since it differs between 32- and 64-bit targets (a pointer field
 /// changes size) and the kernel decodes it out of the request number to size
 /// its `copy_from_user`/`copy_to_user`.
+///
+/// This is the asm-generic layout, correct for the x86 and ARM targets
+/// usbtop-ng ships on; powerpc, mips, and sparc pack `dir`/`size` into a
+/// different bit layout and would need their own `ioc`.
 const fn ioc(dir: u32, ty: u32, nr: u32, size: u32) -> u32 {
     (dir << 30) | (size << 16) | (ty << 8) | nr
 }
@@ -145,16 +149,6 @@ impl RingMapping {
         }
         Ok(RingMapping { ptr, len })
     }
-
-    /// The mapped bytes, valid for as long as `self` is not dropped.
-    fn as_slice(&self) -> &[u8] {
-        // SAFETY: `ptr` was returned by a successful `mmap` of exactly `len`
-        // read-only bytes in `map`, above, and nothing in this process ever
-        // writes through it (the mapping is `PROT_READ`, and no other code in
-        // this module holds a mutable pointer to it). The returned slice's
-        // lifetime is tied to `&self`, so it cannot outlive the mapping.
-        unsafe { std::slice::from_raw_parts(self.ptr.cast::<u8>(), self.len) }
-    }
 }
 
 impl Drop for RingMapping {
@@ -169,33 +163,122 @@ impl Drop for RingMapping {
     }
 }
 
-// --- the pure ring walk (hermetically tested) -----------------------------
+// --- the ring walk ---------------------------------------------------------
+//
+// Two walks share the same offset-bounds-check (`header_start`) and the same
+// parser (`parse_binary_header`), and differ only in how they get the 48
+// header bytes out of the ring: `packets_from_offsets` is a hermetically
+// tested pure function over an owned `&[u8]`, used only by tests; the live
+// reader instead calls `packets_from_ring_ptr`, which never forms a `&[u8]`
+// over the mapping at all — see that function's doc for why.
+
+/// Bounds-checks a fetched ring offset against `ring_len`: `Some(start)` when
+/// the 48-byte header at `off` lies entirely within the ring, `None` when it
+/// runs past the end, or `off` is large enough that `off + HEADER_LEN`
+/// overflows `usize` outright (possible on a 32-bit target). Shared by both
+/// walks below, so the one check standing between a bad or hostile offset and
+/// an out-of-bounds read is defined, and tested, exactly once.
+fn header_start(off: u32, ring_len: usize) -> Option<usize> {
+    let start = off as usize;
+    let end = start.checked_add(HEADER_LEN)?;
+    if end > ring_len {
+        return None;
+    }
+    Some(start)
+}
 
 /// Bounds-checks and parses every offset in `offsets` against `ring`, calling
 /// `emit` once per event `parse_binary_header` recognizes.
 ///
 /// Only the 48 header bytes at each offset are ever read — the captured
 /// payload that follows them in the ring is never touched, which is the whole
-/// point of the mmap interface over `read(2)`. An offset whose header would
-/// run past `ring`'s end is skipped rather than read out of bounds: the
-/// kernel is trusted for the ring's *contents*, but a defensive bounds check
-/// costs nothing and turns a hypothetical kernel bug into a dropped event
-/// instead of undefined behaviour.
+/// point of the mmap interface over `read(2)`.
+///
+/// Test-only: this is the slice-based twin of [`packets_from_ring_ptr`],
+/// which the live reader actually uses. It exists to prove the walk/parse
+/// logic hermetically, over a synthetic, singly-owned buffer that a `&[u8]`
+/// is perfectly sound to read — unlike the live mmap ring, which the kernel
+/// can be concurrently writing into.
+#[cfg(test)]
 fn packets_from_offsets(ring: &[u8], offsets: &[u32], mut emit: impl FnMut(UsbPacket)) {
     for &off in offsets {
-        let start = off as usize;
-        let Some(end) = start.checked_add(HEADER_LEN) else {
+        let Some(start) = header_start(off, ring.len()) else {
             continue;
         };
-        if end > ring.len() {
-            continue;
-        }
         let mut header = [0u8; HEADER_LEN];
-        header.copy_from_slice(&ring[start..end]);
+        header.copy_from_slice(&ring[start..start + HEADER_LEN]);
         if let Some((packet, _len_cap)) = parse_binary_header(&header) {
             emit(packet);
         }
     }
+}
+
+/// Bounds-checks and parses every offset in `offsets`, reading each header
+/// directly out of a live ring mapping via `ptr::copy_nonoverlapping` instead
+/// of through a `&[u8]`.
+///
+/// A `&[u8]` spanning the whole `MAP_SHARED` ring, held across the fetch
+/// calls that let the kernel write new events into it, would be unsound even
+/// though the specific bytes this reader actually looks at (offsets the
+/// kernel already handed back, and promises not to touch again until they are
+/// flushed) are quiescent: Rust's aliasing rules apply to the reference's
+/// full extent, not just the bytes read through it, so the reference's mere
+/// existence over kernel-mutated memory is enough to be undefined behaviour.
+/// Reading through a raw pointer and copying the bytes out sidesteps that —
+/// no reference is ever formed over the mapping.
+///
+/// # Safety
+///
+/// `base` must be valid for reads of `ring_len` bytes for the whole call
+/// (i.e. it must point at the start of a live mapping, or a plain buffer,
+/// at least `ring_len` bytes long).
+unsafe fn packets_from_ring_ptr(
+    base: *const u8,
+    ring_len: usize,
+    offsets: &[u32],
+    mut emit: impl FnMut(UsbPacket),
+) {
+    for &off in offsets {
+        let Some(start) = header_start(off, ring_len) else {
+            continue;
+        };
+        let mut header = [0u8; HEADER_LEN];
+        // SAFETY: the caller of `packets_from_ring_ptr` guarantees `base` is
+        // valid for reads of `ring_len` bytes, and `header_start` just
+        // confirmed `start + HEADER_LEN <= ring_len`, so the source range
+        // `base.add(start) .. base.add(start) + HEADER_LEN` lies entirely
+        // within that. `header` is a fresh stack array with no other
+        // references to it, exactly `HEADER_LEN` bytes. Copying the bytes
+        // (rather than borrowing through a `&[u8]`) means nothing here
+        // aliases ring memory the kernel may be writing elsewhere in the same
+        // `MAP_SHARED` mapping — and the specific offset copied from is one
+        // the kernel already handed back through `MON_IOCX_MFETCH`, which by
+        // the ring protocol it will not touch again until this reader
+        // flushes it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(base.add(start), header.as_mut_ptr(), HEADER_LEN);
+        }
+        if let Some((packet, _len_cap)) = parse_binary_header(&header) {
+            emit(packet);
+        }
+    }
+}
+
+/// The `nflush` to carry into the *next* `MON_IOCX_MFETCH` call, given
+/// whether the call just made fetched anything.
+///
+/// `MON_IOCX_MFETCH` flushes before it fetches, unconditionally (per
+/// `drivers/usb/mon/mon_bin.c`: `mon_bin_ioctl_mfetch` calls
+/// `mon_bin_flush` before `mon_bin_fetch`, and the flush is not conditioned
+/// on the fetch succeeding). So whatever `nflush` was just passed into a
+/// call has already been released back to the ring by the time that call
+/// returns — whether the fetch half found events (`Some(n)`) or came back
+/// empty/failed (`None`). Carrying a stale, already-flushed count into the
+/// *next* call would flush it a second time: not the batch this reader
+/// already saw, but whatever the kernel has since put at the ring head —
+/// events this reader never fetched at all.
+fn next_nflush(just_fetched: Option<u32>) -> u32 {
+    just_fetched.unwrap_or(0)
 }
 
 // --- syscall helpers --------------------------------------------------
@@ -401,7 +484,11 @@ impl MmapReader {
         }
         let mapping = RingMapping::map(fd, ring_len)
             .map_err(|e| anyhow!("mmap {}: {}", self.path.display(), e))?;
-        let ring = mapping.as_slice();
+        // A raw pointer, not a `&[u8]`: see `packets_from_ring_ptr`'s doc for
+        // why a slice over this live, kernel-written mapping would be
+        // unsound. `mapping` is not dropped until this function returns, so
+        // `ring_base` stays valid for every use below.
+        let ring_base = mapping.ptr.cast::<u8>().cast_const();
 
         let mut offsets = [0u32; OFFSETS_CAP];
         let mut nflush = 0u32;
@@ -415,7 +502,7 @@ impl MmapReader {
                 Ok(n) => {
                     // Flush this batch on the *next* call, whether or not it
                     // turned out to hold any events.
-                    nflush = n;
+                    nflush = next_nflush(Some(n));
                     if n == 0 {
                         if !self.follow || !park(shutdown) {
                             break;
@@ -424,41 +511,63 @@ impl MmapReader {
                     }
 
                     // A callback `Err` must stop calling the callback for the
-                    // rest of this batch. `packets_from_offsets`'s `emit`
+                    // rest of this batch. `packets_from_ring_ptr`'s `emit`
                     // closure returns nothing, so the remaining offsets in the
                     // batch are still parsed (cheap, read-only, no side
                     // effects) but no longer delivered once `stop` is set.
                     let mut stop = false;
-                    packets_from_offsets(ring, &offsets[..n as usize], |packet| {
-                        if stop {
-                            return;
-                        }
-                        if let Err(e) = callback(packet) {
-                            debug!("Packet callback error: {}", e);
-                            stop = true;
-                        }
-                    });
+                    // SAFETY: `ring_base` is the base of `mapping`'s live
+                    // `mmap` of exactly `ring_len` bytes, and `mapping` is
+                    // still alive here (it is not dropped until this function
+                    // returns), so `ring_base` is valid for reads of
+                    // `ring_len` bytes for this call.
+                    unsafe {
+                        packets_from_ring_ptr(
+                            ring_base,
+                            ring_len,
+                            &offsets[..n as usize],
+                            |packet| {
+                                if stop {
+                                    return;
+                                }
+                                if let Err(e) = callback(packet) {
+                                    debug!("Packet callback error: {}", e);
+                                    stop = true;
+                                }
+                            },
+                        );
+                    }
                     if stop {
                         break;
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // MON_IOCX_MFETCH flushes before it fetches, so this call
+                    // already released `nflush` even though it found nothing
+                    // to fetch: see `next_nflush`.
+                    nflush = next_nflush(None);
                     if !self.follow || !park(shutdown) {
                         break;
                     }
                 }
                 Err(e) => {
+                    // Same flush-before-fetch reasoning as the WouldBlock arm
+                    // above: this call's `nflush` is already spent.
+                    nflush = next_nflush(None);
                     error!("MON_IOCX_MFETCH on {}: {}", self.path.display(), e);
                     break;
                 }
             }
         }
 
-        // The last successful fetch's batch is only ever flushed by the
-        // *next* fetch's `nflush` field — and there is no next fetch once the
-        // loop above has ended. Release it explicitly so this reader does not
-        // leave events permanently marked "fetched but never flushed" in a
-        // ring another reader could reopen after this fd closes.
+        // `nflush` here is 0 whenever the loop above last called `mfetch` and
+        // got back `Err` (see `next_nflush`: a call that didn't fetch has
+        // already flushed whatever it was given) — it is only nonzero when
+        // the loop exited via the shutdown check *before* a further `mfetch`
+        // call, leaving the last successful batch flushed by nobody. Release
+        // that batch explicitly, so this reader does not leave events
+        // permanently marked "fetched but never flushed" in a ring another
+        // reader could reopen after this fd closes.
         if nflush > 0 {
             if let Err(e) = mflush(fd, nflush) {
                 debug!("MON_IOCH_MFLUSH on {}: {}", self.path.display(), e);
@@ -560,6 +669,51 @@ mod tests {
         // or wrap into an in-bounds-looking value.
         packets_from_offsets(&ring, &[u32::MAX], |_| n += 1);
         assert_eq!(n, 0);
+    }
+
+    /// The raw-pointer live walk must find and parse the same events as the
+    /// slice-based hermetic walk, and must likewise never read the payload.
+    /// `ring` is a plain, singly-owned `Vec<u8>` with no other live borrow
+    /// during the call, so reading through a raw pointer into it is exactly
+    /// as sound as reading through a slice would be — this proves
+    /// `packets_from_ring_ptr`'s walk/parse logic without needing a live
+    /// mapping.
+    #[test]
+    fn ring_walk_via_raw_pointer_parses_headers_and_never_reads_payload() {
+        let mut ring = vec![0u8; 4096];
+        write_ring_event(&mut ring, 0, b'C', 4, 1, 1000, &[0xFF; 64]);
+        write_ring_event(&mut ring, 128, b'C', 4, 1, 500, &[0xFF; 64]);
+
+        let mut got = Vec::new();
+        // SAFETY: `ring` is valid for reads of `ring.len()` bytes for the
+        // whole call (it is a `Vec<u8>` that outlives it, untouched by
+        // anything else for the duration).
+        unsafe {
+            packets_from_ring_ptr(ring.as_ptr(), ring.len(), &[0, 128], |p| got.push(p));
+        }
+
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].data_length, 1000);
+        assert_eq!(got[1].data_length, 500);
+    }
+
+    /// `MON_IOCX_MFETCH` flushes before it fetches (see `next_nflush`'s doc):
+    /// a call made with `nflush = 5` that then finds the ring empty has
+    /// already released those 5 events by the time it returns `WouldBlock`.
+    /// The bug this pins: carrying 5 into the *next* call would flush 5
+    /// events this reader never fetched — whatever the kernel put at the
+    /// ring head while this reader was parked.
+    #[test]
+    fn next_nflush_resets_to_zero_after_a_call_that_did_not_fetch() {
+        let nflush = next_nflush(Some(5));
+        assert_eq!(nflush, 5, "the next call must flush this batch");
+
+        let nflush = next_nflush(None);
+        assert_eq!(
+            nflush, 0,
+            "a call that did not fetch (WouldBlock or an error) already \
+             flushed whatever nflush it was given"
+        );
     }
 
     #[test]
