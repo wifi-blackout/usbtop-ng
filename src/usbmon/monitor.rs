@@ -56,13 +56,14 @@ pub struct MonitorHandle {
     /// Clone the `Arc` before `stop()` to keep reading it (the UI surfaces the
     /// count in its header so a lossy session is never silently lossy).
     pub dropped: Arc<AtomicU64>,
-    /// Kernel-side drops the mmap ring readers' `MON_IOCG_STATS` reported —
-    /// traffic the kernel itself discarded before this process ever saw it,
-    /// distinct from [`Self::dropped`] (a full channel, after delivery).
-    /// Readers on the text or read()-based binary interface never touch this
-    /// counter, so it stays at zero unless the mmap interface is in use.
-    /// Clone the `Arc` before `stop()` to keep reading it, same as
-    /// [`Self::dropped`].
+    /// Kernel-side drops — traffic the kernel discarded before this process
+    /// ever saw it, distinct from [`Self::dropped`] (a full channel, after
+    /// delivery). Fed by the mmap ring readers' `MON_IOCG_STATS` count and,
+    /// under the `ebpf` backend, by its full-aggregation-map drop counter
+    /// (see `usbmon::ebpf::EbpfSource`). Readers on the text or read()-based
+    /// binary interface never touch it, so it stays at zero unless the mmap
+    /// interface is in use or the eBPF map fills. Clone the `Arc` before
+    /// `stop()` to keep reading it, same as [`Self::dropped`].
     pub kernel_dropped: Arc<AtomicU64>,
     /// The live-interface flags a report reads to pick its `source` label and
     /// mark text-interface estimates (see [`SourceFlags`]). Clone before
@@ -268,12 +269,13 @@ fn try_ebpf_capture() -> Option<(Receiver<TrafficDelta>, MonitorHandle)> {
     let (tx, rx) = sync_channel(CHANNEL_BOUND);
     let shutdown = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicU64::new(0));
-    // No kernel-side (MON_IOCG_STATS) or text-estimate concept applies to
-    // the eBPF backend: its counters are exact, and a full kernel map (see
-    // `src/bpf/usbrate.bpf.c`'s `max_entries`) is a silent loss this poller
-    // cannot observe from userspace, distinct from the channel-full drops
-    // `dropped` below counts. Both stay at their zero/false defaults for
-    // the life of the session.
+    // The eBPF backend's per-key byte counts are exact, but its bounded
+    // aggregation map (see `src/bpf/usbrate.bpf.c`'s `max_entries`) drops a
+    // new key's URB once full. The poller reads that kernel-side loss from the
+    // BPF `dropped` counter and stores it here, so it surfaces as `kdropped:`
+    // and `kernel_dropped_packets` exactly like the usbmon backends'
+    // `MON_IOCG_STATS` drops -- distinct from the channel-full `dropped` count
+    // above. It stays at zero unless the map actually fills.
     let kernel_dropped = Arc::new(AtomicU64::new(0));
     let text_active = Arc::new(AtomicBool::new(false));
     // The eBPF backend is neither the mmap ring nor any usbmon reader, so this
@@ -282,25 +284,28 @@ fn try_ebpf_capture() -> Option<(Receiver<TrafficDelta>, MonitorHandle)> {
 
     let poller_shutdown = Arc::clone(&shutdown);
     let poller_dropped = Arc::clone(&dropped);
+    let poller_kernel_dropped = Arc::clone(&kernel_dropped);
     let spawned = thread::Builder::new()
         .name("usbmon-ebpf".to_string())
         .spawn(move || {
-            source.run(&poller_shutdown, |delta| match tx.try_send(delta) {
-                Ok(()) => {}
-                // The receiver has been dropped -- nothing will ever consume
-                // another delta -- so ask the poll loop to stop now instead
-                // of spinning until `stop()`, matching how the packet readers'
-                // `send` closure in `run_source_chain` exits on disconnect.
-                // `run` only holds a shared `&` borrow of the same flag, so
-                // setting it here is sound.
-                Err(TrySendError::Disconnected(_)) => {
-                    poller_shutdown.store(true, Ordering::Relaxed);
-                }
-                // Same bargain as the packet readers' `send` closure in
-                // `run_source_chain`: a reader must never park on a full
-                // channel, so the delta is dropped and counted instead.
-                Err(TrySendError::Full(_)) => {
-                    poller_dropped.fetch_add(1, Ordering::Relaxed);
+            source.run(&poller_shutdown, &poller_kernel_dropped, |delta| {
+                match tx.try_send(delta) {
+                    Ok(()) => {}
+                    // The receiver has been dropped -- nothing will ever consume
+                    // another delta -- so ask the poll loop to stop now instead
+                    // of spinning until `stop()`, matching how the packet readers'
+                    // `send` closure in `run_source_chain` exits on disconnect.
+                    // `run` only holds a shared `&` borrow of the same flag, so
+                    // setting it here is sound.
+                    Err(TrySendError::Disconnected(_)) => {
+                        poller_shutdown.store(true, Ordering::Relaxed);
+                    }
+                    // Same bargain as the packet readers' `send` closure in
+                    // `run_source_chain`: a reader must never park on a full
+                    // channel, so the delta is dropped and counted instead.
+                    Err(TrySendError::Full(_)) => {
+                        poller_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             });
         });

@@ -16,12 +16,11 @@
 
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{MapFlags, OpenObject};
-use log::warn;
 
 use crate::device::manager::TrafficDelta;
 use crate::usbmon::parser::TransferType;
@@ -110,21 +109,6 @@ pub(crate) fn delta_since(last: &mut HashMap<Key, u64>, key: Key, current: u64) 
     }
 }
 
-/// The kernel `dropped` counter's new cumulative total when it has grown since
-/// the last reading (updating `last_reported` to it), or `None` otherwise.
-/// Mirrors [`delta_since`]'s "report only the change" shape so a full map
-/// warns as it worsens, not once every poll -- and, like it, never lowers
-/// `last_reported`, so a counter that somehow read backwards cannot re-arm a
-/// spurious warning.
-pub(crate) fn dropped_growth(last_reported: &mut u64, current: u64) -> Option<u64> {
-    if current > *last_reported {
-        *last_reported = current;
-        Some(current)
-    } else {
-        None
-    }
-}
-
 /// `xfer`'s `usb_pipetype` encoding (`(pipe >> 30) & 0x3`; see
 /// `src/bpf/usbrate.bpf.c`): 0 Isochronous, 1 Interrupt, 2 Control, 3 Bulk.
 /// Any other value -- impossible from a real `pipe` field, but the map
@@ -165,10 +149,6 @@ fn traffic_delta(key: Key, bytes: u64) -> TrafficDelta {
 pub struct EbpfSource {
     skel: UsbrateSkel<'static>,
     last: HashMap<Key, u64>,
-    /// Last-warned value of the kernel `dropped` map-full counter (see
-    /// [`dropped_growth`]), so the warning fires as the loss grows rather than
-    /// every poll while a full map keeps losing URBs.
-    last_dropped: u64,
 }
 
 impl EbpfSource {
@@ -206,20 +186,20 @@ impl EbpfSource {
         Ok(Self {
             skel,
             last: HashMap::new(),
-            last_dropped: 0,
         })
     }
 
     /// The kernel `dropped` counter's current cumulative total: the number of
     /// URBs whose bytes were lost because the `bytes` map was full (see
-    /// `src/bpf/usbrate.bpf.c`). Slot 0 of the single-entry array map. Any read
-    /// failure yields `0` -- surfacing the drop count must never crash the
-    /// poller, and a map that cannot be read simply reports no growth.
-    fn read_dropped(&self) -> u64 {
+    /// `src/bpf/usbrate.bpf.c`). Slot 0 of the single-entry array map. `None`
+    /// on any read failure -- surfacing the drop count must never crash the
+    /// poller, and an unreadable map simply leaves the last total in place
+    /// rather than resetting it to a spurious zero.
+    fn read_dropped(&self) -> Option<u64> {
         let key = 0u32.to_ne_bytes();
         match libbpf_rs::MapCore::lookup(&self.skel.maps.dropped, &key, MapFlags::ANY) {
-            Ok(Some(raw)) => decode_value(&raw).unwrap_or(0),
-            _ => 0,
+            Ok(Some(raw)) => decode_value(&raw),
+            _ => None,
         }
     }
 
@@ -237,7 +217,7 @@ impl EbpfSource {
     /// dead, which fails `-D warnings`. Not importing the trait at all here
     /// and calling it fully qualified sidesteps that without needing an
     /// `#[allow]` anywhere.
-    fn poll_once(&mut self, mut on_delta: impl FnMut(TrafficDelta)) {
+    fn poll_once(&mut self, kernel_dropped: &AtomicU64, mut on_delta: impl FnMut(TrafficDelta)) {
         // Collected up front rather than iterated lazily: `keys()` borrows
         // the map, and the loop body below needs its own borrow (`lookup`)
         // plus a mutable borrow of `self.last` -- collecting first keeps
@@ -268,17 +248,18 @@ impl EbpfSource {
             }
         }
 
-        // Surface the bounded map-full loss the kprobe records: when the
-        // `bytes` map is full, a new key's URB cannot be accounted, and the
-        // rate silently under-reports. Warn as the drop count grows so a too-
-        // small map is visible instead of masquerading as low traffic.
-        let current_dropped = self.read_dropped();
-        if let Some(total) = dropped_growth(&mut self.last_dropped, current_dropped) {
-            warn!(
-                "eBPF aggregation map full: {total} URB(s) unattributed and undercounted \
-                 (the bytes map holds 4096 device/endpoint keys). Traffic is under-reported \
-                 until keys free up."
-            );
+        // Surface the bounded map-full loss the kprobe records into the same
+        // `kernel_dropped` counter the usbmon backends feed, which the header
+        // shows as `kdropped:` and JSON as `kernel_dropped_packets`: when the
+        // `bytes` map is full a new key's URB cannot be accounted and the rate
+        // silently under-reports, so this makes that loss a persistent,
+        // in-model indicator rather than a log line the alternate-screen TUI
+        // would bury. The map counter is cumulative (the kprobe only ever
+        // increments it), so this `store`s the latest total -- unlike the
+        // usbmon path, whose read-and-clear `MON_IOCG_STATS` count is added.
+        // A read failure leaves the last stored value in place.
+        if let Some(total) = self.read_dropped() {
+            kernel_dropped.store(total, Ordering::Relaxed);
         }
     }
 
@@ -289,9 +270,14 @@ impl EbpfSource {
     /// A map lookup never blocks the way a `read(2)` can, so unlike the
     /// file-backed readers this parks unconditionally between passes rather
     /// than only on `WouldBlock`.
-    pub fn run(&mut self, shutdown: &AtomicBool, mut on_delta: impl FnMut(TrafficDelta)) {
+    pub fn run(
+        &mut self,
+        shutdown: &AtomicBool,
+        kernel_dropped: &AtomicU64,
+        mut on_delta: impl FnMut(TrafficDelta),
+    ) {
         loop {
-            self.poll_once(&mut on_delta);
+            self.poll_once(kernel_dropped, &mut on_delta);
             if shutdown.load(Ordering::Relaxed) {
                 return;
             }
@@ -347,24 +333,6 @@ mod tests {
     fn decode_value_rejects_the_wrong_byte_count() {
         assert!(decode_value(&[0u8; 7]).is_none());
         assert!(decode_value(&[0u8; 9]).is_none());
-    }
-
-    #[test]
-    fn dropped_growth_reports_only_when_the_counter_climbs() {
-        let mut last = 0u64;
-        // The first drop warns with the cumulative total.
-        assert_eq!(dropped_growth(&mut last, 3), Some(3));
-        // A steady reading does not warn again.
-        assert_eq!(dropped_growth(&mut last, 3), None);
-        // Further loss warns with the new total.
-        assert_eq!(dropped_growth(&mut last, 5), Some(5));
-        // A backward reading -- never expected from a monotonic counter --
-        // neither warns nor lowers the watermark.
-        assert_eq!(dropped_growth(&mut last, 4), None);
-        assert_eq!(last, 5);
-        // The steady-state no-drops case (a zero counter) never warns.
-        let mut fresh = 0u64;
-        assert_eq!(dropped_growth(&mut fresh, 0), None);
     }
 
     fn key(devnum: u8) -> Key {
@@ -522,10 +490,15 @@ mod tests {
         // whatever it produces is readable on the other end, not that any
         // particular traffic occurred during the test.
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
-        source.poll_once(|delta| {
+        let kernel_dropped = AtomicU64::new(0);
+        source.poll_once(&kernel_dropped, |delta| {
             let _ = tx.try_send(delta);
         });
         drop(tx);
         let _ = rx.try_iter().count();
+        // A brief poll over a fresh map cannot fill its 4096 keys, so the
+        // map-full drop counter -- now surfaced through `kernel_dropped` --
+        // stays zero.
+        assert_eq!(kernel_dropped.load(Ordering::Relaxed), 0);
     }
 }
