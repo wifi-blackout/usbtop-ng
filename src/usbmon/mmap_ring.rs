@@ -36,18 +36,32 @@ use super::{open_nonblocking, POLL_INTERVAL};
 /// event.
 const OFFSETS_CAP: usize = 64;
 
-/// Ring size requested via [`MON_IOCT_RING_SIZE`] before mapping. The kernel's
-/// default ring is ~300 KiB, which overflows within about a millisecond at
-/// USB3 throughput -- a 336 MB/s bulk read dropped ~87% of packets on it (a
-/// smaller 16 MiB ring cut that ~15x but still dropped a couple thousand
-/// events) -- so a reader thread that is briefly descheduled loses events the
-/// kernel had nowhere to keep. 64 MiB is the kernel's own maximum on current
-/// kernels and, live-tested, drops zero packets across a full 4 GiB read at
+/// Ring sizes to request via [`MON_IOCT_RING_SIZE`] before mapping, largest
+/// first. The kernel's default ring is ~300 KiB, which overflows within about
+/// a millisecond at USB3 throughput -- a 336 MB/s bulk read dropped ~87% of
+/// packets on it (a smaller 16 MiB ring cut that ~15x but still dropped a
+/// couple thousand events) -- so a reader thread that is briefly descheduled
+/// loses events the kernel had nowhere to keep. 64 MiB is this kernel's own
+/// maximum and, live-tested, drops zero packets across a full 4 GiB read at
 /// 5 Gbps and a 12 GiB read at 10 Gbps, matching a concurrent eBPF capture to
-/// the byte. The kernel clamps this request to its own limit and the reader
-/// maps whatever [`ring_size`] reports afterward, so it is a request, not a
-/// guarantee; a lower-max kernel simply gets its largest ring.
-const RING_TARGET_BYTES: usize = 64 * 1024 * 1024;
+/// the byte.
+///
+/// The list is a ladder, not a single value, because the kernel does NOT clamp
+/// an over-`BUFF_MAX` request down: it rejects it outright with `EINVAL` and
+/// leaves the ring at its previous (default) size. A lone 64 MiB request would
+/// therefore silently keep the tiny default ring -- reintroducing the drop bug
+/// -- on any kernel whose `BUFF_MAX` is below 64 MiB. Stepping down lands on
+/// the largest ring the running kernel actually accepts. Each reader that maps
+/// a ring requests its own, so in the (rare) non-aggregate multi-bus topology
+/// this is per-bus kernel memory; the common case is a single aggregate reader
+/// on `usbmon0` (one ring). All sizes failing just leaves the default ring --
+/// best-effort, never fatal.
+const RING_SIZE_LADDER: [usize; 4] = [
+    64 * 1024 * 1024,
+    32 * 1024 * 1024,
+    16 * 1024 * 1024,
+    8 * 1024 * 1024,
+];
 
 // --- ioctl numbers, derived rather than hard-coded ---------------------
 
@@ -320,11 +334,15 @@ fn ring_size(fd: RawFd) -> io::Result<usize> {
     Ok(ret as usize)
 }
 
-/// `MON_IOCT_RING_SIZE`: request `bytes` for this fd's ring, best-effort. The
-/// kernel clamps to its own limits; read [`ring_size`] afterward for what it
-/// actually set. Returns the ioctl error (e.g. `ENOTTY` on a kernel without
-/// this request, or `EINVAL`) so the caller can carry on with the default ring
-/// rather than fail the whole reader.
+/// `MON_IOCT_RING_SIZE`: request `bytes` for this fd's ring, best-effort. On
+/// success the kernel page-aligns `bytes` and reallocates the ring; read
+/// [`ring_size`] afterward for the exact value it set. A request above the
+/// kernel's `BUFF_MAX` is rejected with `EINVAL` and leaves the ring at its
+/// previous size (the kernel does not clamp) -- see [`RING_SIZE_LADDER`] for
+/// why the caller steps down rather than trusting one large request. Returns
+/// the ioctl error (e.g. `ENOTTY` on a kernel without this request, or
+/// `EINVAL`) so the caller can carry on with the default ring rather than fail
+/// the whole reader.
 fn set_ring_size(fd: RawFd, bytes: usize) -> io::Result<()> {
     // SAFETY: `fd` is a valid, open descriptor for the duration of this call.
     // `MON_IOCT_RING_SIZE` is a directionless `_IO` request that reads its size
@@ -549,15 +567,20 @@ impl MmapReader {
             .map_err(|e| anyhow!("Failed to open {}: {}", self.path.display(), e))?;
         let fd = file.as_raw_fd();
         // Enlarge the ring before mapping. The kernel's small default overflows
-        // under USB3 throughput (see `RING_TARGET_BYTES`); this must precede the
-        // `mmap` below, since the kernel reallocates the ring on resize. It is
-        // best-effort: on a kernel that lacks the request or denies it, fall
-        // back to the default ring rather than fail the reader.
-        if let Err(e) = set_ring_size(fd, RING_TARGET_BYTES) {
-            debug!(
-                "MON_IOCT_RING_SIZE({RING_TARGET_BYTES}) on {}: {e}; using the default ring",
-                self.path.display()
-            );
+        // under USB3 throughput (see `RING_SIZE_LADDER`); this must precede the
+        // `mmap` below, since the kernel refuses a resize once the fd is mapped
+        // (and reallocates the ring on an accepted one). Best-effort: step the
+        // ladder down largest-first and stop at the first size this kernel
+        // accepts; if every request fails (an old kernel without the ioctl, or
+        // one that denies it), carry on with the default ring rather than fail.
+        for &target in &RING_SIZE_LADDER {
+            match set_ring_size(fd, target) {
+                Ok(()) => break,
+                Err(e) => debug!(
+                    "MON_IOCT_RING_SIZE({target}) on {}: {e}",
+                    self.path.display()
+                ),
+            }
         }
         let ring_len = ring_size(fd)
             .map_err(|e| anyhow!("MON_IOCQ_RING_SIZE on {}: {}", self.path.display(), e))?;

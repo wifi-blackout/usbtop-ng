@@ -144,7 +144,8 @@ pub struct UsbTopApp {
     /// see [`Self::retain_filtered_devices`].
     filter: FilterSet,
     /// The monitor's text-source-active flag (see
-    /// `usbmon::monitor::MonitorHandle::text_active`): true only while a
+    /// `usbmon::monitor::SourceFlags::text_active`, held on
+    /// `MonitorHandle::flags`): true only while a
     /// debugfs text source backs the session. Read through the
     /// `text_source_active()` method to gate the `~` estimate marker on
     /// isochronous device rows (see `UsbDevice::has_iso_traffic`) and the
