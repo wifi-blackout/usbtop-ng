@@ -475,7 +475,7 @@ fn main() -> Result<()> {
             capture,
             Arc::clone(&monitor.dropped),
             Arc::clone(&monitor.kernel_dropped),
-            Arc::clone(&monitor.text_active),
+            monitor.flags.clone(),
             filter,
             headless::HeadlessOptions {
                 json: cli.json,
@@ -516,7 +516,7 @@ fn main() -> Result<()> {
             preferences.clone(),
         )
         .with_filter(filter)
-        .with_text_source_flag(Arc::clone(&monitor.text_active));
+        .with_text_source_flag(Arc::clone(&monitor.flags.text_active));
     // Mirrors the usbids/internal-snapshot home-copy pattern above: a
     // missing HOME must not fail the TUI, it just means `S`'s `y` has
     // nowhere to write and lands in `Done` saying so (see

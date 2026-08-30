@@ -183,9 +183,9 @@ predates it. Candidate future fix wave: compare the event header's
 characterize the drop behavior under load. The eBPF backend already
 measures these transfers correctly.
 
-### Discovered: usbmon drops badly under high throughput; the ring is never enlarged
+### Fixed: usbmon dropped badly under high throughput; the ring is now enlarged
 
-The iso undercount above turns out to be one symptom of a broader,
+The iso undercount above turned out to be one symptom of a broader,
 pre-existing throughput problem. An exact-byte bulk test -- a read-only
 `dd` of 4 GiB from a USB3 SSD (5 Gbps link, 336 MB/s), with both backends
 observing the same transfer over a window that contained it -- measured:
@@ -193,19 +193,22 @@ observing the same transfer over a window that contained it -- measured:
 | Source | Captured | vs. the exact 4 GiB | Kernel drops |
 |---|---|---|---|
 | eBPF | 4,291,952,544 | 0.9993x (byte-exact) | 0 |
-| usbmon (mmap ring) | 537,421,984 | 0.125x (-87.5%) | 40,046 |
+| usbmon (mmap ring), before | 537,421,984 | 0.125x (-87.5%) | 40,046 |
+| usbmon (mmap ring), after | 4,293,525,472 | 0.9997x (byte-exact) | 0 |
 
-So usbmon's accuracy problem is not iso-specific: at USB3 rates it drops
+usbmon's accuracy problem was not iso-specific: at USB3 rates it dropped
 the great majority of any high-throughput stream, bulk included. Root
-cause: usbtop-ng runs the mmap ring reader on the kernel's *default*
-usbmon ring and never enlarges it -- `src/usbmon/mmap_ring.rs` reads
-`MON_IOCQ_RING_SIZE` but never calls the `MON_IOCT_RING_SIZE` setter, so
-the small default ring overflows continuously and the kernel drops whole
-events. Candidate fix wave: enlarge the ring before `mmap` (and re-run this
-`dd` test against the attached USB3 SSDs to confirm the drop rate falls).
-The eBPF backend aggregates in-kernel and is immune -- it stayed byte-exact
-through the same load, the strongest validation yet of that backend for
-high-throughput monitoring.
+cause: usbtop-ng ran the mmap ring reader on the kernel's *default* ~300 KiB
+usbmon ring and never enlarged it -- it read `MON_IOCQ_RING_SIZE` but never
+called the `MON_IOCT_RING_SIZE` setter, so the small default ring overflowed
+continuously and the kernel dropped whole events. Fixed by requesting a large
+ring (a 64 MiB..8 MiB step-down ladder, since the kernel rejects an over-max
+request outright rather than clamping) before `mmap`; best-effort, so a
+kernel without the ioctl falls back to the default ring. Live-verified to
+drop zero packets across a 4 GiB read at 5 Gbps and a 12 GiB read at 10 Gbps,
+matching the eBPF capture and the exact `dd` count (numbers above). The eBPF
+backend aggregates in-kernel and was immune throughout -- the strongest
+validation yet of that backend for high-throughput monitoring.
 
 ## Engineering follow-ups
 
@@ -215,14 +218,12 @@ These came out of code review. Each is small and none blocks a release.
 - A root-owned /dev/usbmon node reads as absent for a plain user, so the
   remedy says no node was found. Distinguishing permission-denied from
   not-found in the probe would give the sharper sudo remedy.
-- The report `source` field mislabels the mmap ring reader as `"binary"`.
-  `capture_source_label` (src/headless/mod.rs) only knows `ebpf`/`text`/
-  `binary`; when the mmap reader is the active source it still prints
-  `"binary"`. Confirmed live: only the mmap reader reports kernel drops, yet
-  a run reporting `source=binary` also reported 40k kdrops -- so mmap was
-  running, mislabeled. Pre-existing on `main`. Fix: have the monitor expose
-  the active source kind (as it already exposes `text_active`) so the label
-  can distinguish `"mmap"`.
+- Fixed: the report `source` field mislabeled the mmap ring reader as
+  `"binary"`. `capture_source_label` (src/headless/mod.rs) knew only
+  `ebpf`/`text`/`binary`, so an active mmap reader printed `"binary"`. The
+  monitor now raises an `mmap_active` flag (bundled with `text_active` into
+  `SourceFlags`) for the interface actually running, and the label reads
+  `"mmap"`. Verified live alongside the ring-size fix above.
 - Search filtering waits for the next refresh tick, up to 1 second at the
   default rate. Pulling the tick forward on a search keystroke would make
   filter-as-you-type feel immediate.
