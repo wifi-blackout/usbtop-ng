@@ -119,6 +119,7 @@ struct btf_ptr;
  * BTF, so the value -- not just the name -- must match the real kernel).
  */
 enum bpf_map_type {
+	BPF_MAP_TYPE_ARRAY = 2,
 	BPF_MAP_TYPE_HASH = 1,
 };
 
