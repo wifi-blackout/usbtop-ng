@@ -62,9 +62,17 @@ or capable hardware lands:
 Revisit this list on kernel upgrades. Display diagnostics stay out by
 charter, not by gap.
 
-Prerequisite: none of the typec, power-delivery, or thunderbolt classes
-exist on the current development host, so even the buildable tier needs
-hardware that exposes them before any of it can be built honestly.
+Prerequisite, now met by the test fleet: the buildable tier needs a host
+that exposes the typec, power-delivery, and thunderbolt classes, and the
+2026-08-30 fleet probe found them on the two x86 hosts -- `asus` (typec +
+power-delivery + thunderbolt) and `judge` (typec + power-delivery, no
+thunderbolt). This is the seam where the fleet work feeds this feature:
+the [port capability matrix](TESTING.md#port-capability-matrix) names the
+host and the free USB-C port to build and test each row against, and the
+feature reads that host's sysfs. `judge`'s USB-C/PD port is free today;
+both of `asus`'s show a connected partner, so free one before testing
+there. The development host itself still exposes none of these classes,
+so this work is done on the fleet, not locally.
 
 ## eBPF backend
 

@@ -50,6 +50,72 @@ independently of the eBPF program's current x86-64-only `pt_regs`; two
 separate reasons the `ebpf` feature stays x86-only. `asus` and `judge`
 are the hosts that can run it today.
 
+### Port capability matrix
+
+Per-host, per-root-hub USB capability, probed 2026-08-30, so it is clear
+which additional test devices each host has room for. Speed is the root
+hub's max link rate; "free" counts downstream ports with nothing attached
+(ports behind an internal hub are called out). The `C/PD/TB` column reads
+the sysfs `typec` / `usb_power_delivery` / `thunderbolt` classes; the ARM
+boards do not expose these classes at all, so a physical USB-C connector
+there is blank rather than a confirmed absence.
+
+| Host | Root hub | Driver | Ports | Speed | C/PD/TB | Free / attached |
+|---|---|---|---|---|---|---|
+| `rattler` | bus1 | xhci | 1 | 480M | — | internal 4p hub (ath9k on 1); 3 hub ports free |
+| `rattler` | bus2 | xhci | 4 | 5G | — | 4 free |
+| `pi400` | bus1 | xhci | 1 | 480M | — | internal 4p hub (kbd, RTL-SDR, HID); 1 hub port free |
+| `pi400` | bus2 | xhci | 4 | 5G | — | UAS SSD on 1; 3 free |
+| `pi58` | bus1 | xhci | 2 | 480M | — | 2 free |
+| `pi58` | bus2 | xhci | 1 | 5G | — | 1 free |
+| `pi58` | bus3 | xhci | 2 | 480M | — | 2 free |
+| `pi58` | bus4 | xhci | 1 | 5G | — | 1 free |
+| `enviro` | bus1 | dwc_otg | 1 | 480M | — | 1 free (the only port; OTG) |
+| `rock-32` | bus1 | xhci | 1 | 480M | — | 1 free |
+| `rock-32` | bus2 | xhci | 1 | 5G | — | 1 free |
+| `rock-32` | bus3 | xhci | 1 | 480M | — | 1 free |
+| `rock-32` | bus4 | ehci | 1 | 480M | — | internal hub (AIC8800 on 3); 3 free |
+| `rock-32` | bus5, bus7 | ohci | 1 | 12M | — | 2 free (low-speed) |
+| `rock-32` | bus6 | ehci | 1 | 480M | — | 1 free |
+| `rock-32` | bus8 | xhci | 1 | 5G | — | 1 free |
+| `airbox` | bus1 | xhci | 1 | 480M | — | internal hub (audio, BT); 2 free |
+| `airbox` | bus2 | xhci | 4 | 5G | — | camera on 1; 3 free |
+| `asus` | bus1 | xhci | 1 | 480M | — | 1 free |
+| `asus` | bus2 | xhci | 4 | 10G | C·PD·TB | 4 free |
+| `asus` | bus3 | xhci | 12 | 480M | — | hub + storage + webcam + BT; 8 free |
+| `asus` | bus4 | xhci | 4 | 10G | C·PD·TB | internal hub w/ 2 IDS cams; 3 root free |
+| `judge` | bus1 | xhci | 4 | 480M | — | HID on 3; 3 free |
+| `judge` | bus2 | xhci | 2 | 10G | C·PD | 2 free |
+| `judge` | bus3 | xhci | 4 | 480M | — | BT on 4; 3 free |
+| `judge` | bus4 | xhci | 2 | 10G | — | 2 free |
+
+Both USB-C ports on `asus` currently show a connected partner, so neither
+is free right now; `judge`'s single USB-C port (PD-capable, no TB) is
+free. Only `asus` exposes a Thunderbolt fabric. `usbfs_memory_mb` is
+raised to 1024 on `asus`; every other host sits at the 16 MB default, so
+raise it (see [the usbfs buffer note](#the-usbfs-buffer-limit-the-one-that-bites))
+before running a high-rate USB3 Vision camera on them.
+
+Where the [to-acquire](#to-acquire) devices go:
+
+- **USB 3.2 Gen 2 SSD enclosure (10 Gbps)** -> `asus` (bus2/bus4) or
+  `judge` (bus2/bus4), the only 10 Gbps hosts. Raise `judge`'s
+  `usbfs_memory_mb` first.
+- **USB 3.2 Gen 2x2 enclosure (20 Gbps)** -> no host on the fleet exposes
+  a 20 Gbps bus, so this one still needs new hardware, not just a host.
+- **USB4 / Thunderbolt dock** -> `asus` only; it is the sole Thunderbolt
+  host (`judge` has none).
+- **E-marked USB-C cables (the future cable diagnostics)** -> `judge`'s
+  free USB-C/PD port today, or free one of `asus`'s two USB-C ports. This
+  is the hardware that unblocks
+  [Cable and port diagnostics](ROADMAP.md#cable-and-port-diagnostics).
+- **USB2-only flash drive** -> any 480M port (e.g. `judge` bus1/bus3,
+  `pi58` bus1/bus3).
+- **Powered USB2 OTG hub + micro-B adapter** -> `enviro`; its single OTG
+  port is the whole reason that item exists.
+- **SD card for the reader** -> put the card reader on any free 5 Gbps
+  port (e.g. `rattler` bus2) and the card in it.
+
 ### On hand
 
 Verified working in captures on the reference laptop.
