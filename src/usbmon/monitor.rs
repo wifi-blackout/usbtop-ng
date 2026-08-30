@@ -22,6 +22,28 @@ use crate::device::manager::TrafficDelta;
 /// than the UI's ~50ms pass needs.
 const CHANNEL_BOUND: usize = 16_384;
 
+/// The pair of "which usbmon interface is live" flags a running source raises,
+/// grouped so the reader chain and the headless report pass them as one unit
+/// rather than as two loose arguments. [`run_source_chain`] sets exactly one to
+/// true for the interface actually reading; a `Deltas` (eBPF) session leaves
+/// both false. The [`MonitorHandle`] owns the canonical `Arc`s and this bundles
+/// clones of them for the call chain.
+#[derive(Clone)]
+pub(crate) struct SourceFlags {
+    /// Set once any reader ends up on the debugfs text interface — either
+    /// because that is the source it was given, or because a binary/mmap
+    /// source fell back to it. The text interface reports isochronous buffer
+    /// sizes, not bytes moved, so headless reports use this to mark iso
+    /// devices' rates `estimated`, and to label the source `"text"`.
+    pub(crate) text_active: Arc<AtomicBool>,
+    /// True while a reader is on the mmap ring interface, cleared if it falls
+    /// back to the `read()`-based binary or text interface (see
+    /// [`run_source_chain`]). Headless reports read this to label the source
+    /// `"mmap"` rather than `"binary"` — both consume the same `/dev/usbmonN`
+    /// device, so nothing else tells them apart.
+    pub(crate) mmap_active: Arc<AtomicBool>,
+}
+
 /// Ownership of the spawned reader threads.
 ///
 /// Callers must `stop()` this before doing anything that requires the usbmon
@@ -42,12 +64,10 @@ pub struct MonitorHandle {
     /// Clone the `Arc` before `stop()` to keep reading it, same as
     /// [`Self::dropped`].
     pub kernel_dropped: Arc<AtomicU64>,
-    /// Set once any reader ends up on the debugfs text interface — either
-    /// because that is the source it was given, or because a binary source
-    /// fell back to it (see `run_source_with_fallback`). The text interface
-    /// reports isochronous buffer sizes, not bytes moved, so headless reports
-    /// use this to mark iso devices' rates `estimated`.
-    pub text_active: Arc<AtomicBool>,
+    /// The live-interface flags a report reads to pick its `source` label and
+    /// mark text-interface estimates (see [`SourceFlags`]). Clone before
+    /// `stop()` to keep reading them.
+    pub flags: SourceFlags,
 }
 
 impl MonitorHandle {
@@ -256,6 +276,9 @@ fn try_ebpf_capture() -> Option<(Receiver<TrafficDelta>, MonitorHandle)> {
     // the life of the session.
     let kernel_dropped = Arc::new(AtomicU64::new(0));
     let text_active = Arc::new(AtomicBool::new(false));
+    // The eBPF backend is neither the mmap ring nor any usbmon reader, so this
+    // stays false; the report labels a Deltas stream "ebpf" regardless.
+    let mmap_active = Arc::new(AtomicBool::new(false));
 
     let poller_shutdown = Arc::clone(&shutdown);
     let poller_dropped = Arc::clone(&dropped);
@@ -289,7 +312,10 @@ fn try_ebpf_capture() -> Option<(Receiver<TrafficDelta>, MonitorHandle)> {
                 threads: vec![thread],
                 dropped,
                 kernel_dropped,
-                text_active,
+                flags: SourceFlags {
+                    text_active,
+                    mmap_active,
+                },
             },
         )),
         Err(e) => {
@@ -325,26 +351,22 @@ fn start_sources_with_bound(
     let dropped = Arc::new(AtomicU64::new(0));
     let kernel_dropped = Arc::new(AtomicU64::new(0));
     let text_active = Arc::new(AtomicBool::new(false));
+    let mmap_active = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
     for source in sources {
         let tx = tx.clone();
         let shutdown = Arc::clone(&shutdown);
         let dropped = Arc::clone(&dropped);
         let kernel_dropped = Arc::clone(&kernel_dropped);
-        let text_active = Arc::clone(&text_active);
+        let flags = SourceFlags {
+            text_active: Arc::clone(&text_active),
+            mmap_active: Arc::clone(&mmap_active),
+        };
         let bus = source.bus_id();
         match thread::Builder::new()
             .name(format!("usbmon-bus-{bus}"))
-            .spawn(move || {
-                run_source(
-                    source,
-                    &shutdown,
-                    &tx,
-                    &dropped,
-                    &kernel_dropped,
-                    &text_active,
-                )
-            }) {
+            .spawn(move || run_source(source, &shutdown, &tx, &dropped, &kernel_dropped, &flags))
+        {
             Ok(handle) => threads.push(handle),
             Err(e) => warn!("failed to spawn usbmon reader for bus {bus}: {e}"),
         }
@@ -356,7 +378,10 @@ fn start_sources_with_bound(
             threads,
             dropped,
             kernel_dropped,
-            text_active,
+            flags: SourceFlags {
+                text_active,
+                mmap_active,
+            },
         },
     )
 }
@@ -370,7 +395,7 @@ fn run_source(
     tx: &SyncSender<UsbPacket>,
     dropped: &AtomicU64,
     kernel_dropped: &AtomicU64,
-    text_active: &AtomicBool,
+    flags: &SourceFlags,
 ) {
     let fallback = UsbmonReader::new(source.bus_id());
     run_source_with_fallback(
@@ -380,7 +405,7 @@ fn run_source(
         tx,
         dropped,
         kernel_dropped,
-        text_active,
+        flags,
     );
 }
 
@@ -399,7 +424,7 @@ fn run_source_with_fallback(
     tx: &SyncSender<UsbPacket>,
     dropped: &AtomicU64,
     kernel_dropped: &AtomicU64,
-    text_active: &AtomicBool,
+    flags: &SourceFlags,
 ) {
     let bus = source.bus_id();
     // `start_monitoring`'s probe only tried the first target bus, and a
@@ -449,7 +474,7 @@ fn run_source_with_fallback(
         tx,
         dropped,
         kernel_dropped,
-        text_active,
+        flags,
     );
 }
 
@@ -472,14 +497,21 @@ fn run_source_chain(
     tx: &SyncSender<UsbPacket>,
     dropped: &AtomicU64,
     kernel_dropped: &AtomicU64,
-    text_active: &AtomicBool,
+    flags: &SourceFlags,
 ) {
     let bus = source.bus_id();
     loop {
-        if matches!(source, PacketSource::Text(_)) {
-            text_active.store(true, Ordering::Relaxed);
-        }
         let kind = source.kind();
+        if kind == SourceKind::Text {
+            flags.text_active.store(true, Ordering::Relaxed);
+        }
+        // Reflect the interface actually running for the report's source label.
+        // Unlike `text_active` (text is terminal, so it only ever latches
+        // true), this must clear when an mmap source falls back to binary/text
+        // on the next loop iteration.
+        flags
+            .mmap_active
+            .store(kind == SourceKind::Mmap, Ordering::Relaxed);
         let send = |packet| match tx.try_send(packet) {
             Ok(()) => Ok(()),
             // The channel is bounded on purpose (see CHANNEL_BOUND) and a reader
@@ -668,7 +700,10 @@ mod tests {
         let missing_device = temp.path().join("usbmon7"); // never created
 
         let (tx, rx) = sync_channel(4);
-        let text_active = AtomicBool::new(false);
+        let flags = SourceFlags {
+            text_active: Arc::new(AtomicBool::new(false)),
+            mmap_active: Arc::new(AtomicBool::new(false)),
+        };
         run_source_with_fallback(
             PacketSource::Binary(BinaryReader::with_path(7, missing_device, false)),
             UsbmonReader::with_path(7, text_path, false),
@@ -676,7 +711,7 @@ mod tests {
             &tx,
             &AtomicU64::new(0),
             &AtomicU64::new(0),
-            &text_active,
+            &flags,
         );
 
         let packets: Vec<_> = rx.try_iter().collect();
@@ -688,7 +723,7 @@ mod tests {
         assert_eq!(packets[0].bus_id, 7);
         assert_eq!(packets[0].data_length, 32);
         assert!(
-            text_active.load(Ordering::Relaxed),
+            flags.text_active.load(Ordering::Relaxed),
             "falling back to the text interface must raise the flag"
         );
     }
@@ -707,7 +742,10 @@ mod tests {
         let missing_ring = temp.path().join("usbmon201"); // never created
 
         let (tx, rx) = sync_channel(4);
-        let text_active = AtomicBool::new(false);
+        let flags = SourceFlags {
+            text_active: Arc::new(AtomicBool::new(false)),
+            mmap_active: Arc::new(AtomicBool::new(false)),
+        };
         let kernel_dropped = AtomicU64::new(0);
         run_source_with_fallback(
             PacketSource::Mmap(MmapReader::with_path(201, missing_ring, false)),
@@ -716,7 +754,7 @@ mod tests {
             &tx,
             &AtomicU64::new(0),
             &kernel_dropped,
-            &text_active,
+            &flags,
         );
 
         let packets: Vec<_> = rx.try_iter().collect();
@@ -728,7 +766,7 @@ mod tests {
         assert_eq!(packets[0].bus_id, 201);
         assert_eq!(packets[0].data_length, 32);
         assert!(
-            text_active.load(Ordering::Relaxed),
+            flags.text_active.load(Ordering::Relaxed),
             "falling back all the way to the text interface must raise the flag"
         );
         assert_eq!(
@@ -782,7 +820,10 @@ mod tests {
         let missing_device = temp.path().join("usbmon50"); // never created
 
         let (tx, rx) = sync_channel(4);
-        let text_active = AtomicBool::new(false);
+        let flags = SourceFlags {
+            text_active: Arc::new(AtomicBool::new(false)),
+            mmap_active: Arc::new(AtomicBool::new(false)),
+        };
         run_source_chain(
             PacketSource::Binary(BinaryReader::with_path(50, missing_device, false)),
             Some(UsbmonReader::with_path(50, text_path, false)),
@@ -790,14 +831,14 @@ mod tests {
             &tx,
             &AtomicU64::new(0),
             &AtomicU64::new(0),
-            &text_active,
+            &flags,
         );
 
         let packets: Vec<_> = rx.try_iter().collect();
         assert_eq!(packets.len(), 1, "the fallback's packets must arrive");
         assert_eq!(packets[0].bus_id, 50);
         assert!(
-            text_active.load(Ordering::Relaxed),
+            flags.text_active.load(Ordering::Relaxed),
             "falling back to the text interface must raise the flag"
         );
     }
@@ -815,7 +856,10 @@ mod tests {
         let missing_device = temp.path().join("usbmon51"); // never created
 
         let (tx, rx) = sync_channel(4);
-        let text_active = AtomicBool::new(false);
+        let flags = SourceFlags {
+            text_active: Arc::new(AtomicBool::new(false)),
+            mmap_active: Arc::new(AtomicBool::new(false)),
+        };
         run_source_chain(
             PacketSource::Binary(BinaryReader::with_path(51, missing_device, false)),
             Some(UsbmonReader::with_path(51, text_path, false)),
@@ -823,7 +867,7 @@ mod tests {
             &tx,
             &AtomicU64::new(0),
             &AtomicU64::new(0),
-            &text_active,
+            &flags,
         );
 
         let packets: Vec<_> = rx.try_iter().collect();
@@ -833,7 +877,7 @@ mod tests {
              one was available"
         );
         assert!(
-            !text_active.load(Ordering::Relaxed),
+            !flags.text_active.load(Ordering::Relaxed),
             "the text fallback must never run once shutdown was requested"
         );
     }
@@ -849,7 +893,10 @@ mod tests {
         std::fs::write(&unused_text, "ffff0000dddd0008 500 C Bi:8:009:1 0 32 <\n").unwrap();
 
         let (tx, rx) = sync_channel(4);
-        let text_active = AtomicBool::new(false);
+        let flags = SourceFlags {
+            text_active: Arc::new(AtomicBool::new(false)),
+            mmap_active: Arc::new(AtomicBool::new(false)),
+        };
         run_source_with_fallback(
             PacketSource::Binary(BinaryReader::with_path(8, binary_path, false)),
             UsbmonReader::with_path(8, unused_text, false),
@@ -857,7 +904,7 @@ mod tests {
             &tx,
             &AtomicU64::new(0),
             &AtomicU64::new(0),
-            &text_active,
+            &flags,
         );
 
         let packets: Vec<_> = rx.try_iter().collect();
@@ -865,7 +912,7 @@ mod tests {
         assert_eq!(packets[0].device_id, 3, "read from the binary source");
         assert_eq!(packets[0].data_length, 64);
         assert!(
-            !text_active.load(Ordering::Relaxed),
+            !flags.text_active.load(Ordering::Relaxed),
             "an openable binary source must not raise the text flag"
         );
     }
@@ -879,7 +926,7 @@ mod tests {
             1, path, false,
         ))]);
         let _ = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(handle.text_active.load(Ordering::Relaxed));
+        assert!(handle.flags.text_active.load(Ordering::Relaxed));
         handle.stop();
     }
 
@@ -892,7 +939,7 @@ mod tests {
             1, path, false,
         ))]);
         let _ = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(!handle.text_active.load(Ordering::Relaxed));
+        assert!(!handle.flags.text_active.load(Ordering::Relaxed));
         handle.stop();
     }
 

@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use crate::device::manager::DeviceManager;
 use crate::filter::FilterSet;
-use crate::usbmon::monitor::CaptureStream;
+use crate::usbmon::monitor::{CaptureStream, SourceFlags};
 use crate::usbmon::parser::format_mbps;
 
 pub struct HeadlessOptions {
@@ -398,16 +398,23 @@ fn drain(manager: &mut DeviceManager, capture: &CaptureStream) -> DrainStatus {
     }
 }
 
-/// The `Report::source` label for `capture`: `"ebpf"` for the eBPF
-/// backend's exact byte counts -- never an estimate, so `text_active` is
-/// irrelevant for it -- or usbmon's own `"text"`/`"binary"` split for a
-/// `Packets` session (`text_active` only ever gets set by the debugfs text
-/// reader, see `monitor::run_source_chain`, so it is always `false` for the
-/// life of a `Deltas` session anyway).
-fn capture_source_label(capture: &CaptureStream, text_active: bool) -> &'static str {
+/// The `Report::source` label for `capture`: `"ebpf"` for the eBPF backend's
+/// exact byte counts, or usbmon's own `"text"`/`"mmap"`/`"binary"` split for a
+/// `Packets` session. `text_active` and `mmap_active` come from
+/// `monitor::run_source_chain`, which sets exactly one to true for the
+/// interface actually running; text wins if both somehow read true (it is the
+/// terminal fallback), then mmap, else the `read()`-based binary interface.
+/// Both are always `false` for the life of a `Deltas` session, which spawns no
+/// usbmon reader, so the eBPF arm never consults them.
+fn capture_source_label(
+    capture: &CaptureStream,
+    text_active: bool,
+    mmap_active: bool,
+) -> &'static str {
     match capture {
         CaptureStream::Deltas(_) => "ebpf",
         CaptureStream::Packets(_) if text_active => "text",
+        CaptureStream::Packets(_) if mmap_active => "mmap",
         CaptureStream::Packets(_) => "binary",
     }
 }
@@ -427,7 +434,7 @@ pub fn run(
     capture: CaptureStream,
     dropped: Arc<AtomicU64>,
     kernel_dropped: Arc<AtomicU64>,
-    text_active: Arc<AtomicBool>,
+    flags: SourceFlags,
     filter: FilterSet,
     opts: HeadlessOptions,
 ) -> Result<()> {
@@ -460,14 +467,18 @@ pub fn run(
         // break the wait loop above before the deadline (see `build_report`).
         let elapsed = window_start.elapsed();
 
-        let source = capture_source_label(&capture, text_active.load(Ordering::Relaxed));
+        let source = capture_source_label(
+            &capture,
+            flags.text_active.load(Ordering::Relaxed),
+            flags.mmap_active.load(Ordering::Relaxed),
+        );
         let mut report = build_report(
             &manager,
             &baseline,
             elapsed,
             source,
             dropped.load(Ordering::Relaxed),
-            text_active.load(Ordering::Relaxed),
+            flags.text_active.load(Ordering::Relaxed),
             &filter,
         );
         // Not a `build_report` parameter (see the field's doc comment): the
@@ -558,7 +569,10 @@ mod tests {
             CaptureStream::Packets(rx),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicBool::new(false)),
+            SourceFlags {
+                text_active: Arc::new(AtomicBool::new(false)),
+                mmap_active: Arc::new(AtomicBool::new(false)),
+            },
             FilterSet::default(),
             HeadlessOptions {
                 json: true,
@@ -1028,19 +1042,37 @@ mod capture_dispatch_tests {
     fn capture_source_label_reports_ebpf_for_a_deltas_stream_regardless_of_text_active() {
         let (_tx, rx) = sync_channel::<crate::device::manager::TrafficDelta>(1);
         let capture = CaptureStream::Deltas(rx);
-        assert_eq!(capture_source_label(&capture, false), "ebpf");
+        assert_eq!(capture_source_label(&capture, false, false), "ebpf");
         assert_eq!(
-            capture_source_label(&capture, true),
+            capture_source_label(&capture, true, true),
             "ebpf",
-            "the eBPF backend's counts are exact, never an estimate"
+            "a Deltas stream is the eBPF backend regardless of the usbmon flags"
         );
     }
 
     #[test]
-    fn capture_source_label_keeps_the_text_binary_split_for_a_packets_stream() {
+    fn capture_source_label_splits_mmap_binary_and_text_for_a_packets_stream() {
         let (_tx, rx) = sync_channel::<crate::usbmon::parser::UsbPacket>(1);
         let capture = CaptureStream::Packets(rx);
-        assert_eq!(capture_source_label(&capture, false), "binary");
-        assert_eq!(capture_source_label(&capture, true), "text");
+        assert_eq!(
+            capture_source_label(&capture, false, false),
+            "binary",
+            "the read()-based binary interface: neither text nor mmap"
+        );
+        assert_eq!(
+            capture_source_label(&capture, false, true),
+            "mmap",
+            "the mmap ring reader must not be mislabeled as binary"
+        );
+        assert_eq!(
+            capture_source_label(&capture, true, false),
+            "text",
+            "text is the terminal fallback"
+        );
+        assert_eq!(
+            capture_source_label(&capture, true, true),
+            "text",
+            "text wins if both flags somehow read true"
+        );
     }
 }

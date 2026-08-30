@@ -36,6 +36,19 @@ use super::{open_nonblocking, POLL_INTERVAL};
 /// event.
 const OFFSETS_CAP: usize = 64;
 
+/// Ring size requested via [`MON_IOCT_RING_SIZE`] before mapping. The kernel's
+/// default ring is ~300 KiB, which overflows within about a millisecond at
+/// USB3 throughput -- a 336 MB/s bulk read dropped ~87% of packets on it (a
+/// smaller 16 MiB ring cut that ~15x but still dropped a couple thousand
+/// events) -- so a reader thread that is briefly descheduled loses events the
+/// kernel had nowhere to keep. 64 MiB is the kernel's own maximum on current
+/// kernels and, live-tested, drops zero packets across a full 4 GiB read at
+/// 5 Gbps and a 12 GiB read at 10 Gbps, matching a concurrent eBPF capture to
+/// the byte. The kernel clamps this request to its own limit and the reader
+/// maps whatever [`ring_size`] reports afterward, so it is a request, not a
+/// guarantee; a lower-max kernel simply gets its largest ring.
+const RING_TARGET_BYTES: usize = 64 * 1024 * 1024;
+
 // --- ioctl numbers, derived rather than hard-coded ---------------------
 
 /// `_IOC_NONE`: no argument copied either direction.
@@ -65,6 +78,14 @@ const fn ioc(dir: u32, ty: u32, nr: u32, size: u32) -> u32 {
 /// Returns the ring's size in bytes as the ioctl's own return value (it takes
 /// no argument, so there is nothing to `_IOR`/`_IOW`).
 const MON_IOCQ_RING_SIZE: u32 = ioc(IOC_NONE, USBMON_IOC_MAGIC, 5, 0);
+
+/// Sets the ring's byte size, passed straight as the ioctl argument (a
+/// directionless `_IO`, like [`MON_IOCH_MFLUSH`], so no size is packed into
+/// the request number). The kernel page-aligns the request and clamps it to
+/// its own `[BUFF_MIN, BUFF_MAX]`, so [`ring_size`] afterward reports the
+/// value actually set. Must be issued before `mmap`, since the kernel
+/// reallocates the ring on resize.
+const MON_IOCT_RING_SIZE: u32 = ioc(IOC_NONE, USBMON_IOC_MAGIC, 4, 0);
 
 /// Releases previously fetched events back to the ring by count.
 /// [`MonBinMfetch::nflush`] does this same job between two fetches; this
@@ -299,6 +320,31 @@ fn ring_size(fd: RawFd) -> io::Result<usize> {
     Ok(ret as usize)
 }
 
+/// `MON_IOCT_RING_SIZE`: request `bytes` for this fd's ring, best-effort. The
+/// kernel clamps to its own limits; read [`ring_size`] afterward for what it
+/// actually set. Returns the ioctl error (e.g. `ENOTTY` on a kernel without
+/// this request, or `EINVAL`) so the caller can carry on with the default ring
+/// rather than fail the whole reader.
+fn set_ring_size(fd: RawFd, bytes: usize) -> io::Result<()> {
+    // SAFETY: `fd` is a valid, open descriptor for the duration of this call.
+    // `MON_IOCT_RING_SIZE` is a directionless `_IO` request that reads its size
+    // straight from the argument (the same shape as `MON_IOCH_MFLUSH`), so
+    // passing `bytes` as the argument is correct and nothing is copied to or
+    // from user memory; the return is checked for the negative-on-error
+    // convention before being treated as success.
+    let ret = unsafe {
+        libc::ioctl(
+            fd,
+            MON_IOCT_RING_SIZE as libc::c_ulong,
+            bytes as libc::c_ulong,
+        )
+    };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `MON_IOCX_MFETCH`: flushes the previous batch (`nflush`) and fetches up to
 /// [`OFFSETS_CAP`] new event offsets into `offsets`, returning how many were
 /// fetched.
@@ -502,6 +548,17 @@ impl MmapReader {
         let file = open_nonblocking(&self.path)
             .map_err(|e| anyhow!("Failed to open {}: {}", self.path.display(), e))?;
         let fd = file.as_raw_fd();
+        // Enlarge the ring before mapping. The kernel's small default overflows
+        // under USB3 throughput (see `RING_TARGET_BYTES`); this must precede the
+        // `mmap` below, since the kernel reallocates the ring on resize. It is
+        // best-effort: on a kernel that lacks the request or denies it, fall
+        // back to the default ring rather than fail the reader.
+        if let Err(e) = set_ring_size(fd, RING_TARGET_BYTES) {
+            debug!(
+                "MON_IOCT_RING_SIZE({RING_TARGET_BYTES}) on {}: {e}; using the default ring",
+                self.path.display()
+            );
+        }
         let ring_len = ring_size(fd)
             .map_err(|e| anyhow!("MON_IOCQ_RING_SIZE on {}: {}", self.path.display(), e))?;
         if ring_len == 0 {
@@ -852,6 +909,7 @@ mod tests {
     #[test]
     fn ioctl_numbers_match_the_verified_constants() {
         assert_eq!(MON_IOCQ_RING_SIZE, 0x9205);
+        assert_eq!(MON_IOCT_RING_SIZE, 0x9204);
         assert_eq!(MON_IOCH_MFLUSH, 0x9208);
         assert_eq!(MON_IOCG_STATS, 0x8008_9203);
         #[cfg(target_pointer_width = "64")]
