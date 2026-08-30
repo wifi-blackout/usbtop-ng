@@ -24,7 +24,7 @@ spans armv6l, aarch64, and x86_64 -- the matrix the roadmap wants.
 | ssh | Board / SoC | Arch | Kernel | OS | usbmon | Notable |
 | --- | --- | --- | --- | --- | --- | --- |
 | `rattler` | Raspberry Pi 4 Model B (BCM2711) | aarch64 | 6.12.75+rpt-rpi-v8 | Debian 13 | module | VL805 USB3 over PCIe + BCM2711 USB2; AR9271 Wi-Fi leaf |
-| `pi400` | Raspberry Pi 400 (BCM2711) | aarch64 | 6.18.34+rpt-rpi-v8 | Debian 13 | module? | VL805; RTL9210 NVMe over UAS on USB3, a built-in saturation source; newest kernel; no passwordless sudo |
+| `pi400` | Raspberry Pi 400 (BCM2711) | aarch64 | 6.18.39+rpt-rpi-v8 | Debian 13 | module | VL805; RTL9210 NVMe over UAS on USB3, a built-in saturation source; newest kernel in the fleet |
 | `pi58` | Raspberry Pi 5 (BCM2712) | aarch64 | 6.6.31+rpt-rpi-2712 | Debian 12 | module | RP1-southbridge xHCI, two USB2 + two USB3 buses; the best Pi USB path |
 | `enviro` | Raspberry Pi Zero W (BCM2835) | **armv6l** | 6.12.96+rpt-rpi-v6 | Raspbian 12 | module | single core, one `dwc_otg` OTG port at 480M; the 32-bit `gnueabihf` build target |
 | `rock-32` | Radxa ROCK 5C (Rockchip RK3588S2) | aarch64 | 6.1.84-8-rk2410 (vendor) | Debian 12 | built-in | usbmon built in, `/dev/usbmon0..8` live; eight buses (xhci + ehci/ohci-platform); the binary-only vendor-kernel path |
@@ -34,13 +34,11 @@ spans armv6l, aarch64, and x86_64 -- the matrix the roadmap wants.
 
 usbmon confirmed on 2026-08-30: `modprobe usbmon` loads the module and
 populates `/dev/usbmon<N>` plus the debugfs text interface on `rattler`,
-`enviro`, `pi58`, `asus`, and `judge`; `rock-32` has it built in with
-nodes already live. Two exceptions: `airbox`'s 5.4 vendor kernel carries
-no usbmon module (`modprobe: FATAL: Module usbmon not found`), so it
-cannot capture until its kernel gains `CONFIG_USB_MON` -- its stage-0
-gate fails today; and `pi400` could not be confirmed non-interactively
-(no passwordless sudo), though its kernel matches `rattler`'s and should
-behave the same once loaded.
+`pi400`, `enviro`, `pi58`, `asus`, and `judge`; `rock-32` has it built in
+with nodes already live. The one exception is `airbox`: its 5.4 vendor
+kernel carries no usbmon module (`modprobe: FATAL: Module usbmon not
+found`), so it cannot capture until its kernel gains `CONFIG_USB_MON` --
+its stage-0 gate fails today.
 
 eBPF backend readiness: the CO-RE prerequisite `/sys/kernel/btf/vmlinux`
 (from `CONFIG_DEBUG_INFO_BTF=y`) is present only on the two x86_64 hosts,
@@ -161,9 +159,7 @@ reverse.
 - `rattler` (Pi 4) and `pi400` (Pi 400): two host stacks. Run stage 3
   once on a blue USB3 port and once on the USB2 path, and confirm both
   controllers group correctly. `pi400` already carries an RTL9210 NVMe
-  over UAS on USB3 -- a built-in saturation source for stage 7 -- but it
-  lacks passwordless sudo, so load usbmon with an interactive
-  `sudo modprobe usbmon` before a run.
+  over UAS on USB3 -- a built-in saturation source for stage 7.
 - `pi58` (Pi 5): repeat stage 6 on both front ports.
 - `rock-32` (ROCK 5C): include the OTG-capable port in stage 3 and note
   its role. Built-in usbmon is confirmed here (`CONFIG_USB_MON=y`,

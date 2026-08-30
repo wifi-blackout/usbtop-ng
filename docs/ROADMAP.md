@@ -210,6 +210,54 @@ matching the eBPF capture and the exact `dd` count (numbers above). The eBPF
 backend aggregates in-kernel and was immune throughout -- the strongest
 validation yet of that backend for high-throughput monitoring.
 
+### Bringing the eBPF backend to ARM
+
+The `ebpf` feature is x86-64-only today; the 2026-08-30 fleet probe (see
+[Test hosts](TESTING.md#test-hosts)) pinned down exactly why and what it
+would take. Two independent blockers, both solvable on arm64.
+
+First, the x86-only `pt_regs`. The program's argument handling is already
+portable -- `src/bpf/usbrate.bpf.c` uses libbpf's `BPF_KPROBE` macro and
+`BPF_CORE_READ` throughout. The one arch-specific piece is the
+hand-written `struct pt_regs` in `src/bpf/vmlinux.h` (the x86-64 register
+layout: `di`/`si`/`dx`/...), which `BPF_KPROBE` reads argument registers
+from. Adding arm64 means making that struct conditional -- an
+`#if defined(__TARGET_ARCH_arm64)` block with the arm64 layout
+(`unsigned long regs[31]; unsigned long sp, pc, pstate;`) -- and passing
+`-D__TARGET_ARCH_arm64` when `build.rs` compiles the BPF object for an ARM
+target, so `bpf_tracing.h`'s `PT_REGS_PARM1` resolves to `regs[0]`. The C
+in `usbrate.bpf.c` does not change; only the header and the build.
+
+Second, missing BTF. CO-RE needs `/sys/kernel/btf/vmlinux`, and the probe
+found it absent on every ARM board (present only on the x86 hosts `asus`
+and `judge`). `CONFIG_BPF_SYSCALL`, `CONFIG_KPROBES`, and the
+`__usb_hcd_giveback_urb` symbol are all present on the ARM boards, so BTF
+is the sole load-time gap. Three ways to supply it, none touching the
+program: an external BTF via libbpf's `btf_custom_path`, generated with
+`pahole -J vmlinux` from the board kernel's DWARF debuginfo (or pulled
+from BTFHub where it carries the kernel -- it will not have the `rpt`,
+Rockchip, or SOPHGO vendor kernels); a kernel rebuilt with
+`CONFIG_DEBUG_INFO_BTF=y`; or a per-kernel non-CO-RE build, which is
+brittle and not worth it.
+
+Per host: `rock-32` (RK3588S2, arm64, 6.1) is the natural first target --
+arm64 with kprobe and BPF confirmed, so it needs only the arm64 `pt_regs`
+and an external BTF. `pi58`, `rattler`, and `pi400` (arm64, rpt kernels)
+follow the same recipe, sourcing BTF from a matching debuginfo build or a
+custom kernel. `enviro` (armv6l, Pi Zero) is out of scope: 32-bit ARM
+eBPF and CO-RE tooling are immature, and usbmon is the right backend
+there. `airbox` (BM1684x, 5.4 vendor) is the worst case -- no usbmon and
+no BTF on an old kernel; it needs a rebuild with both `CONFIG_USB_MON`
+and `CONFIG_DEBUG_INFO_BTF` before either backend runs.
+
+Worth doing, not urgent: usbmon now captures byte-exact at high
+throughput on every ARM board except `airbox`, so the eBPF backend's ARM
+upside is mainly the isochronous-undercount case and future per-process
+attribution. The concrete next step is a spike on `rock-32` -- add the
+conditional arm64 `pt_regs`, compile with `-D__TARGET_ARCH_arm64`,
+generate BTF with `pahole -J`, and attempt a verify-load and a short
+capture.
+
 ## Engineering follow-ups
 
 These came out of code review. Each is small and none blocks a release.
