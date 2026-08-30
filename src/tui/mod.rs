@@ -256,6 +256,9 @@ fn run_app(
 
     loop {
         let now = Instant::now();
+        // Set by a search keystroke this pass (see [`Fold::resync`]); consumed
+        // below, after the capture drain, to rebuild the filtered view now.
+        let mut resync = false;
         let timeout = if packet_backlog {
             // The last drain filled its batch, so the channel may still hold
             // more: come straight back for the rest instead of spending a
@@ -286,6 +289,7 @@ fn run_app(
                     force_full_repaint(terminal)?;
                 }
                 dirty |= fold.dirty;
+                resync = fold.resync;
             }
             Err(RecvTimeoutError::Timeout) => {}
             // Every sender is gone, so no event can ever wake the loop again.
@@ -297,6 +301,17 @@ fn run_app(
         // The wait above may have consumed the whole timeout, so the clock is
         // re-read before deciding what this pass owes.
         let now = Instant::now();
+        // A search keystroke changed which devices should show: rebuild the
+        // filtered view from the manager now, before the draw below, so the
+        // search box filters as you type instead of waiting for the next tick
+        // (up to a full `--refresh` interval away). Runs after the capture
+        // drain so it also reflects any packets that just arrived. Unlike the
+        // tick, it does not advance the bandwidth history -- only the visible
+        // filtering changed, not the clock.
+        if resync {
+            app.sync_from(manager);
+            dirty = true;
+        }
         if now >= next_tick {
             // `sync_from` rebuilds the whole snapshot, so the list of devices
             // dropped by this refresh needs no separate handling.
@@ -341,6 +356,10 @@ fn run_app(
 struct Fold {
     /// Something changed what the screen should show.
     dirty: bool,
+    /// A search keystroke changed which devices should show, so the filtered
+    /// view has to be rebuilt from the manager before the repaint rather than
+    /// at the next refresh tick. Implies `dirty`.
+    resync: bool,
     /// The screen itself is suspect and has to be wiped before the repaint.
     clear: bool,
     /// The size the screen ended the batch at, when the batch resized it. Only
@@ -387,6 +406,10 @@ fn fold_events(
                         fold.dirty = true;
                     }
                     KeyOutcome::Redraw => fold.dirty = true,
+                    KeyOutcome::Resync => {
+                        fold.dirty = true;
+                        fold.resync = true;
+                    }
                     KeyOutcome::None => {}
                 }
             }
@@ -459,6 +482,7 @@ mod tests {
             fold,
             Fold {
                 dirty: true,
+                resync: false,
                 clear: false,
                 // The size the drag finished at, not the five it passed
                 // through: that is the one the writer has to be told about.
@@ -498,11 +522,32 @@ mod tests {
             fold,
             Fold {
                 dirty: true,
+                resync: false,
                 clear: true,
                 resize: None,
                 exit: None
             }
         );
+    }
+
+    /// A search keystroke asks the loop to rebuild the filtered view now (see
+    /// [`Fold::resync`]) rather than at the next tick, so the table filters as
+    /// you type. A plain redraw would repaint the same, still-stale rows.
+    #[test]
+    fn a_search_keystroke_asks_the_loop_to_resync_the_view() {
+        let mut app = test_app();
+        // Open the search box for editing so the next char enters the query.
+        app.search = ui::SearchState::Editing(String::new());
+        let fold = fold_events(
+            &mut app,
+            &mut test_manager(),
+            iter::once(key_event(KeyCode::Char('a'))),
+        );
+        assert!(
+            fold.resync,
+            "a typed search character rebuilds the filtered view now"
+        );
+        assert!(fold.dirty, "resync implies a redraw");
     }
 
     #[test]

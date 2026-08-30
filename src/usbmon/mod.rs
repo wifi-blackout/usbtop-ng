@@ -41,7 +41,7 @@ pub struct UsbmonStatus {
     /// `binary_available || text_available`: whether *some* usbmon interface
     /// can be read, regardless of which one.
     pub usbmon_available: bool,
-    /// Whether some `/dev/usbmon*` node opened (see [`binary_interface_available`]).
+    /// Whether some `/dev/usbmon*` node opened (see [`classify_binary_interface`]).
     pub binary_available: bool,
     /// Whether the debugfs `usbmon` directory is present and readable.
     pub text_available: bool,
@@ -62,14 +62,14 @@ pub fn check_usbmon_status() -> Result<UsbmonStatus> {
     let debugfs_root = Path::new("/sys/kernel/debug/usb/usbmon");
 
     let discovered_buses = discover_buses(sysfs_root, dev_root, debugfs_root);
-    let binary_available = binary_interface_available(dev_root, &discovered_buses);
+    let binary_state = classify_binary_interface(dev_root, &discovered_buses);
+    let binary_available = binary_state == BinaryState::Openable;
     let debugfs_state = classify_debugfs_path(debugfs_root);
     let text_available = debugfs_state == DebugfsState::Present;
     let usbmon_available = binary_available || text_available;
 
     let debugfs_mounted = is_debugfs_mounted()?;
-    let permission_denied =
-        permission_denied_from(debugfs_mounted, debugfs_state, binary_available);
+    let permission_denied = permission_denied_from(debugfs_mounted, debugfs_state, binary_state);
     let module_loaded = is_usbmon_module_loaded(binary_available, text_available)?;
 
     Ok(UsbmonStatus {
@@ -84,7 +84,7 @@ pub fn check_usbmon_status() -> Result<UsbmonStatus> {
 }
 
 /// Restores the `--force` contract: [`discover_buses`] runs unconditionally
-/// (its result feeds [`binary_interface_available`], the probe that decides
+/// (its result feeds [`classify_binary_interface`], the probe that decides
 /// `usbmon_available` in the first place), but that discovery must not leak
 /// into `available_buses` when no usbmon interface actually exists. Without
 /// this gate, `--force` on a host with real USB buses but no usbmon spawns
@@ -134,28 +134,60 @@ fn discover_buses(sysfs_root: &Path, dev_root: &Path, debugfs_root: &Path) -> Ve
     buses
 }
 
-/// Whether some `/dev/usbmon*` node can actually be opened: `usbmon0` (the
+/// What an open of the `/dev/usbmon*` nodes tells us, mirroring
+/// [`DebugfsState`] for the binary interface: at least one node opened, no
+/// node at all, or a node that exists but refused to open for permissions.
+/// The old bool collapsed the last case into "absent", which sent a user
+/// with a root-owned node to `modprobe`/`mount` instructions that cannot fix
+/// a permission problem instead of to `sudo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryState {
+    Openable,
+    Absent,
+    Unreadable,
+}
+
+/// Which [`BinaryState`] the `/dev/usbmon*` nodes are in: `usbmon0` (the
 /// kernel's aggregate) first, then each bus [`discover_buses`] found. Uses
 /// [`open_nonblocking`], the same probe primitive
 /// [`monitor::start_monitoring`] uses, and drops every handle immediately —
-/// a probe must never pin the module the way a would-be reader could.
-fn binary_interface_available(dev_root: &Path, buses: &[u8]) -> bool {
-    std::iter::once(0)
-        .chain(buses.iter().copied())
-        .any(|bus| open_nonblocking(&dev_root.join(format!("usbmon{bus}"))).is_ok())
+/// a probe must never pin the module the way a would-be reader could. A node
+/// that exists but refuses to open for permissions yields `Unreadable`, not
+/// `Absent`, so the caller can name `sudo` rather than `modprobe`.
+fn classify_binary_interface(dev_root: &Path, buses: &[u8]) -> BinaryState {
+    let mut denied = false;
+    for bus in std::iter::once(0).chain(buses.iter().copied()) {
+        match open_nonblocking(&dev_root.join(format!("usbmon{bus}"))) {
+            Ok(_) => return BinaryState::Openable,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => denied = true,
+            Err(_) => {}
+        }
+    }
+    if denied {
+        BinaryState::Unreadable
+    } else {
+        BinaryState::Absent
+    }
 }
 
 /// A permission problem is only nameable as such when it is the *only*
-/// reason usbmon is unavailable: debugfs is mounted, its `usbmon` directory
-/// exists but this user cannot read it, and no `/dev/usbmon*` node stood in
-/// for it either. A root-only debugfs next to a working binary node is not
-/// an error at all — the binary interface stands alone.
+/// reason usbmon is unavailable: some interface is present but blocked for
+/// permissions — debugfs mounted with an unreadable `usbmon` directory, or a
+/// `/dev/usbmon*` node that exists but refused to open — and no other
+/// interface stood in for it. A root-only interface next to a working one is
+/// not an error at all; the working interface stands alone.
 fn permission_denied_from(
     debugfs_mounted: bool,
-    state: DebugfsState,
-    binary_available: bool,
+    debugfs_state: DebugfsState,
+    binary_state: BinaryState,
 ) -> bool {
-    debugfs_mounted && state == DebugfsState::Unreadable && !binary_available
+    let available = binary_state == BinaryState::Openable || debugfs_state == DebugfsState::Present;
+    if available {
+        return false;
+    }
+    let debugfs_blocked = debugfs_mounted && debugfs_state == DebugfsState::Unreadable;
+    let binary_blocked = binary_state == BinaryState::Unreadable;
+    debugfs_blocked || binary_blocked
 }
 
 /// Whether usbmon is loaded, including kernels that build it in rather than
@@ -624,32 +656,64 @@ mod tests {
     }
 
     #[test]
-    fn binary_interface_available_finds_a_fifo_standing_in_for_usbmon0() {
+    fn classify_binary_interface_finds_a_fifo_standing_in_for_usbmon0() {
         let temp = tempfile::tempdir().unwrap();
         let dev_root = temp.path().join("dev");
         std::fs::create_dir_all(&dev_root).unwrap();
         touch_fifo(&dev_root.join("usbmon0"));
 
-        assert!(super::binary_interface_available(&dev_root, &[1, 3]));
+        assert_eq!(
+            super::classify_binary_interface(&dev_root, &[1, 3]),
+            super::BinaryState::Openable
+        );
     }
 
     #[test]
-    fn binary_interface_available_finds_a_per_bus_node_without_the_aggregate() {
+    fn classify_binary_interface_finds_a_per_bus_node_without_the_aggregate() {
         let temp = tempfile::tempdir().unwrap();
         let dev_root = temp.path().join("dev");
         std::fs::create_dir_all(&dev_root).unwrap();
         touch_fifo(&dev_root.join("usbmon3"));
 
-        assert!(super::binary_interface_available(&dev_root, &[1, 3]));
+        assert_eq!(
+            super::classify_binary_interface(&dev_root, &[1, 3]),
+            super::BinaryState::Openable
+        );
     }
 
     #[test]
-    fn binary_interface_available_is_false_with_no_dev_nodes() {
+    fn classify_binary_interface_is_absent_with_no_dev_nodes() {
         let temp = tempfile::tempdir().unwrap();
         let dev_root = temp.path().join("dev");
         std::fs::create_dir_all(&dev_root).unwrap();
 
-        assert!(!super::binary_interface_available(&dev_root, &[1, 3]));
+        assert_eq!(
+            super::classify_binary_interface(&dev_root, &[1, 3]),
+            super::BinaryState::Absent
+        );
+    }
+
+    /// A `/dev/usbmon*` node that exists but is root-owned: a plain user's
+    /// open returns `EACCES`, which must classify as `Unreadable` (node is
+    /// there, needs `sudo`), never `Absent` (send the user to `modprobe`).
+    /// Root bypasses file permissions, so the assertion is skipped there.
+    #[test]
+    fn classify_binary_interface_is_unreadable_for_a_permission_denied_node() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root opens a 0000 node fine; the EACCES path is unreachable
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let dev_root = temp.path().join("dev");
+        std::fs::create_dir_all(&dev_root).unwrap();
+        let node = dev_root.join("usbmon0");
+        std::fs::write(&node, "").unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert_eq!(
+            super::classify_binary_interface(&dev_root, &[1, 3]),
+            super::BinaryState::Unreadable
+        );
     }
 
     /// The full scenario from the spec: a host with sysfs buses and a working
@@ -669,7 +733,8 @@ mod tests {
         let buses = super::discover_buses(&sysfs_root, &dev_root, &debugfs_root);
         assert_eq!(buses, vec![0, 1, 3]);
 
-        let binary_available = super::binary_interface_available(&dev_root, &buses);
+        let binary_available =
+            super::classify_binary_interface(&dev_root, &buses) == super::BinaryState::Openable;
         let text_available =
             super::classify_debugfs_path(&debugfs_root) == super::DebugfsState::Present;
         assert!(
@@ -701,7 +766,8 @@ mod tests {
         let buses = super::discover_buses(&sysfs_root, &dev_root, &debugfs_root);
         assert_eq!(buses, vec![0, 1, 3]);
 
-        let binary_available = super::binary_interface_available(&dev_root, &buses);
+        let binary_available =
+            super::classify_binary_interface(&dev_root, &buses) == super::BinaryState::Openable;
         let text_available =
             super::classify_debugfs_path(&debugfs_root) == super::DebugfsState::Present;
         assert!(!binary_available);
@@ -726,7 +792,8 @@ mod tests {
         let discovered = super::discover_buses(&sysfs_root, &dev_root, &debugfs_root);
         assert_eq!(discovered, vec![1, 3], "sysfs still lists real buses");
 
-        let binary_available = super::binary_interface_available(&dev_root, &discovered);
+        let binary_available = super::classify_binary_interface(&dev_root, &discovered)
+            == super::BinaryState::Openable;
         let text_available =
             super::classify_debugfs_path(&debugfs_root) == super::DebugfsState::Present;
         let usbmon_available = binary_available || text_available;
@@ -743,25 +810,41 @@ mod tests {
     }
 
     #[test]
-    fn permission_denied_requires_binary_to_also_be_unavailable() {
+    fn permission_denied_requires_a_blocked_interface_and_no_working_one() {
+        use super::{BinaryState, DebugfsState};
+        // Debugfs mounted but unreadable, no binary node: the original case.
         assert!(super::permission_denied_from(
             true,
-            super::DebugfsState::Unreadable,
-            false
+            DebugfsState::Unreadable,
+            BinaryState::Absent
         ));
+        // The sharper case this fix adds: a root-owned /dev/usbmon node
+        // (EACCES) with no debugfs at all is still a permission problem, so
+        // the remedy must be `sudo`, not `modprobe`.
         assert!(
-            !super::permission_denied_from(true, super::DebugfsState::Unreadable, true),
+            super::permission_denied_from(false, DebugfsState::Absent, BinaryState::Unreadable),
+            "a root-owned /dev/usbmon node is a permission problem, not an absent one"
+        );
+        // A working interface on either side means it is not a permission error.
+        assert!(
+            !super::permission_denied_from(true, DebugfsState::Unreadable, BinaryState::Openable),
             "a working /dev/usbmon node means this is not a permission error"
         );
-        assert!(!super::permission_denied_from(
-            true,
-            super::DebugfsState::Present,
-            false
-        ));
+        assert!(
+            !super::permission_denied_from(true, DebugfsState::Present, BinaryState::Unreadable),
+            "a readable debugfs interface means this is not a permission error"
+        );
+        // Nothing present at all is a not-found problem, not a permission one.
         assert!(!super::permission_denied_from(
             false,
-            super::DebugfsState::Unreadable,
-            false
+            DebugfsState::Absent,
+            BinaryState::Absent
+        ));
+        // Debugfs unreadable but not mounted is not attributable to permissions.
+        assert!(!super::permission_denied_from(
+            false,
+            DebugfsState::Unreadable,
+            BinaryState::Absent
         ));
     }
 

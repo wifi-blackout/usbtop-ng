@@ -14,6 +14,18 @@ struct {
     __type(value, __u64);
 } bytes SEC(".maps");
 
+/* Single-slot counter of URBs whose bytes were lost because `bytes` was full
+ * (see the giveback handler below). Userspace reads slot 0 each poll and folds
+ * it into the `kernel_dropped` counter (surfaced as `kdropped:` and
+ * `kernel_dropped_packets`), so the bounded map-full loss shows up instead of
+ * silently under-reporting. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} dropped SEC(".maps");
+
 SEC("kprobe/__usb_hcd_giveback_urb")
 int BPF_KPROBE(on_giveback, struct urb *urb)
 {
@@ -46,7 +58,16 @@ int BPF_KPROBE(on_giveback, struct urb *urb)
     __u64 init = len;
     if (bpf_map_update_elem(&bytes, &k, &init, BPF_NOEXIST) != 0) {
         cur = bpf_map_lookup_elem(&bytes, &k);
-        if (cur) __sync_fetch_and_add(cur, (__u64)len);
+        if (cur) {
+            __sync_fetch_and_add(cur, (__u64)len);
+        } else {
+            /* Not a first-insert race (that re-lookup would have hit): the map
+             * is genuinely full, so this URB's bytes have nowhere to go. Count
+             * the drop so userspace can warn rather than under-report silently. */
+            __u32 zero = 0;
+            __u64 *d = bpf_map_lookup_elem(&dropped, &zero);
+            if (d) __sync_fetch_and_add(d, (__u64)1);
+        }
     }
     return 0;
 }

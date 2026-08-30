@@ -120,6 +120,7 @@ struct btf_ptr;
  */
 enum bpf_map_type {
 	BPF_MAP_TYPE_HASH = 1,
+	BPF_MAP_TYPE_ARRAY = 2,
 };
 
 enum {

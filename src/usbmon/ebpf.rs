@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
@@ -189,6 +189,20 @@ impl EbpfSource {
         })
     }
 
+    /// The kernel `dropped` counter's current cumulative total: the number of
+    /// URBs whose bytes were lost because the `bytes` map was full (see
+    /// `src/bpf/usbrate.bpf.c`). Slot 0 of the single-entry array map. `None`
+    /// on any read failure -- surfacing the drop count must never crash the
+    /// poller, and an unreadable map simply leaves the last total in place
+    /// rather than resetting it to a spurious zero.
+    fn read_dropped(&self) -> Option<u64> {
+        let key = 0u32.to_ne_bytes();
+        match libbpf_rs::MapCore::lookup(&self.skel.maps.dropped, &key, MapFlags::ANY) {
+            Ok(Some(raw)) => decode_value(&raw),
+            _ => None,
+        }
+    }
+
     /// One poll pass: read every key currently in the `bytes` map, and hand
     /// [`delta_since`]'s `Some` results to `on_delta` as [`TrafficDelta`]s.
     ///
@@ -203,7 +217,7 @@ impl EbpfSource {
     /// dead, which fails `-D warnings`. Not importing the trait at all here
     /// and calling it fully qualified sidesteps that without needing an
     /// `#[allow]` anywhere.
-    fn poll_once(&mut self, mut on_delta: impl FnMut(TrafficDelta)) {
+    fn poll_once(&mut self, kernel_dropped: &AtomicU64, mut on_delta: impl FnMut(TrafficDelta)) {
         // Collected up front rather than iterated lazily: `keys()` borrows
         // the map, and the loop body below needs its own borrow (`lookup`)
         // plus a mutable borrow of `self.last` -- collecting first keeps
@@ -233,6 +247,20 @@ impl EbpfSource {
                 on_delta(traffic_delta(key, bytes));
             }
         }
+
+        // Surface the bounded map-full loss the kprobe records into the same
+        // `kernel_dropped` counter the usbmon backends feed, which the header
+        // shows as `kdropped:` and JSON as `kernel_dropped_packets`: when the
+        // `bytes` map is full a new key's URB cannot be accounted and the rate
+        // silently under-reports, so this makes that loss a persistent,
+        // in-model indicator rather than a log line the alternate-screen TUI
+        // would bury. The map counter is cumulative (the kprobe only ever
+        // increments it), so this `store`s the latest total -- unlike the
+        // usbmon path, whose read-and-clear `MON_IOCG_STATS` count is added.
+        // A read failure leaves the last stored value in place.
+        if let Some(total) = self.read_dropped() {
+            kernel_dropped.store(total, Ordering::Relaxed);
+        }
     }
 
     /// Poll loop mirroring the other readers' shutdown/park contract (see
@@ -242,9 +270,14 @@ impl EbpfSource {
     /// A map lookup never blocks the way a `read(2)` can, so unlike the
     /// file-backed readers this parks unconditionally between passes rather
     /// than only on `WouldBlock`.
-    pub fn run(&mut self, shutdown: &AtomicBool, mut on_delta: impl FnMut(TrafficDelta)) {
+    pub fn run(
+        &mut self,
+        shutdown: &AtomicBool,
+        kernel_dropped: &AtomicU64,
+        mut on_delta: impl FnMut(TrafficDelta),
+    ) {
         loop {
-            self.poll_once(&mut on_delta);
+            self.poll_once(kernel_dropped, &mut on_delta);
             if shutdown.load(Ordering::Relaxed) {
                 return;
             }
@@ -457,10 +490,15 @@ mod tests {
         // whatever it produces is readable on the other end, not that any
         // particular traffic occurred during the test.
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
-        source.poll_once(|delta| {
+        let kernel_dropped = AtomicU64::new(0);
+        source.poll_once(&kernel_dropped, |delta| {
             let _ = tx.try_send(delta);
         });
         drop(tx);
         let _ = rx.try_iter().count();
+        // A brief poll over a fresh map cannot fill its 4096 keys, so the
+        // map-full drop counter -- now surfaced through `kernel_dropped` --
+        // stays zero.
+        assert_eq!(kernel_dropped.load(Ordering::Relaxed), 0);
     }
 }

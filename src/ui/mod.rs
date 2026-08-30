@@ -567,6 +567,11 @@ pub(crate) enum KeyOutcome {
     Quit,
     /// App state changed; the screen is stale until the next frame.
     Redraw,
+    /// A search keystroke changed which devices should show: the filtered
+    /// view must be rebuilt from the manager before the repaint, so the
+    /// search box filters as you type instead of only at the next refresh
+    /// tick (up to a whole `--refresh` interval away). Implies a redraw.
+    Resync,
     /// The screen itself is suspect (Ctrl-L): wipe it, then repaint.
     ClearAndRedraw,
     /// The key means nothing here; the screen is still correct.
@@ -637,12 +642,12 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
             KeyCode::Char(c) if plain_or_shifted => {
                 query.push(c);
                 app.search = SearchState::Editing(query);
-                KeyOutcome::Redraw
+                KeyOutcome::Resync
             }
             KeyCode::Backspace if plain_or_shifted => {
                 query.pop();
                 app.search = SearchState::Editing(query);
-                KeyOutcome::Redraw
+                KeyOutcome::Resync
             }
             // An empty query has nothing to filter on, so committing it
             // would leave `Committed("")` -- a vacuous filter state
@@ -659,7 +664,7 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
             }
             KeyCode::Esc if plain_or_shifted => {
                 app.search = SearchState::Off;
-                KeyOutcome::Redraw
+                KeyOutcome::Resync
             }
             _ => KeyOutcome::None,
         };
@@ -702,7 +707,7 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
         // while it's active" precedence `show_help` gets just above.
         KeyCode::Esc if matches!(app.search, SearchState::Committed(_)) => {
             app.search = SearchState::Off;
-            KeyOutcome::Redraw
+            KeyOutcome::Resync
         }
         // A committed query is normal browsing, so `q` quits here same as
         // `Off` -- only `Editing` captures `q` as a letter, and it's
@@ -3844,7 +3849,8 @@ mod tests {
 
         assert_eq!(
             apply_key(&mut app, key(KeyCode::Char('a'))),
-            KeyOutcome::Redraw
+            KeyOutcome::Resync,
+            "a typed character changes which rows match, so the view resyncs live"
         );
         assert_eq!(app.search, SearchState::Editing("a".to_string()));
         apply_key(&mut app, key(KeyCode::Char('b')));
@@ -3858,7 +3864,7 @@ mod tests {
 
         assert_eq!(
             apply_key(&mut app, key(KeyCode::Char('q'))),
-            KeyOutcome::Redraw
+            KeyOutcome::Resync
         );
         assert_eq!(app.search, SearchState::Editing("q".to_string()));
     }
@@ -3870,7 +3876,7 @@ mod tests {
 
         assert_eq!(
             apply_key(&mut app, key(KeyCode::Backspace)),
-            KeyOutcome::Redraw
+            KeyOutcome::Resync
         );
         assert_eq!(app.search, SearchState::Editing("a".to_string()));
     }
@@ -3889,7 +3895,7 @@ mod tests {
         let mut app = UsbTopApp::new(Duration::from_millis(100));
         app.search = SearchState::Editing("ab".to_string());
 
-        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Redraw);
+        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Resync);
         assert_eq!(app.search, SearchState::Off);
     }
 
@@ -3898,7 +3904,7 @@ mod tests {
         let mut app = UsbTopApp::new(Duration::from_millis(100));
         app.search = SearchState::Committed("ab".to_string());
 
-        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Redraw);
+        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Resync);
         assert_eq!(app.search, SearchState::Off);
     }
 
@@ -3925,7 +3931,7 @@ mod tests {
         app.search = SearchState::Editing("ab".to_string());
         assert_eq!(
             apply_key(&mut app, key(KeyCode::Char('q'))),
-            KeyOutcome::Redraw,
+            KeyOutcome::Resync,
             "editing still captures q as a letter"
         );
         assert_eq!(app.search, SearchState::Editing("abq".to_string()));
@@ -4002,7 +4008,7 @@ mod tests {
         app.search = SearchState::Editing(String::new());
 
         let shifted = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
-        assert_eq!(apply_key(&mut app, shifted), KeyOutcome::Redraw);
+        assert_eq!(apply_key(&mut app, shifted), KeyOutcome::Resync);
         assert_eq!(app.search, SearchState::Editing("A".to_string()));
     }
 

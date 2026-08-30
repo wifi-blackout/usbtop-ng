@@ -9,11 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- An opt-in eBPF capture backend (`ebpf` cargo feature): a kprobe on `__usb_hcd_giveback_urb` aggregates bytes per bus, device, endpoint, direction, and transfer type in a kernel hash map, polled into the same accounting path as usbmon. Throughput only; it does not attribute traffic to a process. The default build is unaffected -- zero libbpf dependencies, no BPF toolchain needed. Building the feature needs clang and libbpf-dev on an x86-64 host (the BPF program's kprobe context is x86-64-specific for now) and adds no Rust-version requirement beyond the crate's 1.88 MSRV; running it needs root (or `CAP_BPF`) and a BTF-enabled kernel. A load or attach failure logs a warning and falls back to the usbmon chain. See [docs/INSTALL.md](docs/INSTALL.md#building-the-ebpf-backend).
+- An opt-in eBPF capture backend (`ebpf` cargo feature): a kprobe on `__usb_hcd_giveback_urb` aggregates bytes per bus, device, endpoint, direction, and transfer type in a kernel hash map, polled into the same accounting path as usbmon. Throughput only; it does not attribute traffic to a process. The default build is unaffected -- zero libbpf dependencies, no BPF toolchain needed. Building the feature needs clang and libbpf-dev on an x86-64 host (the BPF program's kprobe context is x86-64-specific for now) and adds no Rust-version requirement beyond the crate's 1.88 MSRV; running it needs root (or `CAP_BPF`) and a BTF-enabled kernel. A load or attach failure logs a warning and falls back to the usbmon chain. If its bounded in-kernel aggregation map ever fills under an extreme device/endpoint count, the unaccounted URBs surface through the same `kdropped:` header field and `kernel_dropped_packets` JSON field as usbmon's kernel drops, rather than being lost silently. See [docs/INSTALL.md](docs/INSTALL.md#building-the-ebpf-backend).
 
 ### Changed
 
 - Internal: traffic accounting now runs on backend-neutral `(key, bytes)` deltas, and the usbmon packet path is an adapter over that. No user-visible change on its own; it is what the eBPF backend above feeds through `apply_delta`.
+
+### Fixed
+
+- The `/` search box now filters as you type. Previously a keystroke's effect on which rows were shown waited for the next refresh tick -- up to a second at the default rate.
+- When a `/dev/usbmon*` node exists but the current user cannot open it, the startup remedy now tells you to run with `sudo` instead of suggesting `modprobe`/`mount`, which cannot fix a permission problem.
 
 ## [1.5.0] - 2026-08-29
 
