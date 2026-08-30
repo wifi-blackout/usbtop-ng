@@ -253,6 +253,23 @@ x86-64-only `pt_regs` today and needs a per-architecture one before it
 builds on these boards -- see the eBPF backend section above. The default
 usbmon build carries no such restriction.)
 
+The fleet is now provisioned and probed (2026-08-30). All six ARM
+targets exist as named, SSH-reachable hosts -- `rattler` (Pi 4), `pi400`
+(Pi 400), `pi58` (Pi 5), `enviro` (Pi Zero W, armv6l), `rock-32`
+(ROCK 5C), and `airbox` (AirBox) -- alongside two x86 hosts, `asus`
+(Intel Tiger Lake, with Thunderbolt 4) and `judge` (AMD Cezanne, USB 3.1
+Gen 2). Their kernels, controllers, and confirmed usbmon and eBPF status
+are in the [Test hosts](TESTING.md#test-hosts) table. Three findings
+already shape the work: `rock-32` ships usbmon built in with
+`/dev/usbmon0..8` live, so the binary-only vendor-kernel path is testable
+today; `airbox`'s 5.4 vendor kernel has no usbmon module at all
+(`modprobe` fails) and no BTF, so it cannot capture with either backend
+until its kernel gains `CONFIG_USB_MON`; and BTF
+(`/sys/kernel/btf/vmlinux`) is absent on every ARM board, which blocks
+the CO-RE eBPF path independently of the x86-64-only `pt_regs` above --
+so the two x86 hosts are the only ones that can run the `ebpf` feature
+today.
+
 Research first:
 
 - Build targets. 64-bit boards (Pi 4, Pi 400, Pi 5, ROCK 5C, AirBox on a
@@ -282,7 +299,9 @@ device inventory, and pass criteria live in [TESTING.md](TESTING.md).
 - Thunderbolt and USB4 hardware validation. usbtop-ng observes USB URBs
   behind such hosts and docks, never PCIe or fabric traffic. A useful
   matrix covers dock controllers, hub topology, hotplug, suspend and
-  resume, and peer links.
+  resume, and peer links. The x86 `asus` host (Intel Tiger Lake-LP,
+  Thunderbolt 4 plus a 10 Gbps USB bus) is now the concrete platform for
+  this matrix; see the [Test hosts](TESTING.md#test-hosts) table.
 - Generate a log with a normalized schema of hardware devices that have
   been tested. Ideas for this would include the date the test was performed
   along with the conditions (kernel version, relevant drivers, attached port
@@ -357,5 +376,64 @@ How that lands per board, useful context for the ARM board testing above:
 - **Pi 3 / Zero**: USB 2.0 only, about 40 MB/s realistic (roughly 25 fps
   at that resolution). Fine for triggered single-shot capture, not for a
   camera's full high-frame-rate stream.
+
+## Tracking the kernel: USB/Thunderbolt updates for Linux 7.3
+
+Greg Kroah-Hartman's `[GIT PULL]` for `usb-7.3-rc1` (25 Aug 2026,
+against `7.2-rc7`, tag `usb-7.3-rc1`) opens the 7.3 merge window for the
+USB and Thunderbolt drivers: 142 files, +3,311/-1,780. usbtop-ng should
+track it through the -rc cycle to the 7.3 **final** release and re-verify
+against it, because the capture surfaces usbtop-ng depends on live in
+this tree. The near-term conclusion is reassuring -- nothing usbtop-ng
+reads is broken by this pull -- but two areas want a re-run of the
+verification suite once 7.3 ships.
+
+**Capture surfaces are unchanged, so there is nothing to port.** The pull
+touches `drivers/usb/core/{config,devices,devio,driver,hub}.c` but not
+`drivers/usb/core/hcd.c`, so the eBPF backend's kprobe target
+`__usb_hcd_giveback_urb` keeps its signature and the CO-RE field offsets
+stay valid on 7.3. No file under `drivers/usb/mon/` changes either (only
+the zh_CN translation of `usbmon.rst`), so the usbmon text, binary, and
+mmap interfaces -- and the `MON_IOCT_RING_SIZE` ring-enlarge fix above --
+are untouched. Confirm both hold when 7.3-final lands; a break in a later
+-rc is the signal to re-check the FFI against source, per the standing
+practice of verifying kernel semantics against the kernel, not a device.
+
+**Re-verify the isochronous accounting.** Mathias Nyman's xHCI series
+reworks isoc scheduling and completion -- "fix frame id calculation and
+checks for isoc URBs", "set frame ID field of isoc TRB when starting an
+isoch stream", plus several endpoint-recovery-after-disconnect changes,
+roughly 500 lines of `xhci-ring.c`. That sits *upstream* of everything
+usbtop-ng observes, so it may shift the high-bandwidth isochronous
+undercount and drop behavior documented above (see "Discovered: the
+usbmon binary reader undercounts high-bandwidth isochronous transfers").
+Re-run the iso characterization on a 7.3 kernel before attributing that
+bug purely to usbmon.
+
+**Robustness context, not a feature to add.** Several fixes harden the
+character-device teardown paths that neighbor our capture: a usbfs
+use-after-free on release, devio validation before buffer allocation, and
+a probe-versus-dynamic-ID use-after-free. usbtop-ng hits the same class of
+races on hotplug; there is nothing to incorporate, but it is useful
+ground truth that 7.3 tightens device-teardown handling underneath a
+monitor.
+
+**Ecosystem watch, out of current scope.** Not incorporable today, but
+worth following: the in-kernel Rust USB abstractions (`rust/kernel/usb.rs`)
+keep maturing, relevant only if usbtop-ng ever grows a kernel-side
+companion; the Thunderbolt `stream` interface and its
+`configfs-thunderbolt_stream` ABI are fabric-level, below the USB URB
+layer usbtop-ng measures, so they stay out of scope (see
+[Testing follow-ups](#testing-follow-ups)); and the large typec / PD /
+UCSI churn is power-delivery negotiation, not data bandwidth -- a possible
+future surface for [Cable and port diagnostics](#cable-and-port-diagnostics),
+never for the bandwidth path.
+
+**The eventual final features.** When 7.3 releases, re-run the throughput
+and iso verification suite on it -- the exact-`dd` cross-checks at 5 and
+10 Gbps and the eBPF-versus-usbmon comparison -- to confirm the ring-size
+fix and the eBPF backend still measure byte-exact, and to re-characterize
+the iso undercount under the new xHCI isoc path. Record the kernel in the
+tested-hardware log.
 
 ## Notes

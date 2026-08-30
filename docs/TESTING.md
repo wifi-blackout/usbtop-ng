@@ -3,11 +3,54 @@
 How to validate usbtop-ng on a physical machine: what to plug in, in what
 order, what traffic to generate, and what to record. One pass of this
 document on one platform produces one entry set for the tested-hardware
-log. The platforms in scope are the x86 reference laptop and the ARM
-boards on the roadmap: Raspberry Pi Zero, Pi 4, Pi 400, Pi 5, Radxa
-ROCK 5C, and SOPHGO Fogwise AirBox.
+log. The platforms in scope are the x86 hosts and the ARM boards on the
+roadmap: Raspberry Pi Zero, Pi 4, Pi 400, Pi 5, Radxa ROCK 5C, and
+SOPHGO Fogwise AirBox. All are now provisioned as SSH-reachable hosts;
+see [Test hosts](#test-hosts) below for the concrete fleet.
 
 ## Test inventory
+
+### Test hosts
+
+Eight SSH-reachable hosts, probed 2026-08-30. These are the concrete
+machines the [per-platform notes](#per-platform-notes) below refer to;
+each is addressable by the `ssh` name shown (`judge` as `paadmin@judge`).
+The `usbmon` column records the probe result: `built-in`, `module` (loads
+on `modprobe usbmon`, nodes appear), `absent` (not in this kernel), or
+`module?` (present but the load is unconfirmed because the host lacks
+passwordless sudo). Kernels span 5.4 through 7.0 and the arch column
+spans armv6l, aarch64, and x86_64 -- the matrix the roadmap wants.
+
+| ssh | Board / SoC | Arch | Kernel | OS | usbmon | Notable |
+| --- | --- | --- | --- | --- | --- | --- |
+| `rattler` | Raspberry Pi 4 Model B (BCM2711) | aarch64 | 6.12.75+rpt-rpi-v8 | Debian 13 | module | VL805 USB3 over PCIe + BCM2711 USB2; AR9271 Wi-Fi leaf |
+| `pi400` | Raspberry Pi 400 (BCM2711) | aarch64 | 6.18.34+rpt-rpi-v8 | Debian 13 | module? | VL805; RTL9210 NVMe over UAS on USB3, a built-in saturation source; newest kernel; no passwordless sudo |
+| `pi58` | Raspberry Pi 5 (BCM2712) | aarch64 | 6.6.31+rpt-rpi-2712 | Debian 12 | module | RP1-southbridge xHCI, two USB2 + two USB3 buses; the best Pi USB path |
+| `enviro` | Raspberry Pi Zero W (BCM2835) | **armv6l** | 6.12.96+rpt-rpi-v6 | Raspbian 12 | module | single core, one `dwc_otg` OTG port at 480M; the 32-bit `gnueabihf` build target |
+| `rock-32` | Radxa ROCK 5C (Rockchip RK3588S2) | aarch64 | 6.1.84-8-rk2410 (vendor) | Debian 12 | built-in | usbmon built in, `/dev/usbmon0..8` live; eight buses (xhci + ehci/ohci-platform); the binary-only vendor-kernel path |
+| `airbox` | SOPHGO Fogwise AirBox / BM1684x | aarch64 | 5.4.217-bm1684 (vendor, dirty) | Ubuntu 20.04 | **absent** | no usbmon module in this kernel and no BTF -- not capturable as-is; Imaging Source 37UX273-ML camera attached; oldest kernel |
+| `asus` | Intel Tiger Lake-LP, i5-1135G7 | x86_64 | 7.0.0-30-generic | Linux Mint 22.3 | module | Thunderbolt 4 (NHI + xHCI) plus a 10 Gbps USB bus; two IDS `1409:3270` USB3 cameras on a 10 Gbps hub (`usbfs`); eBPF-ready (BTF present) |
+| `judge` | AMD Ryzen 9 5900HX (Cezanne) | x86_64 | 7.0.0-30-generic | Linux Mint 22.3 | module | AMD Renoir/Cezanne USB 3.1, two 10 Gbps + two 480M buses; eBPF-ready (BTF present); AMD, not Thunderbolt/USB4 |
+
+usbmon confirmed on 2026-08-30: `modprobe usbmon` loads the module and
+populates `/dev/usbmon<N>` plus the debugfs text interface on `rattler`,
+`enviro`, `pi58`, `asus`, and `judge`; `rock-32` has it built in with
+nodes already live. Two exceptions: `airbox`'s 5.4 vendor kernel carries
+no usbmon module (`modprobe: FATAL: Module usbmon not found`), so it
+cannot capture until its kernel gains `CONFIG_USB_MON` -- its stage-0
+gate fails today; and `pi400` could not be confirmed non-interactively
+(no passwordless sudo), though its kernel matches `rattler`'s and should
+behave the same once loaded.
+
+eBPF backend readiness: the CO-RE prerequisite `/sys/kernel/btf/vmlinux`
+(from `CONFIG_DEBUG_INFO_BTF=y`) is present only on the two x86_64 hosts,
+`asus` and `judge` -- both also carry `bpftool`, `CONFIG_BPF_SYSCALL=y`,
+and `CONFIG_KPROBES=y`. The kprobe target `__usb_hcd_giveback_urb`
+resolves in `/proc/kallsyms` on every host, so the symbol is never the
+blocker. Every ARM board ships without BTF, which blocks CO-RE
+independently of the eBPF program's current x86-64-only `pt_regs`; two
+separate reasons the `ebpf` feature stays x86-only. `asus` and `judge`
+are the hosts that can run it today.
 
 ### On hand
 
@@ -98,17 +141,43 @@ reverse.
 
 - Reference x86 laptop: run the full ladder. This is the baseline every
   board compares against.
-- Pi Zero: one OTG port, so stages 3 through 8 all run behind the powered
-  OTG hub. Also test the TUI over SSH and over the serial console, and
-  watch `dropped` — it is the slowest core in the fleet.
-- Pi 4 and Pi 400: two host stacks. Run stage 3 once on a blue USB3 port
-  and once on the USB2 path, and confirm both controllers group
-  correctly.
-- Pi 5: repeat stage 6 on both front ports.
-- ROCK 5C: include the OTG-capable port in stage 3 and note its role.
-- Fogwise AirBox: stage 0 gate first — confirm the vendor kernel ships
-  usbmon and mounts debugfs before running anything else. Record the
-  kernel config findings either way.
+- `asus` (x86, Tiger Lake-LP): the Thunderbolt / USB4 and IDS-camera
+  platform, and one of the two eBPF-ready hosts (BTF present). It carries
+  a Thunderbolt 4 controller and a 10 Gbps USB bus, and two IDS
+  `1409:3270` USB3 cameras already sit on a 10 Gbps hub bound to `usbfs`.
+  Use it for the Thunderbolt/USB4 matrix in the roadmap's testing
+  follow-ups, for high-rate USB3 bulk near the 10 Gbps ceiling, and to run
+  the `ebpf` backend; the IDS cameras are the isochronous/bulk vision
+  source.
+- `judge` (x86, AMD Cezanne): the other eBPF-ready host (BTF present), a
+  16-core Ryzen 9 5900HX with AMD Renoir/Cezanne USB 3.1 (two 10 Gbps
+  buses) but no Thunderbolt or USB4. Use it to exercise the `ebpf` backend
+  on an AMD host and as a second high-rate USB3 bulk target.
+- `enviro` (Pi Zero W): one `dwc_otg` OTG port, so stages 3 through 8 all
+  run behind the powered OTG hub. It is `armv6l`, so it needs the 32-bit
+  `arm-unknown-linux-gnueabihf` build, and it is the single slowest core
+  in the fleet. Also test the TUI over SSH and over the serial console,
+  and watch `dropped`.
+- `rattler` (Pi 4) and `pi400` (Pi 400): two host stacks. Run stage 3
+  once on a blue USB3 port and once on the USB2 path, and confirm both
+  controllers group correctly. `pi400` already carries an RTL9210 NVMe
+  over UAS on USB3 -- a built-in saturation source for stage 7 -- but it
+  lacks passwordless sudo, so load usbmon with an interactive
+  `sudo modprobe usbmon` before a run.
+- `pi58` (Pi 5): repeat stage 6 on both front ports.
+- `rock-32` (ROCK 5C): include the OTG-capable port in stage 3 and note
+  its role. Built-in usbmon is confirmed here (`CONFIG_USB_MON=y`,
+  `/dev/usbmon0..8` present), so this host exercises the debugfs-free
+  binary path directly -- the binary-only vendor-kernel shape the startup
+  code must handle.
+- `airbox` (Fogwise AirBox): the stage-0 gate already fails. The 5.4
+  vendor kernel carries no usbmon module (`modprobe: FATAL: Module usbmon
+  not found`) and no BTF, so neither the usbmon nor the eBPF backend can
+  capture on it as shipped -- it needs a kernel built with
+  `CONFIG_USB_MON` (and, for eBPF, `CONFIG_DEBUG_INFO_BTF`) before it can
+  join the ladder. Until then it is a build-and-kernel task, not a test
+  run. The Imaging Source 37UX273-ML camera on it is the vision source
+  once capture works.
 - Every ARM board: record which usbmon interface the run used (the
   startup log prints it) and whether `/dev/usbmon<N>` nodes exist.
 
