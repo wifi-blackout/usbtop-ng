@@ -473,7 +473,8 @@ mod tests {
     /// BTF-enabled kernel (as the controller verified live for the
     /// spec this backend implements), this also exercises that the loaded
     /// program's map is actually readable through the same `poll_once` path
-    /// `run` uses.
+    /// `run` uses, and that a non-zero map-full drop count surfaces into
+    /// `kernel_dropped`.
     #[test]
     fn loads_and_attaches_when_root_and_btf_are_available() {
         let mut source = match EbpfSource::load_and_attach() {
@@ -500,5 +501,23 @@ mod tests {
         // map-full drop counter -- now surfaced through `kernel_dropped` --
         // stays zero.
         assert_eq!(kernel_dropped.load(Ordering::Relaxed), 0);
+
+        // The non-zero side: the kprobe bumps the `dropped` counter map only
+        // once the `bytes` map is full, which a test cannot force without
+        // 4096+ distinct live keys. Write a known count into its single slot
+        // directly and confirm the next poll folds it into `kernel_dropped` --
+        // exercising `read_dropped`'s `Some` arm and the `store` that the zero
+        // assertion above never reaches. Overwriting the slot (rather than
+        // adding) also means a real drop racing in first cannot skew it.
+        const INJECTED: u64 = 7;
+        libbpf_rs::MapCore::update(
+            &source.skel.maps.dropped,
+            &0u32.to_ne_bytes(),
+            &INJECTED.to_ne_bytes(),
+            MapFlags::ANY,
+        )
+        .expect("write the single-slot dropped counter");
+        source.poll_once(&kernel_dropped, |_| {});
+        assert_eq!(kernel_dropped.load(Ordering::Relaxed), INJECTED);
     }
 }
