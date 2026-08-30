@@ -124,9 +124,14 @@ Design notes:
   (documented, not enforced on the default Rust 1.88 build), kernel BTF at
   runtime, and CI that builds and hermetic-tests the feature but cannot
   attach kprobes unprivileged.
-- The kernel hash map that aggregates bytes is bounded at 4096 keys --
-  ample for realistic device and endpoint counts, but a map-full insert is
-  a silent loss today. Noted here as an MVP follow-up, not fixed.
+- Fixed: the kernel hash map that aggregates bytes is bounded at 4096
+  keys -- ample for realistic device and endpoint counts. A map-full
+  insert was a silent loss; it is now surfaced. The BPF program counts the
+  dropped URBs in a single-slot counter map, and the poller folds that
+  cumulative total into the same `kernel_dropped` counter the usbmon
+  backends feed, shown as `kdropped:` in the header and
+  `kernel_dropped_packets` in JSON. The map is not enlarged or evicted --
+  the loss stays bounded, but it is visible now rather than silent.
 
 ### The mmap middle path: shipped
 
