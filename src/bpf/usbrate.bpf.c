@@ -15,9 +15,10 @@ struct {
 } bytes SEC(".maps");
 
 /* Single-slot counter of URBs whose bytes were lost because `bytes` was full
- * (see the giveback handler below). Userspace reads slot 0 each poll and warns
- * when it grows, so the bounded map-full loss surfaces instead of silently
- * under-reporting. */
+ * (see the giveback handler below). Userspace reads slot 0 each poll and folds
+ * it into the `kernel_dropped` counter (surfaced as `kdropped:` and
+ * `kernel_dropped_packets`), so the bounded map-full loss shows up instead of
+ * silently under-reporting. */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
