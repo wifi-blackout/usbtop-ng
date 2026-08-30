@@ -210,6 +210,90 @@ matching the eBPF capture and the exact `dd` count (numbers above). The eBPF
 backend aggregates in-kernel and was immune throughout -- the strongest
 validation yet of that backend for high-throughput monitoring.
 
+## Engineering follow-ups
+
+These came out of code review. Each is small and none blocks a release.
+
+- Error and log strings brought under the documentation style guide.
+- A root-owned /dev/usbmon node reads as absent for a plain user, so the
+  remedy says no node was found. Distinguishing permission-denied from
+  not-found in the probe would give the sharper sudo remedy.
+- Fixed: the report `source` field mislabeled the mmap ring reader as
+  `"binary"`. `capture_source_label` (src/headless/mod.rs) knew only
+  `ebpf`/`text`/`binary`, so an active mmap reader printed `"binary"`. The
+  monitor now raises an `mmap_active` flag (bundled with `text_active` into
+  `SourceFlags`) for the interface actually running, and the label reads
+  `"mmap"`. Verified live alongside the ring-size fix above.
+- Search filtering waits for the next refresh tick, up to 1 second at the
+  default rate. Pulling the tick forward on a search keystroke would make
+  filter-as-you-type feel immediate.
+- The usbmon text fallback overcounts isochronous transfers. Its length
+  column holds the buffer size, not the bytes moved. On a camera stream the
+  overcount was 3.6x. The text format prints 5 of 32 descriptors per URB, so
+  no exact count exists in text mode. The binary interface reports true
+  bytes for ordinary transfers and is already the preferred source -- but
+  not for high-bandwidth isochronous ones; see "Discovered: the usbmon
+  binary reader undercounts high-bandwidth isochronous transfers" in the
+  eBPF backend section above, a separate bug. The UI and the JSON output
+  now mark affected rates as estimates. The remaining idea: sum the printed
+  descriptors to tighten the estimate. Caveat before building it: only up
+  to 5 descriptors print, so a sum can under-estimate as badly as the
+  length over-estimates, and the kernel's usbmon document claims callback
+  lengths are actual values, which the measurement above contradicts on
+  this kernel. Commit a raw trace alongside any fix.
+
+## ARM board support
+
+In-depth research and testing of usbtop-ng on small ARM hosts: Raspberry
+Pi Zero, Pi 4, Pi 400, and Pi 5, plus the Radxa ROCK 5C and the SOPHGO
+Fogwise AirBox. usbmon is architecture-independent, so the questions are
+builds, vendor kernels, and controller behavior, not core capture logic.
+(The optional `ebpf` feature is the one exception: its BPF program has an
+x86-64-only `pt_regs` today and needs a per-architecture one before it
+builds on these boards -- see "Bringing the eBPF backend to ARM" below.
+The default usbmon build carries no such restriction.)
+
+The fleet is now provisioned and probed (2026-08-30). All six ARM
+targets exist as named, SSH-reachable hosts -- `rattler` (Pi 4), `pi400`
+(Pi 400), `pi58` (Pi 5), `enviro` (Pi Zero W, armv6l), `rock-32`
+(ROCK 5C), and `airbox` (AirBox) -- alongside two x86 hosts, `asus`
+(Intel Tiger Lake, with Thunderbolt 4) and `judge` (AMD Cezanne, USB 3.1
+Gen 2). Their kernels, controllers, and confirmed usbmon and eBPF status
+are in the [Test hosts](TESTING.md#test-hosts) table. Three findings
+already shape the work: `rock-32` ships usbmon built in with
+`/dev/usbmon0..8` live, so the binary-only vendor-kernel path is testable
+today; `airbox`'s 5.4 vendor kernel has no usbmon module at all
+(`modprobe` fails) and no BTF, so it cannot capture with either backend
+until its kernel gains `CONFIG_USB_MON`; and BTF
+(`/sys/kernel/btf/vmlinux`) is absent on every ARM board, which blocks
+the CO-RE eBPF path independently of the x86-64-only `pt_regs` above --
+so the two x86 hosts are the only ones that can run the `ebpf` feature
+today.
+
+Research first:
+
+- Build targets. 64-bit boards (Pi 4, Pi 400, Pi 5, ROCK 5C, AirBox on a
+  64-bit OS) need `aarch64-unknown-linux-gnu`. The original Pi Zero is
+  ARMv6 and needs `arm-unknown-linux-gnueabihf` on a 32-bit OS. Verify
+  the MSRV toolchain exists for both, then extend the release workflow
+  with an aarch64 artifact (cross-compile or an ARM runner).
+- Vendor kernels. Confirm each ships usbmon (module or built-in), whether
+  debugfs mounts by default, and whether `/dev/usbmon<N>` nodes appear.
+  Built-in detection and debugfs-free startup shipped in 2026-08, so a
+  binary-only vendor kernel is a supported shape to test.
+- Controller matrix. Each board exercises a different host stack: the
+  Zero's single OTG controller, the Pi 4 and Pi 400's PCIe xHCI for the
+  USB3 ports plus the OTG port, the Pi 5's RP1 southbridge, the ROCK 5C's
+  Rockchip RK3588-class OTG plus xHCI mix, and the AirBox's SOPHGO
+  BM1684X. Verify capture, bus numbering, topology, and speeds on each.
+- Small-core behavior. The Zero is a single slow core: measure the reader
+  thread, channel bound, and TUI refresh there, and the TUI over SSH and
+  a serial console.
+
+Then record every board in the tested-hardware log below, with kernel,
+OS image, controller, and capture backend per entry. The procedure,
+device inventory, and pass criteria live in [TESTING.md](TESTING.md).
+
 ### Bringing the eBPF backend to ARM
 
 The `ebpf` feature is x86-64-only today; the 2026-08-30 fleet probe (see
@@ -257,90 +341,6 @@ attribution. The concrete next step is a spike on `rock-32` -- add the
 conditional arm64 `pt_regs`, compile with `-D__TARGET_ARCH_arm64`,
 generate BTF with `pahole -J`, and attempt a verify-load and a short
 capture.
-
-## Engineering follow-ups
-
-These came out of code review. Each is small and none blocks a release.
-
-- Error and log strings brought under the documentation style guide.
-- A root-owned /dev/usbmon node reads as absent for a plain user, so the
-  remedy says no node was found. Distinguishing permission-denied from
-  not-found in the probe would give the sharper sudo remedy.
-- Fixed: the report `source` field mislabeled the mmap ring reader as
-  `"binary"`. `capture_source_label` (src/headless/mod.rs) knew only
-  `ebpf`/`text`/`binary`, so an active mmap reader printed `"binary"`. The
-  monitor now raises an `mmap_active` flag (bundled with `text_active` into
-  `SourceFlags`) for the interface actually running, and the label reads
-  `"mmap"`. Verified live alongside the ring-size fix above.
-- Search filtering waits for the next refresh tick, up to 1 second at the
-  default rate. Pulling the tick forward on a search keystroke would make
-  filter-as-you-type feel immediate.
-- The usbmon text fallback overcounts isochronous transfers. Its length
-  column holds the buffer size, not the bytes moved. On a camera stream the
-  overcount was 3.6x. The text format prints 5 of 32 descriptors per URB, so
-  no exact count exists in text mode. The binary interface reports true
-  bytes for ordinary transfers and is already the preferred source -- but
-  not for high-bandwidth isochronous ones; see "Discovered: the usbmon
-  binary reader undercounts high-bandwidth isochronous transfers" in the
-  eBPF backend section above, a separate bug. The UI and the JSON output
-  now mark affected rates as estimates. The remaining idea: sum the printed
-  descriptors to tighten the estimate. Caveat before building it: only up
-  to 5 descriptors print, so a sum can under-estimate as badly as the
-  length over-estimates, and the kernel's usbmon document claims callback
-  lengths are actual values, which the measurement above contradicts on
-  this kernel. Commit a raw trace alongside any fix.
-
-## ARM board support
-
-In-depth research and testing of usbtop-ng on small ARM hosts: Raspberry
-Pi Zero, Pi 4, Pi 400, and Pi 5, plus the Radxa ROCK 5C and the SOPHGO
-Fogwise AirBox. usbmon is architecture-independent, so the questions are
-builds, vendor kernels, and controller behavior, not core capture logic.
-(The optional `ebpf` feature is the one exception: its BPF program has an
-x86-64-only `pt_regs` today and needs a per-architecture one before it
-builds on these boards -- see the eBPF backend section above. The default
-usbmon build carries no such restriction.)
-
-The fleet is now provisioned and probed (2026-08-30). All six ARM
-targets exist as named, SSH-reachable hosts -- `rattler` (Pi 4), `pi400`
-(Pi 400), `pi58` (Pi 5), `enviro` (Pi Zero W, armv6l), `rock-32`
-(ROCK 5C), and `airbox` (AirBox) -- alongside two x86 hosts, `asus`
-(Intel Tiger Lake, with Thunderbolt 4) and `judge` (AMD Cezanne, USB 3.1
-Gen 2). Their kernels, controllers, and confirmed usbmon and eBPF status
-are in the [Test hosts](TESTING.md#test-hosts) table. Three findings
-already shape the work: `rock-32` ships usbmon built in with
-`/dev/usbmon0..8` live, so the binary-only vendor-kernel path is testable
-today; `airbox`'s 5.4 vendor kernel has no usbmon module at all
-(`modprobe` fails) and no BTF, so it cannot capture with either backend
-until its kernel gains `CONFIG_USB_MON`; and BTF
-(`/sys/kernel/btf/vmlinux`) is absent on every ARM board, which blocks
-the CO-RE eBPF path independently of the x86-64-only `pt_regs` above --
-so the two x86 hosts are the only ones that can run the `ebpf` feature
-today.
-
-Research first:
-
-- Build targets. 64-bit boards (Pi 4, Pi 400, Pi 5, ROCK 5C, AirBox on a
-  64-bit OS) need `aarch64-unknown-linux-gnu`. The original Pi Zero is
-  ARMv6 and needs `arm-unknown-linux-gnueabihf` on a 32-bit OS. Verify
-  the MSRV toolchain exists for both, then extend the release workflow
-  with an aarch64 artifact (cross-compile or an ARM runner).
-- Vendor kernels. Confirm each ships usbmon (module or built-in), whether
-  debugfs mounts by default, and whether `/dev/usbmon<N>` nodes appear.
-  Built-in detection and debugfs-free startup shipped in 2026-08, so a
-  binary-only vendor kernel is a supported shape to test.
-- Controller matrix. Each board exercises a different host stack: the
-  Zero's single OTG controller, the Pi 4 and Pi 400's PCIe xHCI for the
-  USB3 ports plus the OTG port, the Pi 5's RP1 southbridge, the ROCK 5C's
-  Rockchip RK3588-class OTG plus xHCI mix, and the AirBox's SOPHGO
-  BM1684X. Verify capture, bus numbering, topology, and speeds on each.
-- Small-core behavior. The Zero is a single slow core: measure the reader
-  thread, channel bound, and TUI refresh there, and the TUI over SSH and
-  a serial console.
-
-Then record every board in the tested-hardware log below, with kernel,
-OS image, controller, and capture backend per entry. The procedure,
-device inventory, and pass criteria live in [TESTING.md](TESTING.md).
 
 ## Testing follow-ups
 
