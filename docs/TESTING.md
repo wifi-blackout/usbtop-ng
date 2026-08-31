@@ -23,7 +23,7 @@ spans armv6l, aarch64, and x86_64 -- the matrix the roadmap wants.
 
 | ssh | Board / SoC | Arch | Kernel | OS | usbmon | Notable |
 | --- | --- | --- | --- | --- | --- | --- |
-| `rattler` | Raspberry Pi 4 Model B (BCM2711) | aarch64 | 6.12.75+rpt-rpi-v8 | Debian 13 | module | VL805 USB3 over PCIe + BCM2711 USB2; AR9271 Wi-Fi leaf |
+| `rattler` | Raspberry Pi 4 Model B (BCM2711) | aarch64 | 6.18.39+rpt-rpi-v8 | Debian 13 | module | VL805 USB3 over PCIe + BCM2711 USB2; AR9271 Wi-Fi leaf; kernel upgraded from 6.12.75 since the first probe |
 | `pi400` | Raspberry Pi 400 (BCM2711) | aarch64 | 6.18.39+rpt-rpi-v8 | Debian 13 | module | VL805; RTL9210 NVMe over UAS on USB3, a built-in saturation source; newest kernel in the fleet |
 | `pi58` | Raspberry Pi 5 (BCM2712) | aarch64 | 6.6.31+rpt-rpi-2712 | Debian 12 | module | RP1-southbridge xHCI, two USB2 + two USB3 buses; the best Pi USB path |
 | `enviro` | Raspberry Pi Zero W (BCM2835) | **armv6l** | 6.12.96+rpt-rpi-v6 | Raspbian 12 | module | single core, one `dwc_otg` OTG port at 480M; the 32-bit `gnueabihf` build target |
@@ -233,6 +233,25 @@ throwaway `stageN.json`.
    coverage boundary, not a missing bundle.
 5. After committing a bundle, run `cargo test fixture_corpus` and confirm it
    passes -- the same replay the default suite runs on every push.
+6. Pull a bundle off a host with tar over ssh
+   (`ssh <host> 'tar -C ~/fixtures -cf - <bundle>' | tar -C tests/fixtures/hosts -xf -`),
+   never `scp -r` -- scp dereferences the bundle's relative `usbN` symlink
+   into a duplicate directory, which SEC-2 then rejects.
+
+Fleet build notes, learned capturing the Pi bundles (2026-08-31):
+
+- One aarch64 binary covers every 64-bit Pi when built on the oldest-glibc
+  host (`pi58`, Debian 12 / glibc 2.36 -- runs unmodified on the Debian 13
+  Pis). `pi58` carries the build box: rustup stable plus this repo.
+- `enviro` (armv6l) needs the **static musl** cross-build, made on `pi58`:
+  `rustup target add arm-unknown-linux-musleabihf`, Debian's
+  `gcc-arm-linux-gnueabihf` as the linker, and
+  `-C target-feature=+crt-static`. The glibc cross-target
+  (`arm-unknown-linux-gnueabihf`) links Debian's ARMv7-flavored runtime and
+  SIGSEGVs on the ARMv6 Zero; the musl target ships its own ARMv6 CRT and
+  runs. (This build is also what forced `IoctlRequest` in
+  `usbmon/mmap_ring.rs`: musl declares `ioctl`'s request as `c_int` where
+  glibc says `c_ulong`.)
 
 ## Per-platform notes
 

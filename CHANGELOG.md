@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The `/` search box now filters as you type. Previously a keystroke's effect on which rows were shown waited for the next refresh tick -- up to a second at the default rate.
 - When a `/dev/usbmon*` node exists but the current user cannot open it, the startup remedy now tells you to run with `sudo` instead of suggesting `modprobe`/`mount`, which cannot fix a permission problem.
+- The mmap-ring reader's ioctl request casts now compile under musl (musl declares `ioctl`'s request parameter as `c_int` where glibc says `c_ulong`), unblocking the static armv6 build for the Pi Zero.
 
 ## [1.5.0] - 2026-08-29
 
