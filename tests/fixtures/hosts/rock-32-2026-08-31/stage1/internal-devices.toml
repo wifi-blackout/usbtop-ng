@@ -1,0 +1,51 @@
+captured_unix = 1788203348
+
+[[devices]]
+port_path = "4-1"
+vendor_id = "1a40"
+product_id = "0101"
+
+[[devices]]
+port_path = "4-1.3"
+vendor_id = "a69c"
+product_id = "8d81"
+
+[[devices]]
+port_path = "usb1"
+vendor_id = "1d6b"
+product_id = "0002"
+
+[[devices]]
+port_path = "usb2"
+vendor_id = "1d6b"
+product_id = "0003"
+
+[[devices]]
+port_path = "usb3"
+vendor_id = "1d6b"
+product_id = "0002"
+
+[[devices]]
+port_path = "usb4"
+vendor_id = "1d6b"
+product_id = "0002"
+
+[[devices]]
+port_path = "usb5"
+vendor_id = "1d6b"
+product_id = "0001"
+
+[[devices]]
+port_path = "usb6"
+vendor_id = "1d6b"
+product_id = "0002"
+
+[[devices]]
+port_path = "usb7"
+vendor_id = "1d6b"
+product_id = "0001"
+
+[[devices]]
+port_path = "usb8"
+vendor_id = "1d6b"
+product_id = "0003"
