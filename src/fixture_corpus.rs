@@ -7,7 +7,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::fixture_replay::{
-    discover_bundles, replay_fixture, report_to_golden_json, to_masked_value, Bundle, FixtureSource,
+    discover_bundles, replay_fixture, report_to_golden_json, to_masked_value, Bundle,
+    FixtureSource, Meta,
 };
 
 fn sources_of(bundle: &Bundle) -> Vec<FixtureSource> {
@@ -17,6 +18,59 @@ fn sources_of(bundle: &Bundle) -> Vec<FixtureSource> {
         .iter()
         .filter_map(|s| FixtureSource::from_tag(s))
         .collect()
+}
+
+/// Root of the committed fixture corpus: `CARGO_MANIFEST_DIR/tests/fixtures/hosts`.
+/// Used directly by the filesystem-walk SEC tests and the strict-corpus test
+/// below, independent of `discover_bundles`'s (lenient) bundle discovery.
+fn fixtures_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("hosts")
+}
+
+/// Recursively collect every path beneath `root` whose file name is exactly
+/// `name`, regardless of what (if anything) its enclosing directory's
+/// `meta.toml` says. Shared by the SEC-1 trace-file walks (`trace.bin` /
+/// `trace.txt`) and the SEC-2 `sysfs`-directory walk below, so the SEC
+/// invariants cover every matching file/dir in the corpus even when a stage's
+/// `meta.toml` is missing or malformed. A canonicalized-directory visited set
+/// guards against a symlink cycle turning a tampered bundle into a hang
+/// instead of a clean test failure.
+fn find_named(root: &Path, name: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut visited = HashSet::new();
+    if let Ok(real_root) = std::fs::canonicalize(root) {
+        visited.insert(real_root);
+    }
+    walk_find_named(root, name, &mut visited, &mut found);
+    found
+}
+
+fn walk_find_named(
+    dir: &Path,
+    name: &str,
+    visited: &mut HashSet<PathBuf>,
+    found: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+            found.push(path.clone());
+        }
+        if path.is_dir() {
+            let Ok(real) = std::fs::canonicalize(&path) else {
+                continue;
+            };
+            if visited.insert(real) {
+                walk_find_named(&path, name, visited, found);
+            }
+        }
+    }
 }
 
 #[test]
@@ -83,10 +137,17 @@ fn read_source_bytes(path: &Path) -> Option<Vec<u8>> {
     }
 }
 
+// The three tests below walk the fixture corpus directly on disk (via
+// `find_named`), rather than iterating `discover_bundles()`'s bundle list.
+// `discover_bundles`/`discover_bundles_in` silently skip a stage directory
+// whose `meta.toml` is missing, unreadable, or malformed — so a tampered
+// bundle with a broken `meta.toml` would otherwise escape every SEC check.
+// Walking the filesystem for `trace.bin`/`trace.txt`/`sysfs` directly makes
+// these invariants hold independent of `meta.toml` entirely.
+
 #[test]
 fn sec1_no_binary_payload() {
-    for bundle in discover_bundles() {
-        let bin = bundle.dir.join("trace.bin");
+    for bin in find_named(&fixtures_root(), "trace.bin") {
         let Some(bytes) = read_source_bytes(&bin) else {
             continue;
         };
@@ -115,8 +176,7 @@ fn sec1_no_binary_payload() {
 
 #[test]
 fn sec1_no_text_data_tag() {
-    for bundle in discover_bundles() {
-        let txt = bundle.dir.join("trace.txt");
+    for txt in find_named(&fixtures_root(), "trace.txt") {
         let Some(bytes) = read_source_bytes(&txt) else {
             continue;
         };
@@ -135,8 +195,7 @@ fn sec1_no_text_data_tag() {
 
 #[test]
 fn sec2_sysfs_paths_stay_inside_the_bundle() {
-    for bundle in discover_bundles() {
-        let sysfs = bundle.dir.join("sysfs");
+    for sysfs in find_named(&fixtures_root(), "sysfs") {
         let root = std::fs::canonicalize(&sysfs).unwrap();
         assert_contained(&root, &root);
     }
@@ -169,6 +228,65 @@ fn walk_contained(root: &Path, dir: &Path, visited: &mut HashSet<PathBuf>) {
             walk_contained(root, &real, visited);
         }
     }
+}
+
+/// Strict-corpus invariant: every directory exactly two levels below `root`
+/// (`hosts/<host>/<stage>/` — the same candidate set `discover_bundles_in`
+/// walks) must be a well-formed bundle: `meta.toml` exists and parses as
+/// [`Meta`], every tag in its `sources` list is recognized by
+/// `FixtureSource::from_tag`, and each declared source's trace file exists.
+/// Unlike `discover_bundles_in` (which stays lenient on purpose, so the bless
+/// helper and failure locality keep working over a still-being-authored
+/// corpus), this never skips a candidate directory: a broken `meta.toml`, an
+/// unrecognized source tag, or a missing declared trace file fails the corpus
+/// instead of silently dropping its coverage.
+fn check_corpus_strict(root: &Path) -> Result<(), String> {
+    let hosts = std::fs::read_dir(root).map_err(|e| format!("read {}: {e}", root.display()))?;
+    let mut host_dirs: Vec<PathBuf> = hosts
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    host_dirs.sort();
+
+    for host in host_dirs {
+        let stages =
+            std::fs::read_dir(&host).map_err(|e| format!("read {}: {e}", host.display()))?;
+        let mut stage_dirs: Vec<PathBuf> = stages
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        stage_dirs.sort();
+
+        for stage in stage_dirs {
+            let meta_path = stage.join("meta.toml");
+            let text = std::fs::read_to_string(&meta_path)
+                .map_err(|e| format!("{}: meta.toml unreadable: {e}", meta_path.display()))?;
+            let meta: Meta = toml::from_str(&text)
+                .map_err(|e| format!("{}: meta.toml does not parse: {e}", meta_path.display()))?;
+
+            for tag in &meta.sources {
+                let source = FixtureSource::from_tag(tag).ok_or_else(|| {
+                    format!("{}: unrecognized source tag {tag:?}", meta_path.display())
+                })?;
+                let trace_path = stage.join(source.trace_filename());
+                if !trace_path.exists() {
+                    return Err(format!(
+                        "{}: declares source {tag:?} but {} is missing",
+                        meta_path.display(),
+                        trace_path.display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn every_stage_dir_is_a_wellformed_bundle() {
+    check_corpus_strict(&fixtures_root()).unwrap();
 }
 
 /// Bless helper: regenerate every *seed's* `trace.bin` and both goldens by
@@ -246,4 +364,66 @@ fn write_seed_binary_from_text(dir: &Path) {
         out.extend_from_slice(&b);
     }
     std::fs::write(dir.join("trace.bin"), &out).unwrap();
+}
+
+#[cfg(test)]
+mod check_corpus_strict_tests {
+    use super::*;
+
+    #[test]
+    fn fails_closed_on_a_broken_meta_toml() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("host-a").join("stage1");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("meta.toml"), "not valid toml {{{").unwrap();
+
+        let err = check_corpus_strict(temp.path()).unwrap_err();
+        assert!(
+            err.contains(&stage.join("meta.toml").display().to_string()),
+            "error must name the offending path: {err}"
+        );
+    }
+
+    #[test]
+    fn fails_closed_on_an_unrecognized_source_tag() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("host-a").join("stage1");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(
+            stage.join("meta.toml"),
+            "sources = [\"binary\", \"bogus\"]\n",
+        )
+        .unwrap();
+        std::fs::write(stage.join("trace.bin"), []).unwrap();
+
+        let err = check_corpus_strict(temp.path()).unwrap_err();
+        assert!(err.contains("bogus"), "error must name the tag: {err}");
+        assert!(
+            err.contains(&stage.join("meta.toml").display().to_string()),
+            "error must name the offending path: {err}"
+        );
+    }
+
+    #[test]
+    fn fails_closed_on_a_missing_declared_trace_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("host-a").join("stage1");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("meta.toml"), "sources = [\"binary\"]\n").unwrap();
+        // trace.bin deliberately not written.
+
+        let err = check_corpus_strict(temp.path()).unwrap_err();
+        assert!(err.contains("trace.bin"), "{err}");
+    }
+
+    #[test]
+    fn accepts_a_wellformed_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("host-a").join("stage1");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("meta.toml"), "sources = [\"binary\"]\n").unwrap();
+        std::fs::write(stage.join("trace.bin"), []).unwrap();
+
+        check_corpus_strict(temp.path()).unwrap();
+    }
 }
