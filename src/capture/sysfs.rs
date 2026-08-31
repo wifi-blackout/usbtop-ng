@@ -50,8 +50,18 @@ pub fn materialize_sysfs(src_base: &Path, dst_sysfs: &Path) -> anyhow::Result<()
                         .with_context(|| format!("symlink {}", link.display()))?;
                 }
                 None => {
-                    // Controller unresolved (e.g. a source tree with no symlink):
-                    // materialize the root hub directly; its controller stays null.
+                    // Controller unresolved at capture time (e.g. a source tree
+                    // where `usbN` is a plain dir, not a symlink into a
+                    // controller dir — real sysfs never shapes it that way):
+                    // materialize the root hub directly, with no symlink. On
+                    // replay, `DeviceManager::update_bus_speed` still
+                    // canonicalizes this now-real `usbN` dir; canonicalize
+                    // doesn't require a symlink to succeed, so it resolves to
+                    // itself and `.parent().file_name()` names the *enclosing
+                    // sysfs directory* (e.g. "sysfs"), not the real controller
+                    // and not `None`. That synthetic value is visibly not a
+                    // PCI/platform id, but it is what both golden generation
+                    // and test replay resolve to here, so golden==replay holds.
                     copy_attrs(&src_dir, &dst_sysfs.join(name.as_ref()))?;
                 }
             }
@@ -162,5 +172,70 @@ mod tests {
         mgr.enumerate_present_devices();
         mgr.update_bus_speeds();
         assert_eq!(mgr.buses[&1].controller.as_deref(), Some("0000:00:14.0"));
+    }
+
+    /// `resolve_controller` returns `None` only when canonicalizing `usbN`
+    /// itself fails (e.g. a dangling symlink) — a *plain real* `usbN` dir
+    /// canonicalizes trivially and takes the `Some` branch instead (with the
+    /// enclosing source dir's own name as a bogus "controller"), so a
+    /// dangling symlink is the deterministic, portable way to hit the
+    /// fallback. A same-bus ordinary device (`1-1`) is included so
+    /// `enumerate_present_devices` still discovers bus 1 from *its* attrs —
+    /// the broken `usb1` entry itself can carry no attrs, since reading
+    /// through a dangling symlink fails the same way canonicalizing it does.
+    ///
+    /// This pins the *true* replay behavior: `DeviceManager::update_bus_speed`
+    /// canonicalizes the now-real, unlinked `usbN` dir at replay time; that
+    /// canonicalize needs no symlink to succeed, so it resolves to itself,
+    /// and `.parent().file_name()` names the *enclosing sysfs directory*
+    /// (here "sysfs") — a visibly synthetic value, not the real controller
+    /// and not `None`.
+    #[test]
+    fn unresolved_controller_falls_back_to_a_real_dir_whose_replayed_controller_is_the_enclosing_dir_name(
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("devices");
+        std::fs::create_dir_all(&src).unwrap();
+        // A dangling symlink: canonicalize (and any read through it) fails.
+        std::os::unix::fs::symlink(src.join("nonexistent-controller"), src.join("usb1")).unwrap();
+        // An ordinary same-bus device so `enumerate_present_devices` still
+        // finds bus 1 despite `usb1` itself carrying no readable attrs.
+        dev(
+            &src,
+            "1-1",
+            &[("busnum", "1\n"), ("devnum", "3\n"), ("idVendor", "0430\n")],
+        );
+
+        // Destination named "sysfs" so the enclosing-dir-name assertion below
+        // has a known, checkable value.
+        let dst = temp.path().join("sysfs");
+        materialize_sysfs(&src, &dst).unwrap();
+
+        // usb1 is a real (empty) dir, not a symlink: the fallback fired.
+        let meta = std::fs::symlink_metadata(dst.join("usb1")).unwrap();
+        assert!(!meta.file_type().is_symlink());
+        assert!(meta.file_type().is_dir());
+
+        // No controller stand-in dir was created: the only entries under dst
+        // are the ordinary device and usb1 itself, nothing else.
+        let mut entries: Vec<_> = std::fs::read_dir(&dst)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                std::ffi::OsString::from("1-1"),
+                std::ffi::OsString::from("usb1")
+            ]
+        );
+
+        // Replay resolves the controller to the enclosing sysfs dir's own
+        // basename, not None and not a real controller id.
+        let mut mgr = crate::device::manager::DeviceManager::with_sysfs_base(dst.clone());
+        mgr.enumerate_present_devices();
+        mgr.update_bus_speeds();
+        assert_eq!(mgr.buses[&1].controller.as_deref(), Some("sysfs"));
     }
 }
