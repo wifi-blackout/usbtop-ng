@@ -319,6 +319,16 @@ fn next_nflush(just_fetched: Option<u32>) -> u32 {
 
 // --- syscall helpers --------------------------------------------------
 
+/// The type `libc::ioctl` declares for its request parameter, which differs
+/// by libc: glibc takes `c_ulong`, musl takes `c_int` (both wrap the same
+/// kernel `unsigned int`, so the `as` casts below are bit-identical either
+/// way). Static armv6 builds for the Pi Zero link musl, so the request casts
+/// go through this alias rather than hard-coding glibc's `c_ulong`.
+#[cfg(target_env = "musl")]
+type IoctlRequest = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+type IoctlRequest = libc::c_ulong;
+
 /// `MON_IOCQ_RING_SIZE`: the ring's size in bytes, returned as the ioctl's own
 /// return value rather than through an output argument.
 fn ring_size(fd: RawFd) -> io::Result<usize> {
@@ -327,7 +337,7 @@ fn ring_size(fd: RawFd) -> io::Result<usize> {
     // so the last parameter is inert; the kernel reports the size through the
     // call's return value, which is checked for the negative-on-error
     // convention before being trusted.
-    let ret = unsafe { libc::ioctl(fd, MON_IOCQ_RING_SIZE as libc::c_ulong, 0) };
+    let ret = unsafe { libc::ioctl(fd, MON_IOCQ_RING_SIZE as IoctlRequest, 0) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -353,7 +363,7 @@ fn set_ring_size(fd: RawFd, bytes: usize) -> io::Result<()> {
     let ret = unsafe {
         libc::ioctl(
             fd,
-            MON_IOCT_RING_SIZE as libc::c_ulong,
+            MON_IOCT_RING_SIZE as IoctlRequest,
             bytes as libc::c_ulong,
         )
     };
@@ -382,7 +392,7 @@ fn mfetch(fd: RawFd, offsets: &mut [u32; OFFSETS_CAP], nflush: u32) -> io::Resul
     let ret = unsafe {
         libc::ioctl(
             fd,
-            mon_iocx_mfetch() as libc::c_ulong,
+            mon_iocx_mfetch() as IoctlRequest,
             std::ptr::addr_of_mut!(req),
         )
     };
@@ -412,7 +422,7 @@ fn mflush(fd: RawFd, count: u32) -> io::Result<()> {
     // `count` back out of the syscall's argument register as a plain integer;
     // there is no user-space buffer for it to read through or write into, so
     // nothing here can be read or written out of bounds.
-    let ret = unsafe { libc::ioctl(fd, MON_IOCH_MFLUSH as libc::c_ulong, count as libc::c_ulong) };
+    let ret = unsafe { libc::ioctl(fd, MON_IOCH_MFLUSH as IoctlRequest, count as libc::c_ulong) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -438,7 +448,7 @@ fn stats(fd: RawFd) -> io::Result<MonBinStats> {
     let ret = unsafe {
         libc::ioctl(
             fd,
-            MON_IOCG_STATS as libc::c_ulong,
+            MON_IOCG_STATS as IoctlRequest,
             std::ptr::addr_of_mut!(stats),
         )
     };
