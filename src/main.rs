@@ -22,6 +22,8 @@ mod capture;
 mod config;
 mod device;
 mod filter;
+#[cfg(test)]
+mod fixture_corpus;
 #[cfg(any(test, feature = "capture-fixture"))]
 mod fixture_replay;
 mod headless;

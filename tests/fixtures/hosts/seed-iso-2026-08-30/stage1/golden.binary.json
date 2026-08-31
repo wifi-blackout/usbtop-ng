@@ -1,0 +1,62 @@
+{
+  "buses": [
+    {
+      "bus": 2,
+      "controller": "0000:00:1a.0",
+      "devices": [
+        {
+          "address": 1,
+          "bus": 2,
+          "endpoints": [],
+          "estimated": false,
+          "internal": false,
+          "port": "",
+          "product": null,
+          "product_id": null,
+          "rx_bps": 0.0,
+          "speed_mbps": 480.0,
+          "total_rx_bytes": 0,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": null,
+          "vendor_id": null
+        },
+        {
+          "address": 4,
+          "bus": 2,
+          "endpoints": [
+            {
+              "bps": 27000.0,
+              "direction": "in",
+              "endpoint": 1,
+              "total_bytes": 27000,
+              "transfer_type": "iso"
+            }
+          ],
+          "estimated": false,
+          "internal": false,
+          "port": "1",
+          "product": "IsoProduct",
+          "product_id": "0003",
+          "rx_bps": 27000.0,
+          "speed_mbps": 480.0,
+          "total_rx_bytes": 27000,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": "IsoVendor",
+          "vendor_id": "1d6b"
+        }
+      ],
+      "rx_bps": 27000.0,
+      "speed_mbps": 480.0,
+      "tx_bps": 0.0
+    }
+  ],
+  "dropped_packets": 0,
+  "kernel_dropped_packets": 0,
+  "source": "binary",
+  "total_rx_bps": 27000.0,
+  "total_tx_bps": 0.0,
+  "version": 1,
+  "window_seconds": 1.0
+}

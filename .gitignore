@@ -23,11 +23,12 @@ Thumbs.db
 *.log
 usbtop-ng.log*
 
-# Config files (except examples and Cargo manifest)
+# Config files (except examples, Cargo manifest, and fixture corpus data)
 config.toml
 *.toml
 !Cargo.toml
 !example-config.toml
+!tests/fixtures/**/*.toml
 
 # Build artifacts
 dist/

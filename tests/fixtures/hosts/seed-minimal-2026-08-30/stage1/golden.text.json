@@ -1,0 +1,62 @@
+{
+  "buses": [
+    {
+      "bus": 1,
+      "controller": "0000:00:14.0",
+      "devices": [
+        {
+          "address": 1,
+          "bus": 1,
+          "endpoints": [],
+          "estimated": false,
+          "internal": false,
+          "port": "",
+          "product": null,
+          "product_id": null,
+          "rx_bps": 0.0,
+          "speed_mbps": 480.0,
+          "total_rx_bytes": 0,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": null,
+          "vendor_id": null
+        },
+        {
+          "address": 3,
+          "bus": 1,
+          "endpoints": [
+            {
+              "bps": 1000.0,
+              "direction": "in",
+              "endpoint": 1,
+              "total_bytes": 1000,
+              "transfer_type": "bulk"
+            }
+          ],
+          "estimated": false,
+          "internal": false,
+          "port": "1",
+          "product": "StringProduct",
+          "product_id": "0100",
+          "rx_bps": 1000.0,
+          "speed_mbps": 480.0,
+          "total_rx_bytes": 1000,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": "StringVendor",
+          "vendor_id": "0430"
+        }
+      ],
+      "rx_bps": 1000.0,
+      "speed_mbps": 480.0,
+      "tx_bps": 0.0
+    }
+  ],
+  "dropped_packets": 0,
+  "kernel_dropped_packets": 0,
+  "source": "text",
+  "total_rx_bps": 1000.0,
+  "total_tx_bps": 0.0,
+  "version": 1,
+  "window_seconds": 1.0
+}
