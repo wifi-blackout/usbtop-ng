@@ -3,7 +3,8 @@
 //! and compared to its committed golden; the SEC-1/SEC-2 invariants are
 //! enforced over every committed fixture. Runs with no feature and no hardware.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use crate::fixture_replay::{
     discover_bundles, replay_fixture, report_to_golden_json, to_masked_value, Bundle, FixtureSource,
@@ -70,15 +71,42 @@ fn declared_controllers_and_speeds_are_non_null_in_the_golden() {
     }
 }
 
+/// Read a fixture source file, distinguishing "legitimately absent" from
+/// every other failure: a missing file (that source wasn't captured for this
+/// bundle) skips the check by returning `None`; any other read error (a
+/// permission error, say) panics rather than silently skipping it.
+fn read_source_bytes(path: &Path) -> Option<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => panic!("read {}: {e}", path.display()),
+    }
+}
+
 #[test]
 fn sec1_no_binary_payload() {
     for bundle in discover_bundles() {
         let bin = bundle.dir.join("trace.bin");
-        if let Ok(meta) = std::fs::metadata(&bin) {
+        let Some(bytes) = read_source_bytes(&bin) else {
+            continue;
+        };
+        assert_eq!(
+            bytes.len() % 48,
+            0,
+            "SEC-1: {} not a whole header count",
+            bin.display()
+        );
+        // A whole header count alone doesn't prove payload-freedom: a trace
+        // could carry a header (len_cap=48) followed by exactly 48 payload
+        // bytes and still pass that check. Walk each 48-byte record and
+        // assert its len_cap (bytes 36..40, native-endian u32) is 0, which
+        // proves both payload-freedom and correct framing.
+        for (i, record) in bytes.chunks_exact(48).enumerate() {
+            let len_cap = u32::from_ne_bytes(record[36..40].try_into().unwrap());
             assert_eq!(
-                meta.len() % 48,
+                len_cap,
                 0,
-                "SEC-1: {} not a whole header count",
+                "SEC-1: {} record {i} carries len_cap={len_cap} (payload leaked?)",
                 bin.display()
             );
         }
@@ -89,15 +117,18 @@ fn sec1_no_binary_payload() {
 fn sec1_no_text_data_tag() {
     for bundle in discover_bundles() {
         let txt = bundle.dir.join("trace.txt");
-        if let Ok(text) = std::fs::read_to_string(&txt) {
-            for (i, line) in text.lines().enumerate() {
-                assert!(
-                    !line.split_whitespace().any(|t| t == "="),
-                    "SEC-1: {}:{} carries a data tag",
-                    txt.display(),
-                    i + 1
-                );
-            }
+        let Some(bytes) = read_source_bytes(&txt) else {
+            continue;
+        };
+        let text = String::from_utf8(bytes)
+            .unwrap_or_else(|e| panic!("SEC-1: {} is not valid UTF-8: {e}", txt.display()));
+        for (i, line) in text.lines().enumerate() {
+            assert!(
+                !line.split_whitespace().any(|t| t == "="),
+                "SEC-1: {}:{} carries a data tag",
+                txt.display(),
+                i + 1
+            );
         }
     }
 }
@@ -112,6 +143,19 @@ fn sec2_sysfs_paths_stay_inside_the_bundle() {
 }
 
 fn assert_contained(root: &Path, dir: &Path) {
+    let mut visited = HashSet::new();
+    visited.insert(dir.to_path_buf());
+    walk_contained(root, dir, &mut visited);
+}
+
+/// Recursive walk behind [`assert_contained`], tracking canonicalized dirs
+/// already visited. A hand-authored in-bundle symlink can resolve back to an
+/// already-visited ancestor (e.g. `sysfs/x -> ..` resolving inside the
+/// bundle); without this guard that would recurse forever and hang instead of
+/// failing. `real.starts_with(root)` is still checked on every entry before
+/// the cycle check, so escape detection is unaffected — only re-descending
+/// into a dir already walked is skipped.
+fn walk_contained(root: &Path, dir: &Path, visited: &mut HashSet<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap().flatten() {
         let real = std::fs::canonicalize(entry.path())
             .unwrap_or_else(|e| panic!("canonicalize {}: {e}", entry.path().display()));
@@ -121,20 +165,28 @@ fn assert_contained(root: &Path, dir: &Path) {
             real.display(),
             root.display()
         );
-        if real.is_dir() {
-            assert_contained(root, &real);
+        if real.is_dir() && visited.insert(real.clone()) {
+            walk_contained(root, &real, visited);
         }
     }
 }
 
-/// Bless helper: regenerate every seed's `trace.bin` and both goldens by
-/// replay, so committed goldens equal harness output by construction. Not run
-/// in CI. Run once after authoring/altering a seed:
+/// Bless helper: regenerate every *seed's* `trace.bin` and both goldens by
+/// replay, so committed goldens equal harness output by construction. Only
+/// touches bundles whose host directory (the bundle dir's parent) is named
+/// `seed-*` — a real fleet capture's host directory won't match that prefix,
+/// so a bless run can never silently replace its real binary trace with a
+/// text-derived reconstruction. Not run in CI. Run once after
+/// authoring/altering a seed:
 ///   cargo test bless_seed_goldens -- --ignored --nocapture
 #[test]
 #[ignore]
 fn bless_seed_goldens() {
     for bundle in discover_bundles() {
+        if !is_seed_bundle(&bundle) {
+            eprintln!("skipping non-seed bundle {}", bundle.dir.display());
+            continue;
+        }
         // (Re)write trace.bin from the bundle's text trace so binary and text
         // describe the same traffic. Seeds only: real captures already have both.
         write_seed_binary_from_text(&bundle.dir);
@@ -150,10 +202,20 @@ fn bless_seed_goldens() {
     }
 }
 
+/// A bundle counts as a seed only when its host directory (`dir`'s parent)
+/// exists and its name starts with `seed-`.
+fn is_seed_bundle(bundle: &Bundle) -> bool {
+    bundle
+        .dir
+        .parent()
+        .and_then(|host| host.file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("seed-"))
+}
+
 /// Build a `trace.bin` whose events mirror the bundle's `trace.txt` callbacks,
 /// so a seed's two sources agree. Handles the fields the pipeline reads:
 /// type, xfer, endpoint+dir, devnum, busnum, length.
-#[cfg(test)]
 fn write_seed_binary_from_text(dir: &Path) {
     use crate::usbmon::parser::{parse_usbmon_text_line, TransferType, UrbType};
     let Ok(text) = std::fs::read_to_string(dir.join("trace.txt")) else {

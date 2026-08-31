@@ -303,7 +303,10 @@ fn main() -> Result<()> {
     // writes a fixture bundle, then exits. Feature-gated developer/CI tooling.
     #[cfg(feature = "capture-fixture")]
     if let Some(outdir) = &cli.capture_fixture {
-        let window = Duration::from_secs_f64(cli.window.unwrap_or(5.0).max(0.1));
+        let window = resolve_capture_fixture_window(cli.window).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            process::exit(2);
+        });
         capture::run_capture_fixture(capture::CaptureFixtureOpts {
             outdir: std::path::PathBuf::from(outdir),
             window,
@@ -670,6 +673,26 @@ fn resolve_window(window: Option<f64>, batch: bool) -> Result<Duration, String> 
     Duration::try_from_secs_f64(floored).map_err(|_| format!("--window {floored} is out of range"))
 }
 
+/// Resolve `--window` for `--capture-fixture` into a [`Duration`]: same
+/// non-finite guard as [`resolve_window`], but this path predates it and
+/// keeps its own default (5s) and floor (0.1s) rather than adopting
+/// `resolve_window`'s (1s/5s by mode, 0.25s floor).
+/// `Duration::from_secs_f64`/`try_from_secs_f64` panic on a NaN, an infinity,
+/// or a finite value too large for a `Duration` to represent — `--window inf`
+/// reached that directly and turned an argument error into a panic (exit
+/// 101). This validates first and reports a normal exit-2 error instead.
+#[cfg(feature = "capture-fixture")]
+fn resolve_capture_fixture_window(window: Option<f64>) -> Result<Duration, String> {
+    let seconds = window.unwrap_or(5.0);
+    if !seconds.is_finite() {
+        return Err(format!(
+            "--window must be a finite number of seconds, got {seconds}"
+        ));
+    }
+    let floored = seconds.max(0.1);
+    Duration::try_from_secs_f64(floored).map_err(|_| format!("--window {floored} is out of range"))
+}
+
 fn create_shell_alias() -> Result<()> {
     println!("🔗 Creating shell alias for 'usbtop' command...\n");
 
@@ -884,6 +907,39 @@ mod tests {
     fn resolve_window_rejects_a_finite_value_too_large_for_duration() {
         // Finite, but far beyond what `Duration` (u64 seconds) can hold.
         assert!(resolve_window(Some(1e300), false).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "capture-fixture")]
+    fn resolve_capture_fixture_window_applies_the_default_and_floor() {
+        assert_eq!(
+            resolve_capture_fixture_window(None).unwrap(),
+            Duration::from_secs_f64(5.0),
+            "defaults to 5s"
+        );
+        assert_eq!(
+            resolve_capture_fixture_window(Some(0.01)).unwrap(),
+            Duration::from_secs_f64(0.1),
+            "floors to 0.1s, not resolve_window's 0.25s"
+        );
+        assert_eq!(
+            resolve_capture_fixture_window(Some(2.5)).unwrap(),
+            Duration::from_secs_f64(2.5)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "capture-fixture")]
+    fn resolve_capture_fixture_window_rejects_non_finite_values_instead_of_panicking() {
+        assert!(resolve_capture_fixture_window(Some(f64::INFINITY)).is_err());
+        assert!(resolve_capture_fixture_window(Some(f64::NEG_INFINITY)).is_err());
+        assert!(resolve_capture_fixture_window(Some(f64::NAN)).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "capture-fixture")]
+    fn resolve_capture_fixture_window_rejects_a_finite_value_too_large_for_duration() {
+        assert!(resolve_capture_fixture_window(Some(1e300)).is_err());
     }
 
     #[test]

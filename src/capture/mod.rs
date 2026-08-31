@@ -43,8 +43,21 @@ pub fn assemble_bundle(
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(outdir).with_context(|| format!("create {}", outdir.display()))?;
 
-    sysfs::materialize_sysfs(src_sysfs, &outdir.join("sysfs"))?;
-    assert_sysfs_contained(&outdir.join("sysfs"))?; // SEC-2, capturer side
+    // Refuse a pre-existing, non-empty sysfs/: materializing into it would
+    // merge in stale device dirs left over from a prior partial run, silently
+    // mixing two captures into one bundle.
+    let sysfs_out = outdir.join("sysfs");
+    if let Ok(mut entries) = std::fs::read_dir(&sysfs_out) {
+        if entries.next().is_some() {
+            return Err(anyhow!(
+                "{} already exists and is not empty (stale from a prior run?); use a fresh outdir",
+                sysfs_out.display()
+            ));
+        }
+    }
+
+    sysfs::materialize_sysfs(src_sysfs, &sysfs_out)?;
+    assert_sysfs_contained(&sysfs_out)?; // SEC-2, capturer side
 
     // Baseline internal-devices snapshot (bare-board; reused across stages).
     let internal = outdir.join("internal-devices.toml");
@@ -91,7 +104,11 @@ pub fn assemble_bundle(
 }
 
 /// SEC-1 capturer-side guard: a binary trace must be a whole number of 48-byte
-/// headers (no payload); a text trace must carry no `=` data tag.
+/// headers, each with `len_cap` (bytes 36..40) zero (no payload); a text
+/// trace must carry no `=` data tag. A whole-header-count check alone isn't
+/// enough: a header (len_cap=48) followed by exactly 48 payload bytes is
+/// itself a whole multiple of 48 and would slip past it, so every record's
+/// `len_cap` is checked too.
 fn assert_payload_free(trace: &CapturedTrace) -> anyhow::Result<()> {
     match trace.source {
         FixtureSource::Binary => {
@@ -100,6 +117,14 @@ fn assert_payload_free(trace: &CapturedTrace) -> anyhow::Result<()> {
                     "SEC-1: binary trace is {} bytes, not a multiple of 48 (payload leaked?)",
                     trace.bytes.len()
                 ));
+            }
+            for (i, record) in trace.bytes.chunks_exact(48).enumerate() {
+                let len_cap = u32::from_ne_bytes(record[36..40].try_into().unwrap());
+                if len_cap != 0 {
+                    return Err(anyhow!(
+                        "SEC-1: binary trace record {i} carries len_cap={len_cap} (payload leaked?)"
+                    ));
+                }
             }
         }
         FixtureSource::Text => {
@@ -162,22 +187,35 @@ pub fn run_capture_fixture(opts: CaptureFixtureOpts) -> anyhow::Result<()> {
 
     // Binary interface, sanitized.
     let bin_dev = PathBuf::from(format!("/dev/usbmon{bus}"));
-    if let Ok(bytes) = capture_window(&bin_dev, opts.window, &stop) {
-        let sanitized = trace::sanitize_binary_stream(&mut std::io::Cursor::new(bytes))?;
-        traces.push(CapturedTrace {
-            source: FixtureSource::Binary,
-            bytes: sanitized,
-        });
+    match capture_window(&bin_dev, opts.window, &stop) {
+        Ok(bytes) => {
+            let sanitized = trace::sanitize_binary_stream(&mut std::io::Cursor::new(bytes))?;
+            traces.push(CapturedTrace {
+                source: FixtureSource::Binary,
+                bytes: sanitized,
+            });
+        }
+        Err(e) => eprintln!(
+            "warning: could not capture {} (binary usbmon interface): {e}",
+            bin_dev.display()
+        ),
     }
     // Text interface, sanitized.
     let text_dev = PathBuf::from(format!("/sys/kernel/debug/usb/usbmon/{bus}u"));
-    if let Ok(bytes) = capture_window(&text_dev, opts.window, &stop) {
-        let sanitized =
-            trace::sanitize_text_stream(&mut std::io::BufReader::new(std::io::Cursor::new(bytes)))?;
-        traces.push(CapturedTrace {
-            source: FixtureSource::Text,
-            bytes: sanitized.into_bytes(),
-        });
+    match capture_window(&text_dev, opts.window, &stop) {
+        Ok(bytes) => {
+            let sanitized = trace::sanitize_text_stream(&mut std::io::BufReader::new(
+                std::io::Cursor::new(bytes),
+            ))?;
+            traces.push(CapturedTrace {
+                source: FixtureSource::Text,
+                bytes: sanitized.into_bytes(),
+            });
+        }
+        Err(e) => eprintln!(
+            "warning: could not capture {} (text usbmon interface): {e}",
+            text_dev.display()
+        ),
     }
     if traces.is_empty() {
         return Err(anyhow!(
@@ -349,5 +387,51 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("SEC-1"), "{err}");
+    }
+
+    #[test]
+    fn assert_payload_free_rejects_a_binary_trace_whose_len_cap_claims_payload() {
+        // 96 bytes: a whole multiple of 48, so the length-only check would
+        // pass it. But it's a header claiming len_cap=48 followed by 48
+        // payload bytes — SEC-1 must catch this by len_cap, not just length.
+        let mut bytes = vec![0u8; 48];
+        bytes[36..40].copy_from_slice(&48u32.to_ne_bytes());
+        bytes.extend_from_slice(&[0xAB; 48]);
+        assert_eq!(bytes.len() % 48, 0, "precondition: a whole header count");
+
+        let trace = CapturedTrace {
+            source: FixtureSource::Binary,
+            bytes,
+        };
+        let err = assert_payload_free(&trace).unwrap_err();
+        assert!(err.to_string().contains("SEC-1"), "{err}");
+    }
+
+    #[test]
+    fn assemble_bundle_rejects_a_stale_nonempty_sysfs_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        build_src_sysfs(temp.path());
+        let outdir = temp.path().join("bundle");
+        let stale = outdir.join("sysfs").join("leftover-device");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("busnum"), "9\n").unwrap();
+
+        let traces = vec![CapturedTrace {
+            source: FixtureSource::Binary,
+            bytes: one_binary_event(),
+        }];
+        let err = assemble_bundle(
+            &temp.path().join("devices"),
+            &outdir,
+            &traces,
+            &BaselineSource::CaptureFrom(temp.path().join("devices")),
+            None,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("sysfs"), "{msg}");
+        assert!(msg.contains("fresh outdir"), "{msg}");
+        // Nothing else got written: the stale dir was the only thing there.
+        assert!(!outdir.join("meta.toml").exists());
     }
 }
