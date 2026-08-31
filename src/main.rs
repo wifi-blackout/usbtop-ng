@@ -20,6 +20,8 @@ use std::sync::Arc;
 mod config;
 mod device;
 mod filter;
+#[cfg(any(test, feature = "capture-fixture"))]
+mod fixture_replay;
 mod headless;
 mod snapshot;
 mod stats;

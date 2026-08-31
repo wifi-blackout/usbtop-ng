@@ -15,6 +15,10 @@ exclude = ["tmp/", ".claude/", ".github/", "release.sh"]
 [features]
 integration = []
 ebpf = ["dep:libbpf-rs", "dep:libbpf-cargo"]
+# Developer/CI tooling: the `--capture-fixture` subcommand and the in-crate
+# replay seams it reuses. Off by default so the shipped binary and its public
+# API are unchanged.
+capture-fixture = []
 
 [dependencies]
 anyhow = "1.0"
