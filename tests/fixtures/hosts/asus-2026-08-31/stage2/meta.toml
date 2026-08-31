@@ -1,0 +1,16 @@
+board = "ZenBook UX363EA_UX363EA"
+soc = ""
+arch = "x86_64"
+kernel = "7.0.0-30-generic"
+os = "Linux Mint 22.3"
+usbtop_ng_version = "1.5.0"
+stage_id = 2
+captured_unix = 1788212776
+controllers = ["0000:00:0d.0", "0000:00:14.0"]
+speed_classes = ["10000", "12", "480", "5000"]
+transfer_types = ["bulk", "iso"]
+sources = ["binary", "text"]
+
+[generator]
+kind = "uvc-stream"
+note = "v4l2-ctl --stream-mmap from the internal UVC webcam (13d3:56eb, bus 3 ep1 iso) spanning the whole window. The goldens pin the documented text-source iso overcount: binary reads 37,750,446 actual bytes (estimated=false); text reads 368,418,816 buffer-size bytes (estimated=true), ~9.8x."

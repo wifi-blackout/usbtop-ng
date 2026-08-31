@@ -1,0 +1,186 @@
+{
+  "buses": [
+    {
+      "bus": 1,
+      "controller": "0000:06:00.3",
+      "devices": [
+        {
+          "address": 1,
+          "bus": 1,
+          "endpoints": [],
+          "estimated": false,
+          "internal": true,
+          "port": "",
+          "product": "xHCI Host Controller",
+          "product_id": "0002",
+          "rx_bps": 0.0,
+          "speed_mbps": 480.0,
+          "total_rx_bytes": 0,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": "Linux 7.0.0-30-generic xhci-hcd",
+          "vendor_id": "1d6b"
+        },
+        {
+          "address": 2,
+          "bus": 1,
+          "endpoints": [],
+          "estimated": false,
+          "internal": true,
+          "port": "3",
+          "product": "N-KEY Device",
+          "product_id": "1866",
+          "rx_bps": 0.0,
+          "speed_mbps": 12.0,
+          "total_rx_bytes": 0,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": "ASUSTek Computer Inc.",
+          "vendor_id": "0b05"
+        }
+      ],
+      "rx_bps": 0.0,
+      "speed_mbps": 480.0,
+      "tx_bps": 0.0
+    },
+    {
+      "bus": 2,
+      "controller": "0000:06:00.3",
+      "devices": [
+        {
+          "address": 1,
+          "bus": 2,
+          "endpoints": [],
+          "estimated": false,
+          "internal": true,
+          "port": "",
+          "product": "xHCI Host Controller",
+          "product_id": "0003",
+          "rx_bps": 0.0,
+          "speed_mbps": 10000.0,
+          "total_rx_bytes": 0,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": "Linux 7.0.0-30-generic xhci-hcd",
+          "vendor_id": "1d6b"
+        }
+      ],
+      "rx_bps": 0.0,
+      "speed_mbps": 10000.0,
+      "tx_bps": 0.0
+    },
+    {
+      "bus": 3,
+      "controller": "0000:06:00.4",
+      "devices": [
+        {
+          "address": 1,
+          "bus": 3,
+          "endpoints": [
+            {
+              "bps": 8.0,
+              "direction": "in",
+              "endpoint": 0,
+              "total_bytes": 8,
+              "transfer_type": "control"
+            },
+            {
+              "bps": 1.0,
+              "direction": "in",
+              "endpoint": 1,
+              "total_bytes": 1,
+              "transfer_type": "interrupt"
+            }
+          ],
+          "estimated": false,
+          "internal": true,
+          "port": "",
+          "product": "xHCI Host Controller",
+          "product_id": "0002",
+          "rx_bps": 9.0,
+          "speed_mbps": 480.0,
+          "total_rx_bytes": 9,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": "Linux 7.0.0-30-generic xhci-hcd",
+          "vendor_id": "1d6b"
+        },
+        {
+          "address": 2,
+          "bus": 3,
+          "endpoints": [
+            {
+              "bps": 500.0,
+              "direction": "out",
+              "endpoint": 0,
+              "total_bytes": 500,
+              "transfer_type": "control"
+            },
+            {
+              "bps": 2.0,
+              "direction": "in",
+              "endpoint": 0,
+              "total_bytes": 2,
+              "transfer_type": "control"
+            },
+            {
+              "bps": 24.0,
+              "direction": "in",
+              "endpoint": 1,
+              "total_bytes": 24,
+              "transfer_type": "interrupt"
+            }
+          ],
+          "estimated": false,
+          "internal": true,
+          "port": "4",
+          "product": null,
+          "product_id": "0029",
+          "rx_bps": 26.0,
+          "speed_mbps": 12.0,
+          "total_rx_bytes": 26,
+          "total_tx_bytes": 500,
+          "tx_bps": 500.0,
+          "vendor": null,
+          "vendor_id": "8087"
+        }
+      ],
+      "rx_bps": 35.0,
+      "speed_mbps": 480.0,
+      "tx_bps": 500.0
+    },
+    {
+      "bus": 4,
+      "controller": "0000:06:00.4",
+      "devices": [
+        {
+          "address": 1,
+          "bus": 4,
+          "endpoints": [],
+          "estimated": false,
+          "internal": true,
+          "port": "",
+          "product": "xHCI Host Controller",
+          "product_id": "0003",
+          "rx_bps": 0.0,
+          "speed_mbps": 10000.0,
+          "total_rx_bytes": 0,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": "Linux 7.0.0-30-generic xhci-hcd",
+          "vendor_id": "1d6b"
+        }
+      ],
+      "rx_bps": 0.0,
+      "speed_mbps": 10000.0,
+      "tx_bps": 0.0
+    }
+  ],
+  "dropped_packets": 0,
+  "kernel_dropped_packets": 0,
+  "source": "text",
+  "total_rx_bps": 35.0,
+  "total_tx_bps": 500.0,
+  "version": 1,
+  "window_seconds": 1.0
+}
