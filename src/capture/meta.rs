@@ -14,8 +14,11 @@ pub struct CoverageTags {
 }
 
 /// The coverage a report exercises: distinct non-null controllers, distinct
-/// device speeds (Mbps, integer, skipping unknown 0), and distinct endpoint
-/// transfer types. Each list is sorted so meta.toml is stable across runs.
+/// device speeds (Mbps, skipping unknown 0; integral values print bare,
+/// fractional ones — e.g. 1.5 Mbps low speed — keep their fraction rather
+/// than truncating or rounding to a fictitious whole number), and distinct
+/// endpoint transfer types. Each list is sorted so meta.toml is stable across
+/// runs.
 pub fn compute_coverage_tags(report: &Report) -> CoverageTags {
     let mut controllers = Vec::new();
     let mut speeds = Vec::new();
@@ -25,8 +28,13 @@ pub fn compute_coverage_tags(report: &Report) -> CoverageTags {
             controllers.push(controller.clone());
         }
         for device in &bus.devices {
-            if device.speed_mbps > 0.0 {
-                speeds.push(format!("{}", device.speed_mbps as u64));
+            let speed = device.speed_mbps;
+            if speed > 0.0 {
+                speeds.push(if speed.fract() == 0.0 {
+                    format!("{}", speed as u64)
+                } else {
+                    format!("{speed}")
+                });
             }
             for ep in &device.endpoints {
                 transfer_types.push(ep.transfer_type.to_string());
@@ -178,6 +186,65 @@ mod tests {
             tags.transfer_types,
             vec!["bulk".to_string(), "iso".to_string()]
         );
+    }
+
+    #[test]
+    fn speed_classes_keep_the_fraction_for_a_low_speed_device_instead_of_truncating() {
+        let temp = tempfile::tempdir().unwrap();
+        let dev = temp.path().join("1-2");
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("busnum"), "1\n").unwrap();
+        std::fs::write(dev.join("devnum"), "2\n").unwrap();
+        // 1.5 Mbps is a real Low Speed link; `as u64` truncates it to "1"
+        // (not a real USB speed) and `.round()` gives "2" (equally
+        // fictitious) -- the fraction must survive.
+        std::fs::write(dev.join("speed"), "1.5\n").unwrap();
+
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let baseline = Baseline::capture(&mgr);
+        mgr.enumerate_present_devices();
+        mgr.update_bus_speeds();
+        let report = build_report(
+            &mgr,
+            &baseline,
+            FIXED_ELAPSED,
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+
+        let tags = compute_coverage_tags(&report);
+        assert_eq!(tags.speed_classes, vec!["1.5".to_string()]);
+    }
+
+    #[test]
+    fn controllers_tag_resolves_through_a_root_hub_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("sysfs");
+        let controller_dir = base.join("0000:00:14.0").join("usb1");
+        std::fs::create_dir_all(&controller_dir).unwrap();
+        std::fs::write(controller_dir.join("busnum"), "1\n").unwrap();
+        std::fs::write(controller_dir.join("devnum"), "1\n").unwrap();
+        std::fs::write(controller_dir.join("speed"), "480\n").unwrap();
+        std::os::unix::fs::symlink("0000:00:14.0/usb1", base.join("usb1")).unwrap();
+
+        let mut mgr = DeviceManager::with_sysfs_base(base);
+        let baseline = Baseline::capture(&mgr);
+        mgr.enumerate_present_devices();
+        mgr.update_bus_speeds();
+        let report = build_report(
+            &mgr,
+            &baseline,
+            FIXED_ELAPSED,
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+
+        let tags = compute_coverage_tags(&report);
+        assert_eq!(tags.controllers, vec!["0000:00:14.0".to_string()]);
     }
 
     #[test]
