@@ -201,6 +201,39 @@ Attachment order inside every stage: hubs first, leaves second, deepest
 level last. Record each device's port path at attach time. Detach in
 reverse.
 
+### Capturing hardware fixtures
+
+The same ladder run also feeds the fixture-capture & golden-replay harness:
+committed, hermetic regression fixtures under `tests/fixtures/hosts/`, each
+a real host+topology replayed against a golden report in the default test
+suite. Capture a fixture for a stage instead of, or alongside, that stage's
+throwaway `stageN.json`.
+
+1. Build with the feature:
+   ```bash
+   cargo build --release --features capture-fixture
+   ```
+2. Attach the stage's devices, start the stage's traffic generator, then run
+   as root:
+   ```bash
+   sudo ./target/release/usbtop-ng --capture-fixture tests/fixtures/hosts/<board>-<date>/stage<N> --window 20
+   ```
+   Use `--bus <n>` to scope the capture to one bus; the default captures the
+   aggregate across every bus. At the bare-board stage (stage 1) omit
+   `--baseline` -- a fresh internal-device baseline is captured and reused
+   by every later stage. From stage 2 on, pass that baseline:
+   `--baseline tests/fixtures/hosts/<board>-<date>/stage1/internal-devices.toml`.
+3. The capturer sanitizes at the source: SEC-1, no captured USB payload in
+   either trace file, and SEC-2, no symlink under the fixture's `sysfs/`
+   escapes the bundle. Both are asserted by the capturer and re-asserted by
+   the corpus tests, so a violation fails the PR that adds the bundle.
+4. `airbox` contributes no fixtures. Its 5.4 vendor kernel carries no usbmon
+   module, so the stage-0 gate fails before any capture is possible (see
+   [Test hosts](#test-hosts)). That usbmon-absent state is a documented
+   coverage boundary, not a missing bundle.
+5. After committing a bundle, run `cargo test fixture_corpus` and confirm it
+   passes -- the same replay the default suite runs on every push.
+
 ## Per-platform notes
 
 - Reference x86 laptop: run the full ladder. This is the baseline every

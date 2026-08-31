@@ -65,7 +65,7 @@ pass, and how to send it.
    ```bash
    cargo test
    ```
-   The unit suite reports 451 passed; the `tests/` directory adds the
+   The unit suite reports 465 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 4. To run with debug output, use:
@@ -182,7 +182,7 @@ cargo test --all-targets
 ```
 
 `cargo test` and `cargo test --all-targets` run the same three suites, all
-hermetic. The unit suite reports 451 passed, working against
+hermetic. The unit suite reports 465 passed, working against
 fixture files, FIFOs, and `tempfile` paths, with no `/dev` and no debugfs
 access. The `tests/` directory adds two more: `restore_pipe.rs` (2 tests),
 proving the terminal-restore bytes reach a piped stdout while the process is
@@ -207,7 +207,7 @@ only after it stops.
    ```bash
    cargo test --features integration
    ```
-   The unit suite reports 455 passed. Without usbmon, without root, or
+   The unit suite reports 469 passed. Without usbmon, without root, or
    without a mmap-capable `/dev/usbmon0`, each of the four extra tests
    prints its own skip message and passes.
 
@@ -225,7 +225,7 @@ needs clang (with the BPF target) and libbpf-dev.
    ```bash
    cargo test --all-targets --features ebpf
    ```
-   The unit suite reports 472 passed. One of those tests loads and attaches
+   The unit suite reports 486 passed. One of those tests loads and attaches
    the real kprobe, needing real root and a BTF-enabled kernel
    (`/sys/kernel/btf/vmlinux`); without either, it prints its own skip
    message and passes, the same contract the `integration` feature's live
@@ -235,6 +235,31 @@ Unlike the `integration` feature, CI does build and hermetic-test this
 feature: `cargo build --features ebpf` and `cargo test --features ebpf` run
 on every push, because attaching a kprobe unprivileged is the only part
 that needs a real machine.
+
+### Hermetic feature tests (the `capture-fixture` feature)
+
+`capture-fixture` is a third opt-in feature build in the gate matrix,
+alongside `integration` and `ebpf` above. It adds the `--capture-fixture`
+subcommand that records a hardware fixture bundle into
+`tests/fixtures/hosts/` -- see
+[TESTING.md](TESTING.md#capturing-hardware-fixtures) for the capture
+procedure. Needs no extra toolchain: the feature builds with just the MSRV
+Rust toolchain.
+
+1. Run the suite with the feature:
+   ```bash
+   cargo clippy --features capture-fixture --all-targets -- -D warnings
+   cargo test --features capture-fixture
+   ```
+   The unit suite reports 481 passed under the feature (465 without it; the
+   extra tests cover the capturer's own sanitizers, sysfs materialization,
+   and `meta.toml` generation).
+
+Like `ebpf`, CI builds and hermetic-tests this feature on every push:
+`cargo clippy --features capture-fixture --all-targets -- -D warnings` and
+`cargo test --features capture-fixture` run in their own job. Nothing in
+this feature needs root or real hardware -- the committed fixture corpus is
+what gets replayed.
 
 ### Writing tests
 
@@ -297,7 +322,7 @@ Cover these areas first:
    ```bash
    cargo test --all-targets
    ```
-   The unit suite reports 451 passed; the `tests/` directory adds the
+   The unit suite reports 465 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 6. Update the documentation your change affects.
