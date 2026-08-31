@@ -1,0 +1,12 @@
+board = "Raspberry Pi Zero W Rev 1.1"
+soc = "raspberrypi,model-zero-w brcm,bcm2835"
+arch = "arm"
+kernel = "6.12.96+rpt-rpi-v6"
+os = "Raspbian GNU/Linux 12 (bookworm)"
+usbtop_ng_version = "1.5.0"
+stage_id = 1
+captured_unix = 1788181953
+controllers = ["20980000.usb"]
+speed_classes = ["480"]
+transfer_types = []
+sources = ["binary", "text"]

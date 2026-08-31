@@ -1,0 +1,6 @@
+captured_unix = 1788181953
+
+[[devices]]
+port_path = "usb1"
+vendor_id = "1d6b"
+product_id = "0002"
