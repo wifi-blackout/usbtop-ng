@@ -34,10 +34,10 @@ impl UsbmonReader {
         }
     }
 
-    /// Test seam: point the reader at an arbitrary file instead of the real
-    /// debugfs path, and optionally disable follow-on-EOF so tests over a
+    /// Test/capture seam: point the reader at an arbitrary file instead of the
+    /// real debugfs path, and optionally disable follow-on-EOF so reads over a
     /// fixed fixture file terminate.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "capture-fixture"))]
     pub fn with_path(bus_id: u8, path: PathBuf, follow: bool) -> Self {
         Self {
             bus_id,

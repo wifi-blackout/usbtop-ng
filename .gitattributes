@@ -1,0 +1,5 @@
+# Fixture trace files are captured bytes (framed binary usbmon records, and
+# usbmon text lines whose exact formatting the golden replay pins). Git must
+# never normalize line endings in them — CRLF/LF rewriting would silently
+# corrupt trace.bin framing and could shift trace.txt byte-for-byte replays.
+tests/fixtures/** -text

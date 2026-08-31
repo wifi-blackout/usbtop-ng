@@ -55,3 +55,26 @@ jobs:
 
       - name: Test the ebpf feature
         run: cargo test --features ebpf
+
+  capture-fixture:
+    name: capture-fixture feature (clippy + hermetic tests)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: capture-fixture
+
+      - name: Clippy the capture-fixture feature
+        run: cargo clippy --features capture-fixture --all-targets -- -D warnings
+
+      - name: Test the capture-fixture feature
+        run: cargo test --features capture-fixture

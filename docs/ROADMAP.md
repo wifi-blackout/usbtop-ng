@@ -363,12 +363,22 @@ capture.
   resume, and peer links. The x86 `asus` host (Intel Tiger Lake-LP,
   Thunderbolt 4 plus a 10 Gbps USB bus) is now the concrete platform for
   this matrix; see the [Test hosts](TESTING.md#test-hosts) table.
-- Generate a log with a normalized schema of hardware devices that have
-  been tested. Ideas for this would include the date the test was performed
-  along with the conditions (kernel version, relevant drivers, attached port
-  chipsets, hubs). Then come up with an option to gather the data which
-  could then be submitted as a contribution. But the methodology of this is
-  open at this time.
+- Landed 2026-08-30: a normalized schema for tested hardware, and an option
+  to gather and submit it. The fixture-capture & golden-replay harness is
+  this, built out further than the "log" originally sketched here: each
+  fixture's `meta.toml` (board, arch, kernel version, controller identities,
+  speed classes, transfer types, capture source) is the normalized record;
+  the opt-in `capture-fixture` cargo feature's `--capture-fixture`
+  subcommand is the tool that gathers it from a real host; and a committed
+  `tests/fixtures/hosts/<board>-<date>/stageN/` bundle -- reviewed like any
+  other pull request -- is how it gets submitted, replayed hermetically
+  against its golden report in the default suite on every push after. See
+  [Capturing hardware fixtures](TESTING.md#capturing-hardware-fixtures). The
+  fleet's ARM and Thunderbolt/USB4 capture campaign -- the ladder in
+  [The topology ladder](TESTING.md#the-topology-ladder), run per host from
+  [Test hosts](TESTING.md#test-hosts) -- now runs on top of this harness:
+  each stage's capture becomes a committed regression fixture, not just a
+  throwaway `stageN.json`.
 
 
 ## USB troubleshooting and performance notes
