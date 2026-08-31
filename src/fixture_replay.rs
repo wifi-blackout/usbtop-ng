@@ -4,10 +4,13 @@
 //! goldens by the same path). Being one module keeps a committed golden equal
 //! to what the replay test produces, by construction.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+#[cfg(test)]
 use serde::Deserialize;
 
 use crate::device::manager::DeviceManager;
@@ -54,6 +57,10 @@ impl FixtureSource {
         self.label()
     }
 
+    /// Parses a `meta.toml` `sources` tag back into a source. Corpus-discovery
+    /// only (`fixture_corpus.rs`'s harness) — the capturer always constructs
+    /// `FixtureSource` directly, so this seam is test-only.
+    #[cfg(test)]
     pub fn from_tag(tag: &str) -> Option<FixtureSource> {
         match tag {
             "binary" => Some(FixtureSource::Binary),
@@ -69,7 +76,10 @@ pub const FIXED_ELAPSED: std::time::Duration = std::time::Duration::from_secs(1)
 
 /// The subset of `meta.toml` the harness and discovery read. Other keys the
 /// capturer writes (board, soc, kernel, `[generator]`, …) are documentation
-/// and ignored here.
+/// and ignored here. Corpus-discovery only (`fixture_corpus.rs`'s harness
+/// reads back committed bundles); the capturer writes `meta.toml`, it never
+/// reads one back, so this type is test-only.
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 pub struct Meta {
     pub sources: Vec<String>,
@@ -80,6 +90,8 @@ pub struct Meta {
 }
 
 /// A discovered fixture bundle: its directory and its parsed `meta.toml`.
+/// Corpus-discovery only; see `Meta`'s doc comment.
+#[cfg(test)]
 pub struct Bundle {
     pub dir: PathBuf,
     pub meta: Meta,
@@ -99,7 +111,12 @@ pub fn report_to_golden_json(report: &Report) -> anyhow::Result<String> {
 
 /// Parse report/golden JSON and drop the top-level `timestamp` key, so two
 /// reports compare equal regardless of wall-clock. Idempotent: text that
-/// already lacks `timestamp` is returned unchanged.
+/// already lacks `timestamp` is returned unchanged. Corpus-comparison only
+/// (`fixture_corpus.rs`'s harness diffs a fresh replay against the committed
+/// golden with this); the capturer only writes goldens
+/// (`report_to_golden_json`), it never re-masks one to compare, so this is
+/// test-only.
+#[cfg(test)]
 pub fn to_masked_value(json: &str) -> anyhow::Result<serde_json::Value> {
     let mut value: serde_json::Value = serde_json::from_str(json)?;
     if let Some(obj) = value.as_object_mut() {
@@ -112,7 +129,9 @@ pub fn to_masked_value(json: &str) -> anyhow::Result<serde_json::Value> {
 /// `*/stage*/` directory holding a readable `meta.toml`. Sorted by path so a
 /// failure names a stable bundle. A malformed `meta.toml` is skipped (the
 /// SEC/golden tests over well-formed bundles still run); discovery never
-/// panics on a stray directory.
+/// panics on a stray directory. Corpus-discovery only; see `Meta`'s doc
+/// comment.
+#[cfg(test)]
 pub fn discover_bundles_in(root: &Path) -> Vec<Bundle> {
     let mut bundles = Vec::new();
     let Ok(hosts) = std::fs::read_dir(root) else {
@@ -141,6 +160,8 @@ pub fn discover_bundles_in(root: &Path) -> Vec<Bundle> {
 }
 
 /// Discover the committed corpus under `CARGO_MANIFEST_DIR/tests/fixtures/hosts`.
+/// Corpus-discovery only; see `Meta`'s doc comment.
+#[cfg(test)]
 pub fn discover_bundles() -> Vec<Bundle> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

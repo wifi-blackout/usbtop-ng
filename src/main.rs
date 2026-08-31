@@ -114,6 +114,24 @@ struct Cli {
     /// Record every currently attached device as internal, then exit
     #[arg(long)]
     snapshot_internal: bool,
+
+    /// Capture the current usbmon traffic + sysfs topology into a fixture
+    /// bundle at DIR, then exit (needs root; reuses --window for the capture
+    /// length). Build with `--features capture-fixture`.
+    #[cfg(feature = "capture-fixture")]
+    #[arg(long, value_name = "DIR")]
+    capture_fixture: Option<String>,
+
+    /// usbmon interface bus to capture (default: 0, the aggregate of all buses)
+    #[cfg(feature = "capture-fixture")]
+    #[arg(long, value_name = "N")]
+    bus: Option<u8>,
+
+    /// Bare-board internal-devices baseline to copy into the bundle (default:
+    /// capture a fresh one — use only at the bare-board stage)
+    #[cfg(feature = "capture-fixture")]
+    #[arg(long, value_name = "PATH")]
+    baseline: Option<String>,
 }
 
 /// `--update-usbids`'s optional mode. Bare `--update-usbids` (no value)
@@ -276,6 +294,20 @@ fn main() -> Result<()> {
             snapshot.devices.len(),
             dest.display()
         );
+        return Ok(());
+    }
+
+    // `--capture-fixture` short-circuits: it opens the usbmon interfaces and
+    // writes a fixture bundle, then exits. Feature-gated developer/CI tooling.
+    #[cfg(feature = "capture-fixture")]
+    if let Some(outdir) = &cli.capture_fixture {
+        let window = Duration::from_secs_f64(cli.window.unwrap_or(5.0).max(0.1));
+        capture::run_capture_fixture(capture::CaptureFixtureOpts {
+            outdir: std::path::PathBuf::from(outdir),
+            window,
+            bus: cli.bus,
+            baseline: cli.baseline.as_deref().map(std::path::PathBuf::from),
+        })?;
         return Ok(());
     }
 
