@@ -176,8 +176,9 @@ pub struct CaptureFixtureOpts {
     pub baseline: Option<PathBuf>,
 }
 
-/// Live entry point: open the binary and text usbmon interfaces, capture a
-/// window of raw events, sanitize them, and assemble the bundle. Needs root.
+/// Live entry point: open the binary and text usbmon interfaces, capture one
+/// shared window of raw events concurrently, sanitize them, and assemble the
+/// bundle. Needs root.
 pub fn run_capture_fixture(opts: CaptureFixtureOpts) -> anyhow::Result<()> {
     let bus = opts.bus.unwrap_or(0);
     let stop = AtomicBool::new(false);
@@ -185,9 +186,19 @@ pub fn run_capture_fixture(opts: CaptureFixtureOpts) -> anyhow::Result<()> {
     let src_sysfs = Path::new("/sys/bus/usb/devices");
     let mut traces = Vec::new();
 
-    // Binary interface, sanitized.
     let bin_dev = PathBuf::from(format!("/dev/usbmon{bus}"));
-    match capture_window(&bin_dev, opts.window, &stop) {
+    let text_dev = PathBuf::from(format!("/sys/kernel/debug/usb/usbmon/{bus}u"));
+
+    // One shared deadline: the two usbmon interfaces are captured
+    // concurrently over the same window, not one after another (which would
+    // double the wall time and let the two sources describe different
+    // traffic).
+    let deadline = Instant::now() + opts.window;
+    let (bin_result, text_result) =
+        capture_pair(&bin_dev, &text_dev, deadline, &stop, capture_until);
+
+    // Binary interface, sanitized.
+    match bin_result {
         Ok(bytes) => {
             let sanitized = trace::sanitize_binary_stream(&mut std::io::Cursor::new(bytes))?;
             traces.push(CapturedTrace {
@@ -201,8 +212,7 @@ pub fn run_capture_fixture(opts: CaptureFixtureOpts) -> anyhow::Result<()> {
         ),
     }
     // Text interface, sanitized.
-    let text_dev = PathBuf::from(format!("/sys/kernel/debug/usb/usbmon/{bus}u"));
-    match capture_window(&text_dev, opts.window, &stop) {
+    match text_result {
         Ok(bytes) => {
             let sanitized = trace::sanitize_text_stream(&mut std::io::BufReader::new(
                 std::io::Cursor::new(bytes),
@@ -233,12 +243,34 @@ pub fn run_capture_fixture(opts: CaptureFixtureOpts) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Read raw bytes from a usbmon interface for `window`, polling a non-blocking
-/// open (idle buses return `WouldBlock`). The raw buffer is framed and
-/// sanitized afterward, so no framing happens here. Thin live glue.
-fn capture_window(path: &Path, window: Duration, stop: &AtomicBool) -> std::io::Result<Vec<u8>> {
+/// Capture the binary and text usbmon interfaces concurrently, both against
+/// the same `deadline`, so they describe one shared traffic window rather
+/// than two disjoint ones. `read` is the per-interface reader (`capture_until`
+/// in production); generic and injectable so the pairing logic can be tested
+/// without touching a real usbmon device or the wall clock.
+fn capture_pair<F>(
+    bin_dev: &Path,
+    text_dev: &Path,
+    deadline: Instant,
+    stop: &AtomicBool,
+    read: F,
+) -> (std::io::Result<Vec<u8>>, std::io::Result<Vec<u8>>)
+where
+    F: Fn(&Path, Instant, &AtomicBool) -> std::io::Result<Vec<u8>> + Sync,
+{
+    std::thread::scope(|scope| {
+        let text_handle = scope.spawn(|| read(text_dev, deadline, stop));
+        let bin_result = read(bin_dev, deadline, stop);
+        let text_result = text_handle.join().expect("text capture thread panicked");
+        (bin_result, text_result)
+    })
+}
+
+/// Read raw bytes from a usbmon interface until `deadline`, polling a
+/// non-blocking open (idle buses return `WouldBlock`). The raw buffer is
+/// framed and sanitized afterward, so no framing happens here. Thin live glue.
+fn capture_until(path: &Path, deadline: Instant, stop: &AtomicBool) -> std::io::Result<Vec<u8>> {
     let mut file = crate::usbmon::open_nonblocking(path)?;
-    let deadline = Instant::now() + window;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 65536];
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
@@ -270,6 +302,65 @@ fn stage_id_from_outdir(outdir: &Path) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::fixture_replay::{replay_fixture, to_masked_value};
+    use std::sync::mpsc;
+    use std::sync::Mutex;
+
+    /// `capture_pair` must give both sides the identical `Instant` deadline
+    /// and actually run them concurrently, not one after another. A recorder
+    /// closure logs each invocation's deadline, and a channel rendezvous
+    /// forces each side to wait for a signal from the other before it can
+    /// return: if `capture_pair` regressed to running the two reads
+    /// sequentially, the second call would never see the first side's signal
+    /// (it hasn't started yet) and this test would fail cleanly on the
+    /// bounded `recv_timeout` instead of hanging or passing by luck.
+    #[test]
+    fn capture_pair_shares_one_deadline_and_runs_both_sides_concurrently() {
+        let deadline = Instant::now() + Duration::from_secs(3600);
+        let stop = AtomicBool::new(false);
+        let seen_deadlines: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
+
+        let (bin_started_tx, bin_started_rx) = mpsc::channel::<()>();
+        let (text_started_tx, text_started_rx) = mpsc::channel::<()>();
+        let bin_started_tx = Mutex::new(bin_started_tx);
+        let text_started_tx = Mutex::new(text_started_tx);
+        let bin_started_rx = Mutex::new(bin_started_rx);
+        let text_started_rx = Mutex::new(text_started_rx);
+
+        let bin_path = Path::new("/dev/fake-bin");
+        let text_path = Path::new("/dev/fake-text");
+
+        let read =
+            |path: &Path, deadline: Instant, _stop: &AtomicBool| -> std::io::Result<Vec<u8>> {
+                seen_deadlines.lock().unwrap().push(deadline);
+                if path == bin_path {
+                    bin_started_tx.lock().unwrap().send(()).unwrap();
+                    text_started_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("text side never started: capture_pair regressed to sequential?");
+                } else {
+                    text_started_tx.lock().unwrap().send(()).unwrap();
+                    bin_started_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("bin side never started: capture_pair regressed to sequential?");
+                }
+                Ok(Vec::new())
+            };
+
+        let (bin_result, text_result) = capture_pair(bin_path, text_path, deadline, &stop, read);
+
+        assert!(bin_result.is_ok());
+        assert!(text_result.is_ok());
+        let seen = seen_deadlines.lock().unwrap();
+        assert_eq!(seen.len(), 2, "both sides must have been invoked");
+        assert_eq!(
+            seen[0], seen[1],
+            "both invocations must receive the identical deadline Instant"
+        );
+    }
 
     fn write(dir: &Path, name: &str, value: &str) {
         std::fs::write(dir.join(name), value).unwrap();
