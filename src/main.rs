@@ -17,6 +17,8 @@ use std::path::Path;
 use std::process;
 use std::sync::Arc;
 
+#[cfg(feature = "capture-fixture")]
+mod capture;
 mod config;
 mod device;
 mod filter;
