@@ -1,0 +1,16 @@
+board = "Raspberry Pi 400 Rev 1.1"
+soc = "raspberrypi,400 brcm,bcm2711"
+arch = "aarch64"
+kernel = "6.18.39+rpt-rpi-v8"
+os = "Debian GNU/Linux 13 (trixie)"
+usbtop_ng_version = "1.5.0"
+stage_id = 2
+captured_unix = 1788181478
+controllers = ["0000:01:00.0"]
+speed_classes = ["1.5", "480", "5000"]
+transfer_types = ["bulk", "control"]
+sources = ["binary", "text"]
+
+[generator]
+kind = "bulk-dd"
+note = "raw read of the RTL9210 UAS NVMe (dd if=/dev/sda of=/dev/null bs=4M iflag=direct) spanning the whole window; ~49 MB/s observed through the VL805, bulk IN on the two UAS data endpoints"

@@ -1,0 +1,21 @@
+captured_unix = 1788181410
+
+[[devices]]
+port_path = "1-1"
+vendor_id = "2109"
+product_id = "3431"
+
+[[devices]]
+port_path = "1-1.1"
+vendor_id = "0cf3"
+product_id = "9271"
+
+[[devices]]
+port_path = "usb1"
+vendor_id = "1d6b"
+product_id = "0002"
+
+[[devices]]
+port_path = "usb2"
+vendor_id = "1d6b"
+product_id = "0003"

@@ -1,0 +1,97 @@
+{
+  "buses": [
+    {
+      "bus": 1,
+      "controller": "0000:01:00.0",
+      "devices": [
+        {
+          "address": 1,
+          "bus": 1,
+          "endpoints": [],
+          "estimated": false,
+          "internal": true,
+          "port": "",
+          "product": "xHCI Host Controller",
+          "product_id": "0002",
+          "rx_bps": 0.0,
+          "speed_mbps": 480.0,
+          "total_rx_bytes": 0,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": "Linux 6.18.39+rpt-rpi-v8 xhci-hcd",
+          "vendor_id": "1d6b"
+        },
+        {
+          "address": 2,
+          "bus": 1,
+          "endpoints": [],
+          "estimated": false,
+          "internal": true,
+          "port": "1",
+          "product": "USB2.0 Hub",
+          "product_id": "3431",
+          "rx_bps": 0.0,
+          "speed_mbps": 480.0,
+          "total_rx_bytes": 0,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": null,
+          "vendor_id": "2109"
+        },
+        {
+          "address": 8,
+          "bus": 1,
+          "endpoints": [],
+          "estimated": false,
+          "internal": true,
+          "port": "1.1",
+          "product": "UB93",
+          "product_id": "9271",
+          "rx_bps": 0.0,
+          "speed_mbps": 480.0,
+          "total_rx_bytes": 0,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": "ATHEROS",
+          "vendor_id": "0cf3"
+        }
+      ],
+      "rx_bps": 0.0,
+      "speed_mbps": 480.0,
+      "tx_bps": 0.0
+    },
+    {
+      "bus": 2,
+      "controller": "0000:01:00.0",
+      "devices": [
+        {
+          "address": 1,
+          "bus": 2,
+          "endpoints": [],
+          "estimated": false,
+          "internal": true,
+          "port": "",
+          "product": "xHCI Host Controller",
+          "product_id": "0003",
+          "rx_bps": 0.0,
+          "speed_mbps": 5000.0,
+          "total_rx_bytes": 0,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": "Linux 6.18.39+rpt-rpi-v8 xhci-hcd",
+          "vendor_id": "1d6b"
+        }
+      ],
+      "rx_bps": 0.0,
+      "speed_mbps": 5000.0,
+      "tx_bps": 0.0
+    }
+  ],
+  "dropped_packets": 0,
+  "kernel_dropped_packets": 0,
+  "source": "binary",
+  "total_rx_bps": 0.0,
+  "total_tx_bps": 0.0,
+  "version": 1,
+  "window_seconds": 1.0
+}

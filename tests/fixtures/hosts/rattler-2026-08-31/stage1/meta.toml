@@ -1,0 +1,12 @@
+board = "Raspberry Pi 4 Model B Rev 1.5"
+soc = "raspberrypi,4-model-b brcm,bcm2711"
+arch = "aarch64"
+kernel = "6.18.39+rpt-rpi-v8"
+os = "Debian GNU/Linux 13 (trixie)"
+usbtop_ng_version = "1.5.0"
+stage_id = 1
+captured_unix = 1788181410
+controllers = ["0000:01:00.0"]
+speed_classes = ["480", "5000"]
+transfer_types = []
+sources = ["binary", "text"]
