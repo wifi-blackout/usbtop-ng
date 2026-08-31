@@ -95,6 +95,23 @@ mod tests {
     }
 
     #[test]
+    fn binary_stream_drops_a_complete_header_whose_claimed_payload_is_truncated() {
+        // A complete 48-byte header claims len_cap=64, but only 30 payload
+        // bytes actually follow (the window was cut mid-payload). The whole
+        // event — header included — must be dropped, not just the payload.
+        let mut raw = vec![0u8; 48];
+        raw[8] = b'C';
+        raw[9] = 3;
+        raw[36..40].copy_from_slice(&64u32.to_ne_bytes());
+        raw.extend_from_slice(&[0xAB; 30]);
+        let out = sanitize_binary_stream(&mut Cursor::new(raw)).unwrap();
+        assert!(
+            out.is_empty(),
+            "the trailing event is dropped, not just truncated"
+        );
+    }
+
+    #[test]
     fn text_stream_sanitizes_each_complete_line() {
         let raw = "ffff0000aaaa0001 200 C Bi:1:003:1 0 512 = 00 11\n\
                    ffff0000bbbb0002 300 C Bo:1:004:2 0 64 >\n\

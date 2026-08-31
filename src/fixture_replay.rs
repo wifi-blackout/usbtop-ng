@@ -379,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_text_labels_source_text_and_marks_iso_estimated_paths() {
+    fn replay_text_labels_source_text_end_to_end() {
         let temp = tempfile::tempdir().unwrap();
         build_min_bundle(temp.path());
         let report = replay_fixture(temp.path(), FixtureSource::Text).unwrap();

@@ -76,4 +76,17 @@ mod tests {
         let line = "ffff88006fff3800 2453805583 E Bi:1:004:1 -108";
         assert_eq!(sanitize_text_line(line), line);
     }
+
+    #[test]
+    fn text_sanitizer_keeps_a_control_out_setup_header_and_elides_the_real_data_field() {
+        // A control-OUT SETUP header (`s ...`) followed by a genuine `=` data
+        // field: everything up to `=` (including the `s`-prefixed header) must
+        // survive verbatim, and only the data after it is elided.
+        let line =
+            "ffff88007c861a00 2389264913 S Co:1:001:0 s 21 09 0300 0000 0008 8 = 0d000000 00000000";
+        assert_eq!(
+            sanitize_text_line(line),
+            "ffff88007c861a00 2389264913 S Co:1:001:0 s 21 09 0300 0000 0008 8 <"
+        );
+    }
 }
