@@ -125,9 +125,9 @@ impl DeviceManager {
         }
     }
 
-    /// Test seam: point sysfs lookups (device metadata, bus speed) at a
+    /// Test/capture seam: point sysfs lookups (device metadata, bus speed) at a
     /// fixture directory instead of the real `/sys/bus/usb/devices`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "capture-fixture"))]
     pub fn with_sysfs_base(base: PathBuf) -> Self {
         Self {
             buses: HashMap::new(),

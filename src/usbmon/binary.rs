@@ -55,10 +55,10 @@ impl BinaryReader {
         }
     }
 
-    /// Test seam: point the reader at a fixture byte stream instead of the real
-    /// character device, and optionally disable follow-on-EOF so tests over a
-    /// fixed file terminate.
-    #[cfg(test)]
+    /// Test/capture seam: point the reader at a fixture byte stream instead of
+    /// the real character device, and optionally disable follow-on-EOF so reads
+    /// over a fixed file terminate.
+    #[cfg(any(test, feature = "capture-fixture"))]
     pub fn with_path(bus_id: u8, path: PathBuf, follow: bool) -> Self {
         Self {
             bus_id,

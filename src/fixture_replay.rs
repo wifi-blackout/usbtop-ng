@@ -5,10 +5,17 @@
 //! to what the replay test produces, by construction.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::headless::Report;
+use crate::device::manager::DeviceManager;
+use crate::filter::FilterSet;
+use crate::headless::{build_report, Baseline, Report};
+use crate::snapshot::Snapshot;
+use crate::usbmon::binary::BinaryReader;
+use crate::usbmon::reader::UsbmonReader;
 
 /// Which usbmon interface a trace came from: selects the reader on replay and
 /// the `Report.source` label.
@@ -142,6 +149,59 @@ pub fn discover_bundles() -> Vec<Bundle> {
     discover_bundles_in(&root)
 }
 
+/// Load a bundle's `internal-devices.toml` for internal-device marking, or
+/// `None` when the file is absent or unparsable (`Snapshot::load`'s contract).
+pub fn load_internal_devices(bundle_dir: &Path) -> Option<Arc<Snapshot>> {
+    Snapshot::load(&bundle_dir.join("internal-devices.toml")).map(Arc::new)
+}
+
+/// Replay one bundle's trace for one source into a deterministic report. The
+/// bus id passed to the reader is cosmetic — every packet carries its own bus
+/// id, so a single trace over the aggregate interface routes to the right bus.
+/// This is the exact sequence the capturer uses to generate goldens, so a
+/// committed golden equals this output by construction.
+pub fn replay_fixture(bundle_dir: &Path, source: FixtureSource) -> anyhow::Result<Report> {
+    let mut manager = DeviceManager::with_sysfs_base(bundle_dir.join("sysfs"));
+    if let Some(snapshot) = load_internal_devices(bundle_dir) {
+        manager.set_internal_snapshot(Some(snapshot));
+    }
+    // usb.ids overlay left None on purpose: names come only from the captured
+    // sysfs strings, so replay is host-independent (see the spec's config parity).
+    let baseline = Baseline::capture(&manager);
+
+    let trace = bundle_dir.join(source.trace_filename());
+    let shutdown = AtomicBool::new(false);
+    match source {
+        FixtureSource::Binary => {
+            BinaryReader::with_path(0, trace, false).read_packets(&shutdown, |packet| {
+                manager.apply_packet(&packet);
+                Ok(())
+            })?;
+        }
+        FixtureSource::Text => {
+            UsbmonReader::with_path(0, trace, false).read_packets(&shutdown, |packet| {
+                manager.apply_packet(&packet);
+                Ok(())
+            })?;
+        }
+    }
+
+    manager.enumerate_present_devices();
+    // Resolves BusReport.controller + bus speed_mbps. Enumeration alone does
+    // NOT (see manager.rs:188); without this the controller/speed fields are null.
+    manager.update_bus_speeds();
+
+    Ok(build_report(
+        &manager,
+        &baseline,
+        FIXED_ELAPSED,
+        source.label(),
+        0,
+        source == FixtureSource::Text,
+        &FilterSet::default(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +286,91 @@ mod tests {
         // is handled gracefully (empty, no panic) rather than asserting on
         // its contents.
         let _ = discover_bundles();
+    }
+
+    fn write_attr(dir: &std::path::Path, name: &str, value: &str) {
+        std::fs::write(dir.join(name), value).unwrap();
+    }
+
+    fn build_min_bundle(dir: &std::path::Path) {
+        // sysfs: controller stand-in + relative usb1 symlink + one device 1-1 (dev 3).
+        let sysfs = dir.join("sysfs");
+        let ctrl = sysfs.join("0000:00:14.0").join("usb1");
+        std::fs::create_dir_all(&ctrl).unwrap();
+        write_attr(&ctrl, "busnum", "1\n");
+        write_attr(&ctrl, "devnum", "1\n");
+        write_attr(&ctrl, "speed", "480\n");
+        std::os::unix::fs::symlink("0000:00:14.0/usb1", sysfs.join("usb1")).unwrap();
+
+        let dev = sysfs.join("1-1");
+        std::fs::create_dir_all(&dev).unwrap();
+        write_attr(&dev, "busnum", "1\n");
+        write_attr(&dev, "devnum", "3\n");
+        write_attr(&dev, "speed", "480\n");
+        write_attr(&dev, "idVendor", "0430\n");
+        write_attr(&dev, "idProduct", "0100\n");
+
+        // trace.bin: one sanitized callback, bus 1 dev 3 ep 0x81 IN bulk length 1000.
+        let mut hdr = vec![0u8; 48];
+        hdr[8] = b'C';
+        hdr[9] = 3; // bulk
+        hdr[10] = 0x81; // ep1 IN
+        hdr[11] = 3; // devnum
+        hdr[12..14].copy_from_slice(&1u16.to_ne_bytes()); // busnum
+        hdr[32..36].copy_from_slice(&1000u32.to_ne_bytes()); // length
+                                                             // len_cap@36 stays 0 (sanitized).
+        std::fs::write(dir.join("trace.bin"), &hdr).unwrap();
+
+        // trace.txt: same traffic, data field elided.
+        std::fs::write(
+            dir.join("trace.txt"),
+            "ffff0000aaaa0001 200 C Bi:1:003:1 0 1000 <\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn replay_binary_produces_a_deterministic_report_with_controller_and_speed() {
+        let temp = tempfile::tempdir().unwrap();
+        build_min_bundle(temp.path());
+
+        let report = replay_fixture(temp.path(), FixtureSource::Binary).unwrap();
+        assert_eq!(report.source, "binary");
+        assert_eq!(report.window_seconds, 1.0);
+        let bus = &report.buses[0];
+        assert_eq!(bus.bus, 1);
+        assert_eq!(bus.controller.as_deref(), Some("0000:00:14.0"));
+        assert_eq!(bus.speed_mbps, 480.0);
+        // The root hub (usb1, empty port-chain) sorts ahead of 1-1 in
+        // `build_report`'s device ordering, so the traffic device is found
+        // by address rather than assumed to be devices[0].
+        let dev = bus.devices.iter().find(|d| d.address == 3).unwrap();
+        assert_eq!(dev.address, 3);
+        assert_eq!(dev.total_rx_bytes, 1000);
+        assert_eq!(dev.rx_bps, 1000.0, "1000 bytes over the fixed 1s window");
+        assert_eq!(dev.vendor_id.as_deref(), Some("0430"));
+
+        // Replaying twice is byte-identical after masking the timestamp.
+        let a = to_masked_value(&serde_json::to_string(&report).unwrap()).unwrap();
+        let report2 = replay_fixture(temp.path(), FixtureSource::Binary).unwrap();
+        let b = to_masked_value(&serde_json::to_string(&report2).unwrap()).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn replay_text_labels_source_text_and_marks_iso_estimated_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        build_min_bundle(temp.path());
+        let report = replay_fixture(temp.path(), FixtureSource::Text).unwrap();
+        assert_eq!(report.source, "text");
+        // The bulk device here has no iso traffic, so estimated stays false; the
+        // point pinned is that the text path runs end to end and labels the source.
+        let dev = report
+            .buses
+            .iter()
+            .flat_map(|b| b.devices.iter())
+            .find(|d| d.address == 3)
+            .unwrap();
+        assert_eq!(dev.total_rx_bytes, 1000);
     }
 }
