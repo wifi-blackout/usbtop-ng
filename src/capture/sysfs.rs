@@ -50,12 +50,12 @@ pub fn materialize_sysfs(src_base: &Path, dst_sysfs: &Path) -> anyhow::Result<()
                         .with_context(|| format!("symlink {}", link.display()))?;
                 }
                 None => {
-                    // Controller unresolved at capture time (e.g. a source tree
-                    // where `usbN` is a plain dir, not a symlink into a
-                    // controller dir — real sysfs never shapes it that way):
-                    // materialize the root hub directly, with no symlink. On
-                    // replay, `DeviceManager::update_bus_speed` still
-                    // canonicalizes this now-real `usbN` dir; canonicalize
+                    // Controller unresolved at capture time (canonicalize
+                    // failed outright: a dangling `usbN` symlink, ELOOP, or a
+                    // path that vanished mid-scan — real sysfs never shapes it
+                    // that way): materialize the root hub directly, with no
+                    // symlink. On replay, `DeviceManager::update_bus_speed`
+                    // still canonicalizes this now-real `usbN` dir; canonicalize
                     // doesn't require a symlink to succeed, so it resolves to
                     // itself and `.parent().file_name()` names the *enclosing
                     // sysfs directory* (e.g. "sysfs"), not the real controller
