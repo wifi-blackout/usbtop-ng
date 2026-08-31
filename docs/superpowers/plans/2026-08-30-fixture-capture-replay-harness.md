@@ -14,7 +14,7 @@
 
 Every task's requirements implicitly include this section. Values copied verbatim from the spec.
 
-- **Naming:** NEVER reference the name "WhatCable" in any source, comment, doc, fixture, or commit message.
+- **Naming:** NEVER reference the private reference project's name (the maintainer knows the one; its docs live outside this repo) in any source, comment, doc, fixture, or commit message.
 - **MSRV:** 1.88. **Zero `#[allow(...)]`** anywhere (`#[ignore]` on a test is permitted; `#[allow]` is not).
 - **Gates that must pass:** `cargo fmt --all -- --check`; `cargo clippy --all-targets -- -D warnings`; `cargo test --all-targets`; and — new in this wave — the same clippy + tests under `--features capture-fixture`. The `integration` and `ebpf` feature builds must remain green and unchanged.
 - **Feature gating:** the capture subcommand and everything it uses that is not already public ship only under the `capture-fixture` cargo feature. The default binary, its public API, and the `--help` surface are unchanged for end users. (Alternative considered and rejected for this plan: always-compiling capture into every binary — it would permanently widen `with_path`/`with_sysfs_base` from test seams into public API and add capture/sanitize weight to the shipped binary. If you prefer always-on, that is a small delta: drop the feature, make the three seams plain `pub`, always-compile `mod capture`, and un-gate the CLI fields. Confirm with the requester before deviating.)
@@ -1992,7 +1992,7 @@ Run, and confirm all PASS:
 - `cargo clippy --features capture-fixture --all-targets -- -D warnings`
 - `cargo test --features capture-fixture`
 - `cargo build --features integration` + `cargo test --features integration` (unchanged, still green)
-- `grep -ri "whatcable" . --exclude-dir=.git` returns nothing.
+- A case-insensitive repo grep for the private reference project's name (excluding .git) returns nothing.
 
 - [ ] **Step 7: Commit**
 
