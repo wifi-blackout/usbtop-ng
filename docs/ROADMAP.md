@@ -91,9 +91,11 @@ device 4, 61 frames of 614,400 bytes each):
   isochronous endpoint. That is the pixel data plus 5% UVC packet headers.
 - The usbmon binary interface reported 39,309,824 bytes for the same window.
   The two sources match to the byte.
-- The usbmon text interface reported 154,028,160 bytes in a matched run, a
-  3.6x overcount. Its length column holds the 97,920-byte buffer size for
-  every isochronous completion. See the engineering follow-up below.
+- The usbmon text interface reported 154,028,160 bytes in a matched run,
+  roughly 3.9x the true total. Its length column holds the 97,920-byte
+  buffer size for every isochronous completion; see "Fixed: the usbmon
+  text fallback's isochronous counts" under
+  [Engineering follow-ups](#engineering-follow-ups) below.
 
 Design notes:
 
@@ -181,20 +183,28 @@ the kprobe entry context, so `--features ebpf` builds on x86-64 only today
 per-architecture `pt_regs` is the follow-up that would let it build on the
 ARM boards below; usbmon capture there needs none of this and works now.
 
-### Discovered: the usbmon binary reader undercounts high-bandwidth isochronous transfers
+### Resolved: the binary interface is exact for isochronous transfers
 
-Live-verifying the eBPF backend against ground truth surfaced a separate,
-pre-existing issue, distinct from the text-interface overcount tracked in
-[Engineering follow-ups](#engineering-follow-ups) below: the usbmon binary
-interface -- usbtop-ng's normally preferred, exact-byte source --
-undercounts high-bandwidth isochronous transfers (endpoints with a 2x or
-3x `wMaxPacketSize` transaction multiplier) by roughly 3x, and drops
-packets outright under sustained isochronous load. `src/usbmon/binary.rs`
-is unchanged by this wave (byte-identical against `main`), so the bug
-predates it. Candidate future fix wave: compare the event header's
-`length` field against the sum of the per-iso-packet descriptors, and
-characterize the drop behavior under load. The eBPF backend already
-measures these transfers correctly.
+Live-verifying the eBPF backend once surfaced an apparent ~3x undercount
+of high-bandwidth isochronous transfers on the binary interface. It was
+the ring overflow fixed below, not an accounting bug. A four-source
+comparison on 2026-09-01 (`mainrag`, Chicony webcam, 100 raw YUYV
+640x480 frames streamed by `v4l2-ctl` inside a 45 s window, exactly
+61,440,000 frame bytes):
+
+| Source | Bytes on the iso endpoint | Ratio to frame bytes |
+|---|---|---|
+| mmap ring (default build) | 62,397,736 | 1.0156 |
+| eBPF build | 62,397,736 | 1.0156 |
+| Frame bytes + one 12-byte UVC header per packet (79,968 packets) | 62,399,616 | 1.0156 |
+
+mmap and eBPF agree byte for byte and sit exactly one UVC payload header
+per packet above the frame data. The kernel source agrees: the binary
+header's length field is `urb->actual_length` for callback events
+(`drivers/usb/mon/mon_bin.c`, v7.0 lines 512-513 and 581), the same
+quantity the eBPF program sums. The committed
+`tests/fixtures/hosts/mainrag-*/stage2` bundle is this measurement, and
+a corpus test keeps it declaring zero kernel drops.
 
 ### Fixed: usbmon dropped badly under high throughput; the ring is now enlarged
 
@@ -227,33 +237,24 @@ validation yet of that backend for high-throughput monitoring.
 
 These came out of code review. Each is small and none blocks a release.
 
-- Error and log strings brought under the documentation style guide.
-- A root-owned /dev/usbmon node reads as absent for a plain user, so the
-  remedy says no node was found. Distinguishing permission-denied from
-  not-found in the probe would give the sharper sudo remedy.
+- Fixed: error, prompt, and log strings follow the three shapes in [CONTRIBUTING](CONTRIBUTING.md#user-facing-text).
 - Fixed: the report `source` field mislabeled the mmap ring reader as
   `"binary"`. `capture_source_label` (src/headless/mod.rs) knew only
   `ebpf`/`text`/`binary`, so an active mmap reader printed `"binary"`. The
   monitor now raises an `mmap_active` flag (bundled with `text_active` into
   `SourceFlags`) for the interface actually running, and the label reads
   `"mmap"`. Verified live alongside the ring-size fix above.
-- Search filtering waits for the next refresh tick, up to 1 second at the
-  default rate. Pulling the tick forward on a search keystroke would make
-  filter-as-you-type feel immediate.
-- The usbmon text fallback overcounts isochronous transfers. Its length
-  column holds the buffer size, not the bytes moved. On a camera stream the
-  overcount was 3.6x. The text format prints 5 of 32 descriptors per URB, so
-  no exact count exists in text mode. The binary interface reports true
-  bytes for ordinary transfers and is already the preferred source -- but
-  not for high-bandwidth isochronous ones; see "Discovered: the usbmon
-  binary reader undercounts high-bandwidth isochronous transfers" in the
-  eBPF backend section above, a separate bug. The UI and the JSON output
-  now mark affected rates as estimates. The remaining idea: sum the printed
-  descriptors to tighten the estimate. Caveat before building it: only up
-  to 5 descriptors print, so a sum can under-estimate as badly as the
-  length over-estimates, and the kernel's usbmon document claims callback
-  lengths are actual values, which the measurement above contradicts on
-  this kernel. Commit a raw trace alongside any fix.
+- Fixed: the usbmon text fallback's isochronous counts. The kernel prints
+  the whole transfer buffer as an isochronous callback's length, but also
+  the first five descriptors with their actual lengths and the full packet
+  count (`drivers/usb/mon/mon_text.c`, v7.0 lines 218-247 and 590-606).
+  The parser now scales the printed sum by count over printed. Against
+  the exact mmap total of the same window: 0.9999x on a sparse MJPEG
+  stream (`asus`, where the buffer size read 15.4x) and 1.011x on a
+  continuous YUYV stream (`mainrag`, buffer size 3.98x); exact whenever
+  five or fewer packets print. It stays flagged `estimated`, because it is
+  one. The plain printed-descriptor sum that was floated here measured
+  0.16x and is not used.
 
 ## ARM board support
 
@@ -470,16 +471,16 @@ are untouched. Confirm both hold when 7.3-final lands; a break in a later
 -rc is the signal to re-check the FFI against source, per the standing
 practice of verifying kernel semantics against the kernel, not a device.
 
-**Re-verify the isochronous accounting.** Mathias Nyman's xHCI series
-reworks isoc scheduling and completion -- "fix frame id calculation and
-checks for isoc URBs", "set frame ID field of isoc TRB when starting an
-isoch stream", plus several endpoint-recovery-after-disconnect changes,
-roughly 500 lines of `xhci-ring.c`. That sits *upstream* of everything
-usbtop-ng observes, so it may shift the high-bandwidth isochronous
-undercount and drop behavior documented above (see "Discovered: the
-usbmon binary reader undercounts high-bandwidth isochronous transfers").
-Re-run the iso characterization on a 7.3 kernel before attributing that
-bug purely to usbmon.
+**Re-run the four-source check.** Mathias Nyman's xHCI series reworks
+isoc scheduling and completion ("fix frame id calculation and checks for
+isoc URBs", "set frame ID field of isoc TRB when starting an isoch
+stream", plus endpoint-recovery-after-disconnect changes, roughly 500
+lines of `xhci-ring.c`). That sits upstream of everything usbtop-ng
+observes. On a 7.3 kernel, repeat the `mainrag` stage2 procedure in
+[TESTING.md](TESTING.md#capturing-hardware-fixtures): mmap, eBPF, the
+fixture capturer, and the text estimate against `v4l2-ctl` frame bytes.
+The binary path is exact today (see "Resolved" above); confirm it stays
+so and that the text estimate stays within 2%.
 
 **Robustness context, not a feature to add.** Several fixes harden the
 character-device teardown paths that neighbor our capture: a usbfs
@@ -503,8 +504,7 @@ never for the bandwidth path.
 **The eventual final features.** When 7.3 releases, re-run the throughput
 and iso verification suite on it -- the exact-`dd` cross-checks at 5 and
 10 Gbps and the eBPF-versus-usbmon comparison -- to confirm the ring-size
-fix and the eBPF backend still measure byte-exact, and to re-characterize
-the iso undercount under the new xHCI isoc path. Record the kernel in the
-tested-hardware log.
+fix and the eBPF backend still measure byte-exact, and to repeat the
+four-source iso check. Record the kernel in the tested-hardware log.
 
 ## Notes

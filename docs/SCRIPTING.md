@@ -212,15 +212,18 @@ sudo usbtop-ng --batch --json | jq -c '.total_rx_bps'
   same report), not the binary `/dev/usbmonN` interface.
 - The device has carried isochronous traffic (webcams, some audio devices).
 
-The text interface's line format only ever prints 5 of an isochronous URB's
-up to 32 descriptors, and its length field holds the descriptor buffer size
-rather than the bytes actually transferred. Measured against the binary
-interface and an independent eBPF trace on the same camera stream, the text
-interface overcounted isochronous bytes by 3.6x. usbtop-ng prefers the binary
-interface for exactly this reason and only falls back to text when the
-binary nodes cannot be opened; `estimated` says so in the report rather than
-publishing an inflated rate silently. Non-isochronous devices are never
-marked `estimated`, on either interface.
+The text interface prints only the first 5 of an isochronous URB's
+descriptors (up to 32 on a webcam) and reports the whole buffer as the
+URB's length. usbtop-ng estimates the bytes moved by scaling the printed
+descriptors' actual lengths by the URB's full packet count. Measured
+against the binary interface on the same window, the estimate landed at
+0.9999x on a sparse MJPEG webcam stream and 1.011x on a continuous YUYV
+stream, where the buffer size had read 15.4x and 4.0x; it is exact
+whenever a URB carries five or fewer packets. It is still a sample-based
+estimate, so the report says so. usbtop-ng prefers the binary interface
+and only falls back to text when the binary nodes cannot be opened.
+Non-isochronous devices are never marked `estimated`, on either
+interface.
 
 ## The `internal` field
 

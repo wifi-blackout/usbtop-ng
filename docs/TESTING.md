@@ -21,6 +21,10 @@ on `modprobe usbmon`, nodes appear), `absent` (not in this kernel), or
 passwordless sudo). Kernels span 5.4 through 7.0 and the arch column
 spans armv6l, aarch64, and x86_64 -- the matrix the roadmap wants.
 
+`mainrag` also appears below, outside the eight-host fleet, because it is
+the development host that contributes the ground-truth isochronous bundle
+(see [Capturing hardware fixtures](#capturing-hardware-fixtures)).
+
 | ssh | Board / SoC | Arch | Kernel | OS | usbmon | Notable |
 | --- | --- | --- | --- | --- | --- | --- |
 | `rattler` | Raspberry Pi 4 Model B (BCM2711) | aarch64 | 6.18.39+rpt-rpi-v8 | Debian 13 | module | VL805 USB3 over PCIe + BCM2711 USB2; AR9271 Wi-Fi leaf; kernel upgraded from 6.12.75 since the first probe |
@@ -31,6 +35,7 @@ spans armv6l, aarch64, and x86_64 -- the matrix the roadmap wants.
 | `airbox` | SOPHGO Fogwise AirBox / BM1684x | aarch64 | 5.4.217-bm1684 (vendor, dirty) | Ubuntu 20.04 | **absent** | no usbmon module in this kernel and no BTF -- not capturable as-is; Imaging Source 37UX273-ML camera attached; oldest kernel |
 | `asus` | Intel Tiger Lake-LP, i5-1135G7 | x86_64 | 7.0.0-30-generic | Linux Mint 22.3 | module | Thunderbolt 4 (NHI + xHCI) plus a 10 Gbps USB bus; two IDS `1409:3270` USB3 cameras on a 10 Gbps hub (`usbfs`); eBPF-ready (BTF present) |
 | `judge` | AMD Ryzen 9 5900HX (Cezanne) | x86_64 | 7.0.0-30-generic | Linux Mint 22.3 | module | AMD Renoir/Cezanne USB 3.1, two 10 Gbps + two 480M buses; eBPF-ready (BTF present); AMD, not Thunderbolt/USB4 |
+| `mainrag` | Development host, AMD Ryzen 9 5900HX (Cezanne), xHCI 0000:06:00.3 and .4 | x86_64 | 7.0.0-30-generic | Linux Mint 22.3 | module | Chicony webcam on bus 1 (the ground-truth iso bundle); BTF present, eBPF runs |
 
 usbmon confirmed on 2026-08-30: `modprobe usbmon` loads the module and
 populates `/dev/usbmon<N>` plus the debugfs text interface on `rattler`,
@@ -237,6 +242,24 @@ throwaway `stageN.json`.
    (`ssh <host> 'tar -C ~/fixtures -cf - <bundle>' | tar -C tests/fixtures/hosts -xf -`),
    never `scp -r` -- scp dereferences the bundle's relative `usbN` symlink
    into a duplicate directory, which SEC-2 then rejects.
+7. The capturer enlarges the kernel ring before reading and records the
+   kernel's drop count for the binary source as `binary_kernel_dropped`
+   in `meta.toml`, warning on stderr when it is not zero. A bundle with
+   drops is still a valid pipeline pin, but do not cite its totals for
+   accuracy; lower the rate or widen the window and recapture. The
+   debugfs text side has no counter and its kernel queue is a few dozen
+   events deep, so on a bulk stream the text trace is expected to be
+   short; keep text-inclusive stages at modest event rates.
+8. Size the window to the generator's real rate, not its nominal one. A
+   webcam in room light may deliver a third of its advertised frame rate:
+   the `mainrag` Chicony ran at 10 fps and the `asus` internal webcam at
+   8 fps, so 100 or 200 frames need 10 to 26 s and the window must end
+   after the stream does. Run the whole stream inside the window or the
+   totals describe only part of it.
+9. The `mainrag` stage2 bundle is the corpus's accuracy anchor: its
+   `[generator]` note records the `v4l2-ctl` command, the exact frame
+   bytes, and the concurrent mmap and eBPF totals. Repeat that procedure
+   on any kernel that changes the xHCI isochronous path.
 
 Fleet build notes, learned capturing the Pi bundles (2026-08-31):
 
