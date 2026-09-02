@@ -5,12 +5,13 @@ kernel = "7.0.0-30-generic"
 os = "Linux Mint 22.3"
 usbtop_ng_version = "1.5.0"
 stage_id = 2
-captured_unix = 1788212776
+captured_unix = 1788321978
+binary_kernel_dropped = 0
 controllers = ["0000:00:0d.0", "0000:00:14.0"]
-speed_classes = ["10000", "12", "480", "5000"]
-transfer_types = ["bulk", "iso"]
+speed_classes = ["1.5", "10000", "12", "480", "5000"]
+transfer_types = ["bulk", "control", "interrupt", "iso"]
 sources = ["binary", "text"]
 
 [generator]
 kind = "uvc-stream"
-note = "v4l2-ctl --stream-mmap from the internal UVC webcam (13d3:56eb, bus 3 ep1 iso) spanning the whole window. The goldens pin the documented text-source iso overcount: binary reads 37,750,446 actual bytes (estimated=false); text reads 368,418,816 buffer-size bytes (estimated=true), ~9.8x."
+note = "v4l2-ctl --stream-mmap --stream-count=200 from the internal UVC webcam (13d3:56eb, bus 3 ep1 iso, MJPEG, ~7.4 fps) inside the window. Recaptured 2026-09-02 with the enlarged kernel ring after the 2026-08-31 capture was found to have kept 32% of its URBs; binary_kernel_dropped above is the proof. The text golden's iso total is the sampled-descriptor estimate (docs/SCRIPTING.md, 'The estimated field'): 28,400,867 bytes against the binary golden's 28,414,910, a 0.9995x ratio; the buffer-size figure it replaced ran 15x. The powered hub attached on 2026-09-01 is present in sysfs but idle."
