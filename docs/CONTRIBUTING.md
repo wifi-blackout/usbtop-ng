@@ -132,6 +132,7 @@ src/
 │   ├── mod.rs        # Module detection, load/unload, setup instructions
 │   ├── monitor.rs    # Interface probe, reader threads, bounded channel
 │   ├── mmap_ring.rs  # Read loop over the usbmon binary interface's mmap ring
+│   ├── ring.rs       # usbmon binary-interface ioctls: ring ladder, size, drop stats
 │   ├── reader.rs     # Read loop over the usbmon Nu text interface
 │   ├── binary.rs     # Read loop over the usbmon /dev/usbmonN binary interface via read()
 │   └── parser.rs     # Nu text-format parsing, UsbSpeed bandwidth/color tables

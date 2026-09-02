@@ -203,8 +203,10 @@ per packet above the frame data. The kernel source agrees: the binary
 header's length field is `urb->actual_length` for callback events
 (`drivers/usb/mon/mon_bin.c`, v7.0 lines 512-513 and 581), the same
 quantity the eBPF program sums. The committed
-`tests/fixtures/hosts/mainrag-*/stage2` bundle is this measurement, and
-a corpus test keeps it declaring zero kernel drops.
+`tests/fixtures/hosts/mainrag-*/stage2` bundle repeats this measurement
+with its own figures (61,854,792 bytes on mmap, eBPF, and the capturer
+alike, 0.68% above the frame bytes; see its `[generator]` note), and a
+corpus test keeps it declaring zero kernel drops.
 
 ### Fixed: usbmon dropped badly under high throughput; the ring is now enlarged
 
@@ -350,11 +352,11 @@ and `CONFIG_DEBUG_INFO_BTF` before either backend runs.
 
 Worth doing, not urgent: usbmon now captures byte-exact at high
 throughput on every ARM board except `airbox`, so the eBPF backend's ARM
-upside is mainly the isochronous-undercount case and future per-process
-attribution. The concrete next step is a spike on `rock-32` -- add the
-conditional arm64 `pt_regs`, compile with `-D__TARGET_ARCH_arm64`,
-generate BTF with `pahole -J`, and attempt a verify-load and a short
-capture.
+upside is future per-process attribution and an in-kernel second opinion
+on the usbmon figures. The concrete next step is a spike on `rock-32` --
+add the conditional arm64 `pt_regs`, compile with
+`-D__TARGET_ARCH_arm64`, generate BTF with `pahole -J`, and attempt a
+verify-load and a short capture.
 
 ## Testing follow-ups
 

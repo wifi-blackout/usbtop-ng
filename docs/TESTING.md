@@ -259,7 +259,10 @@ throwaway `stageN.json`.
 9. The `mainrag` stage2 bundle is the corpus's accuracy anchor: its
    `[generator]` note records the `v4l2-ctl` command, the exact frame
    bytes, and the concurrent mmap and eBPF totals. Repeat that procedure
-   on any kernel that changes the xHCI isochronous path.
+   on any kernel that changes the xHCI isochronous path. The anchor's own
+   figures: mmap, eBPF, and the capturer byte-identical (61,854,792 bytes
+   for 61,440,000 raw frame bytes, 0.68% of UVC header overhead), the
+   text estimate within 1% of them, and `binary_kernel_dropped = 0`.
 
 Fleet build notes, learned capturing the Pi bundles (2026-08-31):
 

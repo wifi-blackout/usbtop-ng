@@ -218,7 +218,7 @@ URB's length. usbtop-ng estimates the bytes moved by scaling the printed
 descriptors' actual lengths by the URB's full packet count. Measured
 against the binary interface on the same window, the estimate landed at
 0.9999x on a sparse MJPEG webcam stream and 1.011x on a continuous YUYV
-stream, where the buffer size had read 15.4x and 4.0x; it is exact
+stream, where the buffer size had read 15.4x and 3.98x; it is exact
 whenever a URB carries five or fewer packets. It is still a sample-based
 estimate, so the report says so. usbtop-ng prefers the binary interface
 and only falls back to text when the binary nodes cannot be opened.

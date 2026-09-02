@@ -1261,10 +1261,11 @@ fn format_rate(bytes_per_second: f64) -> String {
 }
 
 /// Device row's Bw↓/Bw↑ cell text: the formatted rate, `~`-prefixed when
-/// `estimated` is set. The text interface reports isochronous buffer sizes,
-/// not bytes moved, so a device with iso traffic under a text source has its
-/// rate flagged as an estimate rather than an exact measurement (see
-/// `UsbTopApp::text_source_active`,
+/// `estimated` is set. The text interface's isochronous figure is a sampled
+/// estimate from the printed descriptors (within about 1% of the binary
+/// interface on the two cameras measured), so a device with iso traffic
+/// under a text source has its rate flagged as an estimate rather than an
+/// exact measurement (see `UsbTopApp::text_source_active`,
 /// `UsbDevice::has_iso_traffic`, and the same convention in
 /// `headless::render_text`).
 fn rate_cell(bytes_per_second: f64, estimated: bool) -> String {
@@ -1651,7 +1652,7 @@ fn draw_help_overlay(f: &mut Frame) {
             Span::raw("   Quit application"),
         ]),
         Line::from(
-            "  ~ marks estimated rates. The text interface reports isochronous buffer sizes, not bytes moved.",
+            "  ~ marks estimated rates: isochronous bytes on the text interface are a sampled estimate, not an exact count.",
         ),
         Line::from(""),
         Line::from("Features:"),
@@ -2972,10 +2973,12 @@ mod tests {
     }
 
     /// Mirrors `headless::estimated_marks_iso_devices_only_when_text_is_active`:
-    /// the debugfs text interface reports isochronous buffer sizes, not
-    /// bytes moved, so a device with iso traffic gets its rate cells marked
-    /// `~` only while a text source backs the session — never under a binary
-    /// source, and never for a non-iso device either way.
+    /// the debugfs text interface's isochronous figure is a sampled estimate
+    /// from the printed descriptors (within about 1% of the binary interface
+    /// on the two cameras measured), so a device with iso traffic gets its
+    /// rate cells marked `~` only while a text source backs the session —
+    /// never under a binary source, and never for a non-iso device either
+    /// way.
     #[test]
     fn device_row_marks_iso_rate_as_estimated_only_when_a_text_source_is_active() {
         let temp = tempfile::tempdir().unwrap();

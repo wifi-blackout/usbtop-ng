@@ -67,7 +67,9 @@ struct MetaOut {
     captured_unix: u64,
     /// Kernel-side events lost from the binary source during the capture.
     /// Absent when the source could not report one. Documentation of the
-    /// bundle's own completeness; never asserted by the harness.
+    /// bundle's own completeness; never asserted by the strict corpus
+    /// check; the mainrag anchor test asserts it is zero for the
+    /// ground-truth bundle.
     #[serde(skip_serializing_if = "Option::is_none")]
     binary_kernel_dropped: Option<u64>,
     controllers: Vec<String>,

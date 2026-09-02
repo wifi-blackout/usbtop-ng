@@ -13,8 +13,9 @@
 //! function the read()-based reader uses — decodes it, so the two readers stay
 //! byte-for-byte consistent in what they extract from an event.
 //!
-//! The ioctl numbers and struct layouts, now in [`super::ring`], were
-//! verified against a live `/dev/usbmon1` (see `tmp/specs/usbmon-mmap.md`).
+//! The ioctl numbers and struct layouts live in [`super::ring`] and were
+//! verified against a live `/dev/usbmon1`;
+//! `ring::tests::ioctl_numbers_match_the_verified_constants` pins them.
 
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -345,7 +346,8 @@ impl MmapReader {
     /// once per [`POLL_INTERVAL`]) and once more at loop exit; each read's
     /// (read-and-clear, see [`stats`]) `dropped` count is summed into
     /// `kernel_dropped` via [`add_kernel_drops`], so `kernel_dropped` is live
-    /// during a session, not just after `stop()`, as `BinaryReader` does.
+    /// during a session, not just after `stop()`; `BinaryReader::read_packets`
+    /// does the same.
     ///
     /// A callback `Err` stops the loop early and still returns `Ok(())`,
     /// matching `BinaryReader`. A fatal `MON_IOCX_MFETCH` error, like a setup

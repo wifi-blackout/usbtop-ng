@@ -33,7 +33,8 @@ pub struct RawCapture {
     pub bytes: Vec<u8>,
     /// `Some(n)`: `MON_IOCG_STATS` worked and the kernel lost `n` events
     /// during this capture. `None`: no such counter on this interface (the
-    /// debugfs text file, or a kernel without the ioctl).
+    /// debugfs text file, or a kernel without the ioctl), or any other
+    /// ioctl failure.
     pub kernel_dropped: Option<u64>,
 }
 

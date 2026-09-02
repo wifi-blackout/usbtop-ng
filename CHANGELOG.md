@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Internal: traffic accounting now runs on backend-neutral `(key, bytes)` deltas, and the usbmon packet path is an adapter over that. No user-visible change on its own; it is what the eBPF backend above feeds through `apply_delta`.
-- The `asus` and `pi400` stage2 bundles were recaptured with the enlarged ring; their earlier binary goldens had kept about a third of their URBs.
+- The `asus` and `pi400` stage2 bundles were recaptured with the enlarged ring; their earlier binary goldens had kept about a third of the traffic's URBs.
 
 ### Fixed
 
