@@ -169,8 +169,28 @@ With the fixed capturer:
   stage): `[generator]` records the `v4l2-ctl` command, the frame count and
   frame bytes, the mmap and eBPF totals, and the UVC-header arithmetic.
   This is the committed characterization fixture the roadmap asked for.
+- Add two `asus-2026-08-31` hub stages, captured on the same trip with the
+  powered hub the tester attached on 2026-09-01. The hub sits on bus 3 as a
+  four-deep chain: root port 1 → RTS5411 (dev 2) → Terminus FE 2.1 7-port
+  (dev 27) → second FE 2.1 (dev 30) → Fujitsu 4-port (dev 32) → Fujitsu
+  keyboard; leaves along it run at 1.5, 12, and 480 Mbps, and the same
+  RTS5411's USB3 side sits on bus 4 with two IDS USB 3.0 cameras.
+  - `stage3`: deep chain plus dual-personality split, ambient traffic,
+    aggregate capture (no `--bus`), ladder stages 5 and 6. Coverage tags
+    should show 1.5, 12, 480, and 5000 Mbps and three hub levels.
+  - `stage4`: saturation through the hub, ladder stage 7 (behind-the-hub
+    placement): `dd if=/dev/sdb of=/dev/null bs=4M iflag=direct` from the
+    FlashDisk (`1aa6:0201`, 963 MB, 480 Mbps, two hubs deep), `--bus 3`.
+    `[generator]` records the command and the observed rate.
+  Both use the existing `stage1/internal-devices.toml` baseline.
 - After every recapture: `cargo test fixture_corpus` green, corpus strict
   check green, SEC-1 and SEC-2 unchanged.
+
+Pointer for wave 3 (one row per physical connector), not in scope here:
+`asus` exposes the sysfs port `peer` links this design needs.
+`/sys/bus/usb/devices/3-1/3-1:1.0/3-1-port1/peer` resolves to
+`usb4/4-1/4-1:1.0/4-1-port1`, pairing the RTS5411's USB2 and USB3 sides;
+the stage3 bundle captures that topology for the design investigation.
 
 ### R5. Documentation
 
