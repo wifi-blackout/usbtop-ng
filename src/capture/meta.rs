@@ -65,6 +65,11 @@ struct MetaOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     stage_id: Option<u32>,
     captured_unix: u64,
+    /// Kernel-side events lost from the binary source during the capture.
+    /// Absent when the source could not report one. Documentation of the
+    /// bundle's own completeness; never asserted by the harness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binary_kernel_dropped: Option<u64>,
     controllers: Vec<String>,
     speed_classes: Vec<String>,
     transfer_types: Vec<String>,
@@ -74,10 +79,13 @@ struct MetaOut {
 /// The `meta.toml` text for a freshly captured bundle: host identity plus the
 /// coverage tags and the sources captured. The tester may hand-append a
 /// `[generator]` block afterward (documentation only, never asserted).
+/// `binary_kernel_dropped` is the kernel's drop count for the binary source,
+/// when it reported one.
 pub fn build_meta(
     report: &Report,
     sources: &[FixtureSource],
     stage_id: Option<u32>,
+    binary_kernel_dropped: Option<u64>,
 ) -> anyhow::Result<String> {
     let tags = compute_coverage_tags(report);
     let host = gather_host_identity();
@@ -90,6 +98,7 @@ pub fn build_meta(
         usbtop_ng_version: env!("CARGO_PKG_VERSION").to_string(),
         stage_id,
         captured_unix: now_unix(),
+        binary_kernel_dropped,
         controllers: tags.controllers,
         speed_classes: tags.speed_classes,
         transfer_types: tags.transfer_types,
@@ -294,6 +303,7 @@ mod tests {
             &report,
             &[FixtureSource::Binary, FixtureSource::Text],
             Some(7),
+            None,
         )
         .unwrap();
         let parsed: crate::fixture_replay::Meta = toml::from_str(&toml_text).unwrap();
@@ -302,5 +312,40 @@ mod tests {
             vec!["binary".to_string(), "text".to_string()]
         );
         assert!(toml_text.contains("stage_id = 7"));
+        assert!(
+            !toml_text.contains("binary_kernel_dropped"),
+            "no count reported: the key must be absent, not zero: {toml_text}"
+        );
+    }
+
+    /// The capturer writes the kernel's drop count for the binary source so
+    /// a bundle declares its own completeness; a bundle captured without the
+    /// stats ioctl (old kernel) simply lacks the key.
+    #[test]
+    fn build_meta_records_the_binary_kernel_drop_count_when_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let baseline = Baseline::capture(&mgr);
+        let report = build_report(
+            &mgr,
+            &baseline,
+            FIXED_ELAPSED,
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        let toml_text = build_meta(&report, &[FixtureSource::Binary], None, Some(1_621)).unwrap();
+        assert!(
+            toml_text.contains("binary_kernel_dropped = 1621"),
+            "{toml_text}"
+        );
+        let value: toml::Value = toml::from_str(&toml_text).unwrap();
+        assert_eq!(
+            value
+                .get("binary_kernel_dropped")
+                .and_then(toml::Value::as_integer),
+            Some(1_621)
+        );
     }
 }

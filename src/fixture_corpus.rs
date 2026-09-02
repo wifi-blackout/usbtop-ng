@@ -289,6 +289,27 @@ fn every_stage_dir_is_a_wellformed_bundle() {
     check_corpus_strict(&fixtures_root()).unwrap();
 }
 
+/// `binary_kernel_dropped` is optional documentation of a bundle's own
+/// completeness; when a bundle declares it, it must be a non-negative
+/// integer. Read through `toml::Value` so the key stays out of `Meta`
+/// (which nothing else would read; see the plan's ruling).
+#[test]
+fn declared_binary_kernel_drops_are_non_negative_integers() {
+    for bundle in discover_bundles() {
+        let text = std::fs::read_to_string(bundle.dir.join("meta.toml")).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        if let Some(v) = value.get("binary_kernel_dropped") {
+            let n = v.as_integer().unwrap_or_else(|| {
+                panic!(
+                    "{}: binary_kernel_dropped is not an integer",
+                    bundle.dir.display()
+                )
+            });
+            assert!(n >= 0, "{}: negative drop count {n}", bundle.dir.display());
+        }
+    }
+}
+
 /// Bless helper: regenerate every *seed's* `trace.bin` and both goldens by
 /// replay, so committed goldens equal harness output by construction. Only
 /// touches bundles whose host directory (the bundle dir's parent) is named

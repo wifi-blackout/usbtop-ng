@@ -7,6 +7,7 @@ pub mod sysfs;
 pub mod trace;
 
 use std::io::Read;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -15,11 +16,25 @@ use anyhow::{anyhow, Context};
 
 use crate::fixture_replay::{replay_fixture, report_to_golden_json, FixtureSource};
 use crate::snapshot::Snapshot;
+use crate::usbmon::ring;
 
 /// One sanitized trace ready to be written into a bundle.
 pub struct CapturedTrace {
     pub source: FixtureSource,
     pub bytes: Vec<u8>,
+    /// Kernel-side events lost during the capture, when the interface could
+    /// report them (the binary device; `None` for the text file).
+    pub kernel_dropped: Option<u64>,
+}
+
+/// Raw bytes read from one usbmon interface, plus the kernel's drop count
+/// when the interface has one.
+pub struct RawCapture {
+    pub bytes: Vec<u8>,
+    /// `Some(n)`: `MON_IOCG_STATS` worked and the kernel lost `n` events
+    /// during this capture. `None`: no such counter on this interface (the
+    /// debugfs text file, or a kernel without the ioctl).
+    pub kernel_dropped: Option<u64>,
 }
 
 /// Where a bundle's `internal-devices.toml` comes from: a fresh bare-board
@@ -95,9 +110,13 @@ pub fn assemble_bundle(
     }
 
     let report = report_for_meta.ok_or_else(|| anyhow!("no sources captured"))?;
+    let binary_kernel_dropped = traces
+        .iter()
+        .find(|t| t.source == FixtureSource::Binary)
+        .and_then(|t| t.kernel_dropped);
     std::fs::write(
         outdir.join("meta.toml"),
-        meta::build_meta(&report, &sources, stage_id)?,
+        meta::build_meta(&report, &sources, stage_id, binary_kernel_dropped)?,
     )
     .context("write meta.toml")?;
     Ok(())
@@ -199,11 +218,20 @@ pub fn run_capture_fixture(opts: CaptureFixtureOpts) -> anyhow::Result<()> {
 
     // Binary interface, sanitized.
     match bin_result {
-        Ok(bytes) => {
-            let sanitized = trace::sanitize_binary_stream(&mut std::io::Cursor::new(bytes))?;
+        Ok(raw) => {
+            if let Some(n) = raw.kernel_dropped.filter(|&n| n > 0) {
+                eprintln!(
+                    "warning: the kernel dropped {n} events from {} during the capture; \
+                     the binary golden still pins the pipeline but understates the traffic, \
+                     so lower the rate or widen the window before citing it for accuracy",
+                    bin_dev.display()
+                );
+            }
+            let sanitized = trace::sanitize_binary_stream(&mut std::io::Cursor::new(raw.bytes))?;
             traces.push(CapturedTrace {
                 source: FixtureSource::Binary,
                 bytes: sanitized,
+                kernel_dropped: raw.kernel_dropped,
             });
         }
         Err(e) => eprintln!(
@@ -213,13 +241,14 @@ pub fn run_capture_fixture(opts: CaptureFixtureOpts) -> anyhow::Result<()> {
     }
     // Text interface, sanitized.
     match text_result {
-        Ok(bytes) => {
+        Ok(raw) => {
             let sanitized = trace::sanitize_text_stream(&mut std::io::BufReader::new(
-                std::io::Cursor::new(bytes),
+                std::io::Cursor::new(raw.bytes),
             ))?;
             traces.push(CapturedTrace {
                 source: FixtureSource::Text,
                 bytes: sanitized.into_bytes(),
+                kernel_dropped: raw.kernel_dropped,
             });
         }
         Err(e) => eprintln!(
@@ -248,15 +277,16 @@ pub fn run_capture_fixture(opts: CaptureFixtureOpts) -> anyhow::Result<()> {
 /// than two disjoint ones. `read` is the per-interface reader (`capture_until`
 /// in production); generic and injectable so the pairing logic can be tested
 /// without touching a real usbmon device or the wall clock.
-fn capture_pair<F>(
+fn capture_pair<T, F>(
     bin_dev: &Path,
     text_dev: &Path,
     deadline: Instant,
     stop: &AtomicBool,
     read: F,
-) -> (std::io::Result<Vec<u8>>, std::io::Result<Vec<u8>>)
+) -> (std::io::Result<T>, std::io::Result<T>)
 where
-    F: Fn(&Path, Instant, &AtomicBool) -> std::io::Result<Vec<u8>> + Sync,
+    T: Send,
+    F: Fn(&Path, Instant, &AtomicBool) -> std::io::Result<T> + Sync,
 {
     std::thread::scope(|scope| {
         let text_handle = scope.spawn(|| read(text_dev, deadline, stop));
@@ -269,8 +299,19 @@ where
 /// Read raw bytes from a usbmon interface until `deadline`, polling a
 /// non-blocking open (idle buses return `WouldBlock`). The raw buffer is
 /// framed and sanitized afterward, so no framing happens here. Thin live glue.
-fn capture_until(path: &Path, deadline: Instant, stop: &AtomicBool) -> std::io::Result<Vec<u8>> {
+///
+/// The kernel ring is enlarged first (see [`ring::request_ring_ladder`]): on
+/// the default ~300 KiB ring the 2026-09-01 spike measured this reader
+/// keeping 32% of an isochronous stream's events. The debugfs text file
+/// answers `ENOTTY` to both ioctls, which the helper and the final stats
+/// read ignore, so one function serves both interfaces. The drop count is
+/// read once at the end: the kernel zeroes it on every read, and nothing
+/// else reads it during a capture, so that single read is the whole
+/// capture's loss.
+fn capture_until(path: &Path, deadline: Instant, stop: &AtomicBool) -> std::io::Result<RawCapture> {
     let mut file = crate::usbmon::open_nonblocking(path)?;
+    let fd = file.as_raw_fd();
+    ring::request_ring_ladder(fd, path);
     let mut buf = Vec::new();
     let mut chunk = [0u8; 65536];
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
@@ -284,7 +325,11 @@ fn capture_until(path: &Path, deadline: Instant, stop: &AtomicBool) -> std::io::
             Err(e) => return Err(e),
         }
     }
-    Ok(buf)
+    let kernel_dropped = ring::stats(fd).ok().map(|s| u64::from(s.dropped));
+    Ok(RawCapture {
+        bytes: buf,
+        kernel_dropped,
+    })
 }
 
 /// Parse a trailing `stageN` component of the output dir into a stage id, for
@@ -408,10 +453,12 @@ mod tests {
             CapturedTrace {
                 source: FixtureSource::Binary,
                 bytes: one_binary_event(),
+                kernel_dropped: None,
             },
             CapturedTrace {
                 source: FixtureSource::Text,
                 bytes: b"ffff0000aaaa0001 200 C Bi:1:003:1 0 1000 <\n".to_vec(),
+                kernel_dropped: None,
             },
         ];
         assemble_bundle(
@@ -468,6 +515,7 @@ mod tests {
         let traces = vec![CapturedTrace {
             source: FixtureSource::Binary,
             bytes: bad,
+            kernel_dropped: None,
         }];
         let err = assemble_bundle(
             &temp.path().join("devices"),
@@ -493,6 +541,7 @@ mod tests {
         let trace = CapturedTrace {
             source: FixtureSource::Binary,
             bytes,
+            kernel_dropped: None,
         };
         let err = assert_payload_free(&trace).unwrap_err();
         assert!(err.to_string().contains("SEC-1"), "{err}");
@@ -510,6 +559,7 @@ mod tests {
         let traces = vec![CapturedTrace {
             source: FixtureSource::Binary,
             bytes: one_binary_event(),
+            kernel_dropped: None,
         }];
         let err = assemble_bundle(
             &temp.path().join("devices"),
@@ -524,5 +574,47 @@ mod tests {
         assert!(msg.contains("fresh outdir"), "{msg}");
         // Nothing else got written: the stale dir was the only thing there.
         assert!(!outdir.join("meta.toml").exists());
+    }
+
+    /// The binary trace's kernel drop count lands in meta.toml so a bundle
+    /// declares its own completeness.
+    #[test]
+    fn assemble_bundle_records_binary_kernel_drops_in_meta() {
+        let temp = tempfile::tempdir().unwrap();
+        build_src_sysfs(temp.path());
+        let outdir = temp.path().join("bundle");
+        let traces = vec![CapturedTrace {
+            source: FixtureSource::Binary,
+            bytes: one_binary_event(),
+            kernel_dropped: Some(7),
+        }];
+        assemble_bundle(
+            &temp.path().join("devices"),
+            &outdir,
+            &traces,
+            &BaselineSource::CaptureFrom(temp.path().join("devices")),
+            Some(2),
+        )
+        .unwrap();
+        let meta = std::fs::read_to_string(outdir.join("meta.toml")).unwrap();
+        assert!(meta.contains("binary_kernel_dropped = 7"), "{meta}");
+    }
+
+    /// `capture_until` on a regular file: the ring ladder and the stats
+    /// ioctl both answer ENOTTY, so the bytes are read and no drop count is
+    /// reported (`None`), which is also what the debugfs text file yields.
+    #[test]
+    fn capture_until_reads_a_regular_file_and_reports_no_drop_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("usbmon1");
+        std::fs::write(&path, one_binary_event()).unwrap();
+        let raw = capture_until(
+            &path,
+            Instant::now() + Duration::from_secs(1),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(raw.bytes, one_binary_event());
+        assert_eq!(raw.kernel_dropped, None);
     }
 }
