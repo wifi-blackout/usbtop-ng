@@ -67,3 +67,8 @@ release.sh
 *.tar.gz
 *.zip
 *.dmg
+
+# Claude Code / SDD scratch, never published
+.superpowers/
+.claude/worktrees/
+.claude/settings.local.json

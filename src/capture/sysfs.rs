@@ -8,8 +8,10 @@ use std::path::Path;
 use anyhow::Context;
 
 /// The attribute files usbtop-ng reads (see `device::read_metadata_from` and
-/// `enumerate_present_devices`). Nothing else is copied.
-const ATTRS: [&str; 9] = [
+/// `enumerate_present_devices`), except `serial`: a bundle is published, a
+/// device serial identifies its owner's hardware, and no replay reads it, so
+/// it is never copied. Nothing else is copied either.
+const ATTRS: [&str; 8] = [
     "busnum",
     "devnum",
     "speed",
@@ -17,7 +19,6 @@ const ATTRS: [&str; 9] = [
     "idProduct",
     "manufacturer",
     "product",
-    "serial",
     "version",
 ];
 

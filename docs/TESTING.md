@@ -14,7 +14,7 @@ see [Test hosts](#test-hosts) below for the concrete fleet.
 
 Eight SSH-reachable hosts, probed 2026-08-30. These are the concrete
 machines the [per-platform notes](#per-platform-notes) below refer to;
-each is addressable by the `ssh` name shown (`judge` as `paadmin@judge`).
+each is addressable by the `ssh` name shown (`judge` as `<user>@judge`).
 The `usbmon` column records the probe result: `built-in`, `module` (loads
 on `modprobe usbmon`, nodes appear), `absent` (not in this kernel), or
 `module?` (present but the load is unconfirmed because the host lacks
@@ -230,7 +230,8 @@ throwaway `stageN.json`.
    `--baseline tests/fixtures/hosts/<board>-<date>/stage1/internal-devices.toml`.
 3. The capturer sanitizes at the source: SEC-1, no captured USB payload in
    either trace file, and SEC-2, no symlink under the fixture's `sysfs/`
-   escapes the bundle. Both are asserted by the capturer and re-asserted by
+   escapes the bundle. The sysfs snapshot copies device attributes only and
+   never `serial`: a bundle is published, and no replay reads it. Both are asserted by the capturer and re-asserted by
    the corpus tests, so a violation fails the PR that adds the bundle.
 4. `airbox` contributes no fixtures. Its 5.4 vendor kernel carries no usbmon
    module, so the stage-0 gate fails before any capture is possible (see

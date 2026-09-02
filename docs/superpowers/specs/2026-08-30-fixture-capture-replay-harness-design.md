@@ -45,7 +45,7 @@ Verified against the codebase (file:line):
   → `build_report`.
 - **sysfs read set is small and centralized** (`read_metadata_from`,
   `src/device/mod.rs:116-146`): per device dir, only `busnum, devnum, speed,
-  idVendor, idProduct, manufacturer, product, serial, version`. Topology comes from
+  idVendor, idProduct, manufacturer, product, version`. Topology comes from
   the **directory name** (`UsbDevice::port_chain`, `src/device/mod.rs:75`), not a
   file. The **controller** is resolved by `canonicalize(<base>/usbN)` then its
   parent's dir name (`src/device/manager.rs:40`), so `usbN` must be a **symlink**
@@ -67,7 +67,7 @@ One committed directory per host **per ladder stage**:
 tests/fixtures/hosts/<board>-<date>/stage<N>/
 ├── sysfs/                     # fixture-owned snapshot of /sys/bus/usb/devices — NO host symlinks
 │   ├── <port-dir>/            # e.g. 3-1.4.2/ — a REAL materialized dir per device (not a symlink); no `*:*` interface dirs
-│   │   ├── busnum devnum speed idVendor idProduct manufacturer product serial version
+│   │   ├── busnum devnum speed idVendor idProduct manufacturer product version
 │   ├── <controller-id>/usb<bus>/              # fixture-local stand-in controller dir (name = PCI/platform id)
 │   └── usb<bus> -> <controller-id>/usb<bus>   # the ONLY symlink: a controlled RELATIVE link so `controller` resolves
 ├── trace.bin                  # SANITIZED binary usbmon events: 48-byte headers only, len_cap forced to 0, NO payload

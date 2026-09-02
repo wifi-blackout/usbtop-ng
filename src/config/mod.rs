@@ -126,8 +126,8 @@ fn fchown_fd(fd: RawFd, uid: u32, gid: u32) -> std::io::Result<()> {
 
 /// Resolve `..`/`.` components without touching the filesystem -- the path
 /// need not exist. Used by [`is_within`] so a lexical trick like
-/// `/home/lylem/../root/x` (which shares a literal component prefix with
-/// `/home/lylem` but does not resolve inside it) cannot pass a naive
+/// `/home/alice/../root/x` (which shares a literal component prefix with
+/// `/home/alice` but does not resolve inside it) cannot pass a naive
 /// component-prefix check.
 fn normalize_lexically(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -381,14 +381,14 @@ mod tests {
     const PASSWD: &str = "root:x:0:0:root:/root:/bin/bash\n\
         daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n\
         malformed line without colons\n\
-        lylem:x:1000:1000:Lyle M:/home/lylem:/bin/bash\n";
+        alice:x:1000:1000:Alice Example:/home/alice:/bin/bash\n";
 
     #[test]
     fn resolver_finds_the_invoking_users_home() {
         let inv = resolve_invoker(0, Some("1000"), Some("1000"), Some(PASSWD)).unwrap();
         assert_eq!(inv.uid, 1000);
         assert_eq!(inv.gid, 1000);
-        assert_eq!(inv.home, PathBuf::from("/home/lylem"));
+        assert_eq!(inv.home, PathBuf::from("/home/alice"));
     }
 
     #[test]
@@ -419,7 +419,7 @@ mod tests {
         let inv = resolve_invoker(0, Some("1000"), Some("1000"), Some(PASSWD));
         assert!(
             inv.is_some(),
-            "the malformed line above lylem's must not abort the scan"
+            "the malformed line above alice's must not abort the scan"
         );
     }
 
@@ -432,16 +432,16 @@ mod tests {
     #[test]
     fn is_within_accepts_a_path_nested_inside_home() {
         assert!(is_within(
-            Path::new("/home/lylem/.usbtop-ng/preferences.toml"),
-            Path::new("/home/lylem")
+            Path::new("/home/alice/.usbtop-ng/preferences.toml"),
+            Path::new("/home/alice")
         ));
     }
 
     #[test]
     fn is_within_accepts_home_itself() {
         assert!(is_within(
-            Path::new("/home/lylem"),
-            Path::new("/home/lylem")
+            Path::new("/home/alice"),
+            Path::new("/home/alice")
         ));
     }
 
@@ -449,31 +449,31 @@ mod tests {
     fn is_within_rejects_an_unrelated_path() {
         assert!(!is_within(
             Path::new("/etc/cron.d/evil"),
-            Path::new("/home/lylem")
+            Path::new("/home/alice")
         ));
     }
 
     #[test]
     fn is_within_rejects_dotdot_traversal_that_escapes_home() {
-        // Lexically normalizes to /home/root/x -- a sibling of /home/lylem
+        // Lexically normalizes to /home/root/x -- a sibling of /home/alice
         // under /home, not a descendant of it. A naive string-prefix check
         // (`starts_with` on the raw text) would wrongly accept this, since
-        // "/home/lylem/../root/x" literally begins with "/home/lylem".
+        // "/home/alice/../root/x" literally begins with "/home/alice".
         assert!(!is_within(
-            Path::new("/home/lylem/../root/x"),
-            Path::new("/home/lylem")
+            Path::new("/home/alice/../root/x"),
+            Path::new("/home/alice")
         ));
     }
 
     #[test]
     fn is_within_rejects_a_sibling_directory_that_shares_a_name_prefix() {
-        // /home/lylem2 must not count as within /home/lylem: guards against
+        // /home/alice2 must not count as within /home/alice: guards against
         // a naive string-prefix bug (component-wise starts_with, which
         // Path::starts_with is, gets this right; raw string starts_with
         // would not).
         assert!(!is_within(
-            Path::new("/home/lylem2/x"),
-            Path::new("/home/lylem")
+            Path::new("/home/alice2/x"),
+            Path::new("/home/alice")
         ));
     }
 
@@ -535,10 +535,10 @@ mod tests {
 
     #[test]
     fn preferences_path_from_joins_config_dir_and_file_name() {
-        let home = Path::new("/home/lylem");
+        let home = Path::new("/home/alice");
         assert_eq!(
             preferences_path_from(home),
-            PathBuf::from("/home/lylem/.usbtop-ng/preferences.toml")
+            PathBuf::from("/home/alice/.usbtop-ng/preferences.toml")
         );
     }
 
