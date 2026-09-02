@@ -344,9 +344,8 @@ impl MmapReader {
     /// `MON_IOCG_STATS` is read periodically while the loop runs (at most
     /// once per [`POLL_INTERVAL`]) and once more at loop exit; each read's
     /// (read-and-clear, see [`stats`]) `dropped` count is summed into
-    /// `kernel_dropped` via [`add_kernel_drops`], so `kernel_dropped` —
-    /// kernel-side drops the `read()`-based reader has no way to see — is
-    /// live during a session, not just after `stop()`.
+    /// `kernel_dropped` via [`add_kernel_drops`], so `kernel_dropped` is live
+    /// during a session, not just after `stop()`, as `BinaryReader` does.
     ///
     /// A callback `Err` stops the loop early and still returns `Ok(())`,
     /// matching `BinaryReader`. A fatal `MON_IOCX_MFETCH` error, like a setup

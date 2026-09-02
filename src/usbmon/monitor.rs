@@ -93,10 +93,11 @@ impl MonitorHandle {
 pub enum PacketSource {
     /// debugfs `Nu` text interface.
     Text(UsbmonReader),
-    /// `/dev/usbmonN` binary interface, read via `read(2)`.
+    /// `/dev/usbmonN` binary interface, read via `read(2)`. Feeds
+    /// [`MonitorHandle::kernel_dropped`], same as [`PacketSource::Mmap`].
     Binary(BinaryReader),
     /// `/dev/usbmonN` binary interface, read via its mmap ring and
-    /// `MON_IOCX_MFETCH` — no payload copy, and the only source of
+    /// `MON_IOCX_MFETCH` — no payload copy. Also feeds
     /// [`MonitorHandle::kernel_dropped`].
     Mmap(MmapReader),
 }
@@ -531,7 +532,7 @@ fn run_source_chain(
         };
         let result = match source {
             PacketSource::Text(reader) => reader.read_packets(shutdown, send),
-            PacketSource::Binary(reader) => reader.read_packets(shutdown, send),
+            PacketSource::Binary(reader) => reader.read_packets(shutdown, kernel_dropped, send),
             PacketSource::Mmap(reader) => reader.read_packets(shutdown, kernel_dropped, send),
         };
         let Err(e) = result else {
