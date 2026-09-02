@@ -13,6 +13,7 @@ pub mod mmap_ring;
 pub mod monitor;
 pub mod parser;
 pub mod reader;
+pub mod ring;
 
 /// How long a reader parks between polls when the interface has nothing to
 /// give (EAGAIN or EOF). Also the worst-case latency of a shutdown request.
