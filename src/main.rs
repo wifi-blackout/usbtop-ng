@@ -171,7 +171,7 @@ fn main() -> Result<()> {
             .init();
     }
 
-    info!("Starting usbtop-ng v{}", env!("CARGO_PKG_VERSION"));
+    info!("starting usbtop-ng v{}", env!("CARGO_PKG_VERSION"));
 
     // Show setup instructions if requested
     if cli.setup {
@@ -361,11 +361,11 @@ fn main() -> Result<()> {
     let mut usbmon_status = match check_usbmon_status() {
         Ok(status) => status,
         Err(e) => {
-            error!("Failed to check usbmon status: {}", e);
+            error!("could not check usbmon status: {}", e);
             if !cli.force {
                 process::exit(1);
             }
-            warn!("Continuing in force mode with limited functionality");
+            warn!("continuing in force mode with limited functionality");
             usbmon::UsbmonStatus {
                 module_loaded: false,
                 debugfs_mounted: false,
@@ -397,7 +397,7 @@ fn main() -> Result<()> {
 
             if should_load {
                 if let Err(e) = attempt_load_usbmon() {
-                    error!("Failed to load usbmon: {}", e);
+                    error!("could not load usbmon: {}", e);
                     if headless {
                         print_remedy_to_stderr(false);
                     } else {
@@ -478,13 +478,13 @@ fn main() -> Result<()> {
     // Log available buses
     if !usbmon_status.available_buses.is_empty() {
         info!(
-            "Available USB buses: {:?} (binary interface: {}, text interface: {})",
+            "available USB buses: {:?} (binary interface: {}, text interface: {})",
             usbmon_status.available_buses,
             usbmon_status.binary_available,
             usbmon_status.text_available
         );
     } else if !cli.force {
-        warn!("No USB buses detected");
+        warn!("no USB buses detected");
     }
 
     let (capture, monitor) = usbmon::monitor::start_capture(&usbmon_status.available_buses);

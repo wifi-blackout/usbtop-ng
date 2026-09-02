@@ -99,12 +99,12 @@ impl BinaryReader {
         F: FnMut(UsbPacket) -> Result<()>,
     {
         debug!(
-            "Starting binary packet capture from {}",
+            "starting binary packet capture from {}",
             self.path.display()
         );
 
         let mut file = open_nonblocking(&self.path)
-            .map_err(|e| anyhow!("Failed to open {}: {}", self.path.display(), e))?;
+            .map_err(|e| anyhow!("could not open {}: {}", self.path.display(), e))?;
         let fd = file.as_raw_fd();
         ring::request_ring_ladder(fd, &self.path);
         let mut header = [0u8; HEADER_LEN];
@@ -140,7 +140,7 @@ impl BinaryReader {
 
             if let Some((packet, _)) = parsed {
                 if let Err(e) = callback(packet) {
-                    debug!("Packet callback error: {}", e);
+                    debug!("packet callback error: {}", e);
                     break;
                 }
             }
@@ -179,7 +179,7 @@ impl BinaryReader {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to read from {}: {}", self.path.display(), e);
+                    error!("could not read {}: {}", self.path.display(), e);
                     return Fill::Stopped;
                 }
             }

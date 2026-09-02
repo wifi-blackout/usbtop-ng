@@ -105,6 +105,24 @@ cargo doc --open
 - Run `cargo clippy` and fix every warning.
 - Document public items with `///` doc comments.
 
+### User-facing text
+
+Every string a person can see follows one of three shapes. Tests assert
+on a few of them, so a rewording is a code change like any other.
+
+- **Error messages** (`anyhow!`, `bail!`, `warn!`, `error!`, and errors
+  printed with `eprintln!`): start lowercase unless the first word is a
+  proper name, acronym, or identifier (`SEC-1`, `MON_IOCG_STATS`, `USB`,
+  `eBPF`); no trailing period; name the subject and the offending value;
+  chain causes with `: ` (`could not open /dev/usbmon1: permission
+  denied`); say "could not", never "Failed to"; no exclamation marks.
+- **Remedies and prompts** (guidance text printed with `println!` or
+  `eprintln!`): sentence case, imperative, one action per line, exact
+  commands on their own line.
+- **Log lines** (`info!`, `debug!`): lowercase, present tense, and name
+  the interface and bus they concern (`using usbmon mmap-ring interface
+  on bus 3`).
+
 ### Code organization
 
 ```

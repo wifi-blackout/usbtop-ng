@@ -360,10 +360,10 @@ impl MmapReader {
     where
         F: FnMut(UsbPacket) -> Result<()>,
     {
-        debug!("Starting mmap packet capture from {}", self.path.display());
+        debug!("starting mmap packet capture from {}", self.path.display());
 
         let file = open_nonblocking(&self.path)
-            .map_err(|e| anyhow!("Failed to open {}: {}", self.path.display(), e))?;
+            .map_err(|e| anyhow!("could not open {}: {}", self.path.display(), e))?;
         let fd = file.as_raw_fd();
         // Enlarge the ring before mapping. The kernel's small default overflows
         // under USB3 throughput (see `ring::RING_SIZE_LADDER`); this must
@@ -449,7 +449,7 @@ impl MmapReader {
                                     return;
                                 }
                                 if let Err(e) = callback(packet) {
-                                    debug!("Packet callback error: {}", e);
+                                    debug!("packet callback error: {}", e);
                                     stop = true;
                                 }
                             },

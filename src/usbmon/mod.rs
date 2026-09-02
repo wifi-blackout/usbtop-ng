@@ -56,7 +56,7 @@ pub struct UsbmonStatus {
 }
 
 pub fn check_usbmon_status() -> Result<UsbmonStatus> {
-    debug!("Checking usbmon kernel module status");
+    debug!("checking usbmon kernel module status");
 
     let sysfs_root = Path::new("/sys/bus/usb/devices");
     let dev_root = Path::new("/dev");
@@ -294,31 +294,31 @@ pub fn prompt_user_to_unload_module() -> Result<bool> {
 }
 
 pub fn attempt_load_usbmon() -> Result<()> {
-    info!("Attempting to load usbmon kernel module");
+    info!("attempting to load usbmon kernel module");
 
     // Try to load usbmon module
     let output = Command::new("sudo")
         .args(["modprobe", "usbmon"])
         .output()
-        .map_err(|e| anyhow!("Failed to run modprobe: {}", e))?;
+        .map_err(|e| anyhow!("could not run modprobe: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("Failed to load usbmon module: {}", stderr));
+        return Err(anyhow!("could not load usbmon module: {}", stderr));
     }
 
     // Try to mount debugfs if needed
     if !is_debugfs_mounted()? {
-        info!("Attempting to mount debugfs");
+        info!("attempting to mount debugfs");
         let output = Command::new("sudo")
             .args(["mount", "-t", "debugfs", "none", "/sys/kernel/debug"])
             .output()
-            .map_err(|e| anyhow!("Failed to mount debugfs: {}", e))?;
+            .map_err(|e| anyhow!("could not mount debugfs: {}", e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             warn!(
-                "Failed to mount debugfs (may already be mounted): {}",
+                "could not mount debugfs (may already be mounted): {}",
                 stderr
             );
         }
@@ -341,16 +341,16 @@ pub fn attempt_load_usbmon() -> Result<()> {
 /// [`announce_automatic_unload`] or by the question itself, and both of those
 /// are skipped when the terminal cannot take them.
 pub fn attempt_unload_usbmon() -> Result<()> {
-    debug!("Attempting to unload usbmon kernel module");
+    debug!("attempting to unload usbmon kernel module");
 
     let output = Command::new("sudo")
         .args(["modprobe", "-r", "usbmon"])
         .output()
-        .map_err(|e| anyhow!("Failed to run modprobe -r: {}", e))?;
+        .map_err(|e| anyhow!("could not run modprobe -r: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("Failed to unload usbmon module: {}", stderr));
+        return Err(anyhow!("could not unload usbmon module: {}", stderr));
     }
 
     Ok(())
@@ -408,7 +408,7 @@ fn announce_automatic_unload(out: &mut impl Write, terminal_reachable: bool) {
 /// unload.
 fn unload_logging_failure() {
     if let Err(e) = attempt_unload_usbmon() {
-        log::warn!("Failed to unload usbmon: {}", e);
+        log::warn!("could not unload usbmon: {}", e);
     }
 }
 
