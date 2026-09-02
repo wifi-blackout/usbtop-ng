@@ -275,9 +275,10 @@ impl UsbDevice {
 
     /// True when any isochronous endpoint has carried bytes. Drives the
     /// text-source estimate marker (see `headless::build_report`): the
-    /// debugfs text interface reports iso callbacks at a rate roughly 3.6x
-    /// the actual transfer count, so a report built from it flags these
-    /// devices as estimated rather than exact.
+    /// debugfs text interface's isochronous figure is a sampled estimate
+    /// from the printed descriptors (within about 1% of the binary
+    /// interface on the two cameras measured), so a report built from it
+    /// flags these devices as estimated rather than exact.
     pub fn has_iso_traffic(&self) -> bool {
         self.endpoints
             .values()

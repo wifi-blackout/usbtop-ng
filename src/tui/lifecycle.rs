@@ -325,7 +325,9 @@ pub fn spawn_signal_thread(tx: std::sync::mpsc::Sender<UiEvent>) {
             // Not fatal: the UI runs fine, it just cannot leave cleanly on a
             // signal, which is what the panic hook and the restore latch are
             // the second line of defense for.
-            log::warn!("Cannot watch for signals, so a signal will not restore the terminal: {e}");
+            log::warn!(
+                "could not watch for signals, so a signal will not restore the terminal: {e}"
+            );
             return;
         }
     };

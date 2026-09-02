@@ -1,0 +1,17 @@
+board = "ZenBook UX363EA_UX363EA"
+soc = ""
+arch = "x86_64"
+kernel = "7.0.0-30-generic"
+os = "Linux Mint 22.3"
+usbtop_ng_version = "1.5.0"
+stage_id = 3
+captured_unix = 1788322007
+binary_kernel_dropped = 0
+controllers = ["0000:00:0d.0", "0000:00:14.0"]
+speed_classes = ["1.5", "10000", "12", "480", "5000"]
+transfer_types = ["bulk"]
+sources = ["binary", "text"]
+
+[generator]
+kind = "ambient"
+note = "Ladder stages 5 and 6 in one capture: root port 1 -> RTS5411 (0bda:5411) -> Terminus FE 2.1 7-port (1a40:0201) -> second FE 2.1 -> Fujitsu 4-port (0430:100e) -> Fujitsu keyboard (0430:00a2); a Fujitsu mouse at 1.5 Mbps, a Bus Pirate and card reader at 12 Mbps, a FlashDisk and an IDS camera at 480 Mbps on the USB2 side, and the same RTS5411's USB3 side on bus 4 carrying two IDS USB 3.0 cameras (1409:3270) at 5 Gbps. Ambient traffic only, 21 devices across four buses. The sysfs snapshot carries the device topology (port chains, speeds, ids) but not the hub port directories or their peer symlinks: the capturer copies a fixed device-attribute allowlist only. The connector-row design investigation reads the peer links live on asus (3-1-port1/peer -> usb4/4-1/4-1:1.0/4-1-port1) and would need to extend the capturer before a bundle could carry them."

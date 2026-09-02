@@ -1,0 +1,146 @@
+captured_unix = 1788354946
+
+[[devices]]
+port_path = "1-2"
+vendor_id = "05e3"
+product_id = "0610"
+
+[[devices]]
+port_path = "1-2.1"
+vendor_id = "0fd9"
+product_id = "006d"
+
+[[devices]]
+port_path = "1-4"
+vendor_id = "04f2"
+product_id = "b71a"
+
+[[devices]]
+port_path = "2-1"
+vendor_id = "0bda"
+product_id = "0316"
+
+[[devices]]
+port_path = "2-2"
+vendor_id = "05e3"
+product_id = "0620"
+
+[[devices]]
+port_path = "2-2.2"
+vendor_id = "0bda"
+product_id = "9210"
+
+[[devices]]
+port_path = "3-1"
+vendor_id = "05e3"
+product_id = "0610"
+
+[[devices]]
+port_path = "3-1.2"
+vendor_id = "2dc8"
+product_id = "310a"
+
+[[devices]]
+port_path = "3-1.4"
+vendor_id = "05e3"
+product_id = "0610"
+
+[[devices]]
+port_path = "3-1.4.1"
+vendor_id = "05e3"
+product_id = "0610"
+
+[[devices]]
+port_path = "3-1.4.1.2"
+vendor_id = "2109"
+product_id = "2822"
+
+[[devices]]
+port_path = "3-1.4.1.2.3"
+vendor_id = "044f"
+product_id = "b352"
+
+[[devices]]
+port_path = "3-1.4.4"
+vendor_id = "534d"
+product_id = "2109"
+
+[[devices]]
+port_path = "3-3"
+vendor_id = "05e3"
+product_id = "0608"
+
+[[devices]]
+port_path = "3-3.1"
+vendor_id = "048d"
+product_id = "ce00"
+
+[[devices]]
+port_path = "3-3.3"
+vendor_id = "048d"
+product_id = "6005"
+
+[[devices]]
+port_path = "3-4"
+vendor_id = "8087"
+product_id = "0029"
+
+[[devices]]
+port_path = "4-1"
+vendor_id = "05e3"
+product_id = "0625"
+
+[[devices]]
+port_path = "4-1.1"
+vendor_id = "0bda"
+product_id = "9210"
+
+[[devices]]
+port_path = "4-1.4"
+vendor_id = "05e3"
+product_id = "0626"
+
+[[devices]]
+port_path = "4-1.4.1"
+vendor_id = "05e3"
+product_id = "0626"
+
+[[devices]]
+port_path = "4-1.4.1.1"
+vendor_id = "1a6e"
+product_id = "089a"
+
+[[devices]]
+port_path = "4-1.4.1.2"
+vendor_id = "2109"
+product_id = "0822"
+
+[[devices]]
+port_path = "4-1.4.1.3"
+vendor_id = "1409"
+product_id = "3270"
+
+[[devices]]
+port_path = "4-1.4.2"
+vendor_id = "1409"
+product_id = "3270"
+
+[[devices]]
+port_path = "usb1"
+vendor_id = "1d6b"
+product_id = "0002"
+
+[[devices]]
+port_path = "usb2"
+vendor_id = "1d6b"
+product_id = "0003"
+
+[[devices]]
+port_path = "usb3"
+vendor_id = "1d6b"
+product_id = "0002"
+
+[[devices]]
+port_path = "usb4"
+vendor_id = "1d6b"
+product_id = "0003"

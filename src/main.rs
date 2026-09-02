@@ -171,7 +171,7 @@ fn main() -> Result<()> {
             .init();
     }
 
-    info!("Starting usbtop-ng v{}", env!("CARGO_PKG_VERSION"));
+    info!("starting usbtop-ng v{}", env!("CARGO_PKG_VERSION"));
 
     // Show setup instructions if requested
     if cli.setup {
@@ -335,11 +335,11 @@ fn main() -> Result<()> {
     if filter.uses_internal() && internal_snapshot.is_none() {
         match &snapshot_path_result {
             Ok(path) => eprintln!(
-                "error: an internal= filter needs a snapshot and none was found at {}. Run usbtop-ng --snapshot-internal first, with external devices unplugged.",
+                "error: an internal= filter needs a snapshot and none was found at {}. Run usbtop-ng --snapshot-internal first, with external devices unplugged",
                 path.display()
             ),
             Err(_) => eprintln!(
-                "error: an internal= filter needs a snapshot. Run usbtop-ng --snapshot-internal first, with external devices unplugged."
+                "error: an internal= filter needs a snapshot. Run usbtop-ng --snapshot-internal first, with external devices unplugged"
             ),
         }
         process::exit(2);
@@ -361,11 +361,11 @@ fn main() -> Result<()> {
     let mut usbmon_status = match check_usbmon_status() {
         Ok(status) => status,
         Err(e) => {
-            error!("Failed to check usbmon status: {}", e);
+            error!("could not check usbmon status: {}", e);
             if !cli.force {
                 process::exit(1);
             }
-            warn!("Continuing in force mode with limited functionality");
+            warn!("continuing in force mode with limited functionality");
             usbmon::UsbmonStatus {
                 module_loaded: false,
                 debugfs_mounted: false,
@@ -388,7 +388,7 @@ fn main() -> Result<()> {
                 }
                 true
             } else if headless {
-                eprintln!("error: usbmon is not available and this mode never prompts.");
+                eprintln!("error: usbmon is not available and this mode never prompts");
                 eprintln!("Set auto_load_usbmon = true in the preferences file, run 'sudo modprobe usbmon' first, or run 'usbtop-ng --setup' for the manual steps.");
                 process::exit(1);
             } else {
@@ -397,7 +397,7 @@ fn main() -> Result<()> {
 
             if should_load {
                 if let Err(e) = attempt_load_usbmon() {
-                    error!("Failed to load usbmon: {}", e);
+                    error!("could not load usbmon: {}", e);
                     if headless {
                         print_remedy_to_stderr(false);
                     } else {
@@ -478,13 +478,13 @@ fn main() -> Result<()> {
     // Log available buses
     if !usbmon_status.available_buses.is_empty() {
         info!(
-            "Available USB buses: {:?} (binary interface: {}, text interface: {})",
+            "available USB buses: {:?} (binary interface: {}, text interface: {})",
             usbmon_status.available_buses,
             usbmon_status.binary_available,
             usbmon_status.text_available
         );
     } else if !cli.force {
-        warn!("No USB buses detected");
+        warn!("no USB buses detected");
     }
 
     let (capture, monitor) = usbmon::monitor::start_capture(&usbmon_status.available_buses);

@@ -1,0 +1,17 @@
+board = "MG-VCP17A-3080"
+soc = ""
+arch = "x86_64"
+kernel = "7.0.0-30-generic"
+os = "Linux Mint 22.3"
+usbtop_ng_version = "1.5.0"
+stage_id = 1
+captured_unix = 1788354946
+binary_kernel_dropped = 0
+controllers = ["0000:06:00.3", "0000:06:00.4"]
+speed_classes = ["10000", "12", "480", "5000"]
+transfer_types = ["bulk"]
+sources = ["binary", "text"]
+
+[generator]
+kind = "ambient"
+note = "Bare-board ambient capture of the development host (AMD Ryzen 9 5900HX, xHCI 0000:06:00.3 and 0000:06:00.4, four buses, kernel 7.0.0-30-generic) for the stage2 baseline."

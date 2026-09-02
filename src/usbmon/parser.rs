@@ -226,7 +226,7 @@ pub fn parse_usbmon_text_line(line: &str) -> Result<UsbPacket> {
     // underscore to stay warning-free in non-test builds.
     let _urb_tag = tokens
         .next()
-        .ok_or_else(|| anyhow!("Invalid usbmon text line format: empty line"))?
+        .ok_or_else(|| anyhow!("invalid usbmon text line: empty line"))?
         .to_string();
 
     // Word 2: timestamp in microseconds. We don't yet reconstruct wall-clock
@@ -234,35 +234,35 @@ pub fn parse_usbmon_text_line(line: &str) -> Result<UsbPacket> {
     // nothing downstream needs it.
     let timestamp_token = tokens
         .next()
-        .ok_or_else(|| anyhow!("Invalid usbmon text line format: missing timestamp"))?;
+        .ok_or_else(|| anyhow!("invalid usbmon text line: missing timestamp"))?;
     let _timestamp_us: u64 = timestamp_token
         .parse()
-        .map_err(|_| anyhow!("Invalid timestamp: {}", timestamp_token))?;
+        .map_err(|_| anyhow!("invalid timestamp: {}", timestamp_token))?;
 
     // Word 3: event type.
     let event_token = tokens
         .next()
-        .ok_or_else(|| anyhow!("Invalid usbmon text line format: missing event type"))?;
+        .ok_or_else(|| anyhow!("invalid usbmon text line: missing event type"))?;
     let urb_type = match event_token {
         "S" => UrbType::Submission,
         "C" => UrbType::Callback,
         "E" => UrbType::Error,
-        _ => return Err(anyhow!("Invalid URB type: {}", event_token)),
+        _ => return Err(anyhow!("invalid URB type: {}", event_token)),
     };
 
     // Word 4: address, e.g. `Bo:1:001:0` or `Ci:2:001:0`.
     let addr_token = tokens
         .next()
-        .ok_or_else(|| anyhow!("Invalid usbmon text line format: missing address word"))?;
+        .ok_or_else(|| anyhow!("invalid usbmon text line: missing address word"))?;
     let addr_parts: Vec<&str> = addr_token.split(':').collect();
     if addr_parts.len() != 4 {
-        return Err(anyhow!("Invalid address format: {}", addr_token));
+        return Err(anyhow!("invalid address format: {}", addr_token));
     }
 
     let transfer_token = addr_parts[0];
     if transfer_token.len() != 2 {
         return Err(anyhow!(
-            "Invalid transfer/address token: {}",
+            "invalid transfer/address token: {}",
             transfer_token
         ));
     }
@@ -271,7 +271,7 @@ pub fn parse_usbmon_text_line(line: &str) -> Result<UsbPacket> {
     let direction_char = token_chars.next().unwrap(); // i=IN, o=OUT
     if !matches!(direction_char, 'i' | 'o') {
         return Err(anyhow!(
-            "Invalid direction in address token: {}",
+            "invalid direction in address token: {}",
             transfer_token
         ));
     }
@@ -279,19 +279,19 @@ pub fn parse_usbmon_text_line(line: &str) -> Result<UsbPacket> {
 
     let bus_id: u8 = addr_parts[1]
         .parse()
-        .map_err(|_| anyhow!("Invalid bus ID: {}", addr_parts[1]))?;
+        .map_err(|_| anyhow!("invalid bus ID: {}", addr_parts[1]))?;
     let device_id: u8 = addr_parts[2]
         .parse()
-        .map_err(|_| anyhow!("Invalid device ID: {}", addr_parts[2]))?;
+        .map_err(|_| anyhow!("invalid device ID: {}", addr_parts[2]))?;
     let endpoint: u8 = addr_parts[3]
         .parse()
-        .map_err(|_| anyhow!("Invalid endpoint: {}", addr_parts[3]))?;
+        .map_err(|_| anyhow!("invalid endpoint: {}", addr_parts[3]))?;
 
     // Word 5: either a captured control setup packet (`s` followed by 5 hex
     // words) or a `STATUS[:INTERVAL[:START_FRAME[:ERROR_COUNT]]]` word.
     let status_token = tokens
         .next()
-        .ok_or_else(|| anyhow!("Invalid usbmon text line format: missing status/setup word"))?;
+        .ok_or_else(|| anyhow!("invalid usbmon text line: missing status/setup word"))?;
     let is_setup = status_token == "s";
 
     // `status`/`setup_packet` are cfg(test)-only fields (see `UsbPacket`
@@ -314,41 +314,59 @@ pub fn parse_usbmon_text_line(line: &str) -> Result<UsbPacket> {
         let status_field = status_token.split(':').next().unwrap_or(status_token);
         let status: i32 = status_field
             .parse()
-            .map_err(|_| anyhow!("Invalid status: {}", status_token))?;
+            .map_err(|_| anyhow!("invalid status: {}", status_token))?;
         (status, None)
     };
 
-    // Word 6 (isochronous transfers only, when word 5 wasn't a setup):
-    // descriptor count followed by up to 5 `status:offset:length` words.
-    if transfer_type == 'Z' && !is_setup {
+    // Word 6 (isochronous transfers only, when word 5 wasn't a setup and the
+    // event is not an `E`, which prints only its status set -- see
+    // mon_text_read_u, drivers/usb/mon/mon_text.c v7.0 lines 455-459): the
+    // URB's *full* descriptor count, then up to 5 `status:offset:length`
+    // words. For a callback those printed lengths are actual lengths while
+    // the length word further on is the whole buffer ("ISO 'C' is sparse",
+    // lines 245-247), so the printed sample scaled by the full count is the
+    // best available estimate of the bytes moved: measured at 0.9999x and
+    // 1.011x of the exact binary total on two cameras (2026-09-01 spike),
+    // and exact whenever every descriptor printed (five or fewer packets).
+    let mut iso_estimate: Option<u32> = None;
+    if transfer_type == 'Z' && !is_setup && urb_type != UrbType::Error {
         let ndesc_token = tokens
             .next()
-            .ok_or_else(|| anyhow!("Missing isochronous descriptor count"))?;
-        let ndesc: usize = ndesc_token
+            .ok_or_else(|| anyhow!("missing isochronous descriptor count"))?;
+        let ndesc: u32 = ndesc_token
             .parse()
-            .map_err(|_| anyhow!("Invalid isochronous descriptor count: {}", ndesc_token))?;
+            .map_err(|_| anyhow!("invalid isochronous descriptor count: {}", ndesc_token))?;
+        let mut printed_lengths: Vec<u32> = Vec::with_capacity(5);
         for _ in 0..ndesc.min(5) {
             match tokens.peek() {
                 Some(word) if word.contains(':') => {
+                    let length_field = word.rsplit(':').next().unwrap_or("");
+                    let length: u32 = length_field
+                        .parse()
+                        .map_err(|_| anyhow!("invalid isochronous descriptor: {}", word))?;
+                    printed_lengths.push(length);
                     tokens.next();
                 }
                 _ => break,
             }
         }
+        if urb_type == UrbType::Callback && !printed_lengths.is_empty() {
+            let printed_count = printed_lengths.len() as f64;
+            let sum: u64 = printed_lengths.iter().map(|&l| u64::from(l)).sum();
+            iso_estimate = Some((sum as f64 * f64::from(ndesc) / printed_count).round() as u32);
+        }
     }
 
-    // Word 7: data length. `E` events may omit it entirely.
-    let data_length: u32 = match tokens.next() {
+    // Word 7: data length. `E` events may omit it entirely. An isochronous
+    // callback's estimate (above) replaces the buffer-size word.
+    let length_word: u32 = match tokens.next() {
         Some(word) => word
             .parse()
-            .map_err(|_| anyhow!("Invalid data length: {}", word))?,
+            .map_err(|_| anyhow!("invalid data length: {}", word))?,
         None if urb_type == UrbType::Error => 0,
-        None => {
-            return Err(anyhow!(
-                "Invalid usbmon text line format: missing data length"
-            ))
-        }
+        None => return Err(anyhow!("invalid usbmon text line: missing data length")),
     };
+    let data_length = iso_estimate.unwrap_or(length_word);
 
     // Word 8: data tag (`=` for captured data, `<`/`>` for none) plus data
     // words. cfg(test)-only field (see `UsbPacket` docs).
@@ -384,8 +402,8 @@ fn next_hex_u8<'a>(
 ) -> Result<u8> {
     let word = tokens
         .next()
-        .ok_or_else(|| anyhow!("Truncated control setup packet: missing {}", field))?;
-    u8::from_str_radix(word, 16).map_err(|_| anyhow!("Invalid setup packet {}: {}", field, word))
+        .ok_or_else(|| anyhow!("truncated control setup packet: missing {}", field))?;
+    u8::from_str_radix(word, 16).map_err(|_| anyhow!("invalid setup packet {}: {}", field, word))
 }
 
 /// Pulls the next token from `tokens` and parses it as a 4-hex-digit word,
@@ -396,8 +414,8 @@ fn next_hex_u16<'a>(
 ) -> Result<u16> {
     let word = tokens
         .next()
-        .ok_or_else(|| anyhow!("Truncated control setup packet: missing {}", field))?;
-    u16::from_str_radix(word, 16).map_err(|_| anyhow!("Invalid setup packet {}: {}", field, word))
+        .ok_or_else(|| anyhow!("truncated control setup packet: missing {}", field))?;
+    u16::from_str_radix(word, 16).map_err(|_| anyhow!("invalid setup packet {}: {}", field, word))
 }
 
 fn parse_hex_data(hex_parts: &[&str]) -> Result<Vec<u8>> {
@@ -441,7 +459,7 @@ mod tests {
     fn test_parse_usbmon_text_line_rejects_short_address_type() {
         let line = "ffff88007c861a00 2389264913 S B:1:001:0 -115 31 = 55534243";
         let err = parse_usbmon_text_line(line).unwrap_err();
-        assert!(err.to_string().contains("Invalid transfer/address token"));
+        assert!(err.to_string().contains("invalid transfer/address token"));
     }
 
     #[test]
@@ -500,7 +518,62 @@ mod tests {
         let p = parse_usbmon_text_line(line).unwrap();
         assert_eq!(p.urb_type, UrbType::Callback);
         assert_eq!(p.status, 0);
-        assert_eq!(p.data_length, 12288);
+        assert_eq!(p.data_length, 6144); // 3 printed of 3: exact
+    }
+
+    /// Real lines from the 2026-09-01 spike captures (asus internal UVC
+    /// webcam, MJPEG; mainrag Chicony webcam, YUYV on a 3x1020 endpoint).
+    /// The kernel prints the first 5 of a URB's descriptors with their
+    /// *actual* lengths plus the full descriptor count, while the length
+    /// word is the whole buffer (mon_text.c v7.0 lines 245-247). The
+    /// estimate is the printed sum scaled by count / printed.
+    #[test]
+    fn iso_callback_length_is_the_printed_descriptors_scaled_by_the_full_count() {
+        // Idle URB: 32 packets, each printed one a 12-byte UVC header.
+        // 60 * 32 / 5 = 384, not the 73,728-byte buffer.
+        let idle = "ffff8b93d7026800 2391376079 C Zi:3:002:1 0:1:23720:0 32 0:0:12 0:2304:12 0:4608:12 0:6912:12 0:9216:12 73728 <";
+        assert_eq!(parse_usbmon_text_line(idle).unwrap().data_length, 384);
+
+        // Partial fill: 956+284+1932+684+660 = 4516; 4516 * 32 / 5 = 28902.4.
+        let partial = "ffff8b94d1a62c00 2391380055 C Zi:3:002:1 0:1:23752:0 32 0:0:956 0:2304:284 0:4608:1932 0:6912:684 0:9216:660 73728 <";
+        assert_eq!(parse_usbmon_text_line(partial).unwrap().data_length, 28902);
+
+        // Every packet full: 5 * 3060 * 32 / 5 = 97920 == the buffer size.
+        let full = "ffff89c8fe10e800 2366937589 C Zi:1:004:1 0:1:16:0 32 0:0:3060 0:3060:3060 0:6120:3060 0:9180:3060 0:12240:3060 97920 <";
+        assert_eq!(parse_usbmon_text_line(full).unwrap().data_length, 97920);
+    }
+
+    /// With five or fewer packets every descriptor prints, so the estimate
+    /// is exact: 3 x 2048 moved, not the 12288-byte buffer.
+    #[test]
+    fn iso_callback_with_all_descriptors_printed_is_exact() {
+        let line = "ffff88005bd8b100 2189040992 C Zo:1:005:2 0:1:1810:0 3 0:0:2048 0:2048:2048 0:4096:2048 12288 >";
+        assert_eq!(parse_usbmon_text_line(line).unwrap().data_length, 6144);
+    }
+
+    /// A descriptor count with no descriptor words (the synthetic seed
+    /// fixtures do this) keeps the length word, exactly as before.
+    #[test]
+    fn iso_callback_without_descriptor_words_keeps_the_length_word() {
+        let line = "ffff0000cccc0001 200 C Zi:2:004:1 0:1:6672:0 32 27000 <";
+        assert_eq!(parse_usbmon_text_line(line).unwrap().data_length, 27000);
+    }
+
+    /// Submissions carry *requested* lengths in their descriptors and are
+    /// never counted; their length word stays untouched.
+    #[test]
+    fn iso_submission_length_is_not_estimated() {
+        let line = "ffff88005bd8b100 2189039971 S Zo:1:005:2 -115:1:1810 3 -18:0:2048 -18:2048:2048 -18:4096:2048 12288 >";
+        assert_eq!(parse_usbmon_text_line(line).unwrap().data_length, 12288);
+    }
+
+    /// `E` events print only a status word (mon_text.c v7.0 lines 455-459):
+    /// no descriptor count, no descriptors, and here no length either.
+    #[test]
+    fn iso_error_event_has_no_descriptors() {
+        let p = parse_usbmon_text_line("ffff88006fff3800 2453805583 E Zi:1:004:1 -2").unwrap();
+        assert_eq!(p.urb_type, UrbType::Error);
+        assert_eq!(p.data_length, 0);
     }
 
     #[test]

@@ -289,6 +289,62 @@ fn every_stage_dir_is_a_wellformed_bundle() {
     check_corpus_strict(&fixtures_root()).unwrap();
 }
 
+/// `binary_kernel_dropped` is optional documentation of a bundle's own
+/// completeness; when a bundle declares it, it must be a non-negative
+/// integer. Read through `toml::Value` so the key stays out of `Meta`
+/// (which nothing else would read; see the plan's ruling).
+#[test]
+fn declared_binary_kernel_drops_are_non_negative_integers() {
+    for bundle in discover_bundles() {
+        let text = std::fs::read_to_string(bundle.dir.join("meta.toml")).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        if let Some(v) = value.get("binary_kernel_dropped") {
+            let n = v.as_integer().unwrap_or_else(|| {
+                panic!(
+                    "{}: binary_kernel_dropped is not an integer",
+                    bundle.dir.display()
+                )
+            });
+            assert!(n >= 0, "{}: negative drop count {n}", bundle.dir.display());
+        }
+    }
+}
+
+/// Every mainrag ground-truth iso bundle (see its `[generator]` note) is a
+/// corpus accuracy anchor: captured with the enlarged ring, its binary
+/// golden matched a concurrent eBPF capture and the v4l2 frame bytes. Each
+/// one must keep declaring zero kernel drops.
+#[test]
+fn the_ground_truth_bundle_declares_zero_binary_drops() {
+    let bundles: Vec<_> = discover_bundles()
+        .into_iter()
+        .filter(|b| {
+            b.dir.ends_with("stage2")
+                && b.dir
+                    .parent()
+                    .and_then(|host| host.file_name())
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("mainrag-"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !bundles.is_empty(),
+        "the mainrag ground-truth bundle is committed"
+    );
+    for bundle in bundles {
+        let text = std::fs::read_to_string(bundle.dir.join("meta.toml")).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(
+            value
+                .get("binary_kernel_dropped")
+                .and_then(toml::Value::as_integer),
+            Some(0),
+            "{}",
+            bundle.dir.display()
+        );
+    }
+}
+
 /// Bless helper: regenerate every *seed's* `trace.bin` and both goldens by
 /// replay, so committed goldens equal harness output by construction. Only
 /// touches bundles whose host directory (the bundle dir's parent) is named
@@ -308,16 +364,41 @@ fn bless_seed_goldens() {
         // (Re)write trace.bin from the bundle's text trace so binary and text
         // describe the same traffic. Seeds only: real captures already have both.
         write_seed_binary_from_text(&bundle.dir);
-        for source in sources_of(&bundle) {
-            let report = replay_fixture(&bundle.dir, source).unwrap();
-            std::fs::write(
-                bundle.dir.join(source.golden_filename()),
-                report_to_golden_json(&report).unwrap(),
-            )
-            .unwrap();
-        }
-        eprintln!("blessed {}", bundle.dir.display());
+        bless_bundle_goldens(&bundle);
     }
+}
+
+/// Bless helper for one named *real* bundle after an intentional pipeline
+/// change (a parser fix that alters what a committed trace replays to).
+/// Regenerates only the goldens -- never a trace -- of the bundle named by
+/// `USBTOP_NG_BLESS_BUNDLE=<host-dir>/<stage-dir>`, relative to
+/// `tests/fixtures/hosts`. Not run in CI:
+///   USBTOP_NG_BLESS_BUNDLE=asus-2026-08-31/stage2 cargo test bless_named_bundle -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bless_named_bundle() {
+    let name = std::env::var("USBTOP_NG_BLESS_BUNDLE")
+        .expect("set USBTOP_NG_BLESS_BUNDLE=<host-dir>/<stage-dir>");
+    let bundle = discover_bundles()
+        .into_iter()
+        .find(|b| b.dir.ends_with(&name))
+        .unwrap_or_else(|| panic!("no bundle named {name} under {}", fixtures_root().display()));
+    bless_bundle_goldens(&bundle);
+}
+
+/// Regenerates a bundle's goldens by replay -- never its trace. Shared by
+/// `bless_seed_goldens` (after it rewrites the seed's `trace.bin`) and
+/// `bless_named_bundle`.
+fn bless_bundle_goldens(bundle: &Bundle) {
+    for source in sources_of(bundle) {
+        let report = replay_fixture(&bundle.dir, source).unwrap();
+        std::fs::write(
+            bundle.dir.join(source.golden_filename()),
+            report_to_golden_json(&report).unwrap(),
+        )
+        .unwrap();
+    }
+    eprintln!("blessed {}", bundle.dir.display());
 }
 
 /// A bundle counts as a seed only when its host directory (`dir`'s parent)

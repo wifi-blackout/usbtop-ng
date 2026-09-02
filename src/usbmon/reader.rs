@@ -75,10 +75,10 @@ impl UsbmonReader {
             ));
         }
 
-        debug!("Starting packet capture from {}", self.path.display());
+        debug!("starting packet capture from {}", self.path.display());
 
         let file = open_nonblocking(&self.path)
-            .map_err(|e| anyhow!("Failed to open {}: {}", self.path.display(), e))?;
+            .map_err(|e| anyhow!("could not open {}: {}", self.path.display(), e))?;
         let mut reader = BufReader::new(file);
         // Held across iterations on purpose: a `WouldBlock` can land mid-line,
         // and `read_line` appends, so the partial line must survive the retry.
@@ -105,12 +105,12 @@ impl UsbmonReader {
                     Ok(packet) => {
                         line.clear();
                         if let Err(e) = callback(packet) {
-                            debug!("Packet callback error: {}", e);
+                            debug!("packet callback error: {}", e);
                             break;
                         }
                     }
                     Err(e) => {
-                        debug!("Failed to parse text line '{}': {}", line.trim(), e);
+                        debug!("could not parse text line '{}': {}", line.trim(), e);
                         line.clear();
                         continue;
                     }
@@ -125,7 +125,7 @@ impl UsbmonReader {
                     continue;
                 }
                 Err(e) => {
-                    error!("Failed to read line from {}: {}", self.path.display(), e);
+                    error!("could not read line from {}: {}", self.path.display(), e);
                     break;
                 }
             }

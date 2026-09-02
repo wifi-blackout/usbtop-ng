@@ -1,0 +1,17 @@
+board = "MG-VCP17A-3080"
+soc = ""
+arch = "x86_64"
+kernel = "7.0.0-30-generic"
+os = "Linux Mint 22.3"
+usbtop_ng_version = "1.5.0"
+stage_id = 2
+captured_unix = 1788355030
+binary_kernel_dropped = 0
+controllers = ["0000:06:00.3", "0000:06:00.4"]
+speed_classes = ["10000", "12", "480", "5000"]
+transfer_types = ["control", "interrupt", "iso"]
+sources = ["binary", "text"]
+
+[generator]
+kind = "uvc-ground-truth"
+note = "v4l2-ctl -d /dev/video0 --set-fmt-video=width=640,height=480,pixelformat=YUYV --set-parm=30 --stream-mmap --stream-count=100 --stream-to=frames.yuv from the Chicony webcam (04f2:b71a, bus 1 ep1 iso, alt setting 3x1020; about 23 fps in daylight, 10 fps in room light (v4l2-ctl requests 30)) inside the window: exactly 100 x 614,400 = 61,440,000 frame bytes. Concurrent captures of the same window: mmap ring 61,854,792 bytes, eBPF 61,854,792 bytes, this bundle's binary golden 61,854,792 bytes, text golden (sampled-descriptor estimate) 61,805,051 bytes. mmap, eBPF, and the capturer agree to the byte and sit 0.68% above the frame bytes, which is one 12-byte UVC payload header per data-carrying packet (1,085 URBs of 32 packets). This is the corpus's accuracy anchor and must keep declaring binary_kernel_dropped = 0."

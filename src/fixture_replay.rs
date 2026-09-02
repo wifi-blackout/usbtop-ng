@@ -8,6 +8,7 @@ use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -194,10 +195,14 @@ pub fn replay_fixture(bundle_dir: &Path, source: FixtureSource) -> anyhow::Resul
     let shutdown = AtomicBool::new(false);
     match source {
         FixtureSource::Binary => {
-            BinaryReader::with_path(0, trace, false).read_packets(&shutdown, |packet| {
-                manager.apply_packet(&packet);
-                Ok(())
-            })?;
+            BinaryReader::with_path(0, trace, false).read_packets(
+                &shutdown,
+                &AtomicU64::new(0),
+                |packet| {
+                    manager.apply_packet(&packet);
+                    Ok(())
+                },
+            )?;
         }
         FixtureSource::Text => {
             UsbmonReader::with_path(0, trace, false).read_packets(&shutdown, |packet| {

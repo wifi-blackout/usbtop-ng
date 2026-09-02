@@ -5,7 +5,8 @@ kernel = "6.18.39+rpt-rpi-v8"
 os = "Debian GNU/Linux 13 (trixie)"
 usbtop_ng_version = "1.5.0"
 stage_id = 2
-captured_unix = 1788181478
+captured_unix = 1788355064
+binary_kernel_dropped = 0
 controllers = ["0000:01:00.0"]
 speed_classes = ["1.5", "480", "5000"]
 transfer_types = ["bulk", "control"]
@@ -13,4 +14,4 @@ sources = ["binary", "text"]
 
 [generator]
 kind = "bulk-dd"
-note = "raw read of the RTL9210 UAS NVMe (dd if=/dev/sda of=/dev/null bs=4M iflag=direct) spanning the whole window; ~49 MB/s observed through the VL805, bulk IN on the two UAS data endpoints"
+note = "raw read of the RTL9210 UAS NVMe (dd if=/dev/sda of=/dev/null bs=4M iflag=direct count=250) through the VL805, bulk IN on the two UAS data endpoints: 1,048,576,000 bytes at 364 MB/s inside the window. The binary golden holds 1,048,812,928 bulk-IN bytes (dd's payload plus UAS command traffic); the text golden holds 460,543,344, 44% of it. Recaptured 2026-09-02 with the enlarged kernel ring (binary_kernel_dropped above). The text side is expected to be short on a bulk stream: the debugfs text queue is a few dozen events deep and has no drop counter, so the text golden pins the pipeline, not the traffic."

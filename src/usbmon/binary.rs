@@ -2,10 +2,13 @@ use anyhow::{anyhow, Result};
 use log::{debug, error};
 use std::fs::File;
 use std::io::{ErrorKind, Read};
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 use super::parser::{TransferType, UrbType, UsbPacket};
+use super::ring;
 use super::{open_nonblocking, POLL_INTERVAL};
 
 /// Bytes of the `usbmon_packet` header that a plain `read(2)` on the binary
@@ -75,24 +78,51 @@ impl BinaryReader {
     /// events, mid-header, and mid-drain — so a caller can stop the loop within
     /// [`POLL_INTERVAL`] and join the thread.
     ///
+    /// The kernel ring is enlarged before the first read (see
+    /// [`ring::request_ring_ladder`]): the ring is the same per-open buffer
+    /// whether it is drained by `read(2)` or by mmap, and on its ~300 KiB
+    /// default five isochronous callbacks fill it. `MON_IOCG_STATS` is read at
+    /// most once per [`POLL_INTERVAL`] and once more at exit, and each
+    /// read-and-clear `dropped` count is summed into `kernel_dropped` via
+    /// [`ring::add_kernel_drops`], exactly as the mmap reader does. On a
+    /// regular file (fixtures) both ioctls answer `ENOTTY` and are ignored.
+    ///
     /// Events of unknown type are skipped (their payload is still drained). A
     /// callback `Err` stops the loop early and still returns `Ok(())`.
-    pub fn read_packets<F>(&self, shutdown: &AtomicBool, mut callback: F) -> Result<()>
+    pub fn read_packets<F>(
+        &self,
+        shutdown: &AtomicBool,
+        kernel_dropped: &AtomicU64,
+        mut callback: F,
+    ) -> Result<()>
     where
         F: FnMut(UsbPacket) -> Result<()>,
     {
         debug!(
-            "Starting binary packet capture from {}",
+            "starting binary packet capture from {}",
             self.path.display()
         );
 
         let mut file = open_nonblocking(&self.path)
-            .map_err(|e| anyhow!("Failed to open {}: {}", self.path.display(), e))?;
+            .map_err(|e| anyhow!("could not open {}: {}", self.path.display(), e))?;
+        let fd = file.as_raw_fd();
+        ring::request_ring_ladder(fd, &self.path);
         let mut header = [0u8; HEADER_LEN];
+        let mut last_stats_at = Instant::now();
 
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 break;
+            }
+
+            // Bounded to at most once per `POLL_INTERVAL` regardless of event
+            // rate, matching the mmap reader.
+            if last_stats_at.elapsed() >= POLL_INTERVAL {
+                last_stats_at = Instant::now();
+                match ring::stats(fd) {
+                    Ok(s) => ring::add_kernel_drops(kernel_dropped, s.dropped),
+                    Err(e) => debug!("MON_IOCG_STATS on {}: {}", self.path.display(), e),
+                }
             }
 
             // A partial header followed by a clean EOF (the tail of a truncated
@@ -110,10 +140,17 @@ impl BinaryReader {
 
             if let Some((packet, _)) = parsed {
                 if let Err(e) = callback(packet) {
-                    debug!("Packet callback error: {}", e);
+                    debug!("packet callback error: {}", e);
                     break;
                 }
             }
+        }
+
+        // One more read-and-clear at exit, so whatever the kernel lost since
+        // the last periodic read is not lost from `kernel_dropped` too.
+        match ring::stats(fd) {
+            Ok(s) => ring::add_kernel_drops(kernel_dropped, s.dropped),
+            Err(e) => debug!("MON_IOCG_STATS on {}: {}", self.path.display(), e),
         }
 
         Ok(())
@@ -142,7 +179,7 @@ impl BinaryReader {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to read from {}: {}", self.path.display(), e);
+                    error!("could not read {}: {}", self.path.display(), e);
                     return Fill::Stopped;
                 }
             }
@@ -296,7 +333,7 @@ mod tests {
         let shutdown = std::sync::atomic::AtomicBool::new(false);
         let mut got = Vec::new();
         reader
-            .read_packets(&shutdown, |p| {
+            .read_packets(&shutdown, &AtomicU64::new(0), |p| {
                 got.push(p);
                 Ok(())
             })
@@ -335,7 +372,7 @@ mod tests {
         let shutdown = std::sync::atomic::AtomicBool::new(false);
         let mut n = 0;
         reader
-            .read_packets(&shutdown, |_| {
+            .read_packets(&shutdown, &AtomicU64::new(0), |_| {
                 n += 1;
                 Ok(())
             })
@@ -408,7 +445,7 @@ mod tests {
         let reader = BinaryReader::with_path(4, path, true);
         let started = std::time::Instant::now();
         reader
-            .read_packets(&AtomicBool::new(true), |_| Ok(()))
+            .read_packets(&AtomicBool::new(true), &AtomicU64::new(0), |_| Ok(()))
             .unwrap();
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),
@@ -427,7 +464,7 @@ mod tests {
         let reader = BinaryReader::with_path(1, path, false);
         let mut count = 0;
         reader
-            .read_packets(&AtomicBool::new(false), |_| {
+            .read_packets(&AtomicBool::new(false), &AtomicU64::new(0), |_| {
                 count += 1;
                 Err(anyhow!("stop"))
             })
@@ -458,7 +495,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             reader
-                .read_packets(&flag, |p| {
+                .read_packets(&flag, &AtomicU64::new(0), |p| {
                     tx.send(p).unwrap();
                     Ok(())
                 })
@@ -491,5 +528,30 @@ mod tests {
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
+    }
+
+    /// A regular file has no usbmon ring: the ladder and stats ioctls fail
+    /// with ENOTTY and are ignored, so a fixture-driven read still delivers
+    /// every event and reports zero kernel drops through the counter.
+    #[test]
+    fn fixture_reads_report_zero_kernel_drops() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("usbmon1");
+        let mut stream = Vec::new();
+        stream.extend(event(b'C', 0x81, 3, 1, 0, 512, &[]));
+        stream.extend(event(b'C', 0x81, 3, 1, 0, 256, &[]));
+        std::fs::write(&path, &stream).unwrap();
+
+        let reader = BinaryReader::with_path(1, path, false);
+        let kernel_dropped = AtomicU64::new(0);
+        let mut delivered = 0;
+        reader
+            .read_packets(&AtomicBool::new(false), &kernel_dropped, |_| {
+                delivered += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(delivered, 2);
+        assert_eq!(kernel_dropped.load(Ordering::Relaxed), 0);
     }
 }

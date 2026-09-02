@@ -189,8 +189,11 @@ With the fixed capturer:
 Pointer for wave 3 (one row per physical connector), not in scope here:
 `asus` exposes the sysfs port `peer` links this design needs.
 `/sys/bus/usb/devices/3-1/3-1:1.0/3-1-port1/peer` resolves to
-`usb4/4-1/4-1:1.0/4-1-port1`, pairing the RTS5411's USB2 and USB3 sides;
-the stage3 bundle captures that topology for the design investigation.
+`usb4/4-1/4-1:1.0/4-1-port1`, pairing the RTS5411's USB2 and USB3 sides.
+The stage3 bundle captures the device topology only: the capturer's sysfs
+allowlist copies device attributes, not hub port directories or their
+`peer` symlinks, so the links are read live on `asus` and a bundle that
+carries them needs a capturer extension in that wave.
 
 ### R5. Documentation
 
