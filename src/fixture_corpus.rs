@@ -310,6 +310,35 @@ fn declared_binary_kernel_drops_are_non_negative_integers() {
     }
 }
 
+/// The mainrag ground-truth iso bundle (see its `[generator]` note) is the
+/// corpus's accuracy anchor: captured with the enlarged ring, its binary
+/// golden matched a concurrent eBPF capture and the v4l2 frame bytes. It
+/// must keep declaring zero kernel drops.
+#[test]
+fn the_ground_truth_bundle_declares_zero_binary_drops() {
+    let bundle = discover_bundles()
+        .into_iter()
+        .find(|b| {
+            b.dir.ends_with("stage2")
+                && b.dir
+                    .parent()
+                    .and_then(|host| host.file_name())
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("mainrag-"))
+        })
+        .expect("the mainrag ground-truth bundle is committed");
+    let text = std::fs::read_to_string(bundle.dir.join("meta.toml")).unwrap();
+    let value: toml::Value = toml::from_str(&text).unwrap();
+    assert_eq!(
+        value
+            .get("binary_kernel_dropped")
+            .and_then(toml::Value::as_integer),
+        Some(0),
+        "{}",
+        bundle.dir.display()
+    );
+}
+
 /// Bless helper: regenerate every *seed's* `trace.bin` and both goldens by
 /// replay, so committed goldens equal harness output by construction. Only
 /// touches bundles whose host directory (the bundle dir's parent) is named
