@@ -308,15 +308,7 @@ fn bless_seed_goldens() {
         // (Re)write trace.bin from the bundle's text trace so binary and text
         // describe the same traffic. Seeds only: real captures already have both.
         write_seed_binary_from_text(&bundle.dir);
-        for source in sources_of(&bundle) {
-            let report = replay_fixture(&bundle.dir, source).unwrap();
-            std::fs::write(
-                bundle.dir.join(source.golden_filename()),
-                report_to_golden_json(&report).unwrap(),
-            )
-            .unwrap();
-        }
-        eprintln!("blessed {}", bundle.dir.display());
+        bless_bundle_goldens(&bundle);
     }
 }
 
@@ -335,7 +327,14 @@ fn bless_named_bundle() {
         .into_iter()
         .find(|b| b.dir.ends_with(&name))
         .unwrap_or_else(|| panic!("no bundle named {name} under {}", fixtures_root().display()));
-    for source in sources_of(&bundle) {
+    bless_bundle_goldens(&bundle);
+}
+
+/// Regenerates a bundle's goldens by replay -- never its trace. Shared by
+/// `bless_seed_goldens` (after it rewrites the seed's `trace.bin`) and
+/// `bless_named_bundle`.
+fn bless_bundle_goldens(bundle: &Bundle) {
+    for source in sources_of(bundle) {
         let report = replay_fixture(&bundle.dir, source).unwrap();
         std::fs::write(
             bundle.dir.join(source.golden_filename()),

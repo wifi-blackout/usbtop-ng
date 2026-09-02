@@ -351,9 +351,9 @@ pub fn parse_usbmon_text_line(line: &str) -> Result<UsbPacket> {
             }
         }
         if urb_type == UrbType::Callback && !printed_lengths.is_empty() {
-            let printed = printed_lengths.len() as f64;
+            let printed_count = printed_lengths.len() as f64;
             let sum: u64 = printed_lengths.iter().map(|&l| u64::from(l)).sum();
-            iso_estimate = Some((sum as f64 * f64::from(ndesc) / printed).round() as u32);
+            iso_estimate = Some((sum as f64 * f64::from(ndesc) / printed_count).round() as u32);
         }
     }
 
