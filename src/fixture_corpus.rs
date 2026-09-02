@@ -320,6 +320,32 @@ fn bless_seed_goldens() {
     }
 }
 
+/// Bless helper for one named *real* bundle after an intentional pipeline
+/// change (a parser fix that alters what a committed trace replays to).
+/// Regenerates only the goldens -- never a trace -- of the bundle named by
+/// `USBTOP_NG_BLESS_BUNDLE=<host-dir>/<stage-dir>`, relative to
+/// `tests/fixtures/hosts`. Not run in CI:
+///   USBTOP_NG_BLESS_BUNDLE=asus-2026-08-31/stage2 cargo test bless_named_bundle -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bless_named_bundle() {
+    let name = std::env::var("USBTOP_NG_BLESS_BUNDLE")
+        .expect("set USBTOP_NG_BLESS_BUNDLE=<host-dir>/<stage-dir>");
+    let bundle = discover_bundles()
+        .into_iter()
+        .find(|b| b.dir.ends_with(&name))
+        .unwrap_or_else(|| panic!("no bundle named {name} under {}", fixtures_root().display()));
+    for source in sources_of(&bundle) {
+        let report = replay_fixture(&bundle.dir, source).unwrap();
+        std::fs::write(
+            bundle.dir.join(source.golden_filename()),
+            report_to_golden_json(&report).unwrap(),
+        )
+        .unwrap();
+    }
+    eprintln!("blessed {}", bundle.dir.display());
+}
+
 /// A bundle counts as a seed only when its host directory (`dir`'s parent)
 /// exists and its name starts with `seed-`.
 fn is_seed_bundle(bundle: &Bundle) -> bool {

@@ -112,10 +112,10 @@
           "bus": 3,
           "endpoints": [
             {
-              "bps": 368418816.0,
+              "bps": 116450304.0,
               "direction": "in",
               "endpoint": 1,
-              "total_bytes": 368418816,
+              "total_bytes": 116450304,
               "transfer_type": "iso"
             }
           ],
@@ -124,9 +124,9 @@
           "port": "5",
           "product": "USB2.0 HD UVC WebCam",
           "product_id": "56eb",
-          "rx_bps": 368418816.0,
+          "rx_bps": 116450304.0,
           "speed_mbps": 480.0,
-          "total_rx_bytes": 368418816,
+          "total_rx_bytes": 116450304,
           "total_tx_bytes": 0,
           "tx_bps": 0.0,
           "vendor": "Azurewave",
@@ -150,7 +150,7 @@
           "vendor_id": "8087"
         }
       ],
-      "rx_bps": 368418816.0,
+      "rx_bps": 116450304.0,
       "speed_mbps": 480.0,
       "tx_bps": 0.0
     },
@@ -251,7 +251,7 @@
   "dropped_packets": 0,
   "kernel_dropped_packets": 0,
   "source": "text",
-  "total_rx_bps": 368420256.0,
+  "total_rx_bps": 116451744.0,
   "total_tx_bps": 0.0,
   "version": 1,
   "window_seconds": 1.0
