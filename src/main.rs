@@ -335,11 +335,11 @@ fn main() -> Result<()> {
     if filter.uses_internal() && internal_snapshot.is_none() {
         match &snapshot_path_result {
             Ok(path) => eprintln!(
-                "error: an internal= filter needs a snapshot and none was found at {}. Run usbtop-ng --snapshot-internal first, with external devices unplugged.",
+                "error: an internal= filter needs a snapshot and none was found at {}. Run usbtop-ng --snapshot-internal first, with external devices unplugged",
                 path.display()
             ),
             Err(_) => eprintln!(
-                "error: an internal= filter needs a snapshot. Run usbtop-ng --snapshot-internal first, with external devices unplugged."
+                "error: an internal= filter needs a snapshot. Run usbtop-ng --snapshot-internal first, with external devices unplugged"
             ),
         }
         process::exit(2);
@@ -388,7 +388,7 @@ fn main() -> Result<()> {
                 }
                 true
             } else if headless {
-                eprintln!("error: usbmon is not available and this mode never prompts.");
+                eprintln!("error: usbmon is not available and this mode never prompts");
                 eprintln!("Set auto_load_usbmon = true in the preferences file, run 'sudo modprobe usbmon' first, or run 'usbtop-ng --setup' for the manual steps.");
                 process::exit(1);
             } else {
