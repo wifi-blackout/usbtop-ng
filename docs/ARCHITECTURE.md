@@ -159,7 +159,8 @@ See [TUI chassis](#tui-chassis) for how these fit together.
 - `diag/redact.rs`: the privacy rules as pure functions. Home paths become
   `~`, the login name becomes `<user>` wherever it is a whole path component
   (a removable-media mount, say), stand-alone MAC addresses in kernel log
-  lines and filesystem UUIDs in the kernel command line are masked, only
+  lines and filesystem UUIDs in the kernel command line are masked, and the
+  `user@host` build stamp in `/proc/version` becomes `<user>@<host>`, only
   five environment variables are ever recorded by value, and every
   substitution is counted for the manifest. Device identity (serial
   strings, descriptors, Thunderbolt `unique_id`) is deliberately not

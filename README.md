@@ -296,6 +296,8 @@ unchanged: it still resolves against `/root`.
   `sudo`, a short capture of the aggregate bus packaged as a replayable
   fixture. It writes `usbtop-ng-support-<UTC time>/` plus a `.tar.gz` beside
   it, prints a summary, and says how to file the issue.
+- Under `sudo`, a bundle written inside your home directory is handed back
+  to you; one written elsewhere (`/tmp`, say) stays root-owned.
 - Nothing that identifies the machine or its owner is collected: no
   hostname, machine-id, DMI serial, host MAC address, IP address, or user
   name. `tar tzf` lists every file; you decide what to attach.
@@ -444,20 +446,20 @@ unchanged: it still resolves against `/root`.
 
 ### Tests
 
-- `cargo test --all-targets` runs the hermetic unit suite (579 tests)
+- `cargo test --all-targets` runs the hermetic unit suite (576 tests)
   against fixture files, FIFOs, and temporary paths, needing no `/dev` and
-  no debugfs access, plus two committed harnesses in `tests/`: a pipe-based
-  regression guard for the terminal-restore bytes, and a PTY harness for
-  the wedged-terminal checks (quit, `SIGHUP`, a terminal that stops
-  reading). Both spawn the real binary; neither touches the real
-  `~/.usbtop-ng` or usbmon.
-- The `integration` cargo feature adds 4 tests that need real root, a real
+  no debugfs access, plus the two harnesses in `tests/` (3 and 2 tests): a
+  PTY harness for the wedged-terminal checks (quit, `SIGHUP`, a terminal
+  that stops reading), and a pipe-based regression guard for the
+  terminal-restore bytes. Both spawn the real binary; neither touches the
+  real `~/.usbtop-ng` or usbmon.
+- The `integration` cargo feature adds 5 tests that need real root, a real
   usbmon interface, or a real mmap-capable `/dev/usbmon0`, each skipping
   gracefully without one. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
 - The `ebpf` cargo feature adds tests covering the eBPF backend's pure
   delta math and transfer-type mapping, plus a live kprobe load/attach test
   gated on root and a BTF-enabled kernel that skips gracefully without
-  them; `cargo test --all-targets --features ebpf` reports 595 unit tests.
+  them; `cargo test --all-targets --features ebpf` reports 597 unit tests.
   See [docs/INSTALL.md](docs/INSTALL.md#building-the-ebpf-backend).
 
 ## Preferences file

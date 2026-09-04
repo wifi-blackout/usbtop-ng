@@ -65,7 +65,7 @@ pass, and how to send it.
    ```bash
    cargo test
    ```
-   The unit suite reports 574 passed; the `tests/` directory adds the
+   The unit suite reports 576 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 4. To run with debug output, use:
@@ -211,7 +211,7 @@ cargo test --all-targets
 ```
 
 `cargo test` and `cargo test --all-targets` run the same three suites, all
-hermetic. The unit suite reports 574 passed, working against
+hermetic. The unit suite reports 576 passed, working against
 fixture files, FIFOs, and `tempfile` paths, with no `/dev` and no debugfs
 access. The `tests/` directory adds two more: `restore_pipe.rs` (2 tests),
 proving the terminal-restore bytes reach a piped stdout while the process is
@@ -238,7 +238,7 @@ drops on an idle bus.
    ```bash
    cargo test --features integration
    ```
-   The unit suite reports 579 passed. Without usbmon, without root, or
+   The unit suite reports 581 passed. Without usbmon, without root, or
    without a mmap-capable `/dev/usbmon0`, each of the five extra tests
    prints its own skip message and passes.
 
@@ -256,7 +256,7 @@ needs clang (with the BPF target) and libbpf-dev.
    ```bash
    cargo test --all-targets --features ebpf
    ```
-   The unit suite reports 595 passed. One of those tests loads and attaches
+   The unit suite reports 597 passed. One of those tests loads and attaches
    the real kprobe, needing real root and a BTF-enabled kernel
    (`/sys/kernel/btf/vmlinux`); without either, it prints its own skip
    message and passes, the same contract the `integration` feature's live
@@ -284,7 +284,7 @@ Rust toolchain.
    cargo clippy --features capture-fixture --all-targets -- -D warnings
    cargo test --features capture-fixture
    ```
-   The unit suite reports 574 passed under the feature, the same as
+   The unit suite reports 576 passed under the feature, the same as
    without it: the capture core it exercises is already part of the
    default build, and the feature adds only the `--capture-fixture`
    subcommand, not tests.
@@ -356,7 +356,7 @@ Cover these areas first:
    ```bash
    cargo test --all-targets
    ```
-   The unit suite reports 574 passed; the `tests/` directory adds the
+   The unit suite reports 576 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 6. Update the documentation your change affects.
@@ -413,7 +413,9 @@ current directory (or in the `PATH` you pass), prints a summary, and lists
 every file it gathered. The summary's `bundle:` line names the archive
 relative to the current directory when it lives there, or with the home
 rewritten to `~` otherwise, so the pasted summary carries no home path.
-Paste the summary into the form and attach the archive. Without `sudo` the
+Paste the summary into the form and attach the archive. Under `sudo`, a
+bundle written inside your home directory is handed back to you; one
+written elsewhere (`/tmp`, say) stays root-owned. Without `sudo` the
 bundle still holds everything but the capture; `--no-capture` skips the
 capture on purpose, `--window SECONDS` sets its length (default 5,
 floor 0.1).
