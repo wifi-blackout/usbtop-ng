@@ -240,7 +240,7 @@ impl BundleWriter {
         let dirname = self
             .root
             .file_name()
-            .ok_or_else(|| note("archive", "bundle directory has no name"))?;
+            .ok_or_else(|| note("archive", "could not determine the bundle directory name"))?;
         let output = Command::new(program)
             .arg("-czf")
             .arg(archive)
@@ -253,7 +253,7 @@ impl BundleWriter {
             return Err(note(
                 "archive",
                 format!(
-                    "{program} exited with {}: {}",
+                    "could not run {program}: exited with {}: {}",
                     output.status,
                     String::from_utf8_lossy(&output.stderr).trim()
                 ),
@@ -500,7 +500,23 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.item, "archive");
         assert!(err.reason.contains("no-such-tar-program"), "{}", err.reason);
+        assert!(err.reason.starts_with("could not run "), "{}", err.reason);
         assert!(!temp.path().join("x.tar.gz").exists());
+    }
+
+    #[test]
+    fn archive_with_a_failing_program_is_a_note() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("usbtop-ng-support-x");
+        let w = BundleWriter::create(&root, Redactor::new(None)).unwrap();
+        let archive = temp.path().join("x.tar.gz");
+        let err = w.archive_with(&archive, "false").unwrap_err();
+        assert_eq!(err.item, "archive");
+        assert!(
+            err.reason.starts_with("could not run false: exited with "),
+            "{}",
+            err.reason
+        );
     }
 
     #[test]
