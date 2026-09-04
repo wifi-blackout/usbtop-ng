@@ -570,9 +570,15 @@ pub fn dump_attrs(root: &Path, max_depth: usize) -> (Vec<AttrDump>, Vec<Note>) {
         let entry = root.join(&name);
         // The entry itself is followed (canonicalized) so `strip_prefix`
         // works on the real tree below it.
-        let Ok(real) = std::fs::canonicalize(&entry) else {
-            notes.push(note(&entry.display().to_string(), "could not be resolved"));
-            continue;
+        let real = match std::fs::canonicalize(&entry) {
+            Ok(real) => real,
+            Err(e) => {
+                notes.push(note(
+                    &entry.display().to_string(),
+                    format!("could not resolve: {e}"),
+                ));
+                continue;
+            }
         };
         let mut attrs = BTreeMap::new();
         // Depth counts directories below the entry: the entry itself is 0,
@@ -675,6 +681,22 @@ mod tests {
         write(&leaf, "speed", "480\n");
         write(&leaf, "bMaxPower", "500mA\n");
         write(&leaf, "bNumInterfaces", " 2\n");
+        write(&leaf, "bDeviceClass", "ef\n");
+        write(&leaf, "bDeviceSubClass", "02\n");
+        write(&leaf, "bDeviceProtocol", "01\n");
+        write(&leaf, "bMaxPacketSize0", "64\n");
+        write(&leaf, "bNumConfigurations", "1\n");
+        write(&leaf, "bConfigurationValue", "1\n");
+        write(&leaf, "bmAttributes", "80\n");
+        write(&leaf, "quirks", "0x0\n");
+        write(&leaf, "avoid_reset_quirk", "0\n");
+        write(&leaf, "ltm_capable", "no\n");
+        write(&leaf, "rx_lanes", "1\n");
+        write(&leaf, "tx_lanes", "1\n");
+        write(&leaf, "urbnum", "11268\n");
+        write(&leaf, "authorized", "1\n");
+        write(&leaf, "removable", "fixed\n");
+        write(&leaf, "maxchild", "0\n");
         write_bytes(
             &leaf,
             "descriptors",
@@ -764,6 +786,10 @@ mod tests {
         assert_eq!(hub.ports[0].state.as_deref(), Some("configured"));
         assert_eq!(hub.ports[1].connect_type.as_deref(), Some("not used"));
         assert_eq!(hub.ports[1].peer, None);
+        assert_eq!(hub.maxchild.as_deref(), Some("4"));
+        assert_eq!(hub.device_class.as_deref(), Some("09"));
+        assert_eq!(hub.id_product.as_deref(), Some("0610"));
+        assert_eq!(hub.speed.as_deref(), Some("480"));
 
         let leaf = &inv.devices[1];
         assert_eq!(
@@ -778,6 +804,25 @@ mod tests {
         );
         assert_eq!(leaf.num_interfaces.as_deref(), Some("2"));
         assert_eq!(leaf.max_power.as_deref(), Some("500mA"));
+        assert_eq!(leaf.id_product.as_deref(), Some("b71a"));
+        assert_eq!(leaf.product.as_deref(), Some("HD Webcam"));
+        assert_eq!(leaf.speed.as_deref(), Some("480"));
+        assert_eq!(leaf.device_class.as_deref(), Some("ef"));
+        assert_eq!(leaf.device_subclass.as_deref(), Some("02"));
+        assert_eq!(leaf.device_protocol.as_deref(), Some("01"));
+        assert_eq!(leaf.max_packet_size0.as_deref(), Some("64"));
+        assert_eq!(leaf.num_configurations.as_deref(), Some("1"));
+        assert_eq!(leaf.configuration_value.as_deref(), Some("1"));
+        assert_eq!(leaf.bm_attributes.as_deref(), Some("80"));
+        assert_eq!(leaf.quirks.as_deref(), Some("0x0"));
+        assert_eq!(leaf.avoid_reset_quirk.as_deref(), Some("0"));
+        assert_eq!(leaf.ltm_capable.as_deref(), Some("no"));
+        assert_eq!(leaf.rx_lanes.as_deref(), Some("1"));
+        assert_eq!(leaf.tx_lanes.as_deref(), Some("1"));
+        assert_eq!(leaf.urbnum.as_deref(), Some("11268"));
+        assert_eq!(leaf.authorized.as_deref(), Some("1"));
+        assert_eq!(leaf.removable.as_deref(), Some("fixed"));
+        assert_eq!(leaf.maxchild.as_deref(), Some("0"));
         assert_eq!(
             leaf.physical_location.get("panel").map(String::as_str),
             Some("front")
@@ -938,6 +983,32 @@ mod tests {
         let (dumps, notes) = dump_attrs(&temp.path().join("thunderbolt"), 2);
         assert!(dumps.is_empty());
         assert_eq!(notes.len(), 1);
+    }
+
+    #[test]
+    fn attr_dump_notes_an_entry_it_cannot_resolve() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real/port0");
+        write(&real, "data_role", "[host] device\n");
+        std::fs::create_dir_all(temp.path().join("drivers/typec")).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("drivers/typec"), real.join("driver")).unwrap();
+        let class = temp.path().join("class/typec");
+        std::fs::create_dir_all(&class).unwrap();
+        // Valid entry that should be dumped
+        std::os::unix::fs::symlink(&real, class.join("port0")).unwrap();
+        // Dangling symlink that cannot be resolved
+        std::os::unix::fs::symlink(temp.path().join("gone"), class.join("port9")).unwrap();
+
+        let (dumps, notes) = dump_attrs(&class, 2);
+        assert_eq!(dumps.len(), 1, "valid entry is dumped");
+        assert_eq!(dumps[0].name, "port0");
+        assert_eq!(
+            dumps[0].attrs.get("data_role").map(String::as_str),
+            Some("[host] device")
+        );
+        assert_eq!(notes.len(), 1, "one note for the dangling symlink");
+        assert!(notes[0].item.ends_with("port9"));
+        assert!(notes[0].reason.starts_with("could not resolve: "));
     }
 
     #[test]
