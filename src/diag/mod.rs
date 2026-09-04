@@ -4,8 +4,9 @@
 //! orchestrator (`support`). Nothing here changes the system; every missing
 //! file or failed probe becomes a [`Note`] and the bundle continues.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+pub mod bundle;
 pub mod collect;
 pub mod inventory;
 pub mod redact;
@@ -13,7 +14,7 @@ pub mod redact;
 /// One "unavailable: reason" record. Collectors return these instead of
 /// failing; the manifest lists every one so a reporter and a maintainer both
 /// know what the bundle lacks.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Note {
     pub item: String,
     pub reason: String,
