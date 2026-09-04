@@ -115,7 +115,7 @@ To test it:
 cargo test --all-targets --features ebpf
 ```
 
-The unit suite reports 470 passed. One test loads and attaches the real
+The unit suite reports 595 passed. One test loads and attaches the real
 kprobe; without root and a BTF-enabled kernel it prints its own skip
 message and passes, the same contract the `integration` feature's live
 tests use (see [CONTRIBUTING.md](CONTRIBUTING.md)).
@@ -265,7 +265,7 @@ From the source tree, run the same three checks CI runs:
    ```bash
    cargo test --all-targets
    ```
-   The unit suite reports 449 passed; the `tests/` directory adds the
+   The unit suite reports 574 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it.
 
 ## Uninstall

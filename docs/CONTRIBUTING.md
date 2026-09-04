@@ -65,7 +65,7 @@ pass, and how to send it.
    ```bash
    cargo test
    ```
-   The unit suite reports 465 passed; the `tests/` directory adds the
+   The unit suite reports 574 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 4. To run with debug output, use:
@@ -211,7 +211,7 @@ cargo test --all-targets
 ```
 
 `cargo test` and `cargo test --all-targets` run the same three suites, all
-hermetic. The unit suite reports 465 passed, working against
+hermetic. The unit suite reports 574 passed, working against
 fixture files, FIFOs, and `tempfile` paths, with no `/dev` and no debugfs
 access. The `tests/` directory adds two more: `restore_pipe.rs` (2 tests),
 proving the terminal-restore bytes reach a piped stdout while the process is
@@ -256,7 +256,7 @@ needs clang (with the BPF target) and libbpf-dev.
    ```bash
    cargo test --all-targets --features ebpf
    ```
-   The unit suite reports 486 passed. One of those tests loads and attaches
+   The unit suite reports 595 passed. One of those tests loads and attaches
    the real kprobe, needing real root and a BTF-enabled kernel
    (`/sys/kernel/btf/vmlinux`); without either, it prints its own skip
    message and passes, the same contract the `integration` feature's live
@@ -356,7 +356,7 @@ Cover these areas first:
    ```bash
    cargo test --all-targets
    ```
-   The unit suite reports 465 passed; the `tests/` directory adds the
+   The unit suite reports 574 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 6. Update the documentation your change affects.
