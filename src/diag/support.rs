@@ -534,6 +534,19 @@ pub fn run_support(
     }
 
     let log_present = dir.join("usbtop-ng.log").exists();
+    // Every note that reaches the summary or the manifest passes through the
+    // redactor first: a collector's note can carry a path (a "could not
+    // read: …" reason or item naming an unreadable file under the home
+    // directory), and the manifest and SUMMARY.txt are the only text this
+    // pipeline writes without already going through `BundleWriter::write_text`
+    // or `write_toml`, both of which redact on the way out.
+    let notes: Vec<Note> = notes
+        .iter()
+        .map(|n| Note {
+            item: writer.redactor().text(&n.item),
+            reason: writer.redactor().text(&n.reason),
+        })
+        .collect();
     let mut summary = Summary {
         dir_name: dir
             .file_name()
@@ -571,6 +584,10 @@ pub fn run_support(
             )
         }
         Err(n) => {
+            let n = Note {
+                item: writer.redactor().text(&n.item),
+                reason: writer.redactor().text(&n.reason),
+            };
             let reason = n.reason.clone();
             summary.notes.push(n);
             ArchiveState::Missing(reason)
@@ -741,6 +758,7 @@ fn redacted_line(redaction: &[(String, usize)]) -> String {
             "user_name" => ("user name", "user names"),
             "mac_address" => ("MAC address", "MAC addresses"),
             "fs_uuid" => ("filesystem UUID", "filesystem UUIDs"),
+            "build_stamp" => ("build stamp", "build stamps"),
             other => (other, other),
         };
         format!("{n} {}", if n == 1 { one } else { many })
@@ -1080,6 +1098,10 @@ mod tests {
             redacted_line(&[]),
             "nothing rewritten; host identity never collected; device serials included"
         );
+        assert_eq!(
+            redacted_line(&[("build_stamp".to_string(), 1)]),
+            "1 build stamp; host identity never collected; device serials included"
+        );
         assert_eq!(with_commas(1_234_567), "1,234,567");
         assert_eq!(format_size(412_300), "412 KB");
         assert_eq!(format_size(3_400_000), "3.4 MB");
@@ -1264,6 +1286,11 @@ mod tests {
             ".usbtop-ng/preferences.toml",
             &format!("usbids_path = \"{}/usb.ids\"\n", home.display()),
         );
+        // A file, not a directory, under the fake home: dump_attrs's
+        // read_dir fails on it and notes "could not read: …" with this path
+        // as the item, the cheapest way to put a home path into a note (see
+        // run_support_without_capture_writes_a_consistent_static_bundle).
+        write(&home, "not-a-dir", "");
         Roots {
             sysfs_devices: devices,
             proc: base.join("proc"),
@@ -1274,7 +1301,7 @@ mod tests {
             dmi: base.join("dmi"),
             device_tree: base.join("proc/device-tree"),
             btf: base.join("sys/kernel/btf/vmlinux"),
-            thunderbolt: base.join("sys/bus/thunderbolt/devices"),
+            thunderbolt: home.join("not-a-dir"),
             typec: base.join("sys/class/typec"),
             power_delivery: base.join("sys/class/usb_power_delivery"),
             home: Some(home.clone()),
@@ -1407,8 +1434,12 @@ mod tests {
                 );
             }
         }
-        // config dir, preferences path, and the preferences body: three rewrites.
-        assert_eq!(manifest.redaction.get("home_path"), Some(&3));
+        // config dir, preferences path, the preferences body, and the
+        // thunderbolt note's item below (every note now passes through the
+        // redactor too, per the final-review fix wave, so its "could not
+        // read: …" item -- the home-relative `not-a-dir` path -- adds a
+        // fourth rewrite): four rewrites.
+        assert_eq!(manifest.redaction.get("home_path"), Some(&4));
         assert_eq!(manifest.redaction.get("fs_uuid"), Some(&1));
         // The fake tree's `alice` appears only under the home, which the
         // home rule already rewrites.
@@ -1417,7 +1448,7 @@ mod tests {
         assert!(
             summary
                 .redacted
-                .starts_with("1 filesystem UUID, 3 home paths"),
+                .starts_with("1 filesystem UUID, 4 home paths"),
             "{}",
             summary.redacted
         );
@@ -1430,6 +1461,24 @@ mod tests {
             .collect();
         assert!(items.contains(&"dmesg"), "{items:?}");
         assert!(items.contains(&"capture"), "{items:?}");
+        // The thunderbolt root is a file under the fake home, so
+        // dump_attrs's note names it; the note passes through the redactor
+        // before it reaches the manifest, so the home path never survives
+        // and the item reads as a `~/…` path instead.
+        let thunderbolt_note = manifest
+            .unavailable
+            .iter()
+            .find(|n| n.item.ends_with("not-a-dir"))
+            .expect("the thunderbolt note is present");
+        assert_eq!(thunderbolt_note.item, "~/not-a-dir");
+        assert!(
+            thunderbolt_note.item.starts_with("~/"),
+            "{thunderbolt_note:?}"
+        );
+        for n in &manifest.unavailable {
+            assert!(!n.item.contains(&home_text), "{n:?}");
+            assert!(!n.reason.contains(&home_text), "{n:?}");
+        }
         assert_eq!(summary.capture, "skipped: --no-capture");
         assert_eq!(summary.devices, "1 across 1 buses (480 Mbps)");
         let summary_text = std::fs::read_to_string(dir.join("SUMMARY.txt")).unwrap();

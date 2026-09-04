@@ -126,7 +126,9 @@ pub fn collect_host(
         "proc/sys/kernel/osrelease",
         &mut notes,
     );
-    let proc_version = read_or_note(proc_root, "version", "proc/version", &mut notes);
+    let proc_version = read_or_note(proc_root, "version", "proc/version", &mut notes)
+        .map(|text| redactor.build_stamp(&text))
+        .unwrap_or_default();
     let os = read_or_note(etc_root, "os-release", "etc/os-release", &mut notes)
         .and_then(|text| os_pretty_name_from(&text));
 
@@ -209,7 +211,7 @@ pub fn collect_host(
     (
         HostInfo {
             kernel: kernel.unwrap_or_default(),
-            proc_version: proc_version.unwrap_or_default(),
+            proc_version,
             os: os.unwrap_or_default(),
             board,
             soc,
@@ -738,9 +740,10 @@ mod tests {
             &mut r,
         );
         assert_eq!(host.kernel, "7.0.0-30-generic");
-        assert!(host
-            .proc_version
-            .starts_with("Linux version 7.0.0-30-generic"));
+        assert_eq!(
+            host.proc_version,
+            "Linux version 7.0.0-30-generic (<user>@<host>) #30"
+        );
         assert_eq!(host.os, "Linux Mint 22.3");
         assert_eq!(host.board, "Example MG-VCP17A-3080");
         assert_eq!(host.soc, "");
@@ -763,6 +766,11 @@ mod tests {
         );
         assert_eq!(host.lockdown, "[none] integrity confidentiality");
         assert!(notes.is_empty(), "{notes:?}");
+        assert!(
+            r.summary().contains(&("build_stamp".to_string(), 1)),
+            "{:?}",
+            r.summary()
+        );
     }
 
     #[test]

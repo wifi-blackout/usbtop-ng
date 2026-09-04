@@ -130,7 +130,8 @@ struct Cli {
         default_missing_value = ".",
         conflicts_with_all = [
             "once", "batch", "snapshot_internal", "update_usbids",
-            "setup", "create_alias", "print_man", "print_completions"
+            "setup", "create_alias", "print_man", "print_completions",
+            "json", "output"
         ]
     )]
     support: Option<String>,
@@ -1014,6 +1015,8 @@ mod tests {
         assert!(Cli::try_parse_from(["usbtop-ng", "--support", "--once"]).is_err());
         assert!(Cli::try_parse_from(["usbtop-ng", "--support", "--batch"]).is_err());
         assert!(Cli::try_parse_from(["usbtop-ng", "--support", "--snapshot-internal"]).is_err());
+        assert!(Cli::try_parse_from(["usbtop-ng", "--support", "--json"]).is_err());
+        assert!(Cli::try_parse_from(["usbtop-ng", "--support", "--output", "x"]).is_err());
         assert!(Cli::try_parse_from(["usbtop-ng", "--no-capture"]).is_err());
     }
 

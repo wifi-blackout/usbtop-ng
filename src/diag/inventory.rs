@@ -491,11 +491,12 @@ pub struct AttrDump {
     pub attrs: BTreeMap<String, String>,
 }
 
-/// Names never read: `nvmem` is a device's firmware image, `power/` is
+/// Names never read: `nvmem` is a device's firmware image, `key` is a
+/// Thunderbolt device's stored authentication secret, `power/` is
 /// runtime-PM noise recorded elsewhere for USB devices, and the two links
 /// below point out of the tree.
 const SKIPPED_DIRS: [&str; 3] = ["power", "subsystem", "firmware_node"];
-const SKIPPED_FILES: [&str; 1] = ["nvmem"];
+const SKIPPED_FILES: [&str; 2] = ["nvmem", "key"];
 
 fn walk_attrs(
     base: &Path,
@@ -924,6 +925,7 @@ mod tests {
             "x\n",
         );
         write(&real, "nvm_active0/nvmem", "binary\n");
+        write(&real, "key", "device-auth-secret\n");
         write(&real, "power/control", "auto\n");
         write(&real, "big", &"x".repeat(ATTR_VALUE_CAP + 10));
         std::fs::write(real.join("bytes"), [0xff, 0xfe, 0x00]).unwrap();
@@ -961,6 +963,10 @@ mod tests {
         assert!(
             !d.attrs.contains_key("nvm_active0/nvmem"),
             "nvmem is never read"
+        );
+        assert!(
+            !d.attrs.contains_key("key"),
+            "key (a stored device-authentication secret) is never read"
         );
         assert!(!d.attrs.contains_key("power/control"), "power/ is skipped");
         assert_eq!(

@@ -182,6 +182,44 @@ impl Redactor {
         tokens.join(" ")
     }
 
+    /// Masks the first top-level parenthesized group containing `@` -- the
+    /// `user@host` build stamp `/proc/version` carries right after the
+    /// kernel release -- as `(<user>@<host>)`, counted under `build_stamp`.
+    /// "Top-level" means a group whose parentheses balance back to depth 0:
+    /// a compiler credit that itself nests parentheses
+    /// (`(x86_64-linux-gnu-gcc-13 (Ubuntu 13.3.0) …)`) is therefore matched,
+    /// and left alone, as one whole group rather than picked apart, since it
+    /// carries no `@`. A line with no group containing `@` is returned
+    /// unchanged, with no count.
+    pub fn build_stamp(&mut self, text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut depth: i32 = 0;
+        let mut group_start = 0usize;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'(' => {
+                    if depth == 0 {
+                        group_start = i;
+                    }
+                    depth += 1;
+                }
+                b')' if depth > 0 => {
+                    depth -= 1;
+                    if depth == 0 && text[group_start..=i].contains('@') {
+                        self.bump("build_stamp");
+                        return format!(
+                            "{}(<user>@<host>){}",
+                            &text[..group_start],
+                            &text[i + 1..]
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        text.to_string()
+    }
+
     pub fn env_allowlisted(name: &str) -> bool {
         ENV_ALLOWLIST.contains(&name)
     }
@@ -333,6 +371,35 @@ mod tests {
                 ("user_name".to_string(), 1),
             ]
         );
+    }
+
+    #[test]
+    fn the_build_stamp_is_masked() {
+        for (input, expected, count) in [
+            (
+                "Linux version 7.0.0-30-generic (buildd@lcy02-amd64-045) (x86_64-linux-gnu-gcc-13 (Ubuntu 13.3.0) 13.3.0, GNU ld 2.42) #30~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC",
+                "Linux version 7.0.0-30-generic (<user>@<host>) (x86_64-linux-gnu-gcc-13 (Ubuntu 13.3.0) 13.3.0, GNU ld 2.42) #30~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC",
+                1,
+            ),
+            (
+                "Linux version 6.9.0 (lyle@workstation) (gcc 14)",
+                "Linux version 6.9.0 (<user>@<host>) (gcc 14)",
+                1,
+            ),
+            ("Linux version 6.1 (gcc 12)", "Linux version 6.1 (gcc 12)", 0),
+        ] {
+            let mut r = Redactor::new(None);
+            assert_eq!(r.build_stamp(input), expected, "{input}");
+            if count == 0 {
+                assert!(r.summary().is_empty(), "{input}");
+            } else {
+                assert_eq!(
+                    r.summary(),
+                    vec![("build_stamp".to_string(), count)],
+                    "{input}"
+                );
+            }
+        }
     }
 
     #[test]
