@@ -17,7 +17,7 @@ use std::path::Path;
 use std::process;
 use std::sync::Arc;
 
-#[cfg(feature = "capture-fixture")]
+#[cfg(any(test, feature = "capture-fixture"))]
 mod capture;
 mod config;
 mod device;

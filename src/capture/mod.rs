@@ -1,5 +1,8 @@
-//! The `--capture-fixture` subcommand: capture one ladder stage into a
-//! committed, hermetic fixture bundle. Feature-gated developer/CI tooling.
+//! Fixture capture and assembly: the `--capture-fixture` subcommand (behind
+//! the `capture-fixture` feature) and the shared core `--support` uses to
+//! embed a replayable bundle. Every bundle is payload-free (SEC-1) and
+//! path-contained (SEC-2) by construction, and both guards are re-runnable
+//! over a bundle on disk.
 
 pub mod meta;
 pub mod sanitize;
@@ -14,6 +17,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
 
+use crate::fixture_replay::replay_fixture_with_elapsed;
+use crate::fixture_replay::FIXED_ELAPSED;
 use crate::fixture_replay::{replay_fixture, report_to_golden_json, FixtureSource};
 use crate::snapshot::Snapshot;
 use crate::usbmon::ring;
@@ -98,7 +103,9 @@ pub fn assemble_bundle(
         sources.push(trace.source);
     }
 
-    // Generate each golden by replaying the just-written bundle.
+    // Generate each golden by replaying the just-written bundle. With no
+    // traces (a static bundle) the report comes from the sysfs snapshot
+    // alone, so meta.toml still carries the coverage tags.
     let mut report_for_meta = None;
     for &source in &sources {
         let report = replay_fixture(outdir, source)?;
@@ -109,8 +116,10 @@ pub fn assemble_bundle(
         .with_context(|| format!("write {}", source.golden_filename()))?;
         report_for_meta.get_or_insert(report);
     }
-
-    let report = report_for_meta.ok_or_else(|| anyhow!("no sources captured"))?;
+    let report = match report_for_meta {
+        Some(report) => report,
+        None => replay_fixture_with_elapsed(outdir, None, FIXED_ELAPSED)?,
+    };
     let binary_kernel_dropped = traces
         .iter()
         .find(|t| t.source == FixtureSource::Binary)
@@ -162,7 +171,7 @@ fn assert_payload_free(trace: &CapturedTrace) -> anyhow::Result<()> {
 
 /// SEC-2 capturer-side guard: every path under `sysfs/`, canonicalized, stays
 /// inside it.
-fn assert_sysfs_contained(sysfs: &Path) -> anyhow::Result<()> {
+pub fn assert_sysfs_contained(sysfs: &Path) -> anyhow::Result<()> {
     let root = std::fs::canonicalize(sysfs)
         .with_context(|| format!("canonicalize {}", sysfs.display()))?;
     let mut stack = vec![root.clone()];
@@ -184,7 +193,49 @@ fn assert_sysfs_contained(sysfs: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// SEC-1 over a bundle on disk: every trace file present is checked with
+/// [`assert_payload_free`]. Used by `--support` to re-assert the invariant
+/// on the fixture it embeds, the same way the corpus test does.
+pub fn assert_bundle_payload_free(bundle_dir: &Path) -> anyhow::Result<()> {
+    for source in [FixtureSource::Binary, FixtureSource::Text] {
+        let path = bundle_dir.join(source.trace_filename());
+        if !path.exists() {
+            continue;
+        }
+        let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        assert_payload_free(&CapturedTrace {
+            source,
+            bytes,
+            kernel_dropped: None,
+        })?;
+    }
+    Ok(())
+}
+
+/// How many usbmon events a capture recorded: the binary trace's 48-byte
+/// record count when it exists (exact), else the text trace's line count.
+pub fn count_events(traces: &[CapturedTrace]) -> u64 {
+    if let Some(binary) = traces.iter().find(|t| t.source == FixtureSource::Binary) {
+        return (binary.bytes.len() / 48) as u64;
+    }
+    traces
+        .iter()
+        .find(|t| t.source == FixtureSource::Text)
+        .map(|t| t.bytes.iter().filter(|&&b| b == b'\n').count() as u64)
+        .unwrap_or(0)
+}
+
+/// What a live capture recorded, for `--support`'s summary line.
+#[cfg(feature = "capture-fixture")]
+#[derive(Debug)]
+pub struct CaptureOutcome {
+    pub sources: Vec<FixtureSource>,
+    pub events: u64,
+    pub binary_kernel_dropped: Option<u64>,
+}
+
 /// `--capture-fixture` options (from the CLI).
+#[cfg(feature = "capture-fixture")]
 pub struct CaptureFixtureOpts {
     pub outdir: PathBuf,
     pub window: Duration,
@@ -199,7 +250,8 @@ pub struct CaptureFixtureOpts {
 /// Live entry point: open the binary and text usbmon interfaces, capture one
 /// shared window of raw events concurrently, sanitize them, and assemble the
 /// bundle. Needs root.
-pub fn run_capture_fixture(opts: CaptureFixtureOpts) -> anyhow::Result<()> {
+#[cfg(feature = "capture-fixture")]
+pub fn run_capture_fixture(opts: CaptureFixtureOpts) -> anyhow::Result<CaptureOutcome> {
     let bus = opts.bus.unwrap_or(0);
     let stop = AtomicBool::new(false);
 
@@ -269,8 +321,29 @@ pub fn run_capture_fixture(opts: CaptureFixtureOpts) -> anyhow::Result<()> {
     };
     let stage_id = stage_id_from_outdir(&opts.outdir);
     assemble_bundle(src_sysfs, &opts.outdir, &traces, &baseline, stage_id)?;
-    eprintln!("captured fixture bundle at {}", opts.outdir.display());
-    Ok(())
+    // Re-check what's now on disk, the same SEC-1 recheck `--support` will
+    // run over the bundle it embeds; also gives the live path itself a
+    // non-test caller of the guard.
+    assert_bundle_payload_free(&opts.outdir)?;
+    let outcome = CaptureOutcome {
+        sources: traces.iter().map(|t| t.source).collect(),
+        events: count_events(&traces),
+        binary_kernel_dropped: traces
+            .iter()
+            .find(|t| t.source == FixtureSource::Binary)
+            .and_then(|t| t.kernel_dropped),
+    };
+    eprintln!(
+        "captured fixture bundle at {}: {} events from {} source(s){}",
+        opts.outdir.display(),
+        outcome.events,
+        outcome.sources.len(),
+        outcome
+            .binary_kernel_dropped
+            .map(|n| format!(", kernel dropped {n}"))
+            .unwrap_or_default()
+    );
+    Ok(outcome)
 }
 
 /// Capture the binary and text usbmon interfaces concurrently, both against
@@ -335,6 +408,7 @@ fn capture_until(path: &Path, deadline: Instant, stop: &AtomicBool) -> std::io::
 
 /// Parse a trailing `stageN` component of the output dir into a stage id, for
 /// meta.toml. Best-effort documentation only.
+#[cfg(feature = "capture-fixture")]
 fn stage_id_from_outdir(outdir: &Path) -> Option<u32> {
     outdir
         .file_name()?
@@ -575,6 +649,125 @@ mod tests {
         assert!(msg.contains("fresh outdir"), "{msg}");
         // Nothing else got written: the stale dir was the only thing there.
         assert!(!outdir.join("meta.toml").exists());
+    }
+
+    /// The orchestrator's non-root path: a bundle with no traces still
+    /// carries the sysfs snapshot, the baseline, and a meta.toml that says
+    /// `sources = []`, and replays to a device list.
+    #[test]
+    fn assemble_bundle_with_no_traces_writes_a_static_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        build_src_sysfs(temp.path());
+        let outdir = temp.path().join("bundle");
+        assemble_bundle(
+            &temp.path().join("devices"),
+            &outdir,
+            &[],
+            &BaselineSource::CaptureFrom(temp.path().join("devices")),
+            None,
+        )
+        .unwrap();
+        for f in ["sysfs", "internal-devices.toml", "meta.toml"] {
+            assert!(outdir.join(f).exists(), "missing {f}");
+        }
+        for f in [
+            "trace.bin",
+            "trace.txt",
+            "golden.binary.json",
+            "golden.text.json",
+        ] {
+            assert!(
+                !outdir.join(f).exists(),
+                "{f} must not exist without a capture"
+            );
+        }
+        let meta: crate::fixture_replay::Meta =
+            toml::from_str(&std::fs::read_to_string(outdir.join("meta.toml")).unwrap()).unwrap();
+        assert!(meta.sources.is_empty());
+        assert_eq!(meta.controllers, vec!["0000:00:14.0".to_string()]);
+        let report =
+            crate::fixture_replay::replay_fixture_with_elapsed(&outdir, None, FIXED_ELAPSED)
+                .unwrap();
+        assert_eq!(report.source, "none");
+    }
+
+    #[test]
+    fn assemble_bundle_copies_a_supplied_baseline_file() {
+        let temp = tempfile::tempdir().unwrap();
+        build_src_sysfs(temp.path());
+        let baseline = temp.path().join("stage1-internal-devices.toml");
+        std::fs::write(
+            &baseline,
+            "captured_unix = 7\n\n[[devices]]\nport_path = \"usb1\"\n",
+        )
+        .unwrap();
+        let outdir = temp.path().join("bundle");
+        assemble_bundle(
+            &temp.path().join("devices"),
+            &outdir,
+            &[],
+            &BaselineSource::CopyFile(baseline.clone()),
+            Some(2),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(outdir.join("internal-devices.toml")).unwrap(),
+            std::fs::read_to_string(&baseline).unwrap()
+        );
+    }
+
+    #[test]
+    fn assert_bundle_payload_free_checks_whichever_traces_exist() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(
+            assert_bundle_payload_free(temp.path()).is_ok(),
+            "no traces, nothing to check"
+        );
+        std::fs::write(temp.path().join("trace.bin"), one_binary_event()).unwrap();
+        std::fs::write(
+            temp.path().join("trace.txt"),
+            "ffff0000aaaa0001 200 C Bi:1:003:1 0 1000 <\n",
+        )
+        .unwrap();
+        assert!(assert_bundle_payload_free(temp.path()).is_ok());
+        let mut bad = one_binary_event();
+        bad.extend_from_slice(&[0xAB; 4]);
+        std::fs::write(temp.path().join("trace.bin"), bad).unwrap();
+        let err = assert_bundle_payload_free(temp.path()).unwrap_err();
+        assert!(err.to_string().contains("SEC-1"), "{err}");
+        std::fs::write(temp.path().join("trace.bin"), one_binary_event()).unwrap();
+        std::fs::write(
+            temp.path().join("trace.txt"),
+            "ffff0000aaaa0001 200 C Bo:1:003:1 0 4 = 01020304\n",
+        )
+        .unwrap();
+        let err = assert_bundle_payload_free(temp.path()).unwrap_err();
+        assert!(err.to_string().contains("SEC-1"), "{err}");
+    }
+
+    #[test]
+    fn count_events_prefers_the_binary_trace_and_falls_back_to_text_lines() {
+        let mut two = one_binary_event();
+        two.extend_from_slice(&one_binary_event());
+        let binary = CapturedTrace {
+            source: FixtureSource::Binary,
+            bytes: two,
+            kernel_dropped: None,
+        };
+        let text = CapturedTrace {
+            source: FixtureSource::Text,
+            bytes: b"a 1 C Bi:1:003:1 0 1 <\nb 2 C Bi:1:003:1 0 1 <\nc 3 C Bi:1:003:1 0 1 <\n"
+                .to_vec(),
+            kernel_dropped: None,
+        };
+        assert_eq!(count_events(&[binary, text]), 2);
+        let text_only = CapturedTrace {
+            source: FixtureSource::Text,
+            bytes: b"a 1 C Bi:1:003:1 0 1 <\nb 2 C Bi:1:003:1 0 1 <\n".to_vec(),
+            kernel_dropped: None,
+        };
+        assert_eq!(count_events(&[text_only]), 2);
+        assert_eq!(count_events(&[]), 0);
     }
 
     /// The binary trace's kernel drop count lands in meta.toml so a bundle

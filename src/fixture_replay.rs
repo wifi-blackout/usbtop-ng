@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(test)]
 use serde::Deserialize;
@@ -183,6 +184,20 @@ pub fn load_internal_devices(bundle_dir: &Path) -> Option<Arc<Snapshot>> {
 /// This is the exact sequence the capturer uses to generate goldens, so a
 /// committed golden equals this output by construction.
 pub fn replay_fixture(bundle_dir: &Path, source: FixtureSource) -> anyhow::Result<Report> {
+    replay_fixture_with_elapsed(bundle_dir, Some(source), FIXED_ELAPSED)
+}
+
+/// [`replay_fixture`] with the window length chosen by the caller: goldens
+/// use [`FIXED_ELAPSED`], the support bundle's `report.json` uses the real
+/// capture window so its rates are the rates that were seen. A `None`
+/// source replays no trace at all (a static bundle captured without root):
+/// the report still enumerates every device the sysfs snapshot holds, with
+/// zero traffic and `source == "none"`.
+pub fn replay_fixture_with_elapsed(
+    bundle_dir: &Path,
+    source: Option<FixtureSource>,
+    elapsed: Duration,
+) -> anyhow::Result<Report> {
     let mut manager = DeviceManager::with_sysfs_base(bundle_dir.join("sysfs"));
     if let Some(snapshot) = load_internal_devices(bundle_dir) {
         manager.set_internal_snapshot(Some(snapshot));
@@ -191,10 +206,10 @@ pub fn replay_fixture(bundle_dir: &Path, source: FixtureSource) -> anyhow::Resul
     // sysfs strings, so replay is host-independent (see the spec's config parity).
     let baseline = Baseline::capture(&manager);
 
-    let trace = bundle_dir.join(source.trace_filename());
     let shutdown = AtomicBool::new(false);
     match source {
-        FixtureSource::Binary => {
+        Some(FixtureSource::Binary) => {
+            let trace = bundle_dir.join(FixtureSource::Binary.trace_filename());
             BinaryReader::with_path(0, trace, false).read_packets(
                 &shutdown,
                 &AtomicU64::new(0),
@@ -204,12 +219,14 @@ pub fn replay_fixture(bundle_dir: &Path, source: FixtureSource) -> anyhow::Resul
                 },
             )?;
         }
-        FixtureSource::Text => {
+        Some(FixtureSource::Text) => {
+            let trace = bundle_dir.join(FixtureSource::Text.trace_filename());
             UsbmonReader::with_path(0, trace, false).read_packets(&shutdown, |packet| {
                 manager.apply_packet(&packet);
                 Ok(())
             })?;
         }
+        None => {}
     }
 
     manager.enumerate_present_devices();
@@ -220,10 +237,10 @@ pub fn replay_fixture(bundle_dir: &Path, source: FixtureSource) -> anyhow::Resul
     Ok(build_report(
         &manager,
         &baseline,
-        FIXED_ELAPSED,
-        source.label(),
+        elapsed,
+        source.map_or("none", FixtureSource::label),
         0,
-        source == FixtureSource::Text,
+        source == Some(FixtureSource::Text),
         &FilterSet::default(),
     ))
 }
@@ -398,5 +415,41 @@ mod tests {
             .find(|d| d.address == 3)
             .unwrap();
         assert_eq!(dev.total_rx_bytes, 1000);
+    }
+
+    #[test]
+    fn replay_with_a_real_elapsed_time_scales_the_rates() {
+        let temp = tempfile::tempdir().unwrap();
+        build_min_bundle(temp.path());
+        let report = replay_fixture_with_elapsed(
+            temp.path(),
+            Some(FixtureSource::Binary),
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(report.window_seconds, 2.0);
+        let dev = report.buses[0]
+            .devices
+            .iter()
+            .find(|d| d.address == 3)
+            .unwrap();
+        assert_eq!(dev.total_rx_bytes, 1000);
+        assert_eq!(dev.rx_bps, 500.0, "1000 bytes over 2 s");
+    }
+
+    #[test]
+    fn replay_without_a_trace_enumerates_devices_with_zero_traffic() {
+        let temp = tempfile::tempdir().unwrap();
+        build_min_bundle(temp.path());
+        std::fs::remove_file(temp.path().join("trace.bin")).unwrap();
+        std::fs::remove_file(temp.path().join("trace.txt")).unwrap();
+        let report = replay_fixture_with_elapsed(temp.path(), None, FIXED_ELAPSED).unwrap();
+        assert_eq!(report.source, "none");
+        let bus = &report.buses[0];
+        assert_eq!(bus.controller.as_deref(), Some("0000:00:14.0"));
+        let dev = bus.devices.iter().find(|d| d.address == 3).unwrap();
+        assert_eq!(dev.vendor_id.as_deref(), Some("0430"));
+        assert_eq!(dev.total_rx_bytes, 0);
+        assert!(dev.endpoints.is_empty());
     }
 }
