@@ -200,7 +200,10 @@ pub fn collect_host(
                 usbcore_params.insert(name, value);
             }
         }
-        Err(e) => notes.push(note("sys/module/usbcore/parameters", e)),
+        Err(e) => notes.push(note(
+            "sys/module/usbcore/parameters",
+            format!("could not read: {e}"),
+        )),
     }
 
     (
@@ -287,35 +290,38 @@ pub fn collect_usbmon(
     };
 
     let mut nodes = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dev_root) {
-        let mut paths: Vec<_> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                    n.strip_prefix("usbmon")
-                        .is_some_and(|rest| rest.parse::<u8>().is_ok())
+    match std::fs::read_dir(dev_root) {
+        Ok(entries) => {
+            let mut paths: Vec<_> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                        n.strip_prefix("usbmon")
+                            .is_some_and(|rest| rest.parse::<u8>().is_ok())
+                    })
                 })
-            })
-            .collect();
-        paths.sort_by_key(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_prefix("usbmon"))
-                .and_then(|n| n.parse::<u8>().ok())
-                .unwrap_or(u8::MAX)
-        });
-        for path in paths {
-            if let Ok(meta) = std::fs::metadata(&path) {
-                nodes.push(NodeInfo {
-                    path: path.display().to_string(),
-                    owner_uid: meta.uid(),
-                    group_gid: meta.gid(),
-                    mode_octal: format!("{:04o}", meta.mode() & 0o7777),
-                    openable: open_nonblocking(&path).is_ok(),
-                });
+                .collect();
+            paths.sort_by_key(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_prefix("usbmon"))
+                    .and_then(|n| n.parse::<u8>().ok())
+                    .unwrap_or(u8::MAX)
+            });
+            for path in paths {
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    nodes.push(NodeInfo {
+                        path: path.display().to_string(),
+                        owner_uid: meta.uid(),
+                        group_gid: meta.gid(),
+                        mode_octal: format!("{:04o}", meta.mode() & 0o7777),
+                        openable: open_nonblocking(&path).is_ok(),
+                    });
+                }
             }
         }
+        Err(e) => notes.push(note("dev directory", format!("could not read: {e}"))),
     }
 
     let debugfs_entries = match std::fs::read_dir(debugfs_root) {
@@ -328,7 +334,10 @@ pub fn collect_usbmon(
             names
         }
         Err(e) => {
-            notes.push(note("debugfs usbmon directory", e));
+            notes.push(note(
+                "debugfs usbmon directory",
+                format!("could not read: {e}"),
+            ));
             Vec::new()
         }
     };
@@ -540,7 +549,7 @@ pub fn collect_config(
     let dir_mode_octal = match std::fs::metadata(dir) {
         Ok(meta) => Some(format!("{:04o}", meta.mode() & 0o7777)),
         Err(e) => {
-            notes.push(note("config directory", e));
+            notes.push(note("config directory", format!("could not read: {e}")));
             None
         }
     };
@@ -550,14 +559,17 @@ pub fn collect_config(
     let preferences = match std::fs::read_to_string(&preferences_file) {
         Ok(text) => Some(redactor.text(&text)),
         Err(e) => {
-            notes.push(note("preferences.toml", e));
+            notes.push(note("preferences.toml", format!("could not read: {e}")));
             None
         }
     };
     let internal_devices = match std::fs::read_to_string(dir.join("internal-devices.toml")) {
         Ok(text) => Some(redactor.text(&text)),
         Err(e) => {
-            notes.push(note("internal-devices.toml", e));
+            notes.push(note(
+                "internal-devices.toml",
+                format!("could not read: {e}"),
+            ));
             None
         }
     };
@@ -799,6 +811,13 @@ mod tests {
                 "missing note for {expected}: {items:?}"
             );
         }
+        let usbcore_note = notes
+            .iter()
+            .find(|n| n.item == "sys/module/usbcore/parameters");
+        assert!(
+            usbcore_note.is_some_and(|n| n.reason.starts_with("could not read: ")),
+            "usbcore note: {usbcore_note:?}"
+        );
     }
 
     #[test]
@@ -848,14 +867,32 @@ mod tests {
     fn usbmon_info_carries_a_failed_status_probe_as_a_note() {
         let temp = tempfile::tempdir().unwrap();
         let status = Err("could not read /proc/modules".to_string());
-        let (info, notes) = collect_usbmon(&status, temp.path(), &temp.path().join("nope"));
+        let (info, notes) = collect_usbmon(
+            &status,
+            &temp.path().join("absent-dev"),
+            &temp.path().join("nope"),
+        );
         assert_eq!(
             info.status_error.as_deref(),
             Some("could not read /proc/modules")
         );
         assert!(!info.usbmon_available);
         assert!(info.nodes.is_empty());
-        assert_eq!(notes.len(), 2, "status and debugfs: {notes:?}");
+        assert_eq!(
+            notes.len(),
+            3,
+            "status, dev directory, and debugfs: {notes:?}"
+        );
+        let dev_note = notes.iter().find(|n| n.item == "dev directory");
+        assert!(
+            dev_note.is_some_and(|n| n.reason.starts_with("could not read: ")),
+            "dev note: {dev_note:?}"
+        );
+        let debugfs_note = notes.iter().find(|n| n.item == "debugfs usbmon directory");
+        assert!(
+            debugfs_note.is_some_and(|n| n.reason.starts_with("could not read: ")),
+            "debugfs note: {debugfs_note:?}"
+        );
     }
 
     #[test]
@@ -981,6 +1018,13 @@ mod tests {
             3,
             "dir, preferences, internal-devices: {notes:?}"
         );
+        for note in &notes {
+            assert!(
+                note.reason.starts_with("could not read: "),
+                "note {}: {note:?}",
+                note.item
+            );
+        }
         let (_, none) = collect_config(None, None, false, &mut r);
         assert_eq!(none[0].item, "config directory");
     }
