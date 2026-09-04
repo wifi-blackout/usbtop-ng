@@ -390,12 +390,21 @@ fn main() -> Result<()> {
             eprintln!("error: {e}");
             process::exit(2);
         });
-        capture::run_capture_fixture(capture::CaptureFixtureOpts {
+        let outcome = capture::run_capture_fixture(capture::CaptureFixtureOpts {
             outdir: std::path::PathBuf::from(outdir),
             window,
             bus: cli.bus,
             baseline: cli.baseline.as_deref().map(std::path::PathBuf::from),
         })?;
+        eprintln!(
+            "captured fixture bundle at {outdir}: {} events from {} source(s){}",
+            outcome.events,
+            outcome.sources.len(),
+            outcome
+                .binary_kernel_dropped
+                .map(|n| format!(", kernel dropped {n}"))
+                .unwrap_or_default()
+        );
         return Ok(());
     }
 

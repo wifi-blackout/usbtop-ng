@@ -322,25 +322,19 @@ pub fn run_capture_fixture(opts: CaptureFixtureOpts) -> anyhow::Result<CaptureOu
     // run over the bundle it embeds; also gives the live path itself a
     // non-test caller of the guard.
     assert_bundle_payload_free(&opts.outdir)?;
-    let outcome = CaptureOutcome {
+    // The human "captured fixture bundle at <dir>" line is left to the
+    // caller: the `--capture-fixture` CLI prints it with the real output
+    // path, while `--support` stays silent here because its `outdir` is a
+    // `/proc/self/fd/<n>/fixture` handle (never a name to show a user) and it
+    // reports the capture through its own logger and SUMMARY instead.
+    Ok(CaptureOutcome {
         sources: traces.iter().map(|t| t.source).collect(),
         events: count_events(&traces),
         binary_kernel_dropped: traces
             .iter()
             .find(|t| t.source == FixtureSource::Binary)
             .and_then(|t| t.kernel_dropped),
-    };
-    eprintln!(
-        "captured fixture bundle at {}: {} events from {} source(s){}",
-        opts.outdir.display(),
-        outcome.events,
-        outcome.sources.len(),
-        outcome
-            .binary_kernel_dropped
-            .map(|n| format!(", kernel dropped {n}"))
-            .unwrap_or_default()
-    );
-    Ok(outcome)
+    })
 }
 
 /// Capture the binary and text usbmon interfaces concurrently, both against
