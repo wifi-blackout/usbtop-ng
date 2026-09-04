@@ -21,6 +21,8 @@ use std::sync::Arc;
 mod capture;
 mod config;
 mod device;
+#[cfg(test)]
+mod diag;
 mod filter;
 #[cfg(test)]
 mod fixture_corpus;
