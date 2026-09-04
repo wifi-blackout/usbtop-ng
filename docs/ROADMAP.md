@@ -77,7 +77,9 @@ Prerequisite, now met by the test fleet: the buildable tier needs a host
 that exposes the typec, power-delivery, and thunderbolt classes, and the
 2026-08-30 fleet probe found them on the two x86 hosts -- `asus` (typec +
 power-delivery + thunderbolt) and `judge` (typec + power-delivery, no
-thunderbolt). This is the seam where the fleet work feeds this feature:
+thunderbolt) -- and the 2026-09-03 probe of `alamo-kali` adds a third
+(typec + power-delivery, its single USB-C port free with no partner, no
+thunderbolt domain despite a Tiger Lake TB4 USB controller). This is the seam where the fleet work feeds this feature:
 the [port capability matrix](TESTING.md#port-capability-matrix) names the
 host and the free USB-C port to build and test each row against, and the
 feature reads that host's sysfs. `judge`'s USB-C/PD port is free today;
@@ -283,9 +285,11 @@ The default usbmon build carries no such restriction.)
 The fleet is now provisioned and probed (2026-08-30). All six ARM
 targets exist as named, SSH-reachable hosts -- `rattler` (Pi 4), `pi400`
 (Pi 400), `pi58` (Pi 5), `enviro` (Pi Zero W, armv6l), `rock-32`
-(ROCK 5C), and `airbox` (AirBox) -- alongside two x86 hosts, `asus`
-(Intel Tiger Lake, with Thunderbolt 4) and `judge` (AMD Cezanne, USB 3.1
-Gen 2). Their kernels, controllers, and confirmed usbmon and eBPF status
+(ROCK 5C), and `airbox` (AirBox) -- alongside three x86 hosts, `asus`
+(Intel Tiger Lake, with Thunderbolt 4), `judge` (AMD Cezanne, USB 3.1
+Gen 2), and `alamo-kali` (added 2026-09-03: Intel Tiger Lake on Kali
+rolling, a Type-C/PD port and no Thunderbolt domain, no passwordless
+sudo, so it doubles as the non-root test case). Their kernels, controllers, and confirmed usbmon and eBPF status
 are in the [Test hosts](TESTING.md#test-hosts) table. Three findings
 already shape the work: `rock-32` ships usbmon built in with
 `/dev/usbmon0..8` live, so the binary-only vendor-kernel path is testable

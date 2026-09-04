@@ -339,3 +339,7 @@ bundle, or explained why not"; terminal and SSH details; anything else.
   `cargo test fixture_corpus` unchanged.
 - `--batch --json --output run.ndjson` for two windows yields a run record
   followed by two report lines that parse with `serde_json`.
+- A non-root `--support` run on `alamo-kali` (Kali rolling, zsh login
+  shell, no passwordless sudo, usbmon not loaded) produces the static
+  bundle with `fixture/sources = []`, the Type-C and power-delivery
+  inventories populated, the capture-skipped note, and exit status 0.

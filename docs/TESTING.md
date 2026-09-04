@@ -12,7 +12,8 @@ see [Test hosts](#test-hosts) below for the concrete fleet.
 
 ### Test hosts
 
-Eight SSH-reachable hosts, probed 2026-08-30. These are the concrete
+Nine SSH-reachable hosts, eight probed 2026-08-30 and `alamo-kali` on
+2026-09-03. These are the concrete
 machines the [per-platform notes](#per-platform-notes) below refer to;
 each is addressable by the `ssh` name shown (`judge` as `<user>@judge`).
 The `usbmon` column records the probe result: `built-in`, `module` (loads
@@ -21,7 +22,7 @@ on `modprobe usbmon`, nodes appear), `absent` (not in this kernel), or
 passwordless sudo). Kernels span 5.4 through 7.0 and the arch column
 spans armv6l, aarch64, and x86_64 -- the matrix the roadmap wants.
 
-`mainrag` also appears below, outside the eight-host fleet, because it is
+`mainrag` also appears below, outside the nine-host fleet, because it is
 the development host that contributes the ground-truth isochronous bundle
 (see [Capturing hardware fixtures](#capturing-hardware-fixtures)).
 
@@ -35,6 +36,7 @@ the development host that contributes the ground-truth isochronous bundle
 | `airbox` | SOPHGO Fogwise AirBox / BM1684x | aarch64 | 5.4.217-bm1684 (vendor, dirty) | Ubuntu 20.04 | **absent** | no usbmon module in this kernel and no BTF -- not capturable as-is; Imaging Source 37UX273-ML camera attached; oldest kernel |
 | `asus` | Intel Tiger Lake-LP, i5-1135G7 | x86_64 | 7.0.0-30-generic | Linux Mint 22.3 | module | Thunderbolt 4 (NHI + xHCI) plus a 10 Gbps USB bus; two IDS `1409:3270` USB3 cameras on a 10 Gbps hub (`usbfs`); eBPF-ready (BTF present) |
 | `judge` | AMD Ryzen 9 5900HX (Cezanne) | x86_64 | 7.0.0-30-generic | Linux Mint 22.3 | module | AMD Renoir/Cezanne USB 3.1, two 10 Gbps + two 480M buses; eBPF-ready (BTF present); AMD, not Thunderbolt/USB4 |
+| `alamo-kali` | HP Pavilion x360 14-dw1xxx, Intel Tiger Lake-LP i5-1135G7 | x86_64 | 7.0.12+kali-amd64 | Kali GNU/Linux Rolling | module? | Tiger Lake TB4 USB controller (0000:00:0d.0) plus a 500-series 10 Gbps xHCI; Type-C/PD port free (no partner) but no Thunderbolt domain exposed; BTF present; **no passwordless sudo**, so it is the fleet's non-root test case; zsh login shell; HP webcam, Elan touch, AX201 BT internal |
 | `mainrag` | Development host, AMD Ryzen 9 5900HX (Cezanne), xHCI 0000:06:00.3 and .4 | x86_64 | 7.0.0-30-generic | Linux Mint 22.3 | module | Chicony webcam on bus 1 (the ground-truth iso bundle); BTF present, eBPF runs |
 
 usbmon confirmed on 2026-08-30: `modprobe usbmon` loads the module and
@@ -43,17 +45,22 @@ populates `/dev/usbmon<N>` plus the debugfs text interface on `rattler`,
 with nodes already live. The one exception is `airbox`: its 5.4 vendor
 kernel carries no usbmon module (`modprobe: FATAL: Module usbmon not
 found`), so it cannot capture until its kernel gains `CONFIG_USB_MON` --
-its stage-0 gate fails today.
+its stage-0 gate fails today. `alamo-kali` ships the module
+(`usbmon.ko.xz`) but the account has no passwordless sudo, so the load is
+unconfirmed from here (`module?`); run `sudo modprobe usbmon` on the host
+before a capture stage.
 
 eBPF backend readiness: the CO-RE prerequisite `/sys/kernel/btf/vmlinux`
-(from `CONFIG_DEBUG_INFO_BTF=y`) is present only on the two x86_64 hosts,
-`asus` and `judge` -- both also carry `bpftool`, `CONFIG_BPF_SYSCALL=y`,
-and `CONFIG_KPROBES=y`. The kprobe target `__usb_hcd_giveback_urb`
+(from `CONFIG_DEBUG_INFO_BTF=y`) is present only on the x86_64 hosts:
+`asus` and `judge` (both also carry `bpftool`, `CONFIG_BPF_SYSCALL=y`,
+and `CONFIG_KPROBES=y`) and `alamo-kali` (BTF and the kprobe symbol
+confirmed; no `bpftool`, kernel config unprobed). The kprobe target `__usb_hcd_giveback_urb`
 resolves in `/proc/kallsyms` on every host, so the symbol is never the
 blocker. Every ARM board ships without BTF, which blocks CO-RE
 independently of the eBPF program's current x86-64-only `pt_regs`; two
 separate reasons the `ebpf` feature stays x86-only. `asus` and `judge`
-are the hosts that can run it today.
+are the hosts that can run it today; `alamo-kali` should, once the
+feature build lands there.
 
 ### Port capability matrix
 
@@ -93,10 +100,15 @@ there is blank rather than a confirmed absence.
 | `judge` | bus2 | xhci | 2 | 10G | C·PD | 2 free |
 | `judge` | bus3 | xhci | 4 | 480M | — | BT on 4; 3 free |
 | `judge` | bus4 | xhci | 2 | 10G | — | 2 free |
+| `alamo-kali` | bus1 | xhci | 1 | 480M | — | 1 free |
+| `alamo-kali` | bus2 | xhci | 4 | 10G | C·PD | 4 free (TB4 USB controller, no TB domain) |
+| `alamo-kali` | bus3 | xhci | 12 | 480M | — | webcam, Elan touch, BT internal; 9 free |
+| `alamo-kali` | bus4 | xhci | 4 | 10G | — | 4 free |
 
 Both USB-C ports on `asus` currently show a connected partner, so neither
 is free right now; `judge`'s single USB-C port (PD-capable, no TB) is
-free. Only `asus` exposes a Thunderbolt fabric. `usbfs_memory_mb` is
+free, and so is `alamo-kali`'s (PD-capable, no partner, no TB domain).
+Only `asus` exposes a Thunderbolt fabric. `usbfs_memory_mb` is
 raised to 1024 on `asus`; every other host sits at the 16 MB default, so
 raise it (see [the usbfs buffer note](#the-usbfs-buffer-limit-the-one-that-bites))
 before running a high-rate USB3 Vision camera on them.
@@ -111,7 +123,8 @@ Where the [to-acquire](#to-acquire) devices go:
 - **USB4 / Thunderbolt dock** -> `asus` only; it is the sole Thunderbolt
   host (`judge` has none).
 - **E-marked USB-C cables (the future cable diagnostics)** -> `judge`'s
-  free USB-C/PD port today, or free one of `asus`'s two USB-C ports. This
+  or `alamo-kali`'s free USB-C/PD port today, or free one of `asus`'s two
+  USB-C ports. This
   is the hardware that unblocks
   [Cable and port diagnostics](ROADMAP.md#cable-and-port-diagnostics).
 - **USB2-only flash drive** -> any 480M port (e.g. `judge` bus1/bus3,
