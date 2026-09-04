@@ -1848,6 +1848,14 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
+    /// Raw bytes (descriptor blobs); never spelled as string escapes, which
+    /// cannot hold bytes above 0x7F and tempt tool JSON into emitting NULs.
+    fn write_bytes(dir: &Path, rel: &str, bytes: &[u8]) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
     /// A sysfs tree shaped like the real one: one xHCI controller with a
     /// symlinked root hub `usb3`, a hub `3-1` with two ports (one carrying a
     /// `peer` link), a leaf `3-1.2` with two interfaces (one in an IAD) and
@@ -1867,7 +1875,7 @@ mod tests {
         write(&usb3, "idProduct", "0002\n");
         write(&usb3, "speed", "480\n");
         write(&usb3, "maxchild", "4\n");
-        write(&usb3, "descriptors", "");
+        write_bytes(&usb3, "descriptors", &[]);
         std::fs::create_dir_all(&devices).unwrap();
         std::os::unix::fs::symlink(&usb3, devices.join("usb3")).unwrap();
 
@@ -1881,7 +1889,14 @@ mod tests {
         write(&hub, "maxchild", "4\n");
         write(&hub, "bDeviceClass", "09\n");
         write(&hub, "version", " 2.10\n");
-        write(&hub, "descriptors", "\x12\x01\x10\x02\x09\x00\x01\x40\xe3\x05\x10\x06\x63\x06\x00\x01\x00\x01");
+        write_bytes(
+            &hub,
+            "descriptors",
+            &[
+                0x12, 0x01, 0x10, 0x02, 0x09, 0x00, 0x01, 0x40, 0xe3, 0x05, 0x10, 0x06, 0x63, 0x06,
+                0x00, 0x01, 0x00, 0x01,
+            ],
+        );
         write(&hub, "power/control", "auto\n");
         write(&hub, "power/runtime_status", "active\n");
         let hub_if = hub.join("3-1:1.0");
@@ -1914,8 +1929,15 @@ mod tests {
         write(&leaf, "speed", "480\n");
         write(&leaf, "bMaxPower", "500mA\n");
         write(&leaf, "bNumInterfaces", " 2\n");
-        write(&leaf, "descriptors", "\x12\x01\x00\x02\xef\x02\x01\x40\xf2\x04\x1a\xb7\x03\x00\x01\x02\x03\x01");
-        write(&leaf, "bos_descriptors", "\x05\x0f\x05\x00\x00");
+        write_bytes(
+            &leaf,
+            "descriptors",
+            &[
+                0x12, 0x01, 0x00, 0x02, 0xef, 0x02, 0x01, 0x40, 0xf2, 0x04, 0x1a, 0xb7, 0x03, 0x00,
+                0x01, 0x02, 0x03, 0x01,
+            ],
+        );
+        write_bytes(&leaf, "bos_descriptors", &[0x05, 0x0f, 0x05, 0x00, 0x00]);
         write(&leaf, "physical_location/panel", "front\n");
         write(&leaf, "physical_location/lid", "no\n");
         let if0 = leaf.join("3-1.2:1.0");
@@ -3749,6 +3771,13 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
+    /// Raw bytes (descriptor blobs); never spelled as string escapes.
+    fn write_bytes(dir: &Path, rel: &str, bytes: &[u8]) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn prepare_dir_places_the_bundle_inside_a_directory_target() {
         let temp = tempfile::tempdir().unwrap();
@@ -3944,7 +3973,7 @@ mod tests {
         write(&usb1, "speed", "480\n");
         write(&usb1, "idVendor", "1d6b\n");
         write(&usb1, "idProduct", "0002\n");
-        write(&usb1, "descriptors", "");
+        write_bytes(&usb1, "descriptors", &[]);
         std::fs::create_dir_all(&devices).unwrap();
         std::os::unix::fs::symlink(&usb1, devices.join("usb1")).unwrap();
         let dev = devices.join("1-1");
@@ -3954,7 +3983,14 @@ mod tests {
         write(&dev, "idVendor", "0430\n");
         write(&dev, "idProduct", "0100\n");
         write(&dev, "serial", "SN-KEEP-ME\n");
-        write(&dev, "descriptors", "\x12\x01\x00\x02\x00\x00\x00\x40\x30\x04\x00\x01\x00\x01\x00\x00\x00\x01");
+        write_bytes(
+            &dev,
+            "descriptors",
+            &[
+                0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x40, 0x30, 0x04, 0x00, 0x01, 0x00, 0x01,
+                0x00, 0x00, 0x00, 0x01,
+            ],
+        );
         write(base, "proc/sys/kernel/osrelease", "7.0.0-30-generic\n");
         write(base, "proc/version", "Linux version 7.0.0-30-generic\n");
         write(base, "proc/cpuinfo", "processor\t: 0\nmodel name\t: Test CPU\n");
