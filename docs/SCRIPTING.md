@@ -47,13 +47,16 @@ anything, so both are safe inside a script or a cron job.
 - `--window SECONDS` sets the sample window. It defaults to 5 seconds with
   `--once` and 1 second with `--batch`.
 - The value floors at 0.25 seconds; anything lower is raised to it.
-- `--window`, `--json`, and `--output` all require `--once` or `--batch`
-  (`--window` is also accepted by `--support`, where it sets the capture
-  length). Passing any of the three without one of those two flags is an
-  error, exit code 2:
+- `--window`, `--json`, and `--output` all require `--once` or `--batch`.
+  Passing any of the three without one of those two flags is an error,
+  exit code 2:
   ```
   error: --json, --window, and --output need --once or --batch
   ```
+- `--window` is also accepted by `--support`, which needs neither `--once`
+  nor `--batch`: there it sets the capture window instead of a report
+  window, with its own default and floor -- 5 seconds and 0.1 seconds, the
+  capture rule, not the report rule above.
 
 ## `--json`
 

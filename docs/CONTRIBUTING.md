@@ -410,10 +410,13 @@ sudo usbtop-ng --support
 
 It writes `usbtop-ng-support-<UTC time>/` and a `.tar.gz` beside it in the
 current directory (or in the `PATH` you pass), prints a summary, and lists
-every file it gathered. Paste the summary into the form and attach the
-archive. Without `sudo` the bundle still holds everything but the capture;
-`--no-capture` skips the capture on purpose, `--window SECONDS` sets its
-length.
+every file it gathered. The summary's `bundle:` line names the archive
+relative to the current directory when it lives there, or with the home
+rewritten to `~` otherwise, so the pasted summary carries no home path.
+Paste the summary into the form and attach the archive. Without `sudo` the
+bundle still holds everything but the capture; `--no-capture` skips the
+capture on purpose, `--window SECONDS` sets its length (default 5,
+floor 0.1).
 
 What the bundle holds: build and host details (`build.toml`, `host.toml`),
 the usbmon probe and the backend the monitor would select (`usbmon.toml`),
@@ -422,8 +425,9 @@ self-description with its raw descriptors (`inventory/`), your preferences
 and internal-device snapshot with home paths rewritten (`config/`), the
 terminal setup (`terminal.toml`), the embedded fixture (`fixture/`, the same
 layout as `tests/fixtures/hosts/`), a replayed report (`report.json`), the
-run's debug log, and a `manifest.toml` listing each file with its size, the
-redaction counts, and everything that was unavailable.
+printed summary saved as `SUMMARY.txt`, the run's debug log
+(`usbtop-ng.log`), and a `manifest.toml` listing each file with its size,
+the redaction counts, and everything that was unavailable.
 
 What it never holds: the hostname, machine-id, DMI serial or UUID, any host
 MAC address or IP address, or a user name. Device serial numbers and

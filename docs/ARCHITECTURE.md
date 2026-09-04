@@ -177,8 +177,9 @@ See [TUI chassis](#tui-chassis) for how these fit together.
 - `diag/support.rs`: the `--support` orchestrator. It embeds a fixture from
   `capture/` (a live capture as root, a static sysfs bundle otherwise),
   re-asserts SEC-1 and SEC-2 over it, replays it into `report.json` through
-  the export sink, and prints the summary and filing guidance. The logger is
-  built with a tee so the run's own log lands in the bundle.
+  the export sink, writes the summary to `SUMMARY.txt` in the bundle, and
+  prints it with filing guidance. The logger is built with a tee so the
+  run's own log lands in the bundle as `usbtop-ng.log`.
 - `capture/` and `fixture_replay.rs` are part of the default build: the
   capturer's assembly and guards are what `--support` embeds, and the replay
   path is shared with the corpus tests so a golden equals a replay by

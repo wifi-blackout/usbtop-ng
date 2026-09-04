@@ -299,9 +299,9 @@ unchanged: it still resolves against `/root`.
 - Nothing that identifies the machine or its owner is collected: no
   hostname, machine-id, DMI serial, host MAC address, IP address, or user
   name. `tar tzf` lists every file; you decide what to attach.
-- `--window SECONDS` sets the capture length (default 5), `--no-capture`
-  skips it, and a `PATH` ending in `.tar.gz` names the archive. See
-  [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md#bug-reports).
+- `--window SECONDS` sets the capture length (default 5, floor 0.1),
+  `--no-capture` skips it, and a `PATH` ending in `.tar.gz` names the
+  archive. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md#bug-reports).
 
 ### The chart pane
 
