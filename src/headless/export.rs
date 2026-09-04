@@ -85,12 +85,26 @@ impl ReportSink {
         let Some(path) = output else {
             return Ok(ReportSink::Stdout);
         };
-        let mut file = File::create(path).map_err(|e| {
+        let file = File::create(path).map_err(|e| {
             io::Error::new(
                 e.kind(),
                 format!("could not create {}: {e}", path.display()),
             )
         })?;
+        Self::from_open_file(file, path.to_path_buf(), run, json)
+    }
+
+    /// Build a file sink from an already-open file (created by the caller,
+    /// e.g. beneath the support bundle's pinned root fd so the create never
+    /// re-resolves a path). Writes the leading run record exactly as
+    /// [`ReportSink::open`] does, then returns the file sink. `path` is kept
+    /// only for the exit notice.
+    pub fn from_open_file(
+        mut file: File,
+        path: PathBuf,
+        run: &RunRecord,
+        json: bool,
+    ) -> io::Result<ReportSink> {
         if json {
             let line = serde_json::to_string(run).expect("run record serializes");
             writeln!(file, "{line}")?;
@@ -99,7 +113,7 @@ impl ReportSink {
         }
         file.flush()?;
         Ok(ReportSink::File {
-            path: path.to_path_buf(),
+            path,
             file,
             written: 0,
         })

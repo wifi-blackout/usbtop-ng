@@ -5,12 +5,14 @@
 //! civil-from-days conversion below, so no date crate is needed.
 
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
@@ -83,40 +85,237 @@ pub struct Manifest {
 }
 
 /// Writes files into the bundle directory, redacting text on the way and
-/// recording every file for the manifest.
+/// recording every file for the manifest. Every create/truncate is done
+/// relative to `root_fd` (see [`create_file_at`]), never by re-resolving a
+/// path, so a symlink swapped into the bundle tree during the capture window
+/// cannot redirect a root-owned write.
 pub struct BundleWriter {
+    /// The bundle root as a *logical* path -- consulted only for the
+    /// ownership containment check (which is itself fd-based, see
+    /// [`chown_created_to_invoker`]) and for naming the archive. Writes never
+    /// resolve through it.
     root: PathBuf,
+    /// A descriptor pinning the real bundle-root inode. Opened once (in
+    /// `prepare_dir`) with `O_DIRECTORY|O_NOFOLLOW` and dup'd here; every
+    /// write resolves component-by-component relative to it.
+    root_fd: OwnedFd,
     redactor: Redactor,
     files: Vec<FileEntry>,
 }
 
-/// Create or truncate `path` (parents included), refusing a symlinked
-/// final component, write `bytes`, and hand the file to the sudo invoker
-/// when there is one. Returns the byte count.
-fn write_new(path: &Path, bytes: &[u8]) -> io::Result<u64> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Turn one bundle path component into a `CString`, rejecting an interior NUL.
+/// Components never legitimately carry one; this is defence in depth.
+fn component_cstring(comp: &str) -> io::Result<CString> {
+    CString::new(comp).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("bundle path component {comp:?} contains an interior NUL"),
+        )
+    })
+}
+
+/// Split a relative bundle path (always `/`-separated in this crate) into its
+/// components, refusing any empty, `.` or `..` component. A single `openat`
+/// on a multi-component path would still follow a symlink at every
+/// intermediate component (`O_NOFOLLOW` guards only the *final* one), so the
+/// caller walks these one at a time instead.
+fn split_bundle_rel(rel: &str) -> io::Result<Vec<&str>> {
+    let comps: Vec<&str> = rel.split('/').collect();
+    if comps
+        .iter()
+        .any(|c| c.is_empty() || *c == "." || *c == "..")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsafe bundle path {rel:?}"),
+        ));
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    Ok(comps)
+}
+
+/// `mkdirat(dirfd, name, 0o700)`, tolerating an already-existing entry.
+fn mkdirat_tolerant(dirfd: BorrowedFd, name: &CString) -> io::Result<()> {
+    // SAFETY: `dirfd` is a valid open directory descriptor for the whole
+    // call; `name` is a valid NUL-terminated C string. `mkdirat` reads no
+    // other memory.
+    let rc = unsafe { libc::mkdirat(dirfd.as_raw_fd(), name.as_ptr(), 0o700) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EEXIST) {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
+/// `openat(dirfd, name, O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`. A symlink (or any
+/// non-directory) at `name` is refused by the kernel (`ELOOP`/`ENOTDIR`),
+/// which is exactly the intermediate-symlink attack we must reject.
+fn open_dir_at(dirfd: BorrowedFd, name: &CString) -> io::Result<OwnedFd> {
+    // SAFETY: `dirfd` is a valid open directory descriptor; `name` is a valid
+    // C string. On success `openat` returns a fresh owned descriptor.
+    let fd = unsafe {
+        libc::openat(
+            dirfd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh, valid descriptor this process now owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Walk `comps` beneath `root_fd`, creating and opening each as a directory
+/// (`O_DIRECTORY|O_NOFOLLOW`), and return a descriptor to the deepest one. An
+/// empty `comps` yields a dup of `root_fd`. Every step refuses a symlink, so
+/// no intermediate component can be followed off the pinned tree.
+fn walk_dirs(root_fd: BorrowedFd, comps: &[&str]) -> io::Result<OwnedFd> {
+    let mut cur = root_fd.try_clone_to_owned()?;
+    for comp in comps {
+        let name = component_cstring(comp)?;
+        mkdirat_tolerant(cur.as_fd(), &name)?;
+        cur = open_dir_at(cur.as_fd(), &name)?;
+    }
+    Ok(cur)
+}
+
+/// Create or truncate the file named by the relative bundle path `rel`,
+/// resolving every component relative to `root_fd` with `O_NOFOLLOW` so a
+/// symlink swapped anywhere along the path is refused rather than followed.
+/// Intermediate directories are created (mode `0o700`) as needed; the final
+/// file is opened `O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW|O_CLOEXEC` at `0o600`.
+/// Ownership fixup is the caller's job (it needs the logical path).
+pub fn create_file_at(root_fd: BorrowedFd, rel: &str) -> io::Result<File> {
+    let comps = split_bundle_rel(rel)?;
+    let (last, dirs) = comps
+        .split_last()
+        .expect("split_bundle_rel rejects an empty path");
+    let dir_fd = walk_dirs(root_fd, dirs)?;
+    let name = component_cstring(last)?;
+    // SAFETY: `dir_fd` is a valid open directory descriptor; `name` is a
+    // valid C string; the mode argument matches `O_CREAT`. `openat` returns a
+    // fresh owned descriptor on success.
+    let fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh, valid descriptor this process now owns.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Create or truncate `rel` beneath `root_fd`, write `bytes`, and hand the
+/// file to the sudo invoker when there is one. `logical` is the bundle-root
+/// join of `rel`, used only for [`chown_created_to_invoker`]'s (fd-based)
+/// containment check. Returns the byte count.
+fn write_new_at(root_fd: BorrowedFd, rel: &str, logical: &Path, bytes: &[u8]) -> io::Result<u64> {
+    let mut file = create_file_at(root_fd, rel)?;
     file.write_all(bytes)?;
     file.flush()?;
-    chown_created_to_invoker(path, file.as_raw_fd());
+    chown_created_to_invoker(logical, file.as_raw_fd());
     Ok(bytes.len() as u64)
 }
 
+/// Open the freshly created bundle root as a pinned directory descriptor:
+/// `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`. `prepare_dir` calls this immediately
+/// after `create_dir(dir)` so the descriptor covers the whole capture window;
+/// the `O_NOFOLLOW` refuses the case where the directory was already swapped
+/// for a symlink in the create->open gap.
+pub fn open_bundle_root(dir: &Path) -> io::Result<OwnedFd> {
+    let handle = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)?;
+    Ok(OwnedFd::from(handle))
+}
+
+/// `fstat` a descriptor.
+fn fstat_fd(fd: BorrowedFd) -> io::Result<libc::stat> {
+    // SAFETY: `st` is a valid, writable `stat`; `fd` is a valid descriptor.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(fd.as_raw_fd(), &mut st) };
+    if rc == 0 {
+        Ok(st)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// `fstatat(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW)` -- stats the path without
+/// following a final-component symlink, so a swapped-in link is seen as the
+/// link itself rather than its target.
+fn lstat_path(path: &Path) -> io::Result<libc::stat> {
+    let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bundle path contains an interior NUL",
+        )
+    })?;
+    // SAFETY: `st` is a valid, writable `stat`; `c` is a valid C string.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::fstatat(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == 0 {
+        Ok(st)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 impl BundleWriter {
-    pub fn create(root: &Path, redactor: Redactor) -> io::Result<BundleWriter> {
-        std::fs::create_dir_all(root)?;
+    /// `root` is the logical bundle-root path (already created); `root_fd` is
+    /// the descriptor pinning it (from [`open_bundle_root`], held in
+    /// [`crate::diag::support::Prepared`]). The descriptor is dup'd, so the
+    /// writer owns its own handle to the same inode.
+    pub fn create(
+        root: &Path,
+        root_fd: BorrowedFd,
+        redactor: Redactor,
+    ) -> io::Result<BundleWriter> {
         Ok(BundleWriter {
             root: root.to_path_buf(),
+            root_fd: root_fd.try_clone_to_owned()?,
             redactor,
             files: Vec::new(),
         })
+    }
+
+    /// Anchored create/truncate + write + ownership fixup for `rel`.
+    fn write_at(&self, rel: &str, bytes: &[u8]) -> io::Result<u64> {
+        write_new_at(self.root_fd.as_fd(), rel, &self.root.join(rel), bytes)
+    }
+
+    /// Create (or truncate) `rel` beneath the anchor and return the open file
+    /// without writing or recording it -- for a component (the report sink,
+    /// the log tee) that writes its own bytes and is recorded later.
+    pub fn open_new_file(&self, rel: &str) -> io::Result<File> {
+        create_file_at(self.root_fd.as_fd(), rel)
+    }
+
+    /// Create the directory `rel` (nested components included) beneath the
+    /// anchor, refusing a symlink at any step. Used to pin `fixture/` before
+    /// the capturer writes into it.
+    pub fn mkdir_at(&self, rel: &str) -> io::Result<()> {
+        let comps = split_bundle_rel(rel)?;
+        walk_dirs(self.root_fd.as_fd(), &comps)?;
+        Ok(())
     }
 
     pub fn redactor(&mut self) -> &mut Redactor {
@@ -139,7 +338,7 @@ impl BundleWriter {
     /// Write text through the redactor.
     pub fn write_text(&mut self, rel: &str, text: &str) -> io::Result<()> {
         let redacted = self.redactor.text(text);
-        let bytes = write_new(&self.root.join(rel), redacted.as_bytes())?;
+        let bytes = self.write_at(rel, redacted.as_bytes())?;
         self.record(rel, bytes, false);
         Ok(())
     }
@@ -147,7 +346,7 @@ impl BundleWriter {
     /// Write bytes verbatim (descriptor blobs are device identity, never
     /// redacted).
     pub fn write_bytes(&mut self, rel: &str, bytes: &[u8]) -> io::Result<()> {
-        let n = write_new(&self.root.join(rel), bytes)?;
+        let n = self.write_at(rel, bytes)?;
         self.record(rel, n, false);
         Ok(())
     }
@@ -162,10 +361,9 @@ impl BundleWriter {
     /// Rewrite an existing text file (one written by another component,
     /// such as the report sink) through the redactor, then record it.
     pub fn redact_file(&mut self, rel: &str) -> io::Result<()> {
-        let path = self.root.join(rel);
-        let text = std::fs::read_to_string(&path)?;
+        let text = std::fs::read_to_string(self.root.join(rel))?;
         let redacted = self.redactor.text(&text);
-        let bytes = write_new(&path, redacted.as_bytes())?;
+        let bytes = self.write_at(rel, redacted.as_bytes())?;
         self.record(rel, bytes, false);
         Ok(())
     }
@@ -224,7 +422,7 @@ impl BundleWriter {
             files,
         };
         let text = toml::to_string_pretty(&manifest)?;
-        write_new(&self.root.join("manifest.toml"), text.as_bytes())?;
+        self.write_at("manifest.toml", text.as_bytes())?;
         Ok(())
     }
 
@@ -236,20 +434,127 @@ impl BundleWriter {
     }
 
     pub fn archive_with(&self, archive: &Path, program: &str) -> Result<u64, Note> {
-        let parent = self.root.parent().unwrap_or(Path::new("."));
         let dirname = self
             .root
             .file_name()
             .ok_or_else(|| note("archive", "could not determine the bundle directory name"))?;
-        let output = Command::new(program)
+
+        // The bundle dir must still be the very inode we pinned at creation.
+        // If the path now names a different inode (or a symlink), it was
+        // swapped during the run: skip tar and keep the directory, rather
+        // than archive through a redirected path.
+        let root_st = fstat_fd(self.root_fd.as_fd()).map_err(|e| {
+            note(
+                "archive",
+                format!("could not stat the bundle directory: {e}"),
+            )
+        })?;
+        match lstat_path(&self.root) {
+            Ok(path_st) => {
+                let is_symlink = (path_st.st_mode & libc::S_IFMT) == libc::S_IFLNK;
+                if is_symlink
+                    || path_st.st_dev != root_st.st_dev
+                    || path_st.st_ino != root_st.st_ino
+                {
+                    return Err(note(
+                        "archive",
+                        format!(
+                            "{} was replaced during the run; not archiving",
+                            self.root.display()
+                        ),
+                    ));
+                }
+            }
+            Err(e) => {
+                return Err(note(
+                    "archive",
+                    format!(
+                        "could not verify {} before archiving: {e}",
+                        self.root.display()
+                    ),
+                ))
+            }
+        }
+
+        // Feed tar the source through the pinned inode rather than a path it
+        // could re-resolve: the parent comes from the pinned root's own `..`
+        // (so it names the real containing directory), and it is passed to
+        // the child by fd via /proc/self/fd. The fd is left inheritable (no
+        // O_CLOEXEC) precisely so the child tar can open it. The archive's
+        // member names keep the `<dirname>/` prefix, so the bundle layout is
+        // unchanged.
+        // SAFETY: `self.root_fd` is a valid open directory descriptor; `".."`
+        // is a valid C string. `openat` returns a fresh owned descriptor.
+        let parent_raw =
+            unsafe { libc::openat(self.root_fd.as_raw_fd(), c"..".as_ptr(), libc::O_DIRECTORY) };
+        if parent_raw < 0 {
+            return Err(note(
+                "archive",
+                format!(
+                    "could not open the bundle parent directory: {}",
+                    io::Error::last_os_error()
+                ),
+            ));
+        }
+        // SAFETY: `parent_raw` is a fresh, valid descriptor this process owns.
+        let parent_fd = unsafe { OwnedFd::from_raw_fd(parent_raw) };
+
+        // Create the archive output ourselves, refusing a pre-planted symlink
+        // or an existing file (O_EXCL | O_NOFOLLOW), and hand tar the open
+        // file as its stdout. That way tar never creates the output by a path
+        // it could be redirected through.
+        let out_file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(archive)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(note(
+                    "archive",
+                    format!("could not create {}: {e}", archive.display()),
+                ))
+            }
+        };
+        let size_fd = match out_file.try_clone() {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = std::fs::remove_file(archive);
+                return Err(note(
+                    "archive",
+                    format!("could not prepare {}: {e}", archive.display()),
+                ));
+            }
+        };
+        let cdir = format!("/proc/self/fd/{}", parent_fd.as_raw_fd());
+        let child = Command::new(program)
             .arg("-czf")
-            .arg(archive)
+            .arg("-")
             .arg("-C")
-            .arg(parent)
+            .arg(&cdir)
             .arg(dirname)
-            .output()
-            .map_err(|e| note("archive", format!("could not run {program}: {e}")))?;
+            .stdout(Stdio::from(out_file))
+            .stderr(Stdio::piped())
+            .spawn();
+        let child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::remove_file(archive);
+                return Err(note("archive", format!("could not run {program}: {e}")));
+            }
+        };
+        let output = match child.wait_with_output() {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = std::fs::remove_file(archive);
+                return Err(note("archive", format!("could not run {program}: {e}")));
+            }
+        };
+        // The child has its own inherited copy of the parent fd by now.
+        drop(parent_fd);
         if !output.status.success() {
+            let _ = std::fs::remove_file(archive);
             return Err(note(
                 "archive",
                 format!(
@@ -259,17 +564,15 @@ impl BundleWriter {
                 ),
             ));
         }
-        let bytes = std::fs::metadata(archive)
+        let bytes = fstat_fd(size_fd.as_fd())
+            .map(|st| st.st_size as u64)
             .map_err(|e| {
                 note(
                     "archive",
                     format!("could not read {} after tar: {e}", archive.display()),
                 )
-            })?
-            .len();
-        if let Ok(file) = File::open(archive) {
-            chown_created_to_invoker(archive, file.as_raw_fd());
-        }
+            })?;
+        chown_created_to_invoker(archive, size_fd.as_raw_fd());
         Ok(bytes)
     }
 }
@@ -334,6 +637,15 @@ mod tests {
         Command::new("tar").arg("--version").output().is_ok()
     }
 
+    /// Create the bundle root and hand a writer anchored on its pinned fd, the
+    /// way `prepare_dir` does in production. The temporary anchor is dropped
+    /// here; the writer holds its own dup, so this mirrors the real flow.
+    fn writer_at(root: &Path, redactor: Redactor) -> BundleWriter {
+        std::fs::create_dir_all(root).unwrap();
+        let fd = open_bundle_root(root).unwrap();
+        BundleWriter::create(root, fd.as_fd(), redactor).unwrap()
+    }
+
     #[test]
     fn utc_stamp_pins_the_epoch_a_recent_date_two_leap_days_and_a_non_leap_century() {
         assert_eq!(utc_stamp(0), "19700101T000000Z");
@@ -348,8 +660,7 @@ mod tests {
     fn write_text_redacts_records_and_creates_parents() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("bundle");
-        let mut w =
-            BundleWriter::create(&root, Redactor::new(Some(Path::new("/home/alice")))).unwrap();
+        let mut w = writer_at(&root, Redactor::new(Some(Path::new("/home/alice"))));
         w.write_text(
             "config/preferences.toml",
             "usbids_path = \"/home/alice/usb.ids\"\n",
@@ -379,8 +690,7 @@ mod tests {
         }
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("bundle");
-        let mut w =
-            BundleWriter::create(&root, Redactor::new(Some(Path::new("/home/alice")))).unwrap();
+        let mut w = writer_at(&root, Redactor::new(Some(Path::new("/home/alice"))));
         w.write_bytes("inventory/descriptors/1-4.bin", &[0x12, 0x01, 0x00, 0x02])
             .unwrap();
         assert_eq!(
@@ -405,8 +715,7 @@ mod tests {
     fn redact_file_rewrites_in_place_and_adopt_file_records_as_is() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("bundle");
-        let mut w =
-            BundleWriter::create(&root, Redactor::new(Some(Path::new("/home/alice")))).unwrap();
+        let mut w = writer_at(&root, Redactor::new(Some(Path::new("/home/alice"))));
         std::fs::write(
             root.join("report.json"),
             "{\"command\":[\"/home/alice/bin/usbtop-ng\"]}\n",
@@ -434,7 +743,7 @@ mod tests {
     fn record_dir_lists_every_file_and_symlink_under_a_subtree() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("bundle");
-        let mut w = BundleWriter::create(&root, Redactor::new(None)).unwrap();
+        let mut w = writer_at(&root, Redactor::new(None));
         let fixture = root.join("fixture");
         std::fs::create_dir_all(fixture.join("sysfs/0000:00:14.0/usb1")).unwrap();
         std::fs::write(fixture.join("sysfs/0000:00:14.0/usb1/busnum"), "1\n").unwrap();
@@ -465,8 +774,7 @@ mod tests {
     fn manifest_lists_files_redaction_and_notes_and_parses_back() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("bundle");
-        let mut w =
-            BundleWriter::create(&root, Redactor::new(Some(Path::new("/home/alice")))).unwrap();
+        let mut w = writer_at(&root, Redactor::new(Some(Path::new("/home/alice"))));
         w.write_text("build.toml", "command = [\"/home/alice/x\"]\n")
             .unwrap();
         w.write_manifest(1_788_000_000, &[note("dmesg", "permission denied")])
@@ -494,7 +802,7 @@ mod tests {
     fn archive_with_a_missing_program_is_a_note_not_an_error() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("usbtop-ng-support-x");
-        let w = BundleWriter::create(&root, Redactor::new(None)).unwrap();
+        let w = writer_at(&root, Redactor::new(None));
         let err = w
             .archive_with(&temp.path().join("x.tar.gz"), "no-such-tar-program")
             .unwrap_err();
@@ -508,7 +816,7 @@ mod tests {
     fn archive_with_a_failing_program_is_a_note() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("usbtop-ng-support-x");
-        let w = BundleWriter::create(&root, Redactor::new(None)).unwrap();
+        let w = writer_at(&root, Redactor::new(None));
         let archive = temp.path().join("x.tar.gz");
         let err = w.archive_with(&archive, "false").unwrap_err();
         assert_eq!(err.item, "archive");
@@ -527,7 +835,7 @@ mod tests {
         }
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("usbtop-ng-support-20260829T104000Z");
-        let mut w = BundleWriter::create(&root, Redactor::new(None)).unwrap();
+        let mut w = writer_at(&root, Redactor::new(None));
         w.write_text("SUMMARY.txt", "usbtop-ng support bundle\n")
             .unwrap();
         w.write_bytes("inventory/descriptors/1-4.bin", &[1, 2, 3])
@@ -592,5 +900,105 @@ mod tests {
         std::os::unix::fs::symlink("sysfs", root.join("fixture/link")).unwrap();
         own_tree(&root);
         assert!(root.join("fixture/sysfs/busnum").exists());
+    }
+
+    /// The load-bearing regression for the finding: with the root fd held, an
+    /// intermediate directory of a bundle path is replaced by a symlink
+    /// pointing outside the tree. The anchored write must refuse to follow it
+    /// (the `openat` of the swapped component fails with `O_NOFOLLOW`), and
+    /// nothing must be created at the symlink's target. This holds regardless
+    /// of uid, so it is not gated. `O_NOFOLLOW` guards only a final component;
+    /// the win here is that we walk `sub` then `inner` one component at a time.
+    #[test]
+    fn an_intermediate_symlink_is_refused_and_writes_nothing_at_its_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("bundle");
+        std::fs::create_dir(&root).unwrap();
+        let root_fd = open_bundle_root(&root).unwrap();
+
+        // A real first component, then `inner` swapped for a link that
+        // escapes the bundle entirely.
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("sub/inner")).unwrap();
+
+        let err = write_new_at(
+            root_fd.as_fd(),
+            "sub/inner/file",
+            &root.join("sub/inner/file"),
+            b"root-owned bytes",
+        )
+        .unwrap_err();
+        // ELOOP (a symlink where O_NOFOLLOW forbids one) or ENOTDIR.
+        assert!(
+            matches!(
+                err.raw_os_error(),
+                Some(e) if e == libc::ELOOP || e == libc::ENOTDIR
+            ),
+            "expected ELOOP/ENOTDIR, got {err:?}"
+        );
+        assert!(
+            !outside.join("file").exists(),
+            "the write escaped through the intermediate symlink"
+        );
+    }
+
+    /// With the root fd held, the bundle root itself is renamed away and a
+    /// symlink is dropped in its place. Writes done relative to the fd still
+    /// land on the original (now-renamed) inode, never at the symlink target:
+    /// a directory fd pins the inode, so the swap cannot redirect them.
+    #[test]
+    fn a_root_swapped_to_a_symlink_still_writes_to_the_pinned_inode() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("bundle");
+        std::fs::create_dir(&root).unwrap();
+        let root_fd = open_bundle_root(&root).unwrap();
+
+        let moved = temp.path().join("bundle-moved");
+        std::fs::rename(&root, &moved).unwrap();
+        let outside = temp.path().join("attacker");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+
+        let n = write_new_at(root_fd.as_fd(), "file", &root.join("file"), b"pinned").unwrap();
+        assert_eq!(n, 6);
+        assert_eq!(std::fs::read(moved.join("file")).unwrap(), b"pinned");
+        assert!(
+            !outside.join("file").exists(),
+            "the write followed the swapped-in root symlink"
+        );
+    }
+
+    /// A normal nested write creates the intermediate directories and the
+    /// file with exactly the bytes given.
+    #[test]
+    fn an_anchored_write_creates_nested_dirs_and_the_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("bundle");
+        std::fs::create_dir(&root).unwrap();
+        let root_fd = open_bundle_root(&root).unwrap();
+
+        let payload = &[0x12u8, 0x01, 0x00, 0x02, 0xAB, 0xFF];
+        let n = write_new_at(
+            root_fd.as_fd(),
+            "a/b/c.bin",
+            &root.join("a/b/c.bin"),
+            payload,
+        )
+        .unwrap();
+        assert_eq!(n, payload.len() as u64);
+        assert!(root.join("a/b").is_dir());
+        assert_eq!(std::fs::read(root.join("a/b/c.bin")).unwrap(), payload);
+    }
+
+    /// `split_bundle_rel` refuses empty, `.` and `..` components so no bundle
+    /// write can be aimed with a traversal component.
+    #[test]
+    fn split_bundle_rel_refuses_traversal_and_empty_components() {
+        assert!(split_bundle_rel("a/b/c.txt").is_ok());
+        for bad in ["", "a//b", "a/./b", "../b", "a/..", ".."] {
+            assert!(split_bundle_rel(bad).is_err(), "{bad:?} must be rejected");
+        }
     }
 }

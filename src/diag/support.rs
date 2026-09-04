@@ -8,6 +8,8 @@
 
 use std::fs::File;
 use std::io::{self, Write};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -35,17 +37,40 @@ pub struct SupportOpts {
     pub command: Vec<String>,
 }
 
-/// The bundle directory (created) and the archive path (not yet written).
+/// The bundle directory (created), a descriptor pinning its real inode, and
+/// the archive path (not yet written). `root_fd` is opened the instant the
+/// directory is created and held for the whole run, so every later write can
+/// resolve relative to it instead of re-resolving the (predictable,
+/// attacker-swappable) path -- see [`crate::diag::bundle`].
 #[derive(Debug)]
 pub struct Prepared {
     pub dir: PathBuf,
+    pub root_fd: OwnedFd,
     pub archive: PathBuf,
+}
+
+/// Pure decision for the safe-parent guard: given a directory's raw `st_mode`,
+/// is it unsafe to drop a root-owned bundle inside it? Unsafe when the
+/// directory is group- or other-writable **and** the sticky bit is not set --
+/// exactly the case where a local attacker could rename our predictable,
+/// root-owned bundle directory away and drop a symlink in its place. A sticky
+/// directory (e.g. `/tmp` at `01777`) blocks that swap because only a file's
+/// owner may rename or unlink it there, so it is treated as safe. The euid
+/// check that decides *whether* to apply this stays out of the function.
+fn parent_is_unsafe_for_root(mode: u32) -> bool {
+    const S_IWGRP: u32 = 0o020;
+    const S_IWOTH: u32 = 0o002;
+    const S_ISVTX: u32 = 0o1000;
+    let writable_by_others = mode & (S_IWGRP | S_IWOTH) != 0;
+    let sticky = mode & S_ISVTX != 0;
+    writable_by_others && !sticky
 }
 
 /// Resolve `--support`'s target: a directory (existing or not) holds the
 /// bundle directory and the archive; a name ending in `.tar.gz` names the
 /// archive and the bundle directory goes beside it. The bundle directory is
-/// created here so the logger can tee into it before anything else runs.
+/// created here so the logger can tee into it before anything else runs, and
+/// its descriptor is pinned immediately (see [`Prepared`]).
 pub fn prepare_dir(target: &Path, now_unix: u64) -> anyhow::Result<Prepared> {
     let stamp = utc_stamp(now_unix);
     let name = format!("usbtop-ng-support-{stamp}");
@@ -66,13 +91,41 @@ pub fn prepare_dir(target: &Path, now_unix: u64) -> anyhow::Result<Prepared> {
         .with_context(|| format!("could not create {}", parent.display()))?;
     let parent = std::fs::canonicalize(&parent)
         .with_context(|| format!("could not resolve {}", parent.display()))?;
+
+    // Defense in depth: running as root (the main capture mode, under sudo),
+    // refuse a parent a local attacker could write and then use to swap our
+    // root-owned bundle directory for a symlink during the capture window.
+    // SAFETY: geteuid() takes no arguments, touches no memory, cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        let meta = std::fs::metadata(&parent)
+            .with_context(|| format!("could not stat {}", parent.display()))?;
+        if parent_is_unsafe_for_root(meta.mode()) {
+            return Err(anyhow!(
+                "{} is writable by other users and not sticky; running as root, refusing to \
+                 write a bundle there (a local user could swap it during the run). Pick a \
+                 location only you or root can write, or run without a target for the default.",
+                parent.display()
+            ));
+        }
+    }
+
     let dir = parent.join(&name);
     if dir.exists() {
         return Err(anyhow!("{} already exists", dir.display()));
     }
     std::fs::create_dir(&dir).with_context(|| format!("could not create {}", dir.display()))?;
+    // Pin the real inode now, before anything writes into the tree. An
+    // O_NOFOLLOW failure here means the directory was already swapped for a
+    // symlink in the create->open gap.
+    let root_fd = bundle::open_bundle_root(&dir).with_context(|| {
+        format!(
+            "could not open {} as a directory (was it replaced with a symlink?)",
+            dir.display()
+        )
+    })?;
     Ok(Prepared {
         dir,
+        root_fd,
         archive: parent.join(archive_name),
     })
 }
@@ -387,8 +440,12 @@ pub fn run_support(
 ) -> anyhow::Result<Summary> {
     let dir = &prepared.dir;
     let mut notes: Vec<Note> = Vec::new();
-    let mut writer = BundleWriter::create(dir, Redactor::new(roots.home.as_deref()))
-        .with_context(|| format!("could not create {}", dir.display()))?;
+    let mut writer = BundleWriter::create(
+        dir,
+        prepared.root_fd.as_fd(),
+        Redactor::new(roots.home.as_deref()),
+    )
+    .with_context(|| format!("could not create {}", dir.display()))?;
 
     info!("collecting build and host information");
     let build = collect::collect_build(
@@ -494,7 +551,14 @@ pub fn run_support(
 
     writer.write_toml("terminal.toml", &env.terminal)?;
 
+    // Pin `fixture/` as a genuine child of the bundle root before the
+    // capturer writes into it, so it cannot be a pre-planted symlink. The
+    // capturer's own writes beneath it remain path-based (see the note in
+    // `write_fixture`), covered by the safe-parent guard in `prepare_dir`.
     let fixture_dir = dir.join("fixture");
+    writer
+        .mkdir_at("fixture")
+        .with_context(|| format!("could not create {}", fixture_dir.display()))?;
     let capture_state = write_fixture(opts, roots, env, &fixture_dir, &mut notes);
     if fixture_dir.join("meta.toml").exists() {
         bundle::assert_fixture_invariants(&fixture_dir)?;
@@ -524,7 +588,12 @@ pub fn run_support(
                     arch: std::env::consts::ARCH,
                     buses: usbmon_info.available_buses.clone(),
                 };
-                let mut sink = ReportSink::open(Some(&dir.join("report.json")), &run, true)?;
+                // Create report.json beneath the anchor (never by path), then
+                // hand the open file to the sink. The subsequent redact_file
+                // rewrites it in place, again through the anchor.
+                let file = writer.open_new_file("report.json")?;
+                let mut sink =
+                    ReportSink::from_open_file(file, dir.join("report.json"), &run, true)?;
                 sink.write(&report, true)?;
                 sink.finish();
                 writer.redact_file("report.json")?;
@@ -845,9 +914,12 @@ pub struct TeeWriter {
 }
 
 impl TeeWriter {
-    pub fn create(path: &Path, home: Option<&Path>) -> io::Result<TeeWriter> {
+    /// Open `usbtop-ng.log` beneath the pinned bundle root (never by path),
+    /// so the log the logger tees into cannot be redirected through a swapped
+    /// component during the run. `root_fd` is [`Prepared::root_fd`].
+    pub fn create(root_fd: BorrowedFd, home: Option<&Path>) -> io::Result<TeeWriter> {
         Ok(TeeWriter {
-            file: File::create(path)?,
+            file: bundle::create_file_at(root_fd, "usbtop-ng.log")?,
             redactor: Redactor::new(home),
         })
     }
@@ -1220,15 +1292,35 @@ mod tests {
     #[test]
     fn tee_writer_redacts_the_file_copy() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("usbtop-ng.log");
-        let mut tee = TeeWriter::create(&path, Some(Path::new("/home/alice"))).unwrap();
+        let root = temp.path();
+        let root_fd = bundle::open_bundle_root(root).unwrap();
+        let mut tee = TeeWriter::create(root_fd.as_fd(), Some(Path::new("/home/alice"))).unwrap();
         tee.write_all(b"[INFO] usb.ids loaded from /home/alice/.usbtop-ng/usb.ids\n")
             .unwrap();
         tee.flush().unwrap();
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
+            std::fs::read_to_string(root.join("usbtop-ng.log")).unwrap(),
             "[INFO] usb.ids loaded from ~/.usbtop-ng/usb.ids\n"
         );
+    }
+
+    /// The safe-parent guard's pure decision, over raw `st_mode` values with
+    /// the `S_IFDIR` bits set as a real stat carries them. World- or
+    /// group-writable without the sticky bit is unsafe; sticky (like `/tmp`)
+    /// or not others-writable is safe.
+    #[test]
+    fn parent_is_unsafe_for_root_flags_others_writable_without_sticky() {
+        assert!(parent_is_unsafe_for_root(0o40777), "0777: others-writable");
+        assert!(
+            !parent_is_unsafe_for_root(0o41777),
+            "1777: others-writable but sticky (e.g. /tmp)"
+        );
+        assert!(
+            !parent_is_unsafe_for_root(0o40755),
+            "0755: not others-writable"
+        );
+        assert!(parent_is_unsafe_for_root(0o40775), "0775: group-writable");
+        assert!(!parent_is_unsafe_for_root(0o40700), "0700: private");
     }
 
     /// A sysfs tree the capturer can materialize: a controller with a

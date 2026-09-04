@@ -11,7 +11,7 @@ use log::{error, info, warn};
 use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process;
@@ -209,11 +209,18 @@ fn main() -> Result<()> {
     };
     let tee = match &prepared {
         Some(prepared) => {
-            let log_path = prepared.dir.join("usbtop-ng.log");
-            match diag::support::TeeWriter::create(&log_path, config_home().ok().as_deref()) {
+            // The log is opened beneath the pinned bundle root fd, not by
+            // path, so it cannot be redirected through a swapped component.
+            match diag::support::TeeWriter::create(
+                prepared.root_fd.as_fd(),
+                config_home().ok().as_deref(),
+            ) {
                 Ok(tee) => Some(tee),
                 Err(e) => {
-                    eprintln!("error: could not create {}: {e}", log_path.display());
+                    eprintln!(
+                        "error: could not create usbtop-ng.log in {}: {e}",
+                        prepared.dir.display()
+                    );
                     process::exit(1);
                 }
             }
