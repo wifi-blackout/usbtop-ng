@@ -85,7 +85,12 @@ impl ReportSink {
         let Some(path) = output else {
             return Ok(ReportSink::Stdout);
         };
-        let mut file = File::create(path)?;
+        let mut file = File::create(path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("could not create {}: {e}", path.display()),
+            )
+        })?;
         if json {
             let line = serde_json::to_string(run).expect("run record serializes");
             writeln!(file, "{line}")?;
@@ -232,7 +237,13 @@ mod tests {
     fn unwritable_output_path_fails_at_open() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("missing-dir").join("run.ndjson");
-        assert!(ReportSink::open(Some(&path), &run(), true).is_err());
+        let err = match ReportSink::open(Some(&path), &run(), true) {
+            Ok(_) => panic!("a missing parent directory must fail ReportSink::open"),
+            Err(e) => e,
+        };
+        let message = err.to_string();
+        assert!(message.starts_with("could not create "), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
     }
 
     #[test]
