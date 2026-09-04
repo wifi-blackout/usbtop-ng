@@ -10,6 +10,7 @@ pub mod bundle;
 pub mod collect;
 pub mod inventory;
 pub mod redact;
+pub mod support;
 
 /// One "unavailable: reason" record. Collectors return these instead of
 /// failing; the manifest lists every one so a reporter and a maintainer both

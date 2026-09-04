@@ -2,8 +2,11 @@
 //! writer. Only `sources`, `controllers`, and `speed_classes` are read back by
 //! the harness; the rest is human-facing documentation.
 
+use std::path::Path;
+
 use serde::Serialize;
 
+use crate::diag::collect::{os_pretty_name_from, read_trimmed};
 use crate::fixture_replay::FixtureSource;
 use crate::headless::Report;
 
@@ -121,35 +124,17 @@ struct HostIdentity {
 /// empty string; this is documentation, not asserted, so it never fails capture.
 fn gather_host_identity() -> HostIdentity {
     HostIdentity {
-        board: read_trimmed("/proc/device-tree/model")
-            .or_else(|| read_trimmed("/sys/devices/virtual/dmi/id/product_name"))
+        board: read_trimmed(Path::new("/proc/device-tree/model"))
+            .or_else(|| read_trimmed(Path::new("/sys/devices/virtual/dmi/id/product_name")))
             .unwrap_or_default(),
-        soc: read_trimmed("/proc/device-tree/compatible").unwrap_or_default(),
+        soc: read_trimmed(Path::new("/proc/device-tree/compatible")).unwrap_or_default(),
         arch: std::env::consts::ARCH.to_string(),
-        kernel: read_trimmed("/proc/sys/kernel/osrelease").unwrap_or_default(),
-        os: os_pretty_name().unwrap_or_default(),
+        kernel: read_trimmed(Path::new("/proc/sys/kernel/osrelease")).unwrap_or_default(),
+        os: std::fs::read_to_string("/etc/os-release")
+            .ok()
+            .and_then(|t| os_pretty_name_from(&t))
+            .unwrap_or_default(),
     }
-}
-
-/// Device-tree files (`model`, `compatible`) are NUL-separated string lists,
-/// so beyond edge-trimming, interior NULs are flattened to single spaces --
-/// `"raspberrypi,5-model-b\0brcm,bcm2712\0"` reads as
-/// `"raspberrypi,5-model-b brcm,bcm2712"` rather than carrying a raw NUL
-/// into meta.toml (where it would serialize as a `\u0000` escape).
-fn read_trimmed(path: &str) -> Option<String> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let trimmed = raw.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-    (!trimmed.is_empty()).then(|| trimmed.replace('\0', " "))
-}
-
-fn os_pretty_name() -> Option<String> {
-    let text = std::fs::read_to_string("/etc/os-release").ok()?;
-    for line in text.lines() {
-        if let Some(value) = line.strip_prefix("PRETTY_NAME=") {
-            return Some(value.trim_matches('"').to_string());
-        }
-    }
-    None
 }
 
 fn now_unix() -> u64 {
@@ -167,30 +152,6 @@ mod tests {
     use crate::fixture_replay::FIXED_ELAPSED;
     use crate::headless::{build_report, Baseline};
     use crate::usbmon::parser::parse_usbmon_text_line;
-
-    /// Device-tree files (`model`, `compatible`) are NUL-separated string
-    /// lists, so a raw read of e.g. `compatible` yields
-    /// `"raspberrypi,5-model-b\0brcm,bcm2712\0"`. Edge NULs must trim away
-    /// and interior NULs must flatten to single spaces, so meta.toml carries
-    /// `"raspberrypi,5-model-b brcm,bcm2712"` instead of a `\u0000` escape.
-    #[test]
-    fn read_trimmed_flattens_interior_nuls_from_device_tree_string_lists() {
-        let temp = tempfile::tempdir().unwrap();
-        let compatible = temp.path().join("compatible");
-        std::fs::write(&compatible, b"raspberrypi,5-model-b\0brcm,bcm2712\0\n").unwrap();
-        assert_eq!(
-            read_trimmed(compatible.to_str().unwrap()).as_deref(),
-            Some("raspberrypi,5-model-b brcm,bcm2712")
-        );
-
-        // A single-string file (trailing NUL only) stays exactly itself.
-        let model = temp.path().join("model");
-        std::fs::write(&model, b"Raspberry Pi 5 Model B Rev 1.0\0").unwrap();
-        assert_eq!(
-            read_trimmed(model.to_str().unwrap()).as_deref(),
-            Some("Raspberry Pi 5 Model B Rev 1.0")
-        );
-    }
 
     #[test]
     fn coverage_tags_are_distinct_sorted_and_skip_zero_speed() {

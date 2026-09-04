@@ -226,7 +226,6 @@ pub fn count_events(traces: &[CapturedTrace]) -> u64 {
 }
 
 /// What a live capture recorded, for `--support`'s summary line.
-#[cfg(feature = "capture-fixture")]
 #[derive(Debug)]
 pub struct CaptureOutcome {
     pub sources: Vec<FixtureSource>,
@@ -235,7 +234,6 @@ pub struct CaptureOutcome {
 }
 
 /// `--capture-fixture` options (from the CLI).
-#[cfg(feature = "capture-fixture")]
 pub struct CaptureFixtureOpts {
     pub outdir: PathBuf,
     pub window: Duration,
@@ -250,7 +248,6 @@ pub struct CaptureFixtureOpts {
 /// Live entry point: open the binary and text usbmon interfaces, capture one
 /// shared window of raw events concurrently, sanitize them, and assemble the
 /// bundle. Needs root.
-#[cfg(feature = "capture-fixture")]
 pub fn run_capture_fixture(opts: CaptureFixtureOpts) -> anyhow::Result<CaptureOutcome> {
     let bus = opts.bus.unwrap_or(0);
     let stop = AtomicBool::new(false);
@@ -408,7 +405,6 @@ fn capture_until(path: &Path, deadline: Instant, stop: &AtomicBool) -> std::io::
 
 /// Parse a trailing `stageN` component of the output dir into a stage id, for
 /// meta.toml. Best-effort documentation only.
-#[cfg(feature = "capture-fixture")]
 fn stage_id_from_outdir(outdir: &Path) -> Option<u32> {
     outdir
         .file_name()?

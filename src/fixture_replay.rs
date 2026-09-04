@@ -1,8 +1,8 @@
-//! Shared replay core for the fixture-capture harness. Compiled under
-//! `cfg(test)` (so the default test suite's replay harness can use it) and
-//! under the `capture-fixture` feature (so `--capture-fixture` generates
-//! goldens by the same path). Being one module keeps a committed golden equal
-//! to what the replay test produces, by construction.
+//! Shared replay core: the default test suite's corpus harness, the
+//! `--capture-fixture` capturer, and `--support`'s embedded fixture all
+//! generate reports by this one path, so a committed golden equals what
+//! replay produces, by construction. The corpus-discovery items stay
+//! `cfg(test)`.
 
 use std::path::Path;
 #[cfg(test)]

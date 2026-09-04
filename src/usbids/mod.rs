@@ -174,7 +174,7 @@ fn load_source(path: &Path) -> Option<UsbIds> {
     }
 }
 
-fn resolve_from_chain(paths: &[&Path]) -> Option<UsbIds> {
+pub(crate) fn resolve_from_chain(paths: &[&Path]) -> Option<UsbIds> {
     for path in paths {
         if let Some(db) = load_source(path) {
             log::debug!("usb.ids loaded from {}", path.display());

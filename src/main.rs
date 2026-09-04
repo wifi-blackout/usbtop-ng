@@ -17,16 +17,13 @@ use std::path::Path;
 use std::process;
 use std::sync::Arc;
 
-#[cfg(any(test, feature = "capture-fixture"))]
 mod capture;
 mod config;
 mod device;
-#[cfg(test)]
 mod diag;
 mod filter;
 #[cfg(test)]
 mod fixture_corpus;
-#[cfg(any(test, feature = "capture-fixture"))]
 mod fixture_replay;
 mod headless;
 mod snapshot;
@@ -124,11 +121,29 @@ struct Cli {
     #[arg(long)]
     snapshot_internal: bool,
 
+    /// Gather a diagnostic bundle for a bug report into PATH (default: the
+    /// current directory; a name ending in .tar.gz names the archive), then exit
+    #[arg(
+        long,
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = ".",
+        conflicts_with_all = [
+            "once", "batch", "snapshot_internal", "update_usbids",
+            "setup", "create_alias", "print_man", "print_completions"
+        ]
+    )]
+    support: Option<String>,
+
+    /// Skip the usbmon capture in --support (static information only)
+    #[arg(long, requires = "support")]
+    no_capture: bool,
+
     /// Capture the current usbmon traffic + sysfs topology into a fixture
     /// bundle at DIR, then exit (needs root; reuses --window for the capture
     /// length). Build with `--features capture-fixture`.
     #[cfg(feature = "capture-fixture")]
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", conflicts_with = "support")]
     capture_fixture: Option<String>,
 
     /// usbmon interface bus to capture (default: 0, the aggregate of all buses)
@@ -167,18 +182,63 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Initialize logging
-    if cli.verbose {
-        env_logger::Builder::from_default_env()
-            .filter_level(log::LevelFilter::Debug)
-            .init();
-    } else {
-        env_logger::Builder::from_default_env()
-            .filter_level(log::LevelFilter::Info)
-            .init();
-    }
+    // `--support` owns the logger: its bundle directory must exist before
+    // the logger is built so every record can be teed into it.
+    let started_unix = now_unix();
+    let prepared = match cli.support.as_deref() {
+        Some(target) => match diag::support::prepare_dir(Path::new(target), started_unix) {
+            Ok(prepared) => Some(prepared),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                process::exit(1);
+            }
+        },
+        None => None,
+    };
+    let tee = match &prepared {
+        Some(prepared) => {
+            let log_path = prepared.dir.join("usbtop-ng.log");
+            match diag::support::TeeWriter::create(&log_path, config_home().ok().as_deref()) {
+                Ok(tee) => Some(tee),
+                Err(e) => {
+                    eprintln!("error: could not create {}: {e}", log_path.display());
+                    process::exit(1);
+                }
+            }
+        }
+        None => None,
+    };
+    diag::support::init_logger(cli.verbose, tee);
 
     info!("starting usbtop-ng v{}", env!("CARGO_PKG_VERSION"));
+
+    if let Some(prepared) = prepared {
+        let window = resolve_capture_window(cli.window).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            process::exit(2);
+        });
+        let roots = diag::support::Roots::live(
+            cli.config.as_deref().map(Path::new),
+            cli.usbids.as_deref().map(Path::new),
+        );
+        let environment = diag::support::Environment::live(&roots);
+        let opts = diag::support::SupportOpts {
+            window,
+            no_capture: cli.no_capture,
+            command: env::args().collect(),
+        };
+        match diag::support::run_support(&opts, &roots, &environment, &prepared, started_unix) {
+            Ok(summary) => {
+                print!("{}", diag::support::render_summary(&summary));
+                print!("{}", diag::support::GUIDANCE);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                process::exit(1);
+            }
+        }
+    }
 
     // Show setup instructions if requested
     if cli.setup {
@@ -310,7 +370,7 @@ fn main() -> Result<()> {
     // writes a fixture bundle, then exits. Feature-gated developer/CI tooling.
     #[cfg(feature = "capture-fixture")]
     if let Some(outdir) = &cli.capture_fixture {
-        let window = resolve_capture_fixture_window(cli.window).unwrap_or_else(|e| {
+        let window = resolve_capture_window(cli.window).unwrap_or_else(|e| {
             eprintln!("error: {e}");
             process::exit(2);
         });
@@ -523,11 +583,8 @@ fn main() -> Result<()> {
         // are set by the reader thread shortly after start, so reading them
         // here may race the first fetch, but the report lines carry the
         // authoritative per-window `source` anyway -- the record's `backend`
-        // documents "selected at start".
-        let started_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // documents "selected at start". `started_unix` is the process's
+        // start time, computed once at the top of `main`.
         let run_record = headless::export::RunRecord {
             record: "run",
             usbtop_ng: env!("CARGO_PKG_VERSION").to_string(),
@@ -565,10 +622,10 @@ fn main() -> Result<()> {
             kernel: std::fs::read_to_string("/proc/sys/kernel/osrelease")
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default(),
-            os: std::fs::read_to_string("/etc/os-release")
-                .ok()
-                .and_then(|text| os_pretty_name_from(&text))
-                .unwrap_or_default(),
+            os: diag::collect::os_pretty_name_from(
+                &std::fs::read_to_string("/etc/os-release").unwrap_or_default(),
+            )
+            .unwrap_or_default(),
             arch: std::env::consts::ARCH,
             buses: usbmon_status.available_buses.clone(),
         };
@@ -720,6 +777,13 @@ fn may_prompt_before_unload(headless: bool) -> bool {
     !headless
 }
 
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Resolve `--window` into a [`Duration`], applying the default (5s for
 /// `--once`, 1s for `--batch`) and the 0.25s floor. `Duration::from_secs_f64`
 /// panics on a NaN, an infinity, or a finite value too large for a `Duration`
@@ -737,16 +801,15 @@ fn resolve_window(window: Option<f64>, batch: bool) -> Result<Duration, String> 
     Duration::try_from_secs_f64(floored).map_err(|_| format!("--window {floored} is out of range"))
 }
 
-/// Resolve `--window` for `--capture-fixture` into a [`Duration`]: same
-/// non-finite guard as [`resolve_window`], but this path predates it and
-/// keeps its own default (5s) and floor (0.1s) rather than adopting
-/// `resolve_window`'s (1s/5s by mode, 0.25s floor).
+/// Resolve `--window` for `--capture-fixture` and `--support` into a
+/// [`Duration`]: same non-finite guard as [`resolve_window`], but this path
+/// predates it and keeps its own default (5s) and floor (0.1s) rather than
+/// adopting `resolve_window`'s (1s/5s by mode, 0.25s floor).
 /// `Duration::from_secs_f64`/`try_from_secs_f64` panic on a NaN, an infinity,
 /// or a finite value too large for a `Duration` to represent — `--window inf`
 /// reached that directly and turned an argument error into a panic (exit
 /// 101). This validates first and reports a normal exit-2 error instead.
-#[cfg(feature = "capture-fixture")]
-fn resolve_capture_fixture_window(window: Option<f64>) -> Result<Duration, String> {
+fn resolve_capture_window(window: Option<f64>) -> Result<Duration, String> {
     let seconds = window.unwrap_or(5.0);
     if !seconds.is_finite() {
         return Err(format!(
@@ -876,32 +939,9 @@ fn open_rc_file(config_file: &str) -> io::Result<std::fs::File> {
     opts.open(config_file)
 }
 
-/// `PRETTY_NAME=` from `/etc/os-release` content, quotes trimmed. A private
-/// stand-in for `capture::meta`'s (feature-gated) `os_pretty_name`, used to
-/// fill the run record's `os` field; a later task replaces this with a
-/// shared, always-available copy and deletes this one.
-fn os_pretty_name_from(text: &str) -> Option<String> {
-    for line in text.lines() {
-        if let Some(value) = line.strip_prefix("PRETTY_NAME=") {
-            return Some(value.trim_matches('"').to_string());
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn os_pretty_name_from_extracts_the_quoted_pretty_name_field() {
-        let text = "NAME=\"Linux Mint\"\nPRETTY_NAME=\"Linux Mint 22.3\"\nVERSION_ID=\"22.3\"\n";
-        assert_eq!(
-            os_pretty_name_from(text),
-            Some("Linux Mint 22.3".to_string())
-        );
-        assert_eq!(os_pretty_name_from("NAME=\"Linux Mint\"\n"), None);
-    }
 
     #[test]
     fn cli_parses_print_completions_shell() {
@@ -934,6 +974,39 @@ mod tests {
 
         let absent = Cli::try_parse_from(["usbtop-ng"]).unwrap();
         assert!(!absent.snapshot_internal);
+    }
+
+    #[test]
+    fn cli_parses_support_with_and_without_a_value() {
+        use clap::Parser;
+        let bare = Cli::try_parse_from(["usbtop-ng", "--support"]).unwrap();
+        assert_eq!(bare.support.as_deref(), Some("."));
+        assert!(!bare.no_capture);
+        let named = Cli::try_parse_from([
+            "usbtop-ng",
+            "--support",
+            "bug.tar.gz",
+            "--no-capture",
+            "--window",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(named.support.as_deref(), Some("bug.tar.gz"));
+        assert!(named.no_capture);
+        assert_eq!(named.window, Some(2.0));
+        assert!(Cli::try_parse_from(["usbtop-ng"])
+            .unwrap()
+            .support
+            .is_none());
+    }
+
+    #[test]
+    fn support_conflicts_with_the_report_modes_and_no_capture_needs_it() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["usbtop-ng", "--support", "--once"]).is_err());
+        assert!(Cli::try_parse_from(["usbtop-ng", "--support", "--batch"]).is_err());
+        assert!(Cli::try_parse_from(["usbtop-ng", "--support", "--snapshot-internal"]).is_err());
+        assert!(Cli::try_parse_from(["usbtop-ng", "--no-capture"]).is_err());
     }
 
     #[test]
@@ -997,36 +1070,33 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "capture-fixture")]
-    fn resolve_capture_fixture_window_applies_the_default_and_floor() {
+    fn resolve_capture_window_applies_the_default_and_floor() {
         assert_eq!(
-            resolve_capture_fixture_window(None).unwrap(),
+            resolve_capture_window(None).unwrap(),
             Duration::from_secs_f64(5.0),
             "defaults to 5s"
         );
         assert_eq!(
-            resolve_capture_fixture_window(Some(0.01)).unwrap(),
+            resolve_capture_window(Some(0.01)).unwrap(),
             Duration::from_secs_f64(0.1),
             "floors to 0.1s, not resolve_window's 0.25s"
         );
         assert_eq!(
-            resolve_capture_fixture_window(Some(2.5)).unwrap(),
+            resolve_capture_window(Some(2.5)).unwrap(),
             Duration::from_secs_f64(2.5)
         );
     }
 
     #[test]
-    #[cfg(feature = "capture-fixture")]
-    fn resolve_capture_fixture_window_rejects_non_finite_values_instead_of_panicking() {
-        assert!(resolve_capture_fixture_window(Some(f64::INFINITY)).is_err());
-        assert!(resolve_capture_fixture_window(Some(f64::NEG_INFINITY)).is_err());
-        assert!(resolve_capture_fixture_window(Some(f64::NAN)).is_err());
+    fn resolve_capture_window_rejects_non_finite_values_instead_of_panicking() {
+        assert!(resolve_capture_window(Some(f64::INFINITY)).is_err());
+        assert!(resolve_capture_window(Some(f64::NEG_INFINITY)).is_err());
+        assert!(resolve_capture_window(Some(f64::NAN)).is_err());
     }
 
     #[test]
-    #[cfg(feature = "capture-fixture")]
-    fn resolve_capture_fixture_window_rejects_a_finite_value_too_large_for_duration() {
-        assert!(resolve_capture_fixture_window(Some(1e300)).is_err());
+    fn resolve_capture_window_rejects_a_finite_value_too_large_for_duration() {
+        assert!(resolve_capture_window(Some(1e300)).is_err());
     }
 
     #[test]

@@ -25,6 +25,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
+        # The default build now compiles the capture core (src/capture, src/fixture_replay) and src/diag; only --capture-fixture stays behind its feature.
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Run tests
