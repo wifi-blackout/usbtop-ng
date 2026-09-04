@@ -58,31 +58,46 @@ impl Redactor {
         self.text(&text)
     }
 
-    /// Every occurrence of the home directory inside free text (a
-    /// preferences file, a command line, a report) becomes `~`, then every
-    /// occurrence of the login name as a whole path component elsewhere in
-    /// the text becomes `<user>` (see [`Redactor::mask_user_name`]). An
-    /// occurrence of the home directory counts only at a path boundary: both
-    /// the character before and the character after the match must be
-    /// absent or not a path character. `/home/alice/x` matches,
-    /// `/home/alice2/x` and `/opt/home/alice/data` do not. The home rule
-    /// runs first and owns whatever text it examines, matched or not, so a
-    /// login name that only ever appears as part of an unredacted home
-    /// occurrence (`/opt/home/alice/data`) is never separately masked.
+    /// Two independent passes over the text, in order: [`Redactor::mask_home`]
+    /// rewrites every home-directory occurrence to `~`, then
+    /// [`Redactor::mask_user_name`] rewrites every occurrence of the login
+    /// name as a whole path component to `<user>` -- over the *whole*
+    /// output of the first pass, not just the text the first pass left
+    /// untouched. A login name that the home rule actually consumed
+    /// (`/home/alice/x` -> `~/x`) is gone before the second pass runs, so it
+    /// is never counted twice; but a login name the home rule's boundary
+    /// check rejected -- `/opt/home/alice/data`, where the character before
+    /// `/home/alice` is not a path boundary, so the home rule leaves the
+    /// text as written -- is still a whole path component on its own and
+    /// the second pass masks it: `/opt/home/<user>/data`. Backup trees,
+    /// snapshots, and container overlays commonly nest a full home path
+    /// this way, so the second pass has to see all of the first pass's
+    /// output, not a filtered subset of it.
     pub fn text(&mut self, text: &str) -> String {
+        let after_home = self.mask_home(text);
+        self.mask_user_name(&after_home)
+    }
+
+    /// Every occurrence of the home directory inside free text (a
+    /// preferences file, a command line, a report) becomes `~`. An
+    /// occurrence counts only at a path boundary: both the character before
+    /// and the character after the match must be absent or not a path
+    /// character. `/home/alice/x` matches, `/home/alice2/x` and
+    /// `/opt/home/alice/data` do not.
+    fn mask_home(&mut self, text: &str) -> String {
         let Some(home) = self.home.clone() else {
-            return self.mask_user_name(text);
+            return text.to_string();
         };
         let mut out = String::with_capacity(text.len());
         let mut rest = text;
         while let Some(at) = rest.find(&home) {
-            out.push_str(&self.mask_user_name(&rest[..at]));
             let before_ok = rest[..at]
                 .chars()
                 .next_back()
                 .is_none_or(|c| !is_path_char(c));
             let after = &rest[at + home.len()..];
             let after_ok = after.chars().next().is_none_or(|c| !is_path_char(c));
+            out.push_str(&rest[..at]);
             if before_ok && after_ok {
                 out.push('~');
                 self.bump("home_path");
@@ -91,7 +106,7 @@ impl Redactor {
             }
             rest = after;
         }
-        out.push_str(&self.mask_user_name(rest));
+        out.push_str(rest);
         out
     }
 
@@ -100,8 +115,9 @@ impl Redactor {
     /// match to be `/` (an occurrence at the very start of the text does not
     /// count: it is not a path component) and the character right after it
     /// to be absent or not a path character. `/media/alice/stick` and a
-    /// trailing `.../alice` match; `/home/alice2/x`, `/opt/xalice/y`, and a
-    /// bare `alice` do not.
+    /// trailing `.../alice` match; `/home/alice2/x`, `/opt/xalice/y`, a
+    /// bare `alice`, and `/media/alice.bak` (`.` is a path character) do
+    /// not.
     fn mask_user_name(&mut self, text: &str) -> String {
         let Some(name) = self.user_name.clone() else {
             return text.to_string();
@@ -229,8 +245,12 @@ mod tests {
             r.path(std::path::Path::new("/home/alice-old/x")),
             "/home/alice-old/x"
         );
-        assert_eq!(r.text("/opt/home/alice/data"), "/opt/home/alice/data");
-        assert!(r.summary().is_empty());
+        // Not under home (the character before `/home/alice` here is not a
+        // path boundary), so the home rule leaves it as written -- but the
+        // login name is still a whole path component on its own, and the
+        // second pass masks it.
+        assert_eq!(r.text("/opt/home/alice/data"), "/opt/home/<user>/data");
+        assert_eq!(r.summary(), vec![("user_name".to_string(), 1)]);
     }
 
     #[test]
@@ -333,6 +353,13 @@ mod tests {
             ("/opt/xalice/y", "/opt/xalice/y", vec![]),
             ("Alice's iPhone", "Alice's iPhone", vec![]),
             ("alice", "alice", vec![]),
+            // `.` is a path character, so it is not a boundary.
+            ("/media/alice.bak", "/media/alice.bak", vec![]),
+            (
+                "/media/alice!",
+                "/media/<user>!",
+                vec![("user_name".to_string(), 1)],
+            ),
         ] {
             let mut r = Redactor::new(Some(home));
             assert_eq!(r.text(input), expected, "{input}");

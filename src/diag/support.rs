@@ -1073,6 +1073,10 @@ mod tests {
             "1 user name; host identity never collected; device serials included"
         );
         assert_eq!(
+            redacted_line(&[("home_path".to_string(), 2), ("user_name".to_string(), 2)]),
+            "2 home paths, 2 user names; host identity never collected; device serials included"
+        );
+        assert_eq!(
             redacted_line(&[]),
             "nothing rewritten; host identity never collected; device serials included"
         );
