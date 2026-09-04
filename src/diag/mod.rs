@@ -12,16 +12,31 @@ pub mod redact;
 /// failing; the manifest lists every one so a reporter and a maintainer both
 /// know what the bundle lacks.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[expect(dead_code)]
 pub struct Note {
     pub item: String,
     pub reason: String,
 }
 
-#[expect(dead_code)]
 pub fn note(item: &str, reason: impl std::fmt::Display) -> Note {
     Note {
         item: item.to_string(),
         reason: reason.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn note_records_the_item_and_the_reason_as_text() {
+        let n = note("dmesg", std::io::Error::other("permission denied"));
+        assert_eq!(
+            n,
+            Note {
+                item: "dmesg".to_string(),
+                reason: "permission denied".to_string(),
+            }
+        );
     }
 }

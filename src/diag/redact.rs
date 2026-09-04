@@ -50,8 +50,10 @@ impl Redactor {
 
     /// Every occurrence of the home directory inside free text (a
     /// preferences file, a command line, a report) becomes `~`. An
-    /// occurrence counts only at a path boundary: `/home/alice/x` matches,
-    /// `/home/alice2/x` and `/home/alice-old` do not.
+    /// occurrence counts only at a path boundary: both the character before
+    /// and the character after the match must be absent or not a path
+    /// character. `/home/alice/x` matches, `/home/alice2/x` and
+    /// `/opt/home/alice/data` do not.
     pub fn text(&mut self, text: &str) -> String {
         let Some(home) = self.home.clone() else {
             return text.to_string();
@@ -59,13 +61,14 @@ impl Redactor {
         let mut out = String::with_capacity(text.len());
         let mut rest = text;
         while let Some(at) = rest.find(&home) {
-            let after = &rest[at + home.len()..];
-            let boundary = after
+            let before_ok = rest[..at]
                 .chars()
-                .next()
-                .is_none_or(|c| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.')));
+                .next_back()
+                .is_none_or(|c| !is_path_char(c));
+            let after = &rest[at + home.len()..];
+            let after_ok = after.chars().next().is_none_or(|c| !is_path_char(c));
             out.push_str(&rest[..at]);
-            if boundary {
+            if before_ok && after_ok {
                 out.push('~');
                 self.bump("home_path");
             } else {
@@ -137,6 +140,10 @@ impl Redactor {
     }
 }
 
+fn is_path_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
+
 fn is_mac_byte(b: u8) -> bool {
     b.is_ascii_hexdigit() || b == b':'
 }
@@ -177,6 +184,7 @@ mod tests {
             r.path(std::path::Path::new("/home/alice-old/x")),
             "/home/alice-old/x"
         );
+        assert_eq!(r.text("/opt/home/alice/data"), "/opt/home/alice/data");
         assert!(r.summary().is_empty());
     }
 
@@ -186,6 +194,14 @@ mod tests {
         let prefs = "usbids_path = \"/home/alice/usb.ids\"\n# was /home/alice/old\n";
         assert_eq!(r.text(prefs), "usbids_path = \"~/usb.ids\"\n# was ~/old\n");
         assert_eq!(r.summary(), vec![("home_path".to_string(), 2)]);
+
+        let mut r = Redactor::new(Some(std::path::Path::new("/home/alice")));
+        assert_eq!(r.text("x=/home/alice"), "x=~");
+        assert_eq!(r.summary(), vec![("home_path".to_string(), 1)]);
+
+        let mut r = Redactor::new(Some(std::path::Path::new("/home/alice")));
+        assert_eq!(r.text("file:///home/alice/x"), "file://~/x");
+        assert_eq!(r.summary(), vec![("home_path".to_string(), 1)]);
     }
 
     #[test]
