@@ -136,6 +136,16 @@ src/
 │   ├── reader.rs     # Read loop over the usbmon Nu text interface
 │   ├── binary.rs     # Read loop over the usbmon /dev/usbmonN binary interface via read()
 │   └── parser.rs     # Nu text-format parsing, UsbSpeed bandwidth/color tables
+├── capture/          # Fixture capture and assembly (shared by --capture-fixture and --support)
+├── diag/             # --support: redaction rules, collectors, device inventory, bundle writer
+│   ├── redact.rs     # Home paths to ~, MAC and UUID masking, the environment allowlist
+│   ├── collect.rs    # Build, host, usbmon, backend probe, dmesg, config, terminal
+│   ├── inventory.rs  # USB devices, interfaces, endpoints, hub ports, descriptors, Type-C, Thunderbolt
+│   ├── bundle.rs     # Bundle directory, manifest, UTC stamp, tar archive
+│   └── support.rs    # The orchestrator, the summary, the log tee
+├── headless/         # --once and --batch reports
+│   ├── mod.rs        # Report model, text renderer, the sampling loop
+│   └── export.rs     # --output file sink and the run record
 ├── device/           # Device management
 │   ├── mod.rs        # Device structure, sysfs metadata, %busy, indicators
 │   └── manager.rs    # Bus aggregation, controller resolution, packet routing
@@ -212,13 +222,15 @@ touches the real `~/.usbtop-ng` or usbmon. CI runs this suite and no other.
 
 ### Live system tests (the `integration` feature)
 
-The opt-in `integration` cargo feature adds 4 tests to the unit suite: one
+The opt-in `integration` cargo feature adds 5 tests to the unit suite: one
 that reads the real usbmon interfaces instead of fixtures, one that exercises
 the real `fchown(2)` call behind `sudo`'s ownership fix-up and needs real root,
 one that opens a real `/dev/usbmon0` and walks its mmap ring through the real
-`mmap`, `MON_IOCX_MFETCH`, and `MON_IOCG_STATS` syscalls, and one that proves
+`mmap`, `MON_IOCX_MFETCH`, and `MON_IOCG_STATS` syscalls, one that proves
 `kernel_dropped` is readable while that mmap reader is still running, not
-only after it stops.
+only after it stops, and one that runs `--support`'s orchestrator live as
+root and checks that the embedded fixture's goldens replay with zero kernel
+drops on an idle bus.
 
 1. Confirm that usbmon is loaded and that you can read
    `/sys/kernel/debug/usb/usbmon`. Root access is the usual route.
@@ -226,8 +238,8 @@ only after it stops.
    ```bash
    cargo test --features integration
    ```
-   The unit suite reports 469 passed. Without usbmon, without root, or
-   without a mmap-capable `/dev/usbmon0`, each of the four extra tests
+   The unit suite reports 579 passed. Without usbmon, without root, or
+   without a mmap-capable `/dev/usbmon0`, each of the five extra tests
    prints its own skip message and passes.
 
 The live test is gated on the feature, so it compiles to nothing on default
@@ -258,11 +270,13 @@ that needs a real machine.
 ### Hermetic feature tests (the `capture-fixture` feature)
 
 `capture-fixture` is a third opt-in feature build in the gate matrix,
-alongside `integration` and `ebpf` above. It adds the `--capture-fixture`
-subcommand that records a hardware fixture bundle into
-`tests/fixtures/hosts/` -- see
+alongside `integration` and `ebpf` above. The capture core itself
+(`src/capture/`, `src/fixture_replay.rs`) is part of the default build,
+since `--support` embeds a fixture bundle; the feature gates only the
+`--capture-fixture` subcommand that records a hardware fixture into
+`tests/fixtures/hosts/` (see
 [TESTING.md](TESTING.md#capturing-hardware-fixtures) for the capture
-procedure. Needs no extra toolchain: the feature builds with just the MSRV
+procedure). Needs no extra toolchain: the feature builds with just the MSRV
 Rust toolchain.
 
 1. Run the suite with the feature:
@@ -270,9 +284,10 @@ Rust toolchain.
    cargo clippy --features capture-fixture --all-targets -- -D warnings
    cargo test --features capture-fixture
    ```
-   The unit suite reports 481 passed under the feature (465 without it; the
-   extra tests cover the capturer's own sanitizers, sysfs materialization,
-   and `meta.toml` generation).
+   The unit suite reports 574 passed under the feature, the same as
+   without it: the capture core it exercises is already part of the
+   default build, and the feature adds only the `--capture-fixture`
+   subcommand, not tests.
 
 Like `ebpf`, CI builds and hermetic-tests this feature on every push:
 `cargo clippy --features capture-fixture --all-targets -- -D warnings` and
@@ -386,13 +401,36 @@ Brief description of changes
 
 ### Bug reports
 
-Use the bug report template and include:
+Open a bug with the [bug report form](https://github.com/wifi-blackout/usbtop-ng/issues/new?template=bug_report.yml)
+after running:
 
-- **Environment**: operating system, Rust version, usbtop-ng version.
-- **Steps to reproduce** the bug.
-- **Expected behavior and actual behavior.**
-- **Log output**, captured with `RUST_LOG=debug`.
-- **System information**: the output of `lsusb` and `lsmod | grep usbmon`.
+```bash
+sudo usbtop-ng --support
+```
+
+It writes `usbtop-ng-support-<UTC time>/` and a `.tar.gz` beside it in the
+current directory (or in the `PATH` you pass), prints a summary, and lists
+every file it gathered. Paste the summary into the form and attach the
+archive. Without `sudo` the bundle still holds everything but the capture;
+`--no-capture` skips the capture on purpose, `--window SECONDS` sets its
+length.
+
+What the bundle holds: build and host details (`build.toml`, `host.toml`),
+the usbmon probe and the backend the monitor would select (`usbmon.toml`),
+the USB lines of the kernel log (`dmesg-usb.txt`), every device's full
+self-description with its raw descriptors (`inventory/`), your preferences
+and internal-device snapshot with home paths rewritten (`config/`), the
+terminal setup (`terminal.toml`), the embedded fixture (`fixture/`, the same
+layout as `tests/fixtures/hosts/`), a replayed report (`report.json`), the
+run's debug log, and a `manifest.toml` listing each file with its size, the
+redaction counts, and everything that was unavailable.
+
+What it never holds: the hostname, machine-id, DMI serial or UUID, any host
+MAC address or IP address, or a user name. Device serial numbers and
+Thunderbolt `unique_id` values are kept, because a cloned or re-badged
+device is often only distinguishable by them. The `inventory/` files are for
+the maintainer reading the issue and are never committed; the `fixture/`
+directory carries no serial and is what becomes a regression fixture.
 
 ### Feature requests
 
@@ -448,6 +486,10 @@ known limitations.
    `src/usbmon/binary.rs` for the binary interface via `read()`, and
    `src/usbmon/mmap_ring.rs` for the binary interface via its mmap ring.
 4. **Statistics**: `src/stats/mod.rs`.
+5. **Diagnostics**: `src/diag/` for anything `--support` gathers. A new
+   collector takes its filesystem roots as parameters, returns typed data
+   plus notes, and never fails the bundle; add the file to the tree in
+   CONTRIBUTING and to the manifest test in `src/diag/support.rs`.
 
 ### Dependencies
 

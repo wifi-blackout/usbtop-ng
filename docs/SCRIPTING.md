@@ -47,10 +47,12 @@ anything, so both are safe inside a script or a cron job.
 - `--window SECONDS` sets the sample window. It defaults to 5 seconds with
   `--once` and 1 second with `--batch`.
 - The value floors at 0.25 seconds; anything lower is raised to it.
-- `--window` and `--json` both require `--once` or `--batch`. Passing either
-  without one of those two flags is an error, exit code 2:
+- `--window`, `--json`, and `--output` all require `--once` or `--batch`
+  (`--window` is also accepted by `--support`, where it sets the capture
+  length). Passing any of the three without one of those two flags is an
+  error, exit code 2:
   ```
-  error: --json and --window need --once or --batch
+  error: --json, --window, and --output need --once or --batch
   ```
 
 ## `--json`
@@ -187,6 +189,52 @@ readability. `--once --json` prints each report as a single compact line:
 ```bash
 sudo usbtop-ng --batch --json | jq -c '.total_rx_bps'
 ```
+
+## `--output PATH`: write to a file
+
+`--output PATH` sends every report to `PATH` instead of stdout, in the active
+format (text, or NDJSON with `--json`). The file is created or truncated when
+the run starts; there is no append and no rotation (redirect stdout if you
+want either). One line on stderr at exit says how many reports were written
+and where. A write error on the file is fatal with a non-zero exit.
+
+```bash
+sudo usbtop-ng --batch --json --window 1 --output run.ndjson
+```
+
+A file export starts with a run record so the file describes the run it
+came from. In JSON it is the first line:
+
+```json
+{"record":"run","usbtop_ng":"1.5.0","features":[],"started_unix":1788354946,"window_seconds":1.0,"batch":true,"filters":[],"command":["usbtop-ng","--batch","--json","--window","1","--output","run.ndjson"],"backend":"mmap","kernel":"7.0.0-30-generic","os":"Linux Mint 22.3","arch":"x86_64","buses":[0,1,2,3,4]}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `record` | string | always `"run"`; report lines never carry this key |
+| `usbtop_ng` | string | the version that wrote the file |
+| `features` | array | cargo features compiled in, sorted (`capture-fixture`, `ebpf`, `integration`) |
+| `started_unix` | u64 | Unix time the run started, seconds |
+| `window_seconds` | f64 | the requested window |
+| `batch` | bool | `true` for `--batch`, `false` for `--once` |
+| `filters` | array | the `--filter` terms as given |
+| `command` | array | the command line as run |
+| `backend` | string | the source selected at start: `ebpf`, `mmap`, `binary`, `text`, or `none`; each report's own `source` stays authoritative |
+| `kernel` | string | kernel release |
+| `os` | string | the OS pretty name |
+| `arch` | string | target architecture |
+| `buses` | array | the usbmon buses available at start |
+
+The report lines that follow are unchanged, schema version 1. A consumer
+that only wants reports skips the record by key:
+
+```bash
+jq -c 'select(.record != "run") | .total_rx_bps' run.ndjson
+```
+
+In text mode the same fields lead the file as a `# key: value` block, one
+per line, before the first report. Stdout never carries the run record, so
+`--batch --json | jq` scripts need no change.
 
 ## Exit behavior
 

@@ -154,6 +154,39 @@ See [TUI chassis](#tui-chassis) for how these fit together.
 - `HOME` locates the default path. usbtop-ng fails with a message naming `HOME`
   when it is unset.
 
+#### 7. Diagnostics (`diag/`, `capture/`, `headless/export.rs`)
+
+- `diag/redact.rs`: the privacy rules as pure functions. Home paths become
+  `~`, stand-alone MAC addresses in kernel log lines and filesystem UUIDs in
+  the kernel command line are masked, only five environment variables are
+  ever recorded by value, and every substitution is counted for the
+  manifest. Device identity (serial strings, descriptors, Thunderbolt
+  `unique_id`) is deliberately not redacted.
+- `diag/collect.rs` and `diag/inventory.rs`: the collectors. Each reads
+  through filesystem roots its caller passes in, so the whole run is
+  testable against a fake tree, and each returns typed data plus
+  "unavailable" notes rather than errors. The inventory reads every USB
+  device's sysfs self-description, its interfaces, endpoints, and hub ports,
+  the raw `descriptors`/`bos_descriptors` blobs to their real length, and
+  the Thunderbolt and Type-C attribute trees; the backend probe answers
+  which usbmon source `start_monitoring` would select with the same probes
+  it uses.
+- `diag/bundle.rs`: the bundle directory, the manifest (format version, UTC
+  time, file list with sizes, redaction counts, notes), and the `tar`
+  archive.
+- `diag/support.rs`: the `--support` orchestrator. It embeds a fixture from
+  `capture/` (a live capture as root, a static sysfs bundle otherwise),
+  re-asserts SEC-1 and SEC-2 over it, replays it into `report.json` through
+  the export sink, and prints the summary and filing guidance. The logger is
+  built with a tee so the run's own log lands in the bundle.
+- `capture/` and `fixture_replay.rs` are part of the default build: the
+  capturer's assembly and guards are what `--support` embeds, and the replay
+  path is shared with the corpus tests so a golden equals a replay by
+  construction. Only the `--capture-fixture` subcommand stays behind the
+  `capture-fixture` feature.
+- `headless/export.rs`: the `ReportSink` behind `--output` and the support
+  bundle's `report.json`, and the run record that leads every file export.
+
 ## Module design
 
 ### USB monitor module

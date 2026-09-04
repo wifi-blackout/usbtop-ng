@@ -281,8 +281,27 @@ unchanged: it still resolves against `/root`.
   Neither mode opens the TUI or prompts for anything.
 - Add `--json` to either mode for one JSON document per report (NDJSON in
   `--batch`). `--window SECONDS` sets the sample length.
+- `--output PATH` writes the reports to a file instead of stdout, led by a
+  run record that names the version, backend, window, filters, and command.
 - See [docs/SCRIPTING.md](docs/SCRIPTING.md) for the full flag reference, the
   JSON field list, and an example document.
+
+### Reporting a problem
+
+- `usbtop-ng --support` gathers a diagnostic bundle for a bug report: the
+  build and host details, the usbmon probe and the backend it would pick,
+  the USB lines of the kernel log, every USB device's full self-description
+  (serial numbers included, as device identity), your configuration with
+  home paths rewritten to `~`, the terminal setup, and, when run with
+  `sudo`, a short capture of the aggregate bus packaged as a replayable
+  fixture. It writes `usbtop-ng-support-<UTC time>/` plus a `.tar.gz` beside
+  it, prints a summary, and says how to file the issue.
+- Nothing that identifies the machine or its owner is collected: no
+  hostname, machine-id, DMI serial, host MAC address, IP address, or user
+  name. `tar tzf` lists every file; you decide what to attach.
+- `--window SECONDS` sets the capture length (default 5), `--no-capture`
+  skips it, and a `PATH` ending in `.tar.gz` names the archive. See
+  [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md#bug-reports).
 
 ### The chart pane
 
@@ -425,7 +444,7 @@ unchanged: it still resolves against `/root`.
 
 ### Tests
 
-- `cargo test --all-targets` runs the hermetic unit suite (449 tests)
+- `cargo test --all-targets` runs the hermetic unit suite (579 tests)
   against fixture files, FIFOs, and temporary paths, needing no `/dev` and
   no debugfs access, plus two committed harnesses in `tests/`: a pipe-based
   regression guard for the terminal-restore bytes, and a PTY harness for
@@ -438,7 +457,7 @@ unchanged: it still resolves against `/root`.
 - The `ebpf` cargo feature adds tests covering the eBPF backend's pure
   delta math and transfer-type mapping, plus a live kprobe load/attach test
   gated on root and a BTF-enabled kernel that skips gracefully without
-  them; `cargo test --all-targets --features ebpf` reports 470 unit tests.
+  them; `cargo test --all-targets --features ebpf` reports 595 unit tests.
   See [docs/INSTALL.md](docs/INSTALL.md#building-the-ebpf-backend).
 
 ## Preferences file
@@ -468,30 +487,53 @@ comments.
 ## Command line options
 
 ```
-usbtop-ng [OPTIONS]
+Live USB bandwidth monitor for Linux
+
+Usage: usbtop-ng [OPTIONS]
 
 Options:
-  -v, --verbose            Enable verbose logging
-  -c, --config <CONFIG>    Preferences file path (default: ~/.usbtop-ng/preferences.toml)
-  -r, --refresh <REFRESH>  Refresh rate in milliseconds (floored at 100ms) [default: 1000]
-      --force              Force run without usbmon (limited functionality)
-      --setup              Show setup instructions for live monitoring
-      --create-alias       Create shell alias for 'usbtop' command
+  -v, --verbose
+          Enable verbose logging
+  -c, --config <CONFIG>
+          Preferences file path (default: ~/.usbtop-ng/preferences.toml)
+  -r, --refresh <REFRESH>
+          Refresh rate in milliseconds (floored at 100ms) [default: 1000]
+      --force
+          Force run without usbmon (limited functionality)
+      --setup
+          Show setup instructions for live monitoring
+      --create-alias
+          Create shell alias for 'usbtop' command
       --filter <KEY=VALUE[,KEY=VALUE...]>
-                           Show only traffic matching KEY=VALUE terms (repeatable, expressions OR)
-      --once               Sample one window, print a report, and exit
-      --batch              Print a report every window until interrupted
-      --json               Print reports as JSON (one document per report)
-      --window <SECONDS>   Sample window in seconds (default: 5 with --once, 1 with --batch)
-      --print-man          Print the man page to stdout
+          Show only traffic matching KEY=VALUE terms (repeatable, expressions OR)
+      --once
+          Sample one window, print a report, and exit
+      --batch
+          Print a report every window until interrupted
+      --json
+          Print reports as JSON (one document per report)
+      --output <PATH>
+          Write the reports to PATH instead of stdout (created or truncated; the file starts with a run record). Needs --once or --batch
+      --window <SECONDS>
+          Sample window in seconds (default: 5 with --once, 1 with --batch)
+      --print-man
+          Print the man page to stdout
       --print-completions <SHELL>
-                           Print a completion script to stdout for the named shell (e.g. bash, zsh, fish)
-      --usbids <PATH>      usb.ids database file for device names (overrides every other source)
+          Print a completion script to stdout for the named shell (e.g. bash, zsh, fish) [possible values: bash, elvish, fish, powershell, zsh]
+      --usbids <PATH>
+          usb.ids database file for device names (overrides every other source)
       --update-usbids [<MODE>]
-                           Check for a newer usb.ids ('check', the default) or fetch it ('pull')
-      --snapshot-internal  Record every currently attached device as internal, then exit
-  -h, --help               Print help
-  -V, --version            Print version
+          Check for a newer usb.ids ('check', the default) or fetch it ('pull') [possible values: check, pull]
+      --snapshot-internal
+          Record every currently attached device as internal, then exit
+      --support [<PATH>]
+          Gather a diagnostic bundle for a bug report into PATH (default: the current directory; a name ending in .tar.gz names the archive), then exit
+      --no-capture
+          Skip the usbmon capture in --support (static information only)
+  -h, --help
+          Print help
+  -V, --version
+          Print version
 ```
 
 `--once` and `--batch` never open the TUI or prompt for anything, which makes

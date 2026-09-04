@@ -5,9 +5,6 @@ schedule. Items move to [CHANGELOG.md](../CHANGELOG.md) when they ship.
 
 ## Feature ideas
 
-- Document file export. `--batch --json > capture.ndjson` already covers
-  it; a native `--output PATH` only earns its place if users ask for
-  append or rotation semantics.
 - One row per physical connector, using the sysfs port `peer` links. Today
   the USB2 side and the USB3 side of one connector list as sibling buses.
   A connector pairs individual hub ports, not whole buses, and `peer`

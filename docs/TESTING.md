@@ -293,6 +293,12 @@ Fleet build notes, learned capturing the Pi bundles (2026-08-31):
   `usbmon/mmap_ring.rs`: musl declares `ioctl`'s request as `c_int` where
   glibc says `c_ulong`.)
 
+`--support` embeds the same bundle layout under `fixture/` (with a live
+capture when run as root, without traces otherwise), so a bug reporter's
+bundle can be promoted to a corpus fixture by copying its `fixture/`
+directory into `tests/fixtures/hosts/<board>-<date>/stage<N>/` and
+re-running `cargo test fixture_corpus`.
+
 ## Per-platform notes
 
 - Reference x86 laptop: run the full ladder. This is the baseline every
