@@ -15,6 +15,17 @@ schedule. Items move to [CHANGELOG.md](../CHANGELOG.md) when they ship.
   real dock fixtures before code.
 - Plugin system for custom monitors. Deferred: the versioned NDJSON
   stream is already the right boundary for external analysis tools.
+- Device disclosure audit. An opt-in, comprehensive probe of one device,
+  hub, or dock that compares what it discloses (product string, the class
+  it presents as, the ports a dock advertises) with what its descriptors,
+  interfaces, endpoints, Thunderbolt router attributes, and Type-C partner
+  details actually expose, and flags hidden or undisclosed functions: a HID
+  interface inside a storage device, extra interfaces behind a hub, a
+  DMA-capable downstream port, a second configuration nobody selects. The
+  support bundle's device inventory (`--support`, 2026-09) stores the raw
+  `descriptors` and `bos_descriptors` blobs and the Thunderbolt and Type-C
+  attributes this needs; the audit is a decoder and a rule set over that
+  inventory, run live or over a bundle.
 - Monitoring of remote systems over the network. `ssh -t host sudo
   usbtop-ng` and `ssh host sudo usbtop-ng --batch --json` already cover
   the common cases; document those before building a network service.

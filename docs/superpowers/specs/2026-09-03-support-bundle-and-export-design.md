@@ -10,8 +10,9 @@ connector; cable and port diagnostics; parked minors.
 
 Give a user with a stock usbtop-ng binary one command, `--support`, that
 gathers everything a maintainer needs to reproduce and diagnose a problem,
-packages it with nothing that identifies the user beyond their hardware
-models, and tells them how to file the bug. Give `--once` and `--batch` an
+packages it with nothing that identifies the machine or its owner while
+keeping every device's full self-description, and tells them how to file
+the bug. Give `--once` and `--batch` an
 `--output PATH` that writes a self-describing report file usable in the
 same report. Add the GitHub issue template the contributing guide already
 refers to.
@@ -23,11 +24,22 @@ refers to.
 - The capture machinery lives in the default build as a shared diagnostic
   core, so a support bundle embeds a real, replayable fixture bundle (chosen
   over keeping capture behind the `capture-fixture` feature).
-- Device serial numbers and MAC addresses are never collected, in any
-  bundle. This tightens the earlier "stable pseudonym" idea: port chains
-  already distinguish identical devices. The fixture capturer's sysfs
-  allowlist dropped `serial` on 2026-09-02 and the corpus history was purged
-  of the values.
+- The privacy boundary is host identity out, device identity in. Nothing
+  that identifies the machine or its owner is collected (hostname,
+  machine-id, DMI system serial and UUID, network MACs, IP addresses, user
+  names, home paths). Everything a USB, Thunderbolt, or Type-C device says
+  about itself is collected verbatim, serial strings and Thunderbolt
+  `unique_id` values included, because a reporter chooses to attach the
+  bundle after seeing its file list, and because a cloned or re-badged
+  device is often only distinguishable by those values.
+- The embedded replayable fixture stays serial-free: it is what a
+  maintainer copies into the public corpus, whose capturer allowlist dropped
+  `serial` on 2026-09-02 and whose history was purged of the values. The
+  device inventory files are never committed.
+- The device inventory is the foundation for a later roadmap item, the
+  device disclosure audit (what a device, hub, or dock discloses versus what
+  its descriptors actually expose). It is designed so that audit consumes
+  the inventory rather than rebuilding it.
 - Archiving shells out to the system `tar`; no new crates.
 - `--output` has no append or rotation. It earns its place through the run
   record, not file management.
@@ -55,16 +67,39 @@ struct plus "unavailable: reason" notes and never fails the bundle.
   size, read() binary, or text), determined by the same probe functions
   `start_monitoring` uses, without starting a capture; eBPF readiness (BTF
   file present, feature built in); a `dmesg` tail filtered to lines
-  mentioning usb, xhci, ehci, ohci, dwc, hub, or usbmon, masked per the
-  privacy rules, or a note when unreadable.
-- **C. USB topology** (`topology.toml`, plus the raw allowlisted sysfs in
-  `fixture/sysfs/`): per device, the port chain, `vid:pid`, names resolved
-  through the usb.ids chain, device class, subclass and protocol, `bcdUSB`,
-  speed, each interface with its class and bound driver name, power state
-  (`power/control`, `power/autosuspend`, `power/runtime_status`),
-  `authorized`, `removable`; per hub, each port's `connect_type` and `peer`
-  link target; per controller, PCI vendor, device, revision, and driver; the
-  usb.ids source in use and its date.
+  mentioning usb, xhci, ehci, ohci, dwc, thunderbolt, hub, or usbmon
+  (device lines kept whole, per the privacy rules), or a note when
+  unreadable.
+- **C. Device inventory** (`inventory/`, plus the raw allowlisted sysfs in
+  `fixture/sysfs/`): the full self-description of every bus interface, hub,
+  dock, and device, read from sysfs.
+  - `inventory/usb.toml`: per device, the port chain, `vid:pid`,
+    `bcdDevice`, `serial`, manufacturer and product strings, names resolved
+    through the usb.ids chain, device class, subclass and protocol,
+    `bcdUSB`, speed, `bMaxPacketSize0`, `bNumConfigurations`, the active
+    configuration (`bConfigurationValue`, `bNumInterfaces`, `bmAttributes`,
+    `bMaxPower`), `quirks`, `avoid_reset_quirk`, `ltm_capable`, `rx_lanes`
+    and `tx_lanes`, `maxchild`, `urbnum`, `authorized`, `removable`,
+    `physical_location` when present, power state (`power/control`,
+    `power/autosuspend`, `power/runtime_status`); per interface, its number,
+    alternate setting, class, subclass and protocol, interface association
+    (`iad_*`), endpoint count, and bound driver; per endpoint, address,
+    attributes, `wMaxPacketSize`, interval, direction, and type; per hub,
+    each port's `connect_type`, `peer` link target, `location`, and
+    `over_current_count`; per controller, PCI vendor, device, revision, and
+    driver.
+  - `inventory/descriptors/<port-chain>.bin` and `<port-chain>.bos.bin`:
+    the raw `descriptors` and `bos_descriptors` blobs sysfs exposes for each
+    device, read to their actual length. These are the ground truth the
+    disclosure audit will decode; the bundle stores them verbatim.
+  - `inventory/thunderbolt.toml`: every domain and router under
+    `/sys/bus/thunderbolt/devices` with `device`, `device_name`, `vendor`,
+    `vendor_name`, `unique_id`, `authorized`, `generation`, `nvm_version`,
+    link speed and lane counts, and the domain's security level.
+  - `inventory/typec.toml`: every port, partner, cable, plug, and alternate
+    mode under `/sys/class/typec`, and every capability under
+    `/sys/class/usb_power_delivery`, as attribute name and value.
+  - The usb.ids source in use and its date.
 - **D. Configuration** (`config/`): `preferences.toml` contents,
   `internal-devices.toml` contents, and `config.toml` with the resolved
   config directory as `~/…`, its permissions, and whether the `sudo`
@@ -91,14 +126,20 @@ struct plus "unavailable: reason" notes and never fails the bundle.
 ## Privacy rules
 
 Implemented in `src/diag/redact.rs` as pure functions with table tests, and
-applied by the bundle writer at write time.
+applied by the bundle writer at write time. The boundary: host identity is
+never collected; device identity is collected verbatim.
 
-- Serial numbers and MAC addresses are never collected: not from sysfs
-  (the allowlist has no `serial`), not in `topology.toml`, and in
-  `dmesg-usb.txt` the value after `SerialNumber:` and any
-  `xx:xx:xx:xx:xx:xx` token are replaced with `[redacted]`.
-- Hostname, machine-id, and IP addresses are never collected. `SSH_TTY`,
-  `SSH_CONNECTION`, and `SSH_CLIENT` are recorded only as present or absent.
+- Never collected: hostname, machine-id, the DMI system serial and product
+  UUID, the MAC address of any host network interface, IP addresses, user
+  names. `SSH_TTY`, `SSH_CONNECTION`, and `SSH_CLIENT` are recorded only as
+  present or absent. `dmesg-usb.txt` is filtered to USB, Thunderbolt, and
+  usbmon lines, which never carry host identity; device `SerialNumber:`
+  lines stay.
+- Collected verbatim, as device details: USB serial strings, Thunderbolt
+  `unique_id` values, and every descriptor field. The embedded `fixture/`
+  never contains a serial (its allowlist omits the attribute), so it can be
+  published as a regression fixture as-is; the `inventory/` files are for
+  the maintainer reading the issue and are never committed.
 - Every path under the user's home directory is rewritten to `~/…`,
   including inside `preferences.toml`, `config.toml`, and the recorded
   command line. No user name is recorded anywhere; the `sudo` resolution
@@ -110,7 +151,8 @@ applied by the bundle writer at write time.
   capturer's own functions.
 - Nothing is hidden silently: the manifest's redaction summary and the
   printed file list exist so the reporter can review the bundle before
-  attaching it.
+  attaching it, and the summary's `redacted:` line says that device
+  identities are included.
 
 ## Architecture
 
@@ -124,7 +166,9 @@ applied by the bundle writer at write time.
   `capture-fixture` feature keeps gating only the `--capture-fixture`
   subcommand and its CLI fields. `fixture_corpus` stays test-only.
 - `src/diag/` (new, default build):
-  - `collect.rs`: the collectors above. Each takes its filesystem roots as
+  - `collect.rs`: the collectors above; the device inventory collector is
+    its own file, `inventory.rs`, since it is the largest and the one the
+    disclosure audit will reuse. Each takes its filesystem roots as
     parameters (`/sys`, `/proc`, the config directory) so tests inject a
     fake tree the way `with_sysfs_base` does.
   - `redact.rs`: the privacy rules.
@@ -181,7 +225,7 @@ usbtop-ng support bundle
   capture:  5.0 s aggregate, 1,234 events, kernel drops 0, sources binary+text
   devices:  21 across 4 buses (1.5/12/480/5000/10000 Mbps)
   notes:    dmesg unavailable (permission denied)
-  redacted: 3 home paths; serials and MACs never collected
+  redacted: 3 home paths; host identity never collected; device serials included
 ```
 
 ### Filing guidance (printed after the summary)
@@ -189,7 +233,8 @@ usbtop-ng support bundle
 ```
 To report a bug:
   1. Review the bundle before attaching it: `tar tzf <archive>` lists every file.
-     Nothing in it identifies you beyond your hardware models, but you decide.
+     It carries your devices' full details, including their serial numbers, and
+     nothing about the host itself; you decide what to attach.
   2. Open https://github.com/wifi-blackout/usbtop-ng/issues/new?template=bug_report.yml
   3. Paste the summary above into "Support summary" and attach the .tar.gz.
   4. Describe what you expected, what happened, and the exact command you ran.
@@ -268,6 +313,8 @@ bundle, or explained why not"; terminal and SSH details; anything else.
 - Append or rotation semantics for `--output`.
 - A feature-request template beyond CONTRIBUTING's existing guidance.
 - Collecting anything the privacy rules exclude, even behind a flag.
+- Decoding or judging the descriptors. The bundle stores them; the device
+  disclosure audit on the roadmap is the consumer.
 
 ## Global constraints
 
@@ -286,7 +333,9 @@ bundle, or explained why not"; terminal and SSH details; anything else.
 - All suites green on the four configs.
 - A `--support` run as root on the development host, then: `tar tzf` lists
   exactly the manifest's files; `grep` over the extracted bundle finds no
-  home path, no hostname, no serial, no MAC; the embedded `fixture/` copied
-  into `tests/fixtures/hosts/` passes `cargo test fixture_corpus` unchanged.
+  home path, no hostname, no machine-id, no host MAC, no IP; `inventory/`
+  holds every device's descriptors and serial; `fixture/` holds no serial
+  file and, copied into `tests/fixtures/hosts/`, passes
+  `cargo test fixture_corpus` unchanged.
 - `--batch --json --output run.ndjson` for two windows yields a run record
   followed by two report lines that parse with `serde_json`.
