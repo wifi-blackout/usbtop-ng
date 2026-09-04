@@ -1,5 +1,5 @@
-//! Builds the `usbrate` eBPF program into a generated skeleton when the
-//! optional `ebpf` feature is enabled.
+//! Records the compiler version for `--support` and, when the optional
+//! `ebpf` feature is enabled, builds the `usbrate` eBPF program into a generated skeleton.
 //!
 //! Under the default build (feature off) this is a no-op: it returns before
 //! touching the filesystem or the `libbpf-cargo`/clang BPF toolchain, so
@@ -8,6 +8,17 @@
 use std::env;
 
 fn main() {
+    // Record the compiler for `--support`'s build.toml (`option_env!`
+    // reads it back as `USBTOP_NG_RUSTC`). Best-effort: a missing or odd
+    // RUSTC just leaves the value unset.
+    if let Some(rustc) = env::var_os("RUSTC") {
+        if let Ok(output) = std::process::Command::new(rustc).arg("--version").output() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                println!("cargo:rustc-env=USBTOP_NG_RUSTC={}", text.trim());
+            }
+        }
+    }
+
     // Cargo sets `CARGO_FEATURE_<NAME>` for every enabled feature. Bail out
     // immediately when `ebpf` isn't on so the default build never touches
     // the BPF toolchain.
