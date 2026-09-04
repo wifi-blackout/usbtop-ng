@@ -1,10 +1,11 @@
 //! The privacy rules, as pure functions with table tests. The boundary is
 //! "host identity out, device identity in": nothing here ever touches a
 //! device serial or descriptor; it rewrites the user's home directory to
-//! `~`, masks host MAC addresses in kernel log lines, masks filesystem UUIDs
-//! in the kernel command line, and decides which environment variables the
-//! bundle may record. Every substitution is counted so the manifest can say
-//! what was changed.
+//! `~`, masks the login name wherever it stands as a whole path component
+//! (a removable-media mount, say), masks host MAC addresses in kernel log
+//! lines, masks filesystem UUIDs in the kernel command line, and decides
+//! which environment variables the bundle may record. Every substitution is
+//! counted so the manifest can say what was changed.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -23,6 +24,9 @@ pub struct Redactor {
     /// disables the path rule (no home known, or a home of `/`, which would
     /// rewrite every absolute path).
     home: Option<String>,
+    /// The login name (the home directory's last path component); `None`
+    /// when `home` is `None`.
+    user_name: Option<String>,
     counts: BTreeMap<&'static str, usize>,
 }
 
@@ -31,8 +35,14 @@ impl Redactor {
         let home = home
             .map(|h| h.to_string_lossy().trim_end_matches('/').to_string())
             .filter(|h| !h.is_empty());
+        let user_name = home
+            .as_deref()
+            .and_then(|h| h.rsplit('/').next())
+            .filter(|n| !n.is_empty())
+            .map(str::to_string);
         Redactor {
             home,
+            user_name,
             counts: BTreeMap::new(),
         }
     }
@@ -49,30 +59,65 @@ impl Redactor {
     }
 
     /// Every occurrence of the home directory inside free text (a
-    /// preferences file, a command line, a report) becomes `~`. An
-    /// occurrence counts only at a path boundary: both the character before
-    /// and the character after the match must be absent or not a path
-    /// character. `/home/alice/x` matches, `/home/alice2/x` and
-    /// `/opt/home/alice/data` do not.
+    /// preferences file, a command line, a report) becomes `~`, then every
+    /// occurrence of the login name as a whole path component elsewhere in
+    /// the text becomes `<user>` (see [`Redactor::mask_user_name`]). An
+    /// occurrence of the home directory counts only at a path boundary: both
+    /// the character before and the character after the match must be
+    /// absent or not a path character. `/home/alice/x` matches,
+    /// `/home/alice2/x` and `/opt/home/alice/data` do not. The home rule
+    /// runs first and owns whatever text it examines, matched or not, so a
+    /// login name that only ever appears as part of an unredacted home
+    /// occurrence (`/opt/home/alice/data`) is never separately masked.
     pub fn text(&mut self, text: &str) -> String {
         let Some(home) = self.home.clone() else {
-            return text.to_string();
+            return self.mask_user_name(text);
         };
         let mut out = String::with_capacity(text.len());
         let mut rest = text;
         while let Some(at) = rest.find(&home) {
+            out.push_str(&self.mask_user_name(&rest[..at]));
             let before_ok = rest[..at]
                 .chars()
                 .next_back()
                 .is_none_or(|c| !is_path_char(c));
             let after = &rest[at + home.len()..];
             let after_ok = after.chars().next().is_none_or(|c| !is_path_char(c));
-            out.push_str(&rest[..at]);
             if before_ok && after_ok {
                 out.push('~');
                 self.bump("home_path");
             } else {
                 out.push_str(&home);
+            }
+            rest = after;
+        }
+        out.push_str(&self.mask_user_name(rest));
+        out
+    }
+
+    /// Every occurrence of the login name as a whole path component becomes
+    /// `<user>`. A whole component requires the character right before the
+    /// match to be `/` (an occurrence at the very start of the text does not
+    /// count: it is not a path component) and the character right after it
+    /// to be absent or not a path character. `/media/alice/stick` and a
+    /// trailing `.../alice` match; `/home/alice2/x`, `/opt/xalice/y`, and a
+    /// bare `alice` do not.
+    fn mask_user_name(&mut self, text: &str) -> String {
+        let Some(name) = self.user_name.clone() else {
+            return text.to_string();
+        };
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find(&name) {
+            let before_ok = rest[..at].ends_with('/');
+            let after = &rest[at + name.len()..];
+            let after_ok = after.chars().next().is_none_or(|c| !is_path_char(c));
+            out.push_str(&rest[..at]);
+            if before_ok && after_ok {
+                out.push_str("<user>");
+                self.bump("user_name");
+            } else {
+                out.push_str(&name);
             }
             rest = after;
         }
@@ -259,9 +304,45 @@ mod tests {
         let mut r = Redactor::new(Some(std::path::Path::new("/home/alice")));
         r.mac_addresses("aa:bb:cc:dd:ee:ff");
         r.text("/home/alice/x");
+        r.text("/media/alice/stick");
         assert_eq!(
             r.summary(),
-            vec![("home_path".to_string(), 1), ("mac_address".to_string(), 1)]
+            vec![
+                ("home_path".to_string(), 1),
+                ("mac_address".to_string(), 1),
+                ("user_name".to_string(), 1),
+            ]
         );
+    }
+
+    #[test]
+    fn the_login_name_is_masked_as_a_path_component() {
+        let home = std::path::Path::new("/home/alice");
+        for (input, expected, summary) in [
+            (
+                "/media/alice/stick",
+                "/media/<user>/stick",
+                vec![("user_name".to_string(), 1)],
+            ),
+            (
+                "--support /run/user/1000/alice",
+                "--support /run/user/1000/<user>",
+                vec![("user_name".to_string(), 1)],
+            ),
+            ("/home/alice2/x", "/home/alice2/x", vec![]),
+            ("/opt/xalice/y", "/opt/xalice/y", vec![]),
+            ("Alice's iPhone", "Alice's iPhone", vec![]),
+            ("alice", "alice", vec![]),
+        ] {
+            let mut r = Redactor::new(Some(home));
+            assert_eq!(r.text(input), expected, "{input}");
+            assert_eq!(r.summary(), summary, "{input}");
+        }
+
+        // The home rule runs first: a path under home is rewritten to `~`
+        // with no separate user_name count.
+        let mut r = Redactor::new(Some(home));
+        assert_eq!(r.text("/home/alice/x"), "~/x");
+        assert_eq!(r.summary(), vec![("home_path".to_string(), 1)]);
     }
 }

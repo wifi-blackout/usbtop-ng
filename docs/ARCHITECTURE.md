@@ -157,11 +157,13 @@ See [TUI chassis](#tui-chassis) for how these fit together.
 #### 7. Diagnostics (`diag/`, `capture/`, `headless/export.rs`)
 
 - `diag/redact.rs`: the privacy rules as pure functions. Home paths become
-  `~`, stand-alone MAC addresses in kernel log lines and filesystem UUIDs in
-  the kernel command line are masked, only five environment variables are
-  ever recorded by value, and every substitution is counted for the
-  manifest. Device identity (serial strings, descriptors, Thunderbolt
-  `unique_id`) is deliberately not redacted.
+  `~`, the login name becomes `<user>` wherever it is a whole path component
+  (a removable-media mount, say), stand-alone MAC addresses in kernel log
+  lines and filesystem UUIDs in the kernel command line are masked, only
+  five environment variables are ever recorded by value, and every
+  substitution is counted for the manifest. Device identity (serial
+  strings, descriptors, Thunderbolt `unique_id`) is deliberately not
+  redacted.
 - `diag/collect.rs` and `diag/inventory.rs`: the collectors. Each reads
   through filesystem roots its caller passes in, so the whole run is
   testable against a fake tree, and each returns typed data plus

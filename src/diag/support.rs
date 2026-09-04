@@ -738,6 +738,7 @@ fn redacted_line(redaction: &[(String, usize)]) -> String {
     let label = |rule: &str, n: usize| -> String {
         let (one, many) = match rule {
             "home_path" => ("home path", "home paths"),
+            "user_name" => ("user name", "user names"),
             "mac_address" => ("MAC address", "MAC addresses"),
             "fs_uuid" => ("filesystem UUID", "filesystem UUIDs"),
             other => (other, other),
@@ -1066,6 +1067,10 @@ mod tests {
         assert_eq!(
             redacted_line(&[("home_path".to_string(), 3), ("mac_address".to_string(), 1)]),
             "3 home paths, 1 MAC address; host identity never collected; device serials included"
+        );
+        assert_eq!(
+            redacted_line(&[("user_name".to_string(), 1)]),
+            "1 user name; host identity never collected; device serials included"
         );
         assert_eq!(
             redacted_line(&[]),
@@ -1401,6 +1406,9 @@ mod tests {
         // config dir, preferences path, and the preferences body: three rewrites.
         assert_eq!(manifest.redaction.get("home_path"), Some(&3));
         assert_eq!(manifest.redaction.get("fs_uuid"), Some(&1));
+        // The fake tree's `alice` appears only under the home, which the
+        // home rule already rewrites.
+        assert_eq!(manifest.redaction.get("user_name"), None);
         // Rules sort by name in the summary: fs_uuid before home_path.
         assert!(
             summary
