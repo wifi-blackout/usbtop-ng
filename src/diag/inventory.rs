@@ -515,8 +515,19 @@ fn walk_attrs(
             .strip_prefix(base)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| name.clone());
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            // Sparse by design: almost every device is missing almost every
+            // attribute, and noting each absence would flood a non-root run
+            // and bury the real signal.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                notes.push(note(
+                    &path.display().to_string(),
+                    format!("could not read: {e}"),
+                ));
+                continue;
+            }
         };
         if meta.file_type().is_symlink() {
             // Inner links (`driver`, `connector`, `device`) lead out of the
@@ -529,10 +540,19 @@ fn walk_attrs(
                 walk_attrs(base, &path, depth + 1, max_depth, attrs, notes);
             }
         } else if !SKIPPED_FILES.contains(&name.as_str()) {
-            // Attribute reads are bounded to the cap; a write-only or
-            // otherwise unreadable file is simply not an attribute here.
-            let Ok(bytes) = read_capped(&path, ATTR_VALUE_CAP) else {
-                continue;
+            // Attribute reads are bounded to the cap; a file that vanished
+            // (or was never really there despite the directory listing) is
+            // simply not an attribute here, and not worth a note.
+            let bytes = match read_capped(&path, ATTR_VALUE_CAP) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    notes.push(note(
+                        &path.display().to_string(),
+                        format!("could not read: {e}"),
+                    ));
+                    continue;
+                }
             };
             match String::from_utf8(bytes) {
                 Ok(text) => {
@@ -1015,6 +1035,74 @@ mod tests {
         assert_eq!(notes.len(), 1, "one note for the dangling symlink");
         assert!(notes[0].item.ends_with("port9"));
         assert!(notes[0].reason.starts_with("could not resolve: "));
+    }
+
+    /// Attributes are sparse by design: a device tree only ever has a small
+    /// subset of the attribute files another device's tree might have. An
+    /// attribute that simply never existed on disk must never generate a
+    /// note; only the walk never visits it, since `entry_names` lists real
+    /// directory entries and nothing else.
+    #[test]
+    fn attr_dump_of_a_sparse_tree_notes_nothing_for_the_missing_attributes() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real/port0");
+        write(&real, "data_role", "[host] device\n");
+        // `power_role`, `preferred_role`, and `usb_power_delivery` are all
+        // real Type-C attributes this port simply does not have; none of
+        // them exist as files, so none of them can be read at all.
+        let class = temp.path().join("class/typec");
+        std::fs::create_dir_all(&class).unwrap();
+        std::os::unix::fs::symlink(&real, class.join("port0")).unwrap();
+
+        let (dumps, notes) = dump_attrs(&class, 2);
+        assert_eq!(dumps.len(), 1);
+        assert_eq!(
+            dumps[0].attrs.get("data_role").map(String::as_str),
+            Some("[host] device")
+        );
+        assert!(!dumps[0].attrs.contains_key("power_role"));
+        assert!(!dumps[0].attrs.contains_key("preferred_role"));
+        assert!(!dumps[0].attrs.contains_key("usb_power_delivery"));
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// A present-but-unreadable attribute (permission denied) is a real
+    /// diagnostic event, unlike a merely absent one: it must surface as a
+    /// note naming the path, and the attribute stays out of the dump. Root
+    /// bypasses file permissions and can read a 0000 file, so this check
+    /// cannot be made to fail as root; skip it there.
+    #[test]
+    fn attr_dump_notes_a_permission_denied_attribute_and_leaves_it_out_of_the_dump() {
+        // SAFETY: geteuid() takes no arguments, touches no memory, and
+        // cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real/port0");
+        write(&real, "data_role", "[host] device\n");
+        let locked = real.join("power_role");
+        std::fs::write(&locked, "[source] sink\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let class = temp.path().join("class/typec");
+        std::fs::create_dir_all(&class).unwrap();
+        std::os::unix::fs::symlink(&real, class.join("port0")).unwrap();
+
+        let (dumps, notes) = dump_attrs(&class, 2);
+        assert_eq!(dumps.len(), 1);
+        assert_eq!(
+            dumps[0].attrs.get("data_role").map(String::as_str),
+            Some("[host] device"),
+            "the readable sibling attribute is unaffected"
+        );
+        assert!(
+            !dumps[0].attrs.contains_key("power_role"),
+            "an unreadable attribute is never recorded as a value"
+        );
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].item.ends_with("port0/power_role"));
+        assert!(notes[0].reason.starts_with("could not read: "));
     }
 
     #[test]
