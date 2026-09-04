@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -279,6 +279,55 @@ fn lstat_path(path: &Path) -> io::Result<libc::stat> {
     }
 }
 
+/// True iff `path` (statted without following a final-component symlink) still
+/// names the very inode `root_fd` pins. A swapped-in symlink, a different
+/// dev/ino, or any stat failure returns false -- so callers fail safe (skip
+/// the operation) when the pin no longer holds. Used before the archive step
+/// and before the fixture-capture step to detect a mid-run directory swap.
+pub fn path_pins_same_inode(root_fd: BorrowedFd, path: &Path) -> bool {
+    let Ok(root_st) = fstat_fd(root_fd) else {
+        return false;
+    };
+    let Ok(path_st) = lstat_path(path) else {
+        return false;
+    };
+    let is_symlink = (path_st.st_mode & libc::S_IFMT) == libc::S_IFLNK;
+    !is_symlink && path_st.st_dev == root_st.st_dev && path_st.st_ino == root_st.st_ino
+}
+
+/// Open `rel` for reading, resolving every component relative to `root_fd`
+/// with `O_NOFOLLOW` (final component included) and creating nothing. The
+/// read-only mirror of [`create_file_at`]: a symlink swapped anywhere along
+/// the path is refused, so a root-path swap cannot redirect the read to
+/// attacker bytes.
+fn open_read_at(root_fd: BorrowedFd, rel: &str) -> io::Result<File> {
+    let comps = split_bundle_rel(rel)?;
+    let (last, dirs) = comps
+        .split_last()
+        .expect("split_bundle_rel rejects an empty path");
+    let mut cur = root_fd.try_clone_to_owned()?;
+    for comp in dirs {
+        let name = component_cstring(comp)?;
+        // Read path: never create, just open (refusing a symlink component).
+        cur = open_dir_at(cur.as_fd(), &name)?;
+    }
+    let name = component_cstring(last)?;
+    // SAFETY: `cur` is a valid open directory descriptor; `name` is a valid C
+    // string. `openat` returns a fresh owned descriptor on success.
+    let fd = unsafe {
+        libc::openat(
+            cur.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh, valid descriptor this process now owns.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
 impl BundleWriter {
     /// `root` is the logical bundle-root path (already created); `root_fd` is
     /// the descriptor pinning it (from [`open_bundle_root`], held in
@@ -359,9 +408,13 @@ impl BundleWriter {
     }
 
     /// Rewrite an existing text file (one written by another component,
-    /// such as the report sink) through the redactor, then record it.
+    /// such as the report sink) through the redactor, then record it. Both
+    /// the read and the rewrite resolve through the anchor with `O_NOFOLLOW`,
+    /// so a root-path swap can neither feed attacker bytes into the read nor
+    /// redirect the rewrite.
     pub fn redact_file(&mut self, rel: &str) -> io::Result<()> {
-        let text = std::fs::read_to_string(self.root.join(rel))?;
+        let mut text = String::new();
+        open_read_at(self.root_fd.as_fd(), rel)?.read_to_string(&mut text)?;
         let redacted = self.redactor.text(&text);
         let bytes = self.write_at(rel, redacted.as_bytes())?;
         self.record(rel, bytes, false);
@@ -443,37 +496,14 @@ impl BundleWriter {
         // If the path now names a different inode (or a symlink), it was
         // swapped during the run: skip tar and keep the directory, rather
         // than archive through a redirected path.
-        let root_st = fstat_fd(self.root_fd.as_fd()).map_err(|e| {
-            note(
+        if !path_pins_same_inode(self.root_fd.as_fd(), &self.root) {
+            return Err(note(
                 "archive",
-                format!("could not stat the bundle directory: {e}"),
-            )
-        })?;
-        match lstat_path(&self.root) {
-            Ok(path_st) => {
-                let is_symlink = (path_st.st_mode & libc::S_IFMT) == libc::S_IFLNK;
-                if is_symlink
-                    || path_st.st_dev != root_st.st_dev
-                    || path_st.st_ino != root_st.st_ino
-                {
-                    return Err(note(
-                        "archive",
-                        format!(
-                            "{} was replaced during the run; not archiving",
-                            self.root.display()
-                        ),
-                    ));
-                }
-            }
-            Err(e) => {
-                return Err(note(
-                    "archive",
-                    format!(
-                        "could not verify {} before archiving: {e}",
-                        self.root.display()
-                    ),
-                ))
-            }
+                format!(
+                    "{} was replaced during the run; not archiving",
+                    self.root.display()
+                ),
+            ));
         }
 
         // Feed tar the source through the pinned inode rather than a path it
@@ -1000,5 +1030,81 @@ mod tests {
         for bad in ["", "a//b", "a/./b", "../b", "a/..", ".."] {
             assert!(split_bundle_rel(bad).is_err(), "{bad:?} must be rejected");
         }
+    }
+
+    /// R1 regression: the capture sub-path writes into `fixture/` through the
+    /// pinned root fd's `/proc/self/fd/<n>` base. With that base held, the
+    /// bundle root pathname is renamed away and a symlink to an external
+    /// directory is dropped in its place -- exactly the parent-owner swap the
+    /// safe-parent guard does not catch. A write through the fd base must land
+    /// on the original (pinned) inode and never at the symlink target, and
+    /// `path_pins_same_inode` must report the swap.
+    #[test]
+    fn writes_through_the_proc_fd_base_ignore_a_swapped_root_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("bundle");
+        std::fs::create_dir(&root).unwrap();
+        let root_fd = open_bundle_root(&root).unwrap();
+        let base = format!("/proc/self/fd/{}", root_fd.as_raw_fd());
+        std::fs::create_dir(format!("{base}/fixture")).unwrap();
+
+        // Swap: rename the root away, drop a symlink to an attacker dir.
+        let moved = temp.path().join("bundle-moved");
+        std::fs::rename(&root, &moved).unwrap();
+        let attacker = temp.path().join("attacker");
+        std::fs::create_dir(&attacker).unwrap();
+        std::os::unix::fs::symlink(&attacker, &root).unwrap();
+
+        // The pin no longer holds for the `dir` pathname...
+        assert!(!path_pins_same_inode(root_fd.as_fd(), &root));
+        assert!(path_pins_same_inode(root_fd.as_fd(), &moved));
+
+        // ...but a write through the fd base still lands on the pinned inode.
+        std::fs::write(format!("{base}/fixture/trace.bin"), b"pinned").unwrap();
+        assert_eq!(
+            std::fs::read(moved.join("fixture/trace.bin")).unwrap(),
+            b"pinned"
+        );
+        assert!(
+            !attacker.join("fixture").exists(),
+            "the write escaped through the swapped-in root symlink"
+        );
+    }
+
+    /// R2 regression: `redact_file`'s read is resolved through the anchor, so a
+    /// root-path swap cannot feed attacker bytes into the read (which would
+    /// then be written into the real file). The real, pinned file is read and
+    /// rewritten; a decoy behind the swapped-in symlink is never touched.
+    #[test]
+    fn redact_file_read_cannot_be_redirected_by_a_root_path_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("bundle");
+        let mut w = writer_at(&root, Redactor::new(None));
+        {
+            use std::io::Write as _;
+            let mut f = w.open_new_file("report.json").unwrap();
+            f.write_all(b"real bytes\n").unwrap();
+        }
+
+        // Swap the root path to an attacker directory holding a decoy.
+        let moved = temp.path().join("bundle-moved");
+        std::fs::rename(&root, &moved).unwrap();
+        let attacker = temp.path().join("attacker");
+        std::fs::create_dir(&attacker).unwrap();
+        std::fs::write(attacker.join("report.json"), b"ATTACKER\n").unwrap();
+        std::os::unix::fs::symlink(&attacker, &root).unwrap();
+
+        // redact_file reads and rewrites via the pinned fd (now at `moved`).
+        w.redact_file("report.json").unwrap();
+        assert_eq!(
+            std::fs::read(moved.join("report.json")).unwrap(),
+            b"real bytes\n",
+            "the pinned file must be the one read and rewritten"
+        );
+        assert_eq!(
+            std::fs::read(attacker.join("report.json")).unwrap(),
+            b"ATTACKER\n",
+            "the decoy behind the symlink must be untouched"
+        );
     }
 }

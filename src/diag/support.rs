@@ -8,7 +8,7 @@
 
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -551,17 +551,45 @@ pub fn run_support(
 
     writer.write_toml("terminal.toml", &env.terminal)?;
 
-    // Pin `fixture/` as a genuine child of the bundle root before the
-    // capturer writes into it, so it cannot be a pre-planted symlink. The
-    // capturer's own writes beneath it remain path-based (see the note in
-    // `write_fixture`), covered by the safe-parent guard in `prepare_dir`.
-    let fixture_dir = dir.join("fixture");
-    writer
-        .mkdir_at("fixture")
-        .with_context(|| format!("could not create {}", fixture_dir.display()))?;
-    let capture_state = write_fixture(opts, roots, env, &fixture_dir, &mut notes);
+    // Pin `fixture/` as a genuine child of the bundle root, then resolve every
+    // capture write through the pinned root fd (`/proc/self/fd/<n>/fixture`)
+    // instead of the swappable `dir` pathname. Because that magic path always
+    // resolves to the inode we pinned at creation, a rename of `dir` mid-run
+    // cannot redirect a root-owned write out of the bundle -- closing the
+    // capture sub-path of the finding. procfs is always mounted on Linux.
+    writer.mkdir_at("fixture").with_context(|| {
+        format!(
+            "could not create the fixture directory in {}",
+            dir.display()
+        )
+    })?;
+    let fixture_proc = format!("/proc/self/fd/{}/fixture", prepared.root_fd.as_raw_fd());
+    let fixture_dir = PathBuf::from(&fixture_proc);
+    // Any collector message that captured the fd base is mapped back to a
+    // clean `fixture` display so the bundle text never carries the fd path.
+    let scrub_fixture = |s: &str| s.replace(&fixture_proc, "fixture");
+
+    // Revalidate the pin right before writing traces: if `dir` no longer names
+    // the inode we pinned (a mid-run swap), skip capture and the fixture
+    // entirely with a note rather than write anything. The bundle still ships,
+    // just without traces.
+    let mut capture_state = if bundle::path_pins_same_inode(prepared.root_fd.as_fd(), dir) {
+        write_fixture(opts, roots, env, &fixture_dir, &mut notes)
+    } else {
+        let reason = "skipped: the bundle directory was replaced during the run".to_string();
+        notes.push(note("capture", reason.clone()));
+        CaptureState::Skipped(reason)
+    };
+    if let CaptureState::Skipped(r) | CaptureState::Failed(r) = &mut capture_state {
+        *r = scrub_fixture(r);
+    }
     if fixture_dir.join("meta.toml").exists() {
-        bundle::assert_fixture_invariants(&fixture_dir)?;
+        bundle::assert_fixture_invariants(&fixture_dir)
+            .map_err(|e| anyhow!("{}", scrub_fixture(&format!("{e:#}"))))?;
+        // record_dir reads the fixture subtree via the real `dir` path (it is
+        // read-only, symlink-aware, and never follows links). It is bracketed
+        // by the same-inode check above and the archive's check below, so a
+        // swap can at worst yield a wrong manifest entry, never a write.
         writer.record_dir("fixture")?;
         let source = match &capture_state {
             CaptureState::Captured { sources, .. } => sources
@@ -608,12 +636,14 @@ pub fn run_support(
     // read: …" reason or item naming an unreadable file under the home
     // directory), and the manifest and SUMMARY.txt are the only text this
     // pipeline writes without already going through `BundleWriter::write_text`
-    // or `write_toml`, both of which redact on the way out.
+    // or `write_toml`, both of which redact on the way out. A fixture note may
+    // also carry the `/proc/self/fd/<n>/fixture` write base, so it is scrubbed
+    // back to a `fixture`-relative form before the redactor runs.
     let notes: Vec<Note> = notes
         .iter()
         .map(|n| Note {
-            item: writer.redactor().text(&n.item),
-            reason: writer.redactor().text(&n.reason),
+            item: writer.redactor().text(&scrub_fixture(&n.item)),
+            reason: writer.redactor().text(&scrub_fixture(&n.reason)),
         })
         .collect();
     let mut summary = Summary {
@@ -974,10 +1004,21 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    /// Create a bundle target directory the safe-parent guard always accepts,
+    /// regardless of the suite's umask or uid: mode 0o700 (owner-only, not
+    /// group/other-writable). Keeps the `prepare_dir` tests correct even if
+    /// the suite is ever run as root under a permissive umask.
+    fn private_target(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     #[test]
     fn prepare_dir_places_the_bundle_inside_a_directory_target() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("out");
+        private_target(&target);
         let p = prepare_dir(&target, 1_788_000_000).unwrap();
         assert_eq!(
             p.dir,
@@ -1412,7 +1453,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let roots = fake_roots(temp.path());
         let home = roots.home.clone().unwrap();
-        let prepared = prepare_dir(&temp.path().join("out"), 1_788_000_000).unwrap();
+        let target = temp.path().join("out");
+        private_target(&target);
+        let prepared = prepare_dir(&target, 1_788_000_000).unwrap();
         // What main's tee would have written before run_support starts.
         std::fs::write(
             prepared.dir.join("usbtop-ng.log"),
