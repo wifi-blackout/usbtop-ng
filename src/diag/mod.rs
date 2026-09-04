@@ -7,6 +7,7 @@
 use serde::Serialize;
 
 pub mod collect;
+pub mod inventory;
 pub mod redact;
 
 /// One "unavailable: reason" record. Collectors return these instead of

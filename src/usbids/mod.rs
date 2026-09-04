@@ -190,7 +190,7 @@ fn resolve_from_chain(paths: &[&Path]) -> Option<UsbIds> {
 /// resolution itself still goes through `resolve_from_chain`, and both call
 /// the same `load_source` predicate, so the two never disagree by
 /// construction rather than by convention.
-fn active_source<'a>(paths: &[&'a Path]) -> Option<&'a Path> {
+pub(crate) fn active_source<'a>(paths: &[&'a Path]) -> Option<&'a Path> {
     paths.iter().find(|p| load_source(p).is_some()).copied()
 }
 
@@ -288,7 +288,7 @@ fn fmt_date(d: (u16, u8, u8)) -> String {
 /// trims rather than matching either literally. `None` when no such line
 /// exists (a payload with a missing or unrecognized header is never trusted
 /// with a freshness comparison; see `validate_payload`).
-fn parse_header_date(text: &str) -> Option<(u16, u8, u8)> {
+pub(crate) fn parse_header_date(text: &str) -> Option<(u16, u8, u8)> {
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("# Date:") {
             let date_part = rest.split_whitespace().next()?;
