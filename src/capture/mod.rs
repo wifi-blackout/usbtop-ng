@@ -147,7 +147,7 @@ fn assert_payload_free(trace: &CapturedTrace) -> anyhow::Result<()> {
                     trace.bytes.len()
                 ));
             }
-            for (i, record) in trace.bytes.chunks_exact(48).enumerate() {
+            for (i, record) in trace.bytes.as_chunks::<48>().0.iter().enumerate() {
                 let len_cap = u32::from_ne_bytes(record[36..40].try_into().unwrap());
                 if len_cap != 0 {
                     return Err(anyhow!(

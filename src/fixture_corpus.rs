@@ -162,7 +162,7 @@ fn sec1_no_binary_payload() {
         // bytes and still pass that check. Walk each 48-byte record and
         // assert its len_cap (bytes 36..40, native-endian u32) is 0, which
         // proves both payload-freedom and correct framing.
-        for (i, record) in bytes.chunks_exact(48).enumerate() {
+        for (i, record) in bytes.as_chunks::<48>().0.iter().enumerate() {
             let len_cap = u32::from_ne_bytes(record[36..40].try_into().unwrap());
             assert_eq!(
                 len_cap,
