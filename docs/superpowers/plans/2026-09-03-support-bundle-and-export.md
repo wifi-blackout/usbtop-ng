@@ -2556,7 +2556,10 @@ pub fn collect_usb_inventory(
 ) -> (UsbInventory, Vec<Note>) {
     let mut notes = Vec::new();
     if let Err(e) = std::fs::read_dir(sysfs_devices) {
-        notes.push(note("sysfs usb devices", format!("{}: {e}", sysfs_devices.display())));
+        notes.push(note(
+            "sysfs usb devices",
+            format!("could not read {}: {e}", sysfs_devices.display()),
+        ));
         return (
             UsbInventory {
                 usbids: usbids_info,
@@ -2609,7 +2612,10 @@ pub fn read_descriptor_blobs(sysfs_devices: &Path) -> (Vec<DescriptorBlob>, Vec<
                     match std::fs::read(&bos_path) {
                         Ok(bytes) => Some(bytes),
                         Err(e) => {
-                            notes.push(note(&format!("{name}/bos_descriptors"), e));
+                            notes.push(note(
+                                &format!("{name}/bos_descriptors"),
+                                format!("could not read: {e}"),
+                            ));
                             None
                         }
                     }
@@ -2622,7 +2628,10 @@ pub fn read_descriptor_blobs(sysfs_devices: &Path) -> (Vec<DescriptorBlob>, Vec<
                     bos,
                 });
             }
-            Err(e) => notes.push(note(&format!("{name}/descriptors"), e)),
+            Err(e) => notes.push(note(
+                &format!("{name}/descriptors"),
+                format!("could not read: {e}"),
+            )),
         }
     }
     (blobs, notes)
@@ -2702,7 +2711,10 @@ fn read_capped(path: &Path, cap: usize) -> std::io::Result<Vec<u8>> {
 pub fn dump_attrs(root: &Path, max_depth: usize) -> (Vec<AttrDump>, Vec<Note>) {
     let mut notes = Vec::new();
     if let Err(e) = std::fs::read_dir(root) {
-        notes.push(note(&root.display().to_string(), e));
+        notes.push(note(
+            &root.display().to_string(),
+            format!("could not read: {e}"),
+        ));
         return (Vec::new(), notes);
     }
     let mut dumps = Vec::new();
@@ -3631,7 +3643,12 @@ impl BundleWriter {
             ));
         }
         let bytes = std::fs::metadata(archive)
-            .map_err(|e| note("archive", format!("{} was not written: {e}", archive.display())))?
+            .map_err(|e| {
+                note(
+                    "archive",
+                    format!("could not read {} after tar: {e}", archive.display()),
+                )
+            })?
             .len();
         if let Ok(file) = File::open(archive) {
             chown_created_to_invoker(archive, file.as_raw_fd());
