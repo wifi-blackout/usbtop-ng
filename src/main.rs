@@ -182,6 +182,17 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // `--support`'s window is resolved before `prepare_dir` runs below, so an
+    // invalid `--window` (e.g. `inf`) exits before the bundle directory (and
+    // its log file) is ever created -- otherwise an orphan directory would be
+    // left on disk for every rejected value.
+    let support_window = cli.support.is_some().then(|| {
+        resolve_capture_window(cli.window).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            process::exit(2);
+        })
+    });
+
     // `--support` owns the logger: its bundle directory must exist before
     // the logger is built so every record can be teed into it.
     let started_unix = now_unix();
@@ -213,10 +224,7 @@ fn main() -> Result<()> {
     info!("starting usbtop-ng v{}", env!("CARGO_PKG_VERSION"));
 
     if let Some(prepared) = prepared {
-        let window = resolve_capture_window(cli.window).unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            process::exit(2);
-        });
+        let window = support_window.expect("support_window is set whenever --support is used");
         let roots = diag::support::Roots::live(
             cli.config.as_deref().map(Path::new),
             cli.usbids.as_deref().map(Path::new),

@@ -258,10 +258,13 @@ pub enum CaptureState {
 }
 
 /// Where the archive stands: not yet attempted (the copy of the summary
-/// inside the bundle), written, or not producible.
+/// inside the bundle), written, or not producible. `Written`'s `String` is
+/// the display form [`display_archive`] computes, never the raw absolute
+/// path: the summary is meant to be pasted into a bug report, so it must
+/// never carry the reporter's home directory or user name.
 pub enum ArchiveState {
     Pending,
-    Written(PathBuf, u64),
+    Written(String, u64),
     Missing(String),
 }
 
@@ -296,6 +299,16 @@ struct TypecFile {
     power_delivery: Vec<AttrDump>,
 }
 
+/// Append the "static fixture written instead" clause to a `Failed` state's
+/// reason, once the static fallback assembly has actually succeeded -- never
+/// claimed before that, since the fallback can itself fail. A `Skipped`
+/// state (no capture was attempted) is left untouched.
+fn note_static_fixture_written(state: &mut CaptureState) {
+    if let CaptureState::Failed(reason) = state {
+        reason.push_str("; static fixture written instead");
+    }
+}
+
 /// Embed the fixture: a live capture when [`Environment::capture_decision`]
 /// allows it, else (or after a capture failure) a static bundle from the
 /// sysfs tree alone. Returns what happened; failures become notes.
@@ -306,7 +319,7 @@ fn write_fixture(
     fixture_dir: &Path,
     notes: &mut Vec<Note>,
 ) -> CaptureState {
-    let state = match env.capture_decision(opts.no_capture) {
+    let mut state = match env.capture_decision(opts.no_capture) {
         Ok(()) => {
             info!(
                 "capturing the usbmon aggregate bus for {:.1} s",
@@ -328,24 +341,30 @@ fn write_fixture(
                 }
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(fixture_dir);
-                    CaptureState::Failed(format!("failed: {e:#}; static fixture written instead"))
+                    CaptureState::Failed(format!("failed: {e:#}"))
                 }
             }
         }
         Err(reason) => CaptureState::Skipped(reason),
     };
-    if let Err(e) = capture::assemble_bundle(
+    // The "static fixture written instead" clause is appended only once the
+    // static assembly below actually succeeds -- claiming it before trying
+    // would be false whenever this assembly itself then fails.
+    match capture::assemble_bundle(
         &roots.sysfs_devices,
         fixture_dir,
         &[],
         &BaselineSource::CaptureFrom(roots.sysfs_devices.clone()),
         None,
     ) {
-        let _ = std::fs::remove_dir_all(fixture_dir);
-        notes.push(note(
-            "fixture",
-            format!("could not write the static fixture: {e:#}"),
-        ));
+        Ok(()) => note_static_fixture_written(&mut state),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(fixture_dir);
+            notes.push(note(
+                "fixture",
+                format!("could not write the static fixture: {e:#}"),
+            ));
+        }
     }
     match &state {
         CaptureState::Skipped(reason) | CaptureState::Failed(reason) => {
@@ -542,7 +561,15 @@ pub fn run_support(
     }
     writer.write_manifest(now_unix, &notes)?;
     summary.archive = match writer.archive(&prepared.archive) {
-        Ok(bytes) => ArchiveState::Written(prepared.archive.clone(), bytes),
+        Ok(bytes) => {
+            let cwd = std::env::current_dir()
+                .ok()
+                .and_then(|d| d.canonicalize().ok());
+            ArchiveState::Written(
+                display_archive(&prepared.archive, cwd.as_deref(), roots.home.as_deref()),
+                bytes,
+            )
+        }
         Err(n) => {
             let reason = n.reason.clone();
             summary.notes.push(n);
@@ -729,15 +756,23 @@ fn redacted_line(redaction: &[(String, usize)]) -> String {
     format!("{rewritten}; host identity never collected; device serials included")
 }
 
+/// How the summary names the archive: relative to the current directory
+/// when it lives under it (`./usbtop-ng-support-….tar.gz`, as the spec
+/// shows), else with the home rule applied (`~/bugs/x.tar.gz`), so the
+/// pasted summary never carries the user's home path.
+fn display_archive(archive: &Path, cwd: Option<&Path>, home: Option<&Path>) -> String {
+    if let Some(rel) = cwd.and_then(|cwd| archive.strip_prefix(cwd).ok()) {
+        return format!("./{}", rel.display());
+    }
+    Redactor::new(home).text(&archive.display().to_string())
+}
+
 fn bundle_line(s: &Summary) -> String {
     match &s.archive {
         ArchiveState::Pending => format!("{}/ ({} files)", s.dir_name, s.file_count),
-        ArchiveState::Written(path, bytes) => format!(
-            "{} ({}, {} files)",
-            path.display(),
-            format_size(*bytes),
-            s.file_count
-        ),
+        ArchiveState::Written(shown, bytes) => {
+            format!("{shown} ({}, {} files)", format_size(*bytes), s.file_count)
+        }
         ArchiveState::Missing(reason) => format!(
             "{}/ ({} files; not archived: {reason}. Archive it by hand from its parent directory: tar -czf {}.tar.gz {})",
             s.dir_name, s.file_count, s.dir_name, s.dir_name
@@ -938,6 +973,24 @@ mod tests {
             .contains("no usbmon interface"));
     }
 
+    /// The "static fixture written instead" clause is appended to a `Failed`
+    /// reason only when the caller has actually confirmed the fallback
+    /// assembly succeeded -- never claimed up front, since that assembly can
+    /// itself fail. A `Skipped` reason is left untouched either way.
+    #[test]
+    fn note_static_fixture_written_only_appends_to_a_failed_state_and_never_touches_skipped() {
+        let mut failed = CaptureState::Failed("failed: boom".to_string());
+        note_static_fixture_written(&mut failed);
+        assert_eq!(
+            capture_line(&failed),
+            "failed: boom; static fixture written instead"
+        );
+
+        let mut skipped = CaptureState::Skipped("skipped: --no-capture".to_string());
+        note_static_fixture_written(&mut skipped);
+        assert_eq!(capture_line(&skipped), "skipped: --no-capture");
+    }
+
     #[test]
     fn summary_lines_match_the_spec_shapes() {
         let mut r = Redactor::new(None);
@@ -1024,11 +1077,43 @@ mod tests {
     }
 
     #[test]
+    fn display_archive_never_shows_the_home_path() {
+        let home = Path::new("/home/alice");
+        assert_eq!(
+            display_archive(
+                Path::new("/home/alice/bug.tar.gz"),
+                Some(Path::new("/home/alice")),
+                Some(home)
+            ),
+            "./bug.tar.gz",
+            "under the cwd: shown relative to it"
+        );
+        assert_eq!(
+            display_archive(
+                Path::new("/home/alice/bugs/bug.tar.gz"),
+                Some(Path::new("/tmp/elsewhere")),
+                Some(home)
+            ),
+            "~/bugs/bug.tar.gz",
+            "under home but not the cwd: the home rule applies"
+        );
+        assert_eq!(
+            display_archive(
+                Path::new("/tmp/x/bug.tar.gz"),
+                Some(Path::new("/var/run")),
+                Some(home)
+            ),
+            "/tmp/x/bug.tar.gz",
+            "neither under the cwd nor under home: unchanged"
+        );
+    }
+
+    #[test]
     fn render_summary_has_the_ten_line_layout() {
         let summary = Summary {
             dir_name: "usbtop-ng-support-20260903T091500Z".into(),
             archive: ArchiveState::Written(
-                PathBuf::from("./usbtop-ng-support-20260903T091500Z.tar.gz"),
+                "./usbtop-ng-support-20260903T091500Z.tar.gz".to_string(),
                 412_300,
             ),
             file_count: 14,
@@ -1342,9 +1427,13 @@ mod tests {
             "{summary_text}"
         );
         match &summary.archive {
-            ArchiveState::Written(path, bytes) => {
-                assert_eq!(path, &prepared.archive);
-                assert_eq!(*bytes, std::fs::metadata(path).unwrap().len());
+            ArchiveState::Written(shown, bytes) => {
+                assert!(
+                    shown.ends_with("usbtop-ng-support-20260829T104000Z.tar.gz"),
+                    "{shown}"
+                );
+                assert!(!shown.contains(&home_text), "{shown}");
+                assert_eq!(*bytes, std::fs::metadata(&prepared.archive).unwrap().len());
             }
             ArchiveState::Missing(reason) => assert!(reason.contains("tar"), "{reason}"),
             ArchiveState::Pending => panic!("run_support must settle the archive state"),
