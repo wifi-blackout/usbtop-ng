@@ -540,9 +540,11 @@ fn walk_attrs(
                 walk_attrs(base, &path, depth + 1, max_depth, attrs, notes);
             }
         } else if !SKIPPED_FILES.contains(&name.as_str()) {
-            // Attribute reads are bounded to the cap; a file that vanished
-            // (or was never really there despite the directory listing) is
-            // simply not an attribute here, and not worth a note.
+            // Attribute reads are bounded to the cap. An attribute that does
+            // not exist (the sparse case, or one that vanished after the
+            // listing) is silent; a file that is present but unreadable (a
+            // permission or I/O error) is noted, so a partially readable tree
+            // is never mistaken for a complete one.
             let bytes = match read_capped(&path, ATTR_VALUE_CAP) {
                 Ok(bytes) => bytes,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1102,6 +1104,46 @@ mod tests {
         );
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].item.ends_with("port0/power_role"));
+        assert!(notes[0].reason.starts_with("could not read: "));
+    }
+
+    #[test]
+    fn attr_dump_notes_an_attribute_whose_metadata_cannot_be_read() {
+        // SAFETY: geteuid() takes no arguments, touches no memory, and
+        // cannot fail. A root process holds CAP_DAC_OVERRIDE and can search
+        // any directory regardless of mode, so the EACCES this test relies on
+        // never fires under root -- skip there rather than assert falsely.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        // A directory that is readable but not searchable: `read_dir` still
+        // lists its entries (needs only read permission), but `symlink_metadata`
+        // on any listed entry fails with EACCES (needs search/execute). This is
+        // the deterministic trigger for the walk's metadata-error branch -- not
+        // a TOCTOU race -- e.g. a sysfs node under a directory the process may
+        // list but not descend.
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real/port0");
+        write(&real, "data_role", "[host] device\n");
+        let class = temp.path().join("class/typec");
+        std::fs::create_dir_all(&class).unwrap();
+        std::os::unix::fs::symlink(&real, class.join("port0")).unwrap();
+        // Strip search permission from the walked directory itself.
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let (dumps, notes) = dump_attrs(&class, 2);
+        // Restore before any assertion so the tempdir can always be cleaned up.
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(dumps.len(), 1);
+        assert!(
+            dumps[0].attrs.is_empty(),
+            "no entry's metadata could be read, so nothing is recorded: {:?}",
+            dumps[0].attrs
+        );
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].item.ends_with("port0/data_role"));
         assert!(notes[0].reason.starts_with("could not read: "));
     }
 
