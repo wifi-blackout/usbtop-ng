@@ -2,7 +2,6 @@
 //! prints every window until interrupted. Never prompts.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
@@ -16,6 +15,8 @@ use crate::filter::FilterSet;
 use crate::usbmon::monitor::{CaptureStream, SourceFlags};
 use crate::usbmon::parser::format_mbps;
 
+pub mod export;
+
 pub struct HeadlessOptions {
     pub json: bool,
     pub batch: bool,
@@ -25,6 +26,10 @@ pub struct HeadlessOptions {
     /// fail rather than report zeros forever. `--force` with no detected
     /// buses spawns no readers, so its empty reports stay legitimate.
     pub expect_capture: bool,
+    /// `--output PATH`; `None` prints to stdout.
+    pub output: Option<std::path::PathBuf>,
+    /// Leads a file export; never printed to stdout.
+    pub run_record: export::RunRecord,
 }
 
 #[derive(Serialize)]
@@ -442,6 +447,8 @@ pub fn run(
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stop))?;
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stop))?;
 
+    let mut sink = export::ReportSink::open(opts.output.as_deref(), &opts.run_record, opts.json)?;
+
     loop {
         manager.enumerate_present_devices();
         let baseline = Baseline::capture(&manager);
@@ -485,31 +492,20 @@ pub fn run(
         // kernel-drop count is read straight from the live counter here,
         // same source `dropped`/`text_active` load from just above.
         report.kernel_dropped_packets = kernel_dropped.load(Ordering::Relaxed);
-        if let Err(e) = emit(&report, opts.json) {
-            if is_expected_write_failure(&e) {
-                return Ok(()); // broken pipe: the reader left, that is not our error
+        if let Err(e) = sink.write(&report, opts.json) {
+            if opts.output.is_none() && is_expected_write_failure(&e) {
+                break; // broken pipe on stdout: the reader left, that is not our error
             }
-            return Err(e.into());
+            return Err(anyhow!("could not write the report: {e}"));
         }
         if !opts.batch || stop.load(Ordering::Relaxed) {
-            return Ok(());
+            break;
         }
     }
-}
-
-/// Write one report. A `BrokenPipe` comes back as Err for the caller to
-/// treat as a clean end (see [`is_expected_write_failure`]); other write
-/// errors come back as Err too, but are propagated as a real failure instead.
-fn emit(report: &Report, json: bool) -> std::io::Result<()> {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    if json {
-        let line = serde_json::to_string(report).expect("report serializes");
-        writeln!(out, "{line}")?;
-    } else {
-        write!(out, "{}", render_text(report))?;
+    if let Some((n, path)) = sink.finish() {
+        eprintln!("wrote {n} report(s) to {}", path.display());
     }
-    out.flush()
+    Ok(())
 }
 
 /// Whether a stdout write error is expected and should end the run quietly
@@ -579,6 +575,22 @@ mod tests {
                 batch: false,
                 window: Duration::from_millis(300),
                 expect_capture: true,
+                output: None,
+                run_record: export::RunRecord {
+                    record: "run",
+                    usbtop_ng: String::new(),
+                    features: vec![],
+                    started_unix: 0,
+                    window_seconds: 1.0,
+                    batch: false,
+                    filters: vec![],
+                    command: vec![],
+                    backend: "binary".into(),
+                    kernel: String::new(),
+                    os: String::new(),
+                    arch: "x86_64",
+                    buses: vec![],
+                },
             },
         )
         .expect_err("a dead capture channel must fail the run, not report zeros");

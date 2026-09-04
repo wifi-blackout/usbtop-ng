@@ -93,6 +93,11 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
+    /// Write the reports to PATH instead of stdout (created or truncated;
+    /// the file starts with a run record). Needs --once or --batch.
+    #[arg(long, value_name = "PATH")]
+    output: Option<String>,
+
     /// Sample window in seconds (default: 5 with --once, 1 with --batch)
     #[arg(long, value_name = "SECONDS")]
     window: Option<f64>,
@@ -345,11 +350,11 @@ fn main() -> Result<()> {
         process::exit(2);
     }
 
-    // `--once`/`--batch` select a headless report instead of the TUI; `--json`
-    // and `--window` only make sense alongside one of them.
+    // `--once`/`--batch` select a headless report instead of the TUI; `--json`,
+    // `--window`, and `--output` only make sense alongside one of them.
     let headless = cli.once || cli.batch;
-    if (cli.json || cli.window.is_some()) && !headless {
-        eprintln!("error: --json and --window need --once or --batch");
+    if (cli.json || cli.window.is_some() || cli.output.is_some()) && !headless {
+        eprintln!("error: --json, --window, and --output need --once or --batch");
         process::exit(2);
     }
     let window = resolve_window(cli.window, cli.batch).unwrap_or_else(|e| {
@@ -511,6 +516,61 @@ fn main() -> Result<()> {
         manager.set_filter(filter.clone());
         manager.set_usbids(usbids.clone());
         manager.set_internal_snapshot(internal_snapshot.clone());
+
+        // Built after `start_capture`, reading the source flags once: they
+        // are set by the reader thread shortly after start, so reading them
+        // here may race the first fetch, but the report lines carry the
+        // authoritative per-window `source` anyway -- the record's `backend`
+        // documents "selected at start".
+        let started_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let run_record = headless::export::RunRecord {
+            record: "run",
+            usbtop_ng: env!("CARGO_PKG_VERSION").to_string(),
+            features: headless::export::enabled_features(),
+            started_unix,
+            window_seconds: window.as_secs_f64(),
+            batch: cli.batch,
+            filters: cli.filter.clone(),
+            command: env::args().collect(),
+            backend: match &capture {
+                usbmon::monitor::CaptureStream::Deltas(_) => "ebpf".to_string(),
+                usbmon::monitor::CaptureStream::Packets(_)
+                    if monitor
+                        .flags
+                        .text_active
+                        .load(std::sync::atomic::Ordering::Relaxed) =>
+                {
+                    "text".to_string()
+                }
+                usbmon::monitor::CaptureStream::Packets(_)
+                    if monitor
+                        .flags
+                        .mmap_active
+                        .load(std::sync::atomic::Ordering::Relaxed) =>
+                {
+                    "mmap".to_string()
+                }
+                usbmon::monitor::CaptureStream::Packets(_)
+                    if usbmon_status.available_buses.is_empty() =>
+                {
+                    "none".to_string()
+                }
+                usbmon::monitor::CaptureStream::Packets(_) => "binary".to_string(),
+            },
+            kernel: std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default(),
+            os: std::fs::read_to_string("/etc/os-release")
+                .ok()
+                .and_then(|text| os_pretty_name_from(&text))
+                .unwrap_or_default(),
+            arch: std::env::consts::ARCH,
+            buses: usbmon_status.available_buses.clone(),
+        };
+
         let result = headless::run(
             manager,
             capture,
@@ -530,6 +590,8 @@ fn main() -> Result<()> {
                 // channel means capture failed and the run must say so (see
                 // headless::run).
                 expect_capture: !usbmon_status.available_buses.is_empty(),
+                output: cli.output.as_deref().map(std::path::PathBuf::from),
+                run_record,
             },
         );
         monitor.stop();
@@ -812,9 +874,32 @@ fn open_rc_file(config_file: &str) -> io::Result<std::fs::File> {
     opts.open(config_file)
 }
 
+/// `PRETTY_NAME=` from `/etc/os-release` content, quotes trimmed. A private
+/// stand-in for `capture::meta`'s (feature-gated) `os_pretty_name`, used to
+/// fill the run record's `os` field; a later task replaces this with a
+/// shared, always-available copy and deletes this one.
+fn os_pretty_name_from(text: &str) -> Option<String> {
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("PRETTY_NAME=") {
+            return Some(value.trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn os_pretty_name_from_extracts_the_quoted_pretty_name_field() {
+        let text = "NAME=\"Linux Mint\"\nPRETTY_NAME=\"Linux Mint 22.3\"\nVERSION_ID=\"22.3\"\n";
+        assert_eq!(
+            os_pretty_name_from(text),
+            Some("Linux Mint 22.3".to_string())
+        );
+        assert_eq!(os_pretty_name_from("NAME=\"Linux Mint\"\n"), None);
+    }
 
     #[test]
     fn cli_parses_print_completions_shell() {
