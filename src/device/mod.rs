@@ -49,16 +49,35 @@ pub struct UsbDevice {
 }
 
 /// A device's string descriptors (`manufacturer`, `product`, `serial`) are
-/// written by its firmware, and the kernel hands them through unchanged. A
-/// hostile or merely broken device can therefore put terminal control
-/// sequences into them; the text report writes these names straight to
-/// stdout, and the TUI's column fitter counts them. Every control character
-/// (C0, DEL, and the C1 range) becomes U+FFFD here, at the one place the
-/// strings enter the process, so no output surface has to remember to
-/// escape them. Printable text passes through untouched.
+/// written by its firmware, and the kernel hands them through unchanged; the
+/// usb.ids names that replace them come from a plain text file the invoker
+/// can edit or point `--usbids` at. A hostile or merely broken source can
+/// therefore put terminal control sequences into a name; the text report
+/// writes these names straight to stdout, and the TUI's column fitter
+/// counts them. Every control character (C0, DEL, and the C1 range) becomes
+/// U+FFFD at both entry points -- the sysfs read and [`UsbDevice::apply_usbids`]
+/// -- so no output surface has to remember to escape them, and so do the
+/// bidirectional overrides, isolates, and marks (U+202A..=U+202E,
+/// U+2066..=U+2069, U+200E, U+200F, U+061C), which are not controls but make
+/// a terminal draw the rest of the line backwards. Printable text, including
+/// non-ASCII, passes through untouched. The support bundle's device
+/// inventory deliberately keeps the raw text: TOML escapes control
+/// characters, and a bundle is evidence of what the device actually sent.
 fn printable(text: &str) -> String {
+    fn reorders_text(c: char) -> bool {
+        matches!(
+            c,
+            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' | '\u{061c}'
+        )
+    }
     text.chars()
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .map(|c| {
+            if c.is_control() || reorders_text(c) {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -303,11 +322,11 @@ impl UsbDevice {
     pub fn apply_usbids(&mut self, db: &crate::usbids::UsbIds) {
         if let Some(vid) = self.vendor_id {
             if let Some(name) = db.vendor_name(vid) {
-                self.vendor = Some(name.to_string());
+                self.vendor = Some(printable(name));
             }
             if let Some(pid) = self.product_id {
                 if let Some(name) = db.product_name(vid, pid) {
-                    self.product = Some(name.to_string());
+                    self.product = Some(printable(name));
                 }
             }
         }
@@ -467,6 +486,41 @@ mod tests {
         assert_eq!(device.vendor.as_deref(), Some("Evil\u{fffd}[2JCorp"));
         assert_eq!(device.product.as_deref(), Some("Bell\u{fffd} Device"));
         assert_eq!(device.serial.as_deref(), Some("SN\u{fffd}001"));
+    }
+
+    #[test]
+    fn bidi_overrides_in_descriptor_strings_are_replaced_too() {
+        // U+202E (right-to-left override) makes a terminal draw the rest
+        // of the line backwards, which can visually swap the name and the
+        // rate columns; the isolates (U+2066..U+2069) and the marks
+        // U+200E/U+200F are the same family. Ordinary text, including
+        // non-ASCII, passes through.
+        assert_eq!(printable("ab\u{202e}cd"), "ab\u{fffd}cd");
+        assert_eq!(printable("x\u{2066}y\u{2069}z"), "x\u{fffd}y\u{fffd}z");
+        assert_eq!(printable("l\u{200e}r\u{200f}"), "l\u{fffd}r\u{fffd}");
+        assert_eq!(
+            printable("Kabel\u{e9} \u{4e2d}\u{6587}"),
+            "Kabel\u{e9} \u{4e2d}\u{6587}"
+        );
+    }
+
+    #[test]
+    fn usbids_names_go_through_the_same_sanitizer() {
+        // usb.ids is a plain text file the invoker can edit (or point
+        // --usbids at), and its names overwrite the firmware strings.
+        let text = "1d6b  Linux\x1b[2J Foundation\n\t0002  2.0 root\x07 hub\n";
+        let db = crate::usbids::UsbIds::parse(text);
+        let mut device = UsbDevice::new(1, 1);
+        device.vendor_id = Some(0x1d6b);
+        device.product_id = Some(0x0002);
+
+        device.apply_usbids(&db);
+
+        assert_eq!(
+            device.vendor.as_deref(),
+            Some("Linux\u{fffd}[2J Foundation")
+        );
+        assert_eq!(device.product.as_deref(), Some("2.0 root\u{fffd} hub"));
     }
 
     #[test]
