@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - `--output PATH` no longer follows a symbolic link at `PATH`: the report file is opened with `O_NOFOLLOW`, so a link planted in a shared directory cannot redirect a root run's output onto another file. A symlink there is refused with an error that says so; a symlinked parent directory still resolves.
+- USB string descriptors (`manufacturer`, `product`, `serial`) are firmware-controlled; any control character in them (a terminal escape, a BEL, a DEL) is now replaced with U+FFFD as the strings are read from sysfs, so a hostile device cannot drive the terminal through the text report or misalign the TUI's columns. Printable names are unchanged.
 
 ## [1.6.0] - 2026-09-07
 

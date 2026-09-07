@@ -48,6 +48,20 @@ pub struct UsbDevice {
     pub endpoints: BTreeMap<(u8, bool), EndpointStats>,
 }
 
+/// A device's string descriptors (`manufacturer`, `product`, `serial`) are
+/// written by its firmware, and the kernel hands them through unchanged. A
+/// hostile or merely broken device can therefore put terminal control
+/// sequences into them; the text report writes these names straight to
+/// stdout, and the TUI's column fitter counts them. Every control character
+/// (C0, DEL, and the C1 range) becomes U+FFFD here, at the one place the
+/// strings enter the process, so no output surface has to remember to
+/// escape them. Printable text passes through untouched.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect()
+}
+
 impl UsbDevice {
     pub fn new(bus_id: u8, device_id: u8) -> Self {
         Self {
@@ -130,15 +144,15 @@ impl UsbDevice {
         }
 
         if let Ok(manufacturer) = std::fs::read_to_string(sysfs_path.join("manufacturer")) {
-            self.vendor = Some(manufacturer.trim().to_string());
+            self.vendor = Some(printable(manufacturer.trim()));
         }
 
         if let Ok(product) = std::fs::read_to_string(sysfs_path.join("product")) {
-            self.product = Some(product.trim().to_string());
+            self.product = Some(printable(product.trim()));
         }
 
         if let Ok(serial) = std::fs::read_to_string(sysfs_path.join("serial")) {
-            self.serial = Some(serial.trim().to_string());
+            self.serial = Some(printable(serial.trim()));
         }
 
         self.max_capability = read_max_capability(sysfs_path);
@@ -427,6 +441,32 @@ mod tests {
         assert_eq!(device.product.as_deref(), Some("Root Hub"));
         assert_eq!(device.serial.as_deref(), Some("test-serial"));
         assert_eq!(device.sysfs_path, Some(temp.path().join("1-2.4")));
+    }
+
+    #[test]
+    fn control_characters_in_descriptor_strings_are_replaced() {
+        // A device's string descriptors are firmware-controlled. A terminal
+        // escape (ESC [ 2 J clears the screen) or a BEL in the product
+        // name must reach no output surface intact: every control character
+        // becomes U+FFFD, and the rest of the string survives.
+        let temp = tempfile::tempdir().unwrap();
+        write_device(
+            &temp.path().join("1-3"),
+            1,
+            7,
+            &[
+                ("manufacturer", "Evil\x1b[2JCorp"),
+                ("product", "Bell\x07 Device"),
+                ("serial", "SN\x7f001"),
+            ],
+        );
+
+        let mut device = UsbDevice::new(1, 7);
+        device.populate_from_sysfs(Some(temp.path()));
+
+        assert_eq!(device.vendor.as_deref(), Some("Evil\u{fffd}[2JCorp"));
+        assert_eq!(device.product.as_deref(), Some("Bell\u{fffd} Device"));
+        assert_eq!(device.serial.as_deref(), Some("SN\u{fffd}001"));
     }
 
     #[test]
