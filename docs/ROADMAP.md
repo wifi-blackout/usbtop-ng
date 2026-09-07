@@ -252,13 +252,11 @@ Open, recorded 2026-09-07 so they do not get lost:
   path under the pinned `fixture/` directory of a support bundle; route
   those writes through the bundle's root descriptor like every other
   bundle file.
-- An `integration` test that injects a synthetic failing capture note to
-  prove the `/proc/self/fd/<n>/fixture` scrub in the support orchestrator,
-  which today is only exercised by a real failure.
-- Connector rows leftovers: move the connector policy (`Placement`,
-  `connector_placement`, `order_sides`) from `src/ui/mod.rs` into
-  `src/ui/connectors.rs`; a dock fixture for the corpus when a dock is
-  available. (Done 2026-09-07: the shared attribute-copy helper, the
+- Connector rows leftovers: a dock fixture for the corpus when a dock is
+  available. (Done 2026-09-07: the `/proc/self/fd/<n>/fixture` scrub is
+  a pure function pinned by a hermetic test with a synthetic failing
+  capture note; the connector policy moved to `src/ui/connectors.rs`;
+  the shared attribute-copy helper, the
   snapshot lock between `--forget-internal` and a concurrent TUI `S`, the
   two test nits, the atomic preferences writer, with `write_file_owned`
   retired in favour of `replace_file_owned`; `port_of_device`/`port_name`

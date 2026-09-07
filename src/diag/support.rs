@@ -567,7 +567,7 @@ pub fn run_support(
     let fixture_dir = PathBuf::from(&fixture_proc);
     // Any collector message that captured the fd base is mapped back to a
     // clean `fixture` display so the bundle text never carries the fd path.
-    let scrub_fixture = |s: &str| s.replace(&fixture_proc, "fixture");
+    let scrub_fixture = |s: &str| scrub_fixture_paths(s, &fixture_proc);
 
     // Revalidate the pin right before writing traces: if `dir` no longer names
     // the inode we pinned (a mid-run swap), skip capture and the fixture
@@ -987,9 +987,37 @@ pub fn init_logger(verbose: bool, tee: Option<TeeWriter>) {
     builder.init();
 }
 
+/// Map every occurrence of the pinned `/proc/self/fd/<n>/fixture` base back
+/// to the plain `fixture` display, so no bundle text (a capture failure, a
+/// collector note, an invariant error) carries the descriptor path.
+fn scrub_fixture_paths(text: &str, fixture_proc: &str) -> String {
+    text.replace(fixture_proc, "fixture")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A capture that fails after the fixture directory is pinned reports
+    /// paths under `/proc/self/fd/<n>/fixture`; the note that reaches the
+    /// bundle must read `fixture/…` instead. Driven with a synthetic failing
+    /// note, since a real one needs root and a broken usbmon.
+    #[test]
+    fn a_failing_capture_note_never_carries_the_fd_path() {
+        let fixture_proc = "/proc/self/fd/7/fixture";
+        let note = format!(
+            "failed: could not open {fixture_proc}/trace.bin: Permission denied; static fixture written instead ({fixture_proc}/sysfs)"
+        );
+        assert_eq!(
+            scrub_fixture_paths(&note, fixture_proc),
+            "failed: could not open fixture/trace.bin: Permission denied; static fixture written instead (fixture/sysfs)"
+        );
+        assert!(!scrub_fixture_paths(&note, fixture_proc).contains("/proc/self/fd"));
+        assert_eq!(
+            scrub_fixture_paths("nothing to scrub", fixture_proc),
+            "nothing to scrub"
+        );
+    }
     use crate::diag::collect::collect_terminal;
 
     fn write(dir: &Path, rel: &str, text: &str) {
