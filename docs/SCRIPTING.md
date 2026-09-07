@@ -204,7 +204,12 @@ itself must not be a symbolic link: the file is opened without following a
 link at its final component, so a link planted in a shared directory cannot
 redirect a root run's output onto some other file (a symlinked parent
 directory is fine). Such a path is refused at start with an error that says
-so.
+so. `/dev/stdout`, `/dev/stderr`, and `/dev/fd/N` are symlinks on Linux but
+name descriptors the process already holds, so they keep working: the sink
+duplicates the descriptor instead of opening a path. The directories on the
+way to `PATH` are trusted as given: do not point `--output` into a directory
+another user can modify, since a root run writes there with root's
+authority.
 
 ```bash
 sudo usbtop-ng --batch --json --window 1 --output run.ndjson

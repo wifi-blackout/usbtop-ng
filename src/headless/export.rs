@@ -6,6 +6,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, Write};
+use std::os::fd::FromRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -78,6 +79,24 @@ pub enum ReportSink {
     },
 }
 
+/// `/dev/stdout`, `/dev/stderr`, and `/dev/fd/N` are symlinks into
+/// `/proc/self/fd`, which the `O_NOFOLLOW` open below would refuse. They name
+/// descriptors this process already holds, so the sink duplicates the
+/// descriptor instead of opening a path at all; nothing on disk is created
+/// or truncated either way. Only these exact spellings qualify.
+fn inherited_descriptor(path: &Path) -> Option<i32> {
+    let text = path.to_str()?;
+    match text {
+        "/dev/stdout" => Some(1),
+        "/dev/stderr" => Some(2),
+        _ => text
+            .strip_prefix("/dev/fd/")?
+            .parse::<i32>()
+            .ok()
+            .filter(|fd| *fd >= 0),
+    }
+}
+
 impl ReportSink {
     /// `None` is the stdout sink. `Some(path)` creates or truncates the
     /// file and writes the run record (a JSON line, or the text comment
@@ -93,23 +112,42 @@ impl ReportSink {
         // final component is affected; a symlinked parent directory still
         // resolves. (`fs.protected_symlinks` already blocks the sticky-dir
         // case on most kernels; this closes the rest.)
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-            .map_err(|e| {
-                let why = if e.raw_os_error() == Some(libc::ELOOP) {
-                    "it is a symbolic link, and --output never follows one".to_string()
-                } else {
-                    e.to_string()
-                };
-                io::Error::new(
+        let file = if let Some(fd) = inherited_descriptor(path) {
+            // SAFETY: dup(2) takes one descriptor and returns a fresh one
+            // (or -1 with errno). The new descriptor is owned by nobody
+            // else, so `from_raw_fd` may take it over.
+            let duplicate = unsafe { libc::dup(fd) };
+            if duplicate < 0 {
+                let e = io::Error::last_os_error();
+                return Err(io::Error::new(
                     e.kind(),
-                    format!("could not create {}: {why}", path.display()),
-                )
-            })?;
+                    format!("could not create {}: {e}", path.display()),
+                ));
+            }
+            unsafe { File::from_raw_fd(duplicate) }
+        } else {
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)
+                .map_err(|e| {
+                    // ELOOP also means "too many links in the ancestors";
+                    // blame the leaf only when the leaf really is a link.
+                    let leaf_is_link = e.raw_os_error() == Some(libc::ELOOP)
+                        && fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+                    let why = if leaf_is_link {
+                        "it is a symbolic link, and --output never follows one".to_string()
+                    } else {
+                        e.to_string()
+                    };
+                    io::Error::new(
+                        e.kind(),
+                        format!("could not create {}: {why}", path.display()),
+                    )
+                })?
+        };
         Self::from_open_file(file, path.to_path_buf(), run, json)
     }
 
@@ -301,6 +339,73 @@ mod tests {
             "keep me",
             "the link target must not be truncated"
         );
+    }
+
+    #[test]
+    fn a_symlinked_parent_directory_still_resolves() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = temp.path().join("link");
+        symlink(&real, &link).unwrap();
+
+        // Only the final component is protected: a home on a symlinked
+        // mount (`/home -> /var/home`) must keep working.
+        ReportSink::open(Some(&link.join("run.ndjson")), &run(), true).unwrap();
+        assert!(real.join("run.ndjson").is_file());
+    }
+
+    #[test]
+    fn an_eloop_from_an_ancestor_is_not_blamed_on_the_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        symlink(&b, &a).unwrap();
+        symlink(&a, &b).unwrap();
+
+        let err = match ReportSink::open(Some(&a.join("run.ndjson")), &run(), true) {
+            Ok(_) => panic!("a symlink loop in the ancestors cannot open"),
+            Err(e) => e,
+        };
+        let message = err.to_string();
+        assert!(message.starts_with("could not create "), "{message}");
+        assert!(
+            !message.contains("symbolic link, and --output"),
+            "a loop in the ancestors is not 'PATH is a symlink': {message}"
+        );
+    }
+
+    #[test]
+    fn dev_fd_paths_duplicate_the_descriptor_instead_of_opening_a_path() {
+        use std::os::fd::AsRawFd;
+
+        let temp = tempfile::tempdir().unwrap();
+        let backing = temp.path().join("backing.ndjson");
+        let file = std::fs::File::create(&backing).unwrap();
+        let via_fd = format!("/dev/fd/{}", file.as_raw_fd());
+
+        // /dev/fd/N (and /dev/stdout, /dev/stderr) are symlinks into
+        // /proc/self/fd that O_NOFOLLOW would refuse; they name descriptors
+        // this process already holds, so the sink duplicates the descriptor.
+        let sink = ReportSink::open(Some(Path::new(&via_fd)), &run(), true).unwrap();
+        drop(sink);
+        let written = std::fs::read_to_string(&backing).unwrap();
+        assert!(written.contains("\"record\":\"run\""), "{written}");
+    }
+
+    #[test]
+    fn inherited_descriptor_recognizes_only_the_standard_forms() {
+        assert_eq!(inherited_descriptor(Path::new("/dev/stdout")), Some(1));
+        assert_eq!(inherited_descriptor(Path::new("/dev/stderr")), Some(2));
+        assert_eq!(inherited_descriptor(Path::new("/dev/fd/7")), Some(7));
+        assert_eq!(inherited_descriptor(Path::new("/dev/fd/-1")), None);
+        assert_eq!(inherited_descriptor(Path::new("/dev/fd/x")), None);
+        assert_eq!(inherited_descriptor(Path::new("/dev/stdin")), None);
+        assert_eq!(inherited_descriptor(Path::new("/tmp/dev/stdout")), None);
     }
 
     #[test]
