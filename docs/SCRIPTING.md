@@ -199,7 +199,12 @@ sudo usbtop-ng --batch --json | jq -c '.total_rx_bps'
 format (text, or NDJSON with `--json`). The file is created or truncated when
 the run starts; there is no append and no rotation (redirect stdout if you
 want either). One line on stderr at exit says how many reports were written
-and where. A write error on the file is fatal with a non-zero exit.
+and where. A write error on the file is fatal with a non-zero exit. `PATH`
+itself must not be a symbolic link: the file is opened without following a
+link at its final component, so a link planted in a shared directory cannot
+redirect a root run's output onto some other file (a symlinked parent
+directory is fine). Such a path is refused at start with an error that says
+so.
 
 ```bash
 sudo usbtop-ng --batch --json --window 1 --output run.ndjson

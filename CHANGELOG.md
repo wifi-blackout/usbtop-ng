@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - User-named connectors: a `[connector_names]` table in the preferences file labels a physical connector by its position (`"3:1" = "Left Type-A"`, either side's bus) or by its kernel port object name, and the device table's connector heading then leads with the name. A support bundle's copy of the preferences file masks these labels (they are free text and can name a room or a person) while keeping the keys. See the README's Preferences file section.
 
+### Security
+
+- `--output PATH` no longer follows a symbolic link at `PATH`: the report file is opened with `O_NOFOLLOW`, so a link planted in a shared directory cannot redirect a root run's output onto another file. A symlink there is refused with an error that says so; a symlinked parent directory still resolves.
+
 ## [1.6.0] - 2026-09-07
 
 ### Added

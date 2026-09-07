@@ -4,8 +4,9 @@
 //! keeps today's byte-exact behaviour: no record, no notice. The support
 //! bundle writes its `report.json` through the same sink.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -85,12 +86,30 @@ impl ReportSink {
         let Some(path) = output else {
             return Ok(ReportSink::Stdout);
         };
-        let file = File::create(path).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("could not create {}: {e}", path.display()),
-            )
-        })?;
+        // `O_NOFOLLOW`: the monitor usually runs as root, and `--output`
+        // names a path the invoker may share with other local users. A
+        // symlink planted there must not turn "create or truncate the
+        // report" into "truncate whatever the link points at". Only the
+        // final component is affected; a symlinked parent directory still
+        // resolves. (`fs.protected_symlinks` already blocks the sticky-dir
+        // case on most kernels; this closes the rest.)
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|e| {
+                let why = if e.raw_os_error() == Some(libc::ELOOP) {
+                    "it is a symbolic link, and --output never follows one".to_string()
+                } else {
+                    e.to_string()
+                };
+                io::Error::new(
+                    e.kind(),
+                    format!("could not create {}: {why}", path.display()),
+                )
+            })?;
         Self::from_open_file(file, path.to_path_buf(), run, json)
     }
 
@@ -258,6 +277,30 @@ mod tests {
         let message = err.to_string();
         assert!(message.starts_with("could not create "), "{message}");
         assert!(message.contains(&path.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn a_symlink_at_the_output_path_is_refused_and_its_target_untouched() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("precious");
+        std::fs::write(&target, "keep me").unwrap();
+        let link = temp.path().join("run.ndjson");
+        symlink(&target, &link).unwrap();
+
+        let err = match ReportSink::open(Some(&link), &run(), true) {
+            Ok(_) => panic!("a symlink at --output must never be followed"),
+            Err(e) => e,
+        };
+        let message = err.to_string();
+        assert!(message.starts_with("could not create "), "{message}");
+        assert!(message.contains("symbolic link"), "{message}");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "keep me",
+            "the link target must not be truncated"
+        );
     }
 
     #[test]
