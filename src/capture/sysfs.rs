@@ -145,14 +145,7 @@ fn copy_ports(
                 continue;
             }
             let dst_port = dst_dev.join(interface_name.as_ref()).join(&port_name);
-            std::fs::create_dir_all(&dst_port)
-                .with_context(|| format!("create {}", dst_port.display()))?;
-            for attr in PORT_ATTRS {
-                if let Ok(bytes) = std::fs::read(port.path().join(attr)) {
-                    std::fs::write(dst_port.join(attr), &bytes)
-                        .with_context(|| format!("write {}", dst_port.join(attr).display()))?;
-                }
-            }
+            copy_named(&port.path(), &dst_port, &PORT_ATTRS)?;
             if let Some(peer) = std::fs::read_link(port.path().join("peer"))
                 .ok()
                 .and_then(|t| t.file_name().map(|f| f.to_string_lossy().into_owned()))
@@ -195,12 +188,18 @@ fn resolve_controller(src_dir: &Path) -> Option<String> {
     Some(real.parent()?.file_name()?.to_string_lossy().into_owned())
 }
 
-/// Copy the known attribute files (those that exist) from `src` into a fresh
+/// Copy a device's known attribute files (those that exist) into a fresh real
+/// dir `dst`.
+fn copy_attrs(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    copy_named(src, dst, &ATTRS)
+}
+
+/// Copy the named attribute files (those that exist) from `src` into a fresh
 /// real dir `dst`. `fs::read` is used, not `fs::copy`, because sysfs files
 /// report a 4096-byte size but return fewer bytes; `read` loops to EOF.
-fn copy_attrs(src: &Path, dst: &Path) -> anyhow::Result<()> {
+fn copy_named(src: &Path, dst: &Path, attrs: &[&str]) -> anyhow::Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("create {}", dst.display()))?;
-    for attr in ATTRS {
+    for attr in attrs {
         let from = src.join(attr);
         if let Ok(bytes) = std::fs::read(&from) {
             std::fs::write(dst.join(attr), &bytes)

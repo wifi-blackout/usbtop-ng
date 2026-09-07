@@ -386,6 +386,7 @@ fn main() -> Result<()> {
         if let Some(parent) = dest.parent() {
             ensure_private_config_dir(parent)?;
         }
+        let _lock = snapshot::SnapshotLock::acquire(&dest)?;
         snapshot.write_to(&dest)?;
         println!(
             "{}",
@@ -402,6 +403,9 @@ fn main() -> Result<()> {
             eprintln!("error: no internal-device snapshot at {}", path.display());
             process::exit(1);
         }
+        // Held across the load, the edit, and the write, so a TUI `S` in the
+        // meantime cannot be overwritten by this stale copy.
+        let _lock = snapshot::SnapshotLock::acquire(&path)?;
         let Some(mut snapshot) = snapshot::Snapshot::load(&path) else {
             // `Snapshot::load` returns `None` for both halves: an
             // unparseable file (which it warns about) and an unreadable one

@@ -182,6 +182,69 @@ pub fn snapshot_path() -> Result<PathBuf> {
     Ok(crate::config::preferences_path()?.with_file_name("internal-devices.toml"))
 }
 
+/// An exclusive advisory lock on the snapshot, held for the life of the
+/// value: `--forget-internal` takes it across its load, edit, and write, and
+/// `--snapshot-internal` and the TUI's `S` key across their write, so an
+/// edit can never be written over a snapshot another run replaced in the
+/// meantime. The last complete operation wins; an interleaving cannot. The
+/// lock is `flock(2)` on `internal-devices.toml.lock` beside the snapshot
+/// (per open file description, released on drop or process exit); the
+/// file is created 0600 and handed to the sudo invoker like every other
+/// file in the directory, and a symlink planted at its path is refused.
+#[derive(Debug)]
+pub struct SnapshotLock {
+    _file: std::fs::File,
+}
+
+impl SnapshotLock {
+    /// Block until the lock is held.
+    pub fn acquire(snapshot_path: &Path) -> std::io::Result<SnapshotLock> {
+        Self::open(snapshot_path, 0)
+    }
+
+    /// The lock, or `None` when another holder has it right now.
+    #[cfg(test)]
+    fn try_acquire(snapshot_path: &Path) -> std::io::Result<Option<SnapshotLock>> {
+        match Self::open(snapshot_path, libc::LOCK_NB) {
+            Ok(lock) => Ok(Some(lock)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn open(snapshot_path: &Path, extra_flock_flags: libc::c_int) -> std::io::Result<SnapshotLock> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = lock_path_for(snapshot_path);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)?;
+        crate::config::chown_created_to_invoker(&path, file.as_raw_fd());
+        // SAFETY: `file` owns a valid open descriptor for the whole call;
+        // `flock` takes the descriptor and an operation and touches no memory.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | extra_flock_flags) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(SnapshotLock { _file: file })
+    }
+}
+
+/// `<snapshot>.lock`, beside the snapshot.
+fn lock_path_for(snapshot_path: &Path) -> PathBuf {
+    let mut name = snapshot_path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".lock");
+    snapshot_path.with_file_name(name)
+}
+
 /// One captured device's vendor+product name, resolved against `db` the same
 /// way `headless::render_text` composes a live device's name: both names
 /// join with a space, a single resolved field stands alone. Unlike that
@@ -414,6 +477,43 @@ mod tests {
             vendor_id: vid.map(String::from),
             product_id: pid.map(String::from),
         }
+    }
+
+    #[test]
+    fn the_snapshot_lock_is_exclusive_until_dropped_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = temp.path().join("internal-devices.toml");
+        let held = SnapshotLock::acquire(&snapshot).unwrap();
+        let lock_file = temp.path().join("internal-devices.toml.lock");
+        assert_eq!(
+            std::fs::metadata(&lock_file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            SnapshotLock::try_acquire(&snapshot).unwrap().is_none(),
+            "a second holder must wait while the first holds the lock"
+        );
+        drop(held);
+        assert!(
+            SnapshotLock::try_acquire(&snapshot).unwrap().is_some(),
+            "released on drop"
+        );
+    }
+
+    #[test]
+    fn the_snapshot_lock_refuses_a_symlink_at_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let decoy = temp.path().join("decoy");
+        std::fs::write(&decoy, b"x").unwrap();
+        std::os::unix::fs::symlink(&decoy, temp.path().join("internal-devices.toml.lock")).unwrap();
+        let err = SnapshotLock::acquire(&temp.path().join("internal-devices.toml")).unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+        assert_eq!(
+            std::fs::read(&decoy).unwrap(),
+            b"x",
+            "the decoy is untouched"
+        );
     }
 
     #[test]

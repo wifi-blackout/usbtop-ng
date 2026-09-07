@@ -248,10 +248,6 @@ These came out of code review. Each is small and none blocks a release.
 
 Open, recorded 2026-09-07 so they do not get lost:
 
-- One fd-anchored write primitive: the support bundle's `write_new_at` and
-  the config writers (`write_file_owned`, `replace_file_owned`) duplicate
-  the create-write-chown shape; and the preferences writer should replace
-  atomically the way the snapshot writer now does.
 - The fixture-capture core (`capture::assemble_bundle`) still writes by
   path under the pinned `fixture/` directory of a support bundle; route
   those writes through the bundle's root descriptor like every other
@@ -259,14 +255,14 @@ Open, recorded 2026-09-07 so they do not get lost:
 - An `integration` test that injects a synthetic failing capture note to
   prove the `/proc/self/fd/<n>/fixture` scrub in the support orchestrator,
   which today is only exercised by a real failure.
-- Connector rows leftovers: a shared attribute-copy helper for
-  `copy_attrs`/`copy_ports`; move the connector policy (`Placement`,
+- Connector rows leftovers: move the connector policy (`Placement`,
   `connector_placement`, `order_sides`) from `src/ui/mod.rs` into
-  `src/ui/connectors.rs` and narrow `port_of_device`/`port_name`
-  visibility; a lock so `--forget-internal` and a concurrent TUI `S` cannot
-  lose each other's edit; two test nits (a literal `99999` pid in the
-  stale-temp test, a loose `err.kind() != NotFound` assertion); a dock
-  fixture for the corpus when a dock is available.
+  `src/ui/connectors.rs`; a dock fixture for the corpus when a dock is
+  available. (Done 2026-09-07: the shared attribute-copy helper, the
+  snapshot lock between `--forget-internal` and a concurrent TUI `S`, the
+  two test nits, the atomic preferences writer, with `write_file_owned`
+  retired in favour of `replace_file_owned`; `port_of_device`/`port_name`
+  stay public because the fallback naming in `ui` uses them.)
 
 - Fixed: error, prompt, and log strings follow the three shapes in [CONTRIBUTING](CONTRIBUTING.md#user-facing-text).
 - Fixed: the report `source` field mislabeled the mmap ring reader as

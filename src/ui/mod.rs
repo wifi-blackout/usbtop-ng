@@ -910,6 +910,13 @@ fn confirm_snapshot(app: &mut UsbTopApp, snapshot: Snapshot) -> SnapshotPrompt {
             return SnapshotPrompt::Done(format!("could not write the snapshot: {e}"));
         }
     }
+    let _lock = match crate::snapshot::SnapshotLock::acquire(&dest) {
+        Ok(lock) => lock,
+        Err(e) => {
+            log::warn!("could not lock the internal-device snapshot: {e}");
+            return SnapshotPrompt::Done(format!("could not write the snapshot: {e}"));
+        }
+    };
     if let Err(e) = snapshot.write_to(&dest) {
         log::warn!("could not write the internal-device snapshot: {e}");
         return SnapshotPrompt::Done(format!("could not write the snapshot: {e}"));

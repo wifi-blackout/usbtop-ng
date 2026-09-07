@@ -228,26 +228,6 @@ pub fn chown_created_to_invoker(path: &Path, fd: RawFd) {
     }
 }
 
-/// Create (or truncate) `path`, write `bytes` to it, and chown the result to
-/// the invoking user via [`chown_created_to_invoker`] -- open, write, and
-/// chown all act on one file descriptor from a single `open(2)`, so there is
-/// exactly one inode in play throughout and nothing left to re-resolve
-/// between steps. The open passes `O_NOFOLLOW`, so a symlink planted at
-/// `path` ahead of time -- the final component resolving to something this
-/// process does not own -- is refused with an error rather than written
-/// through or (had a path-based chown been used) chowned by way of.
-pub fn write_file_owned(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    file.write_all(bytes)?;
-    chown_created_to_invoker(path, file.as_raw_fd());
-    Ok(())
-}
-
 /// Replace the contents of `path` atomically: write `bytes` to a fresh
 /// temporary file in the same directory, fsync it, chown it to the invoking
 /// user via [`chown_created_to_invoker`], and rename it over `path`. At no
@@ -403,7 +383,8 @@ pub fn load_or_create_default_at(path: &Path) -> Result<Preferences> {
     Ok(prefs)
 }
 
-/// Writes via [`write_file_owned`] (create/truncate, `O_NOFOLLOW`, fchown on
+/// Writes via [`replace_file_owned`] (an atomic same-directory replacement,
+/// so a full disk or a kill mid-write keeps the previous file; `O_NOFOLLOW`, fchown on
 /// the fd that created the file -- see its doc comment for the race this
 /// closes). Does NOT chown a parent directory it creates here: in
 /// production, every default-path caller creates `.usbtop-ng` first via
@@ -424,7 +405,7 @@ pub fn write_preferences_at(path: &Path, prefs: &Preferences) -> Result<()> {
     }
 
     let content = toml::to_string_pretty(prefs).context("failed to serialize preferences")?;
-    write_file_owned(path, content.as_bytes())
+    replace_file_owned(path, content.as_bytes())
         .with_context(|| format!("failed to write preferences to {}", path.display()))?;
     Ok(())
 }
@@ -789,6 +770,30 @@ mod tests {
             .contains("[connector_names]"));
     }
 
+    /// The `i` toggle rewrites the whole preferences file: a failed rewrite
+    /// must leave the previous file, names and all, exactly as it was.
+    #[test]
+    fn a_failed_preferences_rewrite_leaves_the_previous_file_intact() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.toml");
+        let mut prefs = Preferences::default();
+        prefs
+            .connector_names
+            .insert("3:1".to_string(), "Left Type-A".to_string());
+        write_preferences_at(&path, &prefs).unwrap();
+        let before = fs::read(&path).unwrap();
+        // A directory squatting on this process's temp name fails the
+        // atomic replacement before a byte of the target is touched.
+        fs::create_dir(
+            temp.path()
+                .join(format!("prefs.toml.{}.tmp", std::process::id())),
+        )
+        .unwrap();
+        prefs.hide_idle_devices = true;
+        assert!(write_preferences_at(&path, &prefs).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
     #[test]
     fn preferences_without_names_serialize_without_the_table() {
         let temp = tempfile::tempdir().unwrap();
@@ -848,34 +853,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn write_file_owned_refuses_a_symlinked_final_component() {
-        // The attack `O_NOFOLLOW` exists to stop, hermetically (no root
-        // needed -- `open(2)` refuses the symlink regardless of privilege):
-        // an attacker who fully controls their own home plants a symlink at
-        // the path this process is about to write, pointing somewhere they
-        // do not own. A path-based write (or a path-based chown afterwards)
-        // would follow it; `write_file_owned`'s `open` must instead fail
-        // outright, leaving both the symlink and its target untouched.
-        let temp = tempfile::tempdir().unwrap();
-        let real_target = temp.path().join("real-target");
-        fs::write(&real_target, b"do not touch").unwrap();
-        let trap = temp.path().join("trap.toml");
-        std::os::unix::fs::symlink(&real_target, &trap).unwrap();
-
-        let result = write_file_owned(&trap, b"attacker-controlled content");
-
-        assert!(
-            result.is_err(),
-            "a symlinked final component must be refused, not followed"
-        );
-        let content = fs::read_to_string(&real_target).unwrap();
-        assert_eq!(
-            content, "do not touch",
-            "the symlink's target must be left untouched -- no write, and so no chown of it either"
-        );
-    }
-
     #[test]
     fn replace_file_owned_replaces_content_privately_and_leaves_no_temp_file() {
         use std::os::unix::fs::PermissionsExt;
@@ -939,7 +916,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("internal-devices.toml");
         std::fs::write(&path, b"old").unwrap();
-        let stale = temp.path().join("internal-devices.toml.99999.tmp");
+        let other_pid = if std::process::id() == 99999 {
+            99998
+        } else {
+            99999
+        };
+        let stale = temp
+            .path()
+            .join(format!("internal-devices.toml.{other_pid}.tmp"));
         std::fs::write(&stale, b"half-written garbage").unwrap();
         replace_file_owned(&path, b"new").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
@@ -1024,7 +1008,7 @@ mod tests {
             .join(format!("internal-devices.toml.{}.tmp", std::process::id()));
         std::fs::create_dir(&squatter).unwrap();
         let err = replace_file_owned(&path, b"replacement").unwrap_err();
-        assert_ne!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"precious original",
