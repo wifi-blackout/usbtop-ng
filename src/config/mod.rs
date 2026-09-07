@@ -292,9 +292,9 @@ pub struct PinnedDir {
     dir: fs::File,
     path: PathBuf,
     /// Verified at the open, through the descriptor: a sudo invoker exists
-    /// and this directory really lies inside their home. Every later
-    /// ownership handoff decides from this, never from a path resolved
-    /// again (see [`PinnedDir::chown_created`]).
+    /// and the directory actually opened lies inside their home, whatever
+    /// path named it. Every later ownership handoff decides from this,
+    /// never from a path resolved again (see [`PinnedDir::chown_created`]).
     in_home: bool,
 }
 
@@ -303,15 +303,18 @@ impl PinnedDir {
     ///
     /// Ancestors may be symlinks -- a dotfiles checkout inside the home, or
     /// `/home -> /var/home` -- so the open follows them; what is judged is
-    /// the directory actually opened. Under sudo, when `file` lexically
-    /// claims a place inside the invoker's home, the directory's real
-    /// location (read back through `/proc/self/fd`) must lie inside the
-    /// resolved home too, else the open is refused: root writes into the
-    /// invoker's home and nowhere else, and an `~/.usbtop-ng` swapped for a
-    /// link to somewhere else is caught at every write, not only at
-    /// startup. An explicit path outside the home (`--config`, `--usbids`)
-    /// is the invoker's own choice and is not second-guessed; without sudo
-    /// there is no privilege boundary at all.
+    /// the directory actually opened, read back through `/proc/self/fd`.
+    /// Under sudo, when `file` (made absolute against the working directory
+    /// if it is relative) lexically claims a place inside the invoker's
+    /// home, that real location must lie inside the resolved home too, else
+    /// the open is refused: root writes into the invoker's home and nowhere
+    /// else, and an `~/.usbtop-ng` swapped for a link to somewhere else is
+    /// caught at every write, not only at startup. An explicit path outside
+    /// the home (`--config`, `--usbids`) is the invoker's own choice and is
+    /// not second-guessed. Ownership is handed to the invoker whenever the
+    /// directory really is inside their home, however it was named (a
+    /// relative `--config ./x` from inside the home included). Without
+    /// sudo there is no privilege boundary at all.
     pub fn for_file(file: &Path) -> io::Result<PinnedDir> {
         let dir_path = match file.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
@@ -330,24 +333,29 @@ impl PinnedDir {
             .open(dir_path)?;
         let mut in_home = false;
         if let Some(home) = invoker_home {
-            if is_within(claimed, home) {
-                let actual = fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd()))?;
-                let home_resolved =
-                    resolve_for_containment_check(home).unwrap_or_else(|| home.to_path_buf());
-                if !is_within(&actual, &home_resolved) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!(
-                            "{} resolves to {}, outside the invoking user's home {}; \
-                             refusing to write there as root",
-                            dir_path.display(),
-                            actual.display(),
-                            home.display()
-                        ),
-                    ));
-                }
-                in_home = true;
+            let claimed = if claimed.is_absolute() {
+                claimed.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(claimed)
+            };
+            let claims_home = is_within(&claimed, home);
+            let actual = fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd()))?;
+            let home_resolved =
+                resolve_for_containment_check(home).unwrap_or_else(|| home.to_path_buf());
+            let actually_home = is_within(&actual, &home_resolved);
+            if claims_home && !actually_home {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} resolves to {}, outside the invoking user's home {}; \
+                         refusing to write there as root",
+                        dir_path.display(),
+                        actual.display(),
+                        home.display()
+                    ),
+                ));
             }
+            in_home = actually_home;
         }
         Ok(PinnedDir {
             dir,
@@ -924,6 +932,19 @@ mod tests {
         // opened, not checked, and no ownership handoff.
         let elsewhere = PinnedDir::open(&outside, &outside.join("usb.ids"), Some(&home)).unwrap();
         assert!(!elsewhere.in_home);
+        // A relative path (`--config ./prefs.toml` from inside the home)
+        // claims nothing lexically, but the directory really is in the
+        // home, so ownership is still handed over.
+        let relative = PinnedDir::open(
+            &home.join(".plain"),
+            Path::new("relative/preferences.toml"),
+            Some(&home),
+        )
+        .unwrap();
+        assert!(
+            relative.in_home,
+            "decided from where the directory really is"
+        );
         let err = open(home.join(".escape")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert!(

@@ -55,15 +55,17 @@ pub struct UsbDevice {
 /// therefore put terminal control sequences into a name; the text report
 /// writes these names straight to stdout, and the TUI's column fitter
 /// counts them. Every control character (C0, DEL, and the C1 range) becomes
-/// U+FFFD at both entry points -- the sysfs read and [`UsbDevice::apply_usbids`]
-/// -- so no output surface has to remember to escape them, and so do the
+/// U+FFFD at both entry points -- the sysfs read here and
+/// [`crate::usbids::UsbIds::parse`], which also serves the snapshot commands
+/// and the bundle inventory -- so no output surface has to remember to
+/// escape them, and so do the
 /// bidirectional overrides, isolates, and marks (U+202A..=U+202E,
 /// U+2066..=U+2069, U+200E, U+200F, U+061C), which are not controls but make
 /// a terminal draw the rest of the line backwards. Printable text, including
 /// non-ASCII, passes through untouched. The support bundle's device
 /// inventory deliberately keeps the raw text: TOML escapes the C0 controls
 /// and DEL, and a bundle is evidence of what the device actually sent.
-fn printable(text: &str) -> String {
+pub(crate) fn printable(text: &str) -> String {
     fn reorders_text(c: char) -> bool {
         matches!(
             c,
@@ -321,12 +323,13 @@ impl UsbDevice {
     /// device's own strings keep any field the database does not list.
     pub fn apply_usbids(&mut self, db: &crate::usbids::UsbIds) {
         if let Some(vid) = self.vendor_id {
+            // Names are sanitized once, as the database is parsed.
             if let Some(name) = db.vendor_name(vid) {
-                self.vendor = Some(printable(name));
+                self.vendor = Some(name.to_string());
             }
             if let Some(pid) = self.product_id {
                 if let Some(name) = db.product_name(vid, pid) {
-                    self.product = Some(printable(name));
+                    self.product = Some(name.to_string());
                 }
             }
         }

@@ -46,7 +46,7 @@ impl UsbIds {
                     continue;
                 };
                 if let Some(vendor) = vendors.get_mut(&vid) {
-                    vendor.products.insert(pid, name.to_string());
+                    vendor.products.insert(pid, crate::device::printable(name));
                 }
                 continue;
             }
@@ -56,7 +56,11 @@ impl UsbIds {
                     vendors.insert(
                         id,
                         Vendor {
-                            name: name.to_string(),
+                            // usb.ids is an editable text file, and its
+                            // names reach every output surface (the device
+                            // table, the snapshot commands, the bundle):
+                            // sanitized once, here, like a sysfs string.
+                            name: crate::device::printable(name),
                             products: HashMap::new(),
                         },
                     );
@@ -735,6 +739,16 @@ ffff  Last Vendor
 C 03  HID (Human Interface Device)
 \t01  Boot Interface Subclass
 ";
+
+    #[test]
+    fn parse_replaces_control_and_bidi_characters_in_names() {
+        // The snapshot commands print these names straight to stdout and
+        // never pass through the device loader, so the parser is where a
+        // tampered file's escape must die.
+        let db = UsbIds::parse("1d6b  Linux\x1b[2J Foundation\n\t0002  root\u{202e}hub\n");
+        assert_eq!(db.vendor_name(0x1d6b), Some("Linux\u{fffd}[2J Foundation"));
+        assert_eq!(db.product_name(0x1d6b, 0x0002), Some("root\u{fffd}hub"));
+    }
 
     #[test]
     fn parses_vendors_and_products() {
