@@ -272,17 +272,31 @@ pub fn prompt_user_to_load_module() -> Result<bool> {
     Ok(is_yes_response(&input))
 }
 
-/// What the user is asked before an unload. It is a constant because it is
+/// What the user is asked before an unload. One function because it is
 /// asked two ways: straight from stdin before the TUI starts, and over the UI
-/// event channel after it exits, when stdin belongs to the input thread.
-pub const UNLOAD_QUESTION: &str = concat!(
-    "usbtop-ng loaded usbmon for this session.\n",
-    "You can leave it loaded for future USB monitoring, or unload it now with:\n",
-    "  sudo modprobe -r usbmon\n",
-    "\n",
-    "This may ask for your sudo password. Answer 'n' to leave usbmon loaded.\n",
-    "Unload usbmon now? (y/N): ",
-);
+/// event channel after it exits, when stdin belongs to the input thread. It
+/// names the command that will actually run: plain `modprobe -r` when
+/// already root, `sudo modprobe -r` otherwise.
+pub fn unload_question() -> String {
+    unload_question_for(effective_uid())
+}
+
+fn unload_question_for(euid: u32) -> String {
+    let sudo = if euid == 0 { "" } else { "sudo " };
+    let password = if euid == 0 {
+        ""
+    } else {
+        "This may ask for your sudo password. "
+    };
+    format!(
+        "usbtop-ng loaded usbmon for this session.\n\
+         You can leave it loaded for future USB monitoring, or unload it now with:\n\
+         \x20 {sudo}modprobe -r usbmon\n\
+         \n\
+         {password}Answer 'n' to leave usbmon loaded.\n\
+         Unload usbmon now? (y/N): "
+    )
+}
 
 /// Ask about unloading by reading stdin. Only safe before the TUI starts:
 /// once the input thread exists it owns stdin, and this would race it.
@@ -290,7 +304,7 @@ pub fn prompt_user_to_unload_module() -> Result<bool> {
     // `write!` rather than `print!`: this is an exit path, and `print!` turns a
     // failed write into a panic instead of the error this function already
     // reports.
-    write!(io::stdout(), "{}", UNLOAD_QUESTION)?;
+    write!(io::stdout(), "{}", unload_question())?;
     io::stdout().flush()?;
 
     let mut input = String::new();
@@ -305,13 +319,26 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// Where a root run looks for `program`. `sudo` finds `modprobe` through its
+/// own `secure_path`; a root shell may not (`su` without a login shell, a
+/// minimal container), so prefer the canonical locations and fall back to
+/// the bare name for a PATH lookup.
+fn root_program(program: &str) -> std::path::PathBuf {
+    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
+        .iter()
+        .map(|dir| std::path::Path::new(dir).join(program))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| std::path::PathBuf::from(program))
+}
+
 /// Build a command that needs root. With an effective uid of 0 (already
 /// under sudo, a root login, a container or rescue shell where `sudo` may
-/// not even be installed) the program runs directly; otherwise it is
-/// wrapped in `sudo`, which may prompt for a password.
+/// not even be installed) the program runs directly, from its canonical
+/// location when one exists (see [`root_program`]); otherwise it is wrapped
+/// in `sudo`, which may prompt for a password.
 fn as_root(euid: u32, program: &str, args: &[&str]) -> Command {
     let mut command = if euid == 0 {
-        Command::new(program)
+        Command::new(root_program(program))
     } else {
         let mut sudo = Command::new("sudo");
         sudo.arg(program);
@@ -511,7 +538,8 @@ pub fn print_permission_remedy() {
 mod tests {
     use super::is_yes_response;
     use super::{
-        announce_automatic_unload, as_root, unload_mode, UnloadMode, AUTOMATIC_UNLOAD_NOTICE,
+        announce_automatic_unload, as_root, unload_mode, unload_question_for, UnloadMode,
+        AUTOMATIC_UNLOAD_NOTICE,
     };
     use std::io::{self, Write};
 
@@ -532,9 +560,32 @@ mod tests {
     #[test]
     fn as_root_runs_the_program_directly_when_already_root() {
         let command = as_root(0, "modprobe", &["usbmon"]);
-        assert_eq!(command.get_program(), "modprobe");
+        let program = std::path::Path::new(command.get_program());
+        // The canonical location when the host has one (every CI runner
+        // and fleet host does), else the bare name for a PATH lookup.
+        let canonical = ["/usr/sbin/modprobe", "/sbin/modprobe"]
+            .iter()
+            .find(|p| std::path::Path::new(p).is_file());
+        match canonical {
+            Some(expected) => assert_eq!(program, std::path::Path::new(expected)),
+            None => assert_eq!(program, std::path::Path::new("modprobe")),
+        }
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(args, ["usbmon"]);
+    }
+
+    #[test]
+    fn the_unload_question_names_the_command_that_will_run() {
+        let as_user = unload_question_for(1000);
+        assert!(as_user.contains("  sudo modprobe -r usbmon\n"), "{as_user}");
+        assert!(as_user.contains("sudo password"), "{as_user}");
+        let as_root = unload_question_for(0);
+        assert!(as_root.contains("  modprobe -r usbmon\n"), "{as_root}");
+        assert!(!as_root.contains("sudo"), "{as_root}");
+        // The pty integration test keys on this substring.
+        for text in [&as_user, &as_root] {
+            assert!(text.ends_with("Unload usbmon now? (y/N): "), "{text}");
+        }
     }
 
     #[test]

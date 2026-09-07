@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Loading, unloading, and the debugfs mount no longer prepend `sudo` when the effective uid is already 0, so a root login, a container, or a rescue shell without `sudo` installed can load usbmon instead of failing with "No such file or directory". The prompt names the command that will actually run.
+- Loading, unloading, and the debugfs mount no longer prepend `sudo` when the effective uid is already 0, so a root login, a container, or a rescue shell without `sudo` installed can load usbmon instead of failing with "No such file or directory". Both the load and the unload prompt name the command that will actually run, and a root run looks for `modprobe` and `mount` in their canonical locations before falling back to `PATH`.
 - Under `sudo`, the invoking user's home is now resolved through the system user database (`getpwuid_r`, so LDAP, SSSD, and other directory-backed accounts resolve) instead of a scan of `/etc/passwd`. Previously a directory-backed user's preferences, snapshot, and usb.ids copy landed in root's home, owned by root.
 
 ## [1.6.0] - 2026-09-07

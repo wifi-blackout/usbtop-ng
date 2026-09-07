@@ -503,6 +503,9 @@ says, and the snapshot is the one list you control.
   ```bash
   sudo modprobe -r usbmon
   ```
+  Again without `sudo` when usbtop-ng is already root; both prompts name the
+  command that will actually run, and a root run finds `modprobe` in its
+  canonical `sbin` location even when the shell's `PATH` lacks it.
 - usbtop-ng reads the preferences file at `~/.usbtop-ng/preferences.toml` and
   creates it on first run.
 - usbtop-ng creates `~/.usbtop-ng` with mode 0700. An existing directory keeps

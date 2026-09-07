@@ -783,7 +783,7 @@ fn main() -> Result<()> {
             // stdin until the process exits.
             UnloadPolicy::PromptFlow => {
                 usbmon::offer_unload_after_session(&preferences, terminal_reachable, || {
-                    session.confirm(usbmon::UNLOAD_QUESTION)
+                    session.confirm(&usbmon::unload_question())
                 });
             }
             UnloadPolicy::AutoOnly => {

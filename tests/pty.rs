@@ -75,7 +75,7 @@ const ALT_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l";
 /// Cursor-show, the second half of that pair.
 const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 
-/// A distinctive substring of `usbmon::UNLOAD_QUESTION` (src/usbmon/mod.rs).
+/// A distinctive substring of `usbmon::unload_question()` (src/usbmon/mod.rs).
 /// This crate has no lib target -- only a bin -- so the harness mirrors the
 /// text instead of importing the constant.
 const UNLOAD_QUESTION_MARKER: &[u8] = b"Unload usbmon now?";
