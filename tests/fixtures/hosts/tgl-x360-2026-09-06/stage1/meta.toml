@@ -1,0 +1,15 @@
+board = "HP Pavilion x360 Convertible 14-dw1xxx"
+soc = ""
+arch = "x86_64"
+kernel = "7.1.5+kali-amd64"
+os = "Kali GNU/Linux Rolling"
+usbtop_ng_version = "1.5.0"
+captured_unix = 1788714952
+controllers = ["0000:00:0d.0", "0000:00:14.0"]
+speed_classes = ["10000", "12", "480"]
+transfer_types = []
+sources = []
+
+[generator]
+kind = "static"
+note = "Static bundle (no traces, no goldens) from a non-root `--support --no-capture` run on the HP Pavilion x360 (Tiger Lake, kernel 7.1.5), promoted for the connector pairing corpus: the two sides of one connector use different port numbers (usb3-port1 pairs with usb4-port2, usb3-port3 with usb4-port1). Read by the connector tests only."

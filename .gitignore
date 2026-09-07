@@ -1,0 +1,75 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+usbtop-ng.log*
+
+# Config files (except examples, Cargo manifest, and fixture corpus data)
+config.toml
+*.toml
+!Cargo.toml
+!example-config.toml
+!tests/fixtures/**/*.toml
+
+# Build artifacts
+dist/
+build/
+debian/usbtop-ng/
+*.deb
+*.rpm
+*.pkg
+
+# Documentation builds
+book/
+docs/_build/
+
+# Test artifacts
+coverage/
+.coverage
+*.profraw
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# Editor artifacts
+.#*
+\#*#
+
+# Local development
+.env
+.env.local
+
+# Local release helper, never published
+release.sh
+
+# Packaging
+*.tar.gz
+*.zip
+*.dmg
+
+# Claude Code / SDD scratch, never published
+.superpowers/
+.claude/worktrees/
+.claude/settings.local.json
+.claude/hooks/denylist.local

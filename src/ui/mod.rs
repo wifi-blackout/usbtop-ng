@@ -1,0 +1,5320 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    symbols,
+    text::{Line, Span},
+    widgets::{Axis, Block, Borders, Chart, Clear, Dataset, Paragraph, Wrap},
+    Frame,
+};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::Receiver,
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+
+use crate::connector::{PortIndex, PortRef};
+use crate::device::manager::{DeviceManager, TrafficDelta, UsbBus};
+use crate::device::UsbDevice;
+use crate::filter::FilterSet;
+use crate::snapshot::{Snapshot, SnapshotDevice};
+use crate::usbmon::monitor::CaptureStream;
+use crate::usbmon::parser::{format_mbps, TransferType, UsbPacket, UsbSpeed};
+
+pub mod colors;
+
+use colors::*;
+
+/// Group name for buses whose host controller could not be resolved.
+const UNKNOWN_CONTROLLER: &str = "unknown";
+
+/// How much of `bandwidth_history` is kept and plotted, in seconds. Eviction
+/// and both charts' x-axis bounds read the same number so the window a chart
+/// claims is the window the data actually covers. Derived from
+/// `stats::RATE_HISTORY_WINDOW` rather than restated here, so the aggregate
+/// and per-device windows can't drift apart. Not a `const`: `Duration`'s
+/// conversion methods aren't guaranteed `const fn` at this MSRV, and a plain
+/// function is the simplest fix that doesn't gamble on that.
+fn history_window_secs() -> f64 {
+    crate::stats::RATE_HISTORY_WINDOW.as_secs_f64()
+}
+
+/// Most packets applied in one pass of the event loop. The channel's bound is
+/// what caps memory; this caps how long a single frame can spend catching up,
+/// so a burst can never stall input handling or the redraw. Anything left over
+/// stays queued, and a pass that fills its batch tells the loop to come
+/// straight back for the rest instead of sleeping until the next tick.
+pub(crate) const DRAIN_BATCH: usize = 8_192;
+
+/// One device as rendered: its physical port chain plus a snapshot of the
+/// device itself, taken once per tick from the `DeviceManager`.
+pub struct DeviceRow {
+    pub port_chain: Option<Vec<u32>>,
+    pub device: UsbDevice,
+}
+
+/// One bus (root hub) as a summary line, holding only the rows nothing places
+/// on a connector: the root hub itself (Port `-`) and any device whose sysfs
+/// entry did not resolve (Port `?`). Every other device row lives under a
+/// [`ConnectorView`] of the same controller.
+pub struct BusView {
+    pub bus_id: u8,
+    pub speed: UsbSpeed,
+    pub side_label: &'static str,
+    pub devices: Vec<DeviceRow>,
+    /// Aggregate %busy across the bus's devices; `None` when the bus speed
+    /// is unknown (see `UsbBus::busy_percentage`).
+    pub busy_percentage: Option<f64>,
+    /// Sum of `rx_bps`/`tx_bps` over every visible row on this bus, its own
+    /// rows and the connector rows whose device is on this bus. Recomputed
+    /// by `UsbTopApp::recompute_rates` after every retention pass.
+    pub rx_bps: f64,
+    pub tx_bps: f64,
+}
+
+/// One physical connector: a USB2 port and its SuperSpeed companion (paired
+/// through the sysfs `peer` links, see `connector`), or a single port. Holds
+/// the rows of the devices attached to it: one for a plain device, two for a
+/// USB3 hub, whose halves enumerate once per bus.
+pub struct ConnectorView {
+    /// The port names, sorted and joined with `+` (`usb3-port1+usb4-port1`),
+    /// `device:<name>` for a device whose port object is absent.
+    pub key: String,
+    /// `Port 1.4`, or `Port 1 (USB3 side: 2)` when the two sides' chains differ.
+    pub label: String,
+    /// The bus numbers the connector spans, ascending: one or two.
+    pub buses: Vec<u8>,
+    /// Whether a device on this connector owns ports of its own.
+    pub is_hub: bool,
+    pub devices: Vec<DeviceRow>,
+    /// Sum over `devices`; recomputed by `UsbTopApp::recompute_rates`.
+    pub rx_bps: f64,
+    pub tx_bps: f64,
+    /// Chain of the USB2-side port, then the lowest bus: the render order.
+    sort_key: (Vec<u32>, u8),
+}
+
+/// One host controller: its bus lines in bus order, then its connectors in
+/// chain order.
+pub struct ControllerView {
+    pub id: String,
+    pub buses: Vec<BusView>,
+    pub connectors: Vec<ConnectorView>,
+}
+
+impl ControllerView {
+    /// Every visible row in render order: the bus lines' own rows bus by
+    /// bus, then the connector rows connector by connector.
+    fn rows(&self) -> impl Iterator<Item = &DeviceRow> {
+        self.buses
+            .iter()
+            .flat_map(|bus| bus.devices.iter())
+            .chain(self.connectors.iter().flat_map(|c| c.devices.iter()))
+    }
+}
+
+pub struct UsbTopApp {
+    pub controllers: Vec<ControllerView>,
+    pub bandwidth_history: Vec<(f64, f64)>, // (timestamp, total_bandwidth)
+    pub selected_device: Option<String>,
+    pub show_help: bool,
+    pub start_time: Instant,
+    /// How often the loop takes a fresh snapshot of the devices; the schedule
+    /// itself lives in the loop (see `tui::run_app`), not here.
+    pub refresh_rate: Duration,
+    pub total_bandwidth: f64,
+    pub peak_bandwidth: f64,
+    /// Vertical scroll offset for the device list, in lines. Follows the
+    /// selected device's row so `select_next_device`/`select_previous_device`
+    /// can't walk the selection off-screen; see `follow_selection_in_list`.
+    pub list_scroll: u16,
+    /// Shared count of packets the reader threads had to discard because the
+    /// channel was full (see `usbmon::monitor`). `None` when no monitor is
+    /// attached; the header surfaces it once it goes above zero, so a lossy
+    /// session never reads like a complete one.
+    pub dropped_counter: Option<Arc<AtomicU64>>,
+    /// Shared count of kernel-side drops the mmap ring readers'
+    /// `MON_IOCG_STATS` reported (see `usbmon::mmap_ring::MmapReader` and
+    /// `usbmon::monitor::MonitorHandle::kernel_dropped`) — traffic the kernel
+    /// itself discarded before this process ever saw it, distinct from
+    /// [`Self::dropped_counter`]'s full-channel losses. `None` when no
+    /// monitor is attached, or when the session is not on the mmap
+    /// interface; the header surfaces it once it goes above zero, same
+    /// bargain as `dropped_counter`.
+    pub kernel_dropped_counter: Option<Arc<AtomicU64>>,
+    /// Shared count of frames the output stage had to discard because the
+    /// terminal stopped reading (see `tui::output`). `None` outside a TUI
+    /// session. Same bargain as [`Self::dropped_counter`]: a session that is
+    /// showing less than it measured has to say so.
+    pub shed_counter: Option<Arc<AtomicU64>>,
+    /// Hide devices with no current traffic. Off by default. Toggled at
+    /// runtime with `i` and saved to the preferences file (see
+    /// [`Self::toggle_hide_idle`]).
+    pub hide_idle_devices: bool,
+    /// Where to write the preference when `i` toggles it: the config path and
+    /// the full preferences snapshot, so the other keys survive the write.
+    /// `None` in tests and whenever no config file backs the session.
+    idle_persist: Option<(std::path::PathBuf, crate::config::Preferences)>,
+    /// The active `--filter` set. Empty (the default) matches every device;
+    /// see [`Self::retain_filtered_devices`].
+    filter: FilterSet,
+    /// The monitor's text-source-active flag (see
+    /// `usbmon::monitor::SourceFlags::text_active`, held on
+    /// `MonitorHandle::flags`): true only while a
+    /// debugfs text source backs the session. Read through the
+    /// `text_source_active()` method to gate the `~` estimate marker on
+    /// isochronous device rows (see `UsbDevice::has_iso_traffic`) and the
+    /// legend line explaining it. `None` in tests and whenever no monitor is
+    /// attached.
+    text_source_active: Option<Arc<AtomicBool>>,
+    /// Open only while the `S` confirmation/result overlay is up. See
+    /// `apply_key`'s prompt-handling branch (which owns every transition)
+    /// and `draw_snapshot_prompt`.
+    pub snapshot_prompt: Option<SnapshotPrompt>,
+    /// A freshly written snapshot waiting for the event loop to hand to the
+    /// manager. `apply_key` sets this from `confirm_snapshot` and never
+    /// clears it itself; `tui::run_app` takes it after every `apply_key`
+    /// call and restamps every device via
+    /// `DeviceManager::set_internal_snapshot`, so the next tick's
+    /// `sync_from` shows the new marks.
+    pub pending_internal_snapshot: Option<Arc<Snapshot>>,
+    /// Where `y` inside the confirmation prompt writes the capture (see
+    /// `confirm_snapshot`). `None` in tests and whenever
+    /// `snapshot::snapshot_path()` could not resolve HOME (see
+    /// `with_snapshot_dest`); `y` then lands straight in `Done` with an
+    /// explanatory message instead of a write.
+    snapshot_dest: Option<std::path::PathBuf>,
+    /// State of the `/` search box. Off by default; see `apply_key`'s
+    /// search-interception branch (which owns every transition while
+    /// `Editing`) and [`Self::retain_searched_devices`].
+    pub(crate) search: SearchState,
+}
+
+/// State of the `/` search box (see `UsbTopApp::search`). `/` opens
+/// `Editing` (from `Off` or `Committed`, prefilled with the committed query);
+/// Enter commits; Esc clears back to `Off` from either state; typing filters
+/// live while `Editing`, same as a committed query (see
+/// `UsbTopApp::retain_searched_devices`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SearchState {
+    /// No query, no filter applied.
+    Off,
+    /// The query being typed. The table filters live as it changes.
+    Editing(String),
+    /// Input mode closed, but the query still filters the table until Esc
+    /// clears it or `/` reopens editing.
+    Committed(String),
+}
+
+impl SearchState {
+    /// The active query text, or `None` when search is `Off`. `Editing` and
+    /// `Committed` are treated identically by
+    /// [`UsbTopApp::retain_searched_devices`] -- the live-filtering promise
+    /// for `Editing` means the query need not be committed to take effect.
+    fn query(&self) -> Option<&str> {
+        match self {
+            SearchState::Off => None,
+            SearchState::Editing(q) | SearchState::Committed(q) => Some(q),
+        }
+    }
+}
+
+/// What the `S` key has open: waiting on `y`/cancel with the captured
+/// snapshot in hand, or showing the result of the last attempt until the
+/// next keypress closes it. See `apply_key`'s prompt-handling branch,
+/// `open_snapshot_prompt`, `confirm_snapshot`, and `draw_snapshot_prompt`.
+#[derive(Debug)]
+pub(crate) enum SnapshotPrompt {
+    /// A snapshot has been captured but not yet written. `y`/`Y` writes it
+    /// (see `confirm_snapshot`); any other key cancels without writing.
+    Confirm(Snapshot),
+    /// The outcome of the last attempt -- a capture error, a write error, or
+    /// a success count -- shown until the next key closes it.
+    Done(String),
+}
+
+impl UsbTopApp {
+    pub fn new(refresh_rate: Duration) -> Self {
+        Self {
+            controllers: Vec::new(),
+            bandwidth_history: Vec::new(),
+            selected_device: None,
+            show_help: false,
+            start_time: Instant::now(),
+            refresh_rate,
+            total_bandwidth: 0.0,
+            peak_bandwidth: 0.0,
+            list_scroll: 0,
+            dropped_counter: None,
+            kernel_dropped_counter: None,
+            shed_counter: None,
+            hide_idle_devices: false,
+            idle_persist: None,
+            filter: FilterSet::default(),
+            text_source_active: None,
+            snapshot_prompt: None,
+            pending_internal_snapshot: None,
+            snapshot_dest: None,
+            search: SearchState::Off,
+        }
+    }
+
+    /// Attach the monitor's dropped-packet counter (see
+    /// [`Self::dropped_counter`]).
+    pub fn with_dropped_counter(mut self, dropped: Arc<AtomicU64>) -> Self {
+        self.dropped_counter = Some(dropped);
+        self
+    }
+
+    /// Attach the mmap ring readers' kernel-side drop counter (see
+    /// [`Self::kernel_dropped_counter`]). Preserves the builder style of
+    /// [`Self::with_dropped_counter`].
+    pub fn with_kernel_dropped_counter(mut self, kernel_dropped: Arc<AtomicU64>) -> Self {
+        self.kernel_dropped_counter = Some(kernel_dropped);
+        self
+    }
+
+    /// Supply the saved value, the config path, and the preferences snapshot so
+    /// `i` can persist the choice. Preserves the builder style of
+    /// [`Self::with_dropped_counter`].
+    pub fn with_idle_setting(
+        mut self,
+        hide: bool,
+        path: std::path::PathBuf,
+        preferences: crate::config::Preferences,
+    ) -> Self {
+        self.hide_idle_devices = hide;
+        self.idle_persist = Some((path, preferences));
+        self
+    }
+
+    /// Attach the active `--filter` set (see [`Self::filter`]). Preserves the
+    /// builder style of [`Self::with_dropped_counter`].
+    pub fn with_filter(mut self, filter: FilterSet) -> Self {
+        self.filter = filter;
+        self
+    }
+
+    /// Attach the monitor's text-source-active flag (see
+    /// [`Self::text_source_active`]). Preserves the builder style of
+    /// [`Self::with_dropped_counter`].
+    pub fn with_text_source_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.text_source_active = Some(flag);
+        self
+    }
+
+    /// Attach where `y` inside the snapshot confirmation prompt writes the
+    /// capture (see [`Self::snapshot_dest`]). Preserves the builder style of
+    /// [`Self::with_dropped_counter`]. The caller skips this call entirely
+    /// when the destination could not be resolved (see `main.rs`), leaving
+    /// `y` to land in `Done` with an explanatory message instead of a write.
+    pub fn with_snapshot_dest(mut self, dest: std::path::PathBuf) -> Self {
+        self.snapshot_dest = Some(dest);
+        self
+    }
+
+    /// Flip the hide-idle flag and save it. A write failure logs and keeps the
+    /// flag effective for the session; it never fails the UI.
+    fn toggle_hide_idle(&mut self) {
+        self.hide_idle_devices = !self.hide_idle_devices;
+        if let Some((path, preferences)) = &mut self.idle_persist {
+            preferences.hide_idle_devices = self.hide_idle_devices;
+            if let Err(e) = crate::config::write_preferences_at(path, preferences) {
+                log::warn!("could not save the hide-idle preference: {e}");
+            }
+        }
+    }
+
+    /// Packets discarded so far, or 0 when no counter is attached.
+    fn dropped_packets(&self) -> u64 {
+        self.dropped_counter
+            .as_ref()
+            .map_or(0, |counter| counter.load(Ordering::Relaxed))
+    }
+
+    /// Kernel-side drops reported so far by the mmap ring readers, or 0 when
+    /// no counter is attached (including every session not on the mmap
+    /// interface).
+    fn kernel_dropped_packets(&self) -> u64 {
+        self.kernel_dropped_counter
+            .as_ref()
+            .map_or(0, |counter| counter.load(Ordering::Relaxed))
+    }
+
+    /// Frames discarded so far, or 0 when no counter is attached.
+    fn shed_frames(&self) -> u64 {
+        self.shed_counter
+            .as_ref()
+            .map_or(0, |counter| counter.load(Ordering::Relaxed))
+    }
+
+    /// True only while a debugfs text source backs the session, or `false`
+    /// when no flag is attached. Gates the `~` estimate marker on
+    /// isochronous device rows and the legend line explaining it.
+    fn text_source_active(&self) -> bool {
+        self.text_source_active
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
+    /// Rebuild the whole render snapshot from the manager: controller ->
+    /// bus summary lines and connectors -> device rows, plus totals and
+    /// selection validity.
+    pub fn sync_from(&mut self, manager: &DeviceManager) {
+        // Fresh every tick, bounded to the manager's own devices: a hub's
+        // port objects and peer links appear after its device directory
+        // does, and a cached index would freeze the half-enumerated view.
+        let index = PortIndex::scan_devices(
+            manager
+                .buses
+                .values()
+                .flat_map(|bus| bus.devices.values())
+                .filter_map(|device| device.sysfs_path.as_deref()),
+        );
+        let bus_speed = |bus_id: u8| manager.buses.get(&bus_id).map(|bus| bus.speed.clone());
+
+        let mut buses: Vec<&UsbBus> = manager.buses.values().collect();
+        buses.sort_by_key(|bus| bus.bus_id);
+
+        let mut grouped: BTreeMap<String, ControllerView> = BTreeMap::new();
+        for bus in buses {
+            let controller = bus
+                .controller
+                .clone()
+                .unwrap_or_else(|| UNKNOWN_CONTROLLER.to_string());
+            let view = grouped
+                .entry(controller.clone())
+                .or_insert_with(|| ControllerView {
+                    id: controller,
+                    buses: Vec::new(),
+                    connectors: Vec::new(),
+                });
+            let mut bus_line = bus_view(bus);
+            for device in bus.devices.values() {
+                let row = DeviceRow {
+                    port_chain: device.port_chain(),
+                    device: device.clone(),
+                };
+                let Some(placement) = connector_placement(&index, &row, bus_speed) else {
+                    bus_line.devices.push(row);
+                    continue;
+                };
+                let is_hub = sysfs_name(&row.device).is_some_and(|name| index.is_hub(name));
+                let connector = match view.connectors.iter().position(|c| c.key == placement.key) {
+                    Some(at) => &mut view.connectors[at],
+                    None => {
+                        view.connectors.push(ConnectorView {
+                            key: placement.key,
+                            label: placement.label,
+                            buses: placement.buses,
+                            is_hub: false,
+                            devices: Vec::new(),
+                            rx_bps: 0.0,
+                            tx_bps: 0.0,
+                            sort_key: placement.sort_key,
+                        });
+                        let last = view.connectors.len() - 1;
+                        &mut view.connectors[last]
+                    }
+                };
+                connector.is_hub |= is_hub;
+                connector.devices.push(row);
+            }
+            // Root hub (empty chain) first, then unresolved (None) by device id.
+            bus_line
+                .devices
+                .sort_by_key(|row| (row.port_chain.is_none(), row.device.device_id));
+            view.buses.push(bus_line);
+        }
+        for view in grouped.values_mut() {
+            view.connectors
+                .sort_by(|a, b| a.sort_key.cmp(&b.sort_key).then_with(|| a.key.cmp(&b.key)));
+            for connector in &mut view.connectors {
+                connector.devices.sort_by_key(|row| {
+                    (
+                        row.port_chain.clone().unwrap_or_default(),
+                        row.device.bus_id,
+                        row.device.device_id,
+                    )
+                });
+            }
+        }
+
+        // Named controllers first (alphabetically), the catch-all group last.
+        let unknown = grouped.remove(UNKNOWN_CONTROLLER);
+        self.controllers = grouped.into_values().chain(unknown).collect();
+
+        if !self.filter.is_empty() {
+            self.retain_filtered_devices();
+        }
+
+        self.total_bandwidth = self
+            .controllers
+            .iter()
+            .flat_map(ControllerView::rows)
+            .map(|row| row.device.bandwidth_stats.current_bps)
+            .sum();
+        if self.total_bandwidth > self.peak_bandwidth {
+            self.peak_bandwidth = self.total_bandwidth;
+        }
+
+        if self.hide_idle_devices {
+            self.retain_active_devices();
+        }
+
+        // After filter and hide-idle, same reasoning as hide-idle: a
+        // search-hidden row must not keep contributing to its heading's
+        // totals below, but search is display-only, so it runs after the
+        // header's total_bandwidth is already summed above.
+        self.retain_searched_devices();
+
+        // Once, after every retention pass: no bare heading survives, and
+        // every total reflects only the rows still shown.
+        self.prune_empty_groups();
+        self.recompute_rates();
+
+        if let Some(selected) = &self.selected_device {
+            if !self.device_keys().iter().any(|key| key == selected) {
+                self.selected_device = None;
+            }
+        }
+    }
+
+    /// Device keys ("bus:dev") flattened in render order.
+    fn device_keys(&self) -> Vec<String> {
+        self.controllers
+            .iter()
+            .flat_map(ControllerView::rows)
+            .map(|row| format!("{}:{}", row.device.bus_id, row.device.device_id))
+            .collect()
+    }
+
+    /// Keep only the rows `keep` accepts, in every bus line and connector.
+    /// Groups left empty are pruned later by `prune_empty_groups`.
+    fn retain_rows(&mut self, keep: impl Fn(&DeviceRow) -> bool) {
+        for controller in &mut self.controllers {
+            for bus in &mut controller.buses {
+                bus.devices.retain(|row| keep(row));
+            }
+            for connector in &mut controller.connectors {
+                connector.devices.retain(|row| keep(row));
+            }
+        }
+    }
+
+    /// Drop rows with no current traffic.
+    fn retain_active_devices(&mut self) {
+        self.retain_rows(|row| row.device.bandwidth_stats.current_bps > 0.0);
+    }
+
+    /// Drop rows the active `--filter` set does not match.
+    fn retain_filtered_devices(&mut self) {
+        let filter = self.filter.clone();
+        self.retain_rows(|row| filter.matches_device(&row.device));
+    }
+
+    /// Drop rows the active search query does not match. A no-op while
+    /// `search` is `Off`. Runs for `Editing` too, not just `Committed`, so
+    /// the table filters live as the query changes rather than only once
+    /// Enter commits it.
+    fn retain_searched_devices(&mut self) {
+        let Some(query) = self.search.query() else {
+            return;
+        };
+        // Lowered once per retention pass (one tick), not once per device.
+        let query = query.to_lowercase();
+        self.retain_rows(|row| device_matches_search(row.device.bus_id, row, &query));
+    }
+
+    /// Drop every group no visible row justifies: a connector with no rows,
+    /// a bus line with no row on its bus (neither its own rows nor a
+    /// connector row whose device is on that bus), and a controller with
+    /// nothing left. Nothing renders as a bare heading.
+    fn prune_empty_groups(&mut self) {
+        for controller in &mut self.controllers {
+            controller.connectors.retain(|c| !c.devices.is_empty());
+            let ControllerView {
+                buses, connectors, ..
+            } = controller;
+            buses.retain(|bus| {
+                !bus.devices.is_empty()
+                    || connectors
+                        .iter()
+                        .flat_map(|c| c.devices.iter())
+                        .any(|row| row.device.bus_id == bus.bus_id)
+            });
+        }
+        // The `!c.connectors.is_empty()` half never decides the outcome on
+        // its own: a connector row's bus line is always in the same
+        // controller, and the `buses.retain` above keeps that line, so a
+        // controller with a surviving connector has a surviving bus too.
+        self.controllers
+            .retain(|c| !c.buses.is_empty() || !c.connectors.is_empty());
+    }
+
+    /// Recompute every connector's and bus line's rx/tx totals from the rows
+    /// currently shown. A bus line sums its own rows and the connector rows
+    /// whose device is on that bus, so it still answers the bus-level
+    /// saturation question after connectors took the rows.
+    fn recompute_rates(&mut self) {
+        for controller in &mut self.controllers {
+            for connector in &mut controller.connectors {
+                let (rx, tx) = sum_rates(connector.devices.iter());
+                connector.rx_bps = rx;
+                connector.tx_bps = tx;
+            }
+            let ControllerView {
+                buses, connectors, ..
+            } = controller;
+            for bus in buses.iter_mut() {
+                let on_bus = connectors
+                    .iter()
+                    .flat_map(|c| c.devices.iter())
+                    .filter(|row| row.device.bus_id == bus.bus_id);
+                let (rx, tx) = sum_rates(bus.devices.iter().chain(on_bus));
+                bus.rx_bps = rx;
+                bus.tx_bps = tx;
+            }
+        }
+    }
+
+    pub fn update_bandwidth_history(&mut self) {
+        self.update_bandwidth_history_at(self.start_time.elapsed().as_secs_f64());
+    }
+
+    /// `update_bandwidth_history`'s body, taking the session-relative
+    /// timestamp as a parameter so tests can pass a synthetic `now_secs`
+    /// instead of backdating `start_time` (which fails on a host with less
+    /// uptime than the backdate).
+    fn update_bandwidth_history_at(&mut self, now_secs: f64) {
+        self.bandwidth_history
+            .push((now_secs, self.total_bandwidth));
+
+        // Keep the last 60 seconds of data, by age rather than by sample
+        // count: the tick rate is the user's `--refresh` choice, so a fixed
+        // count would mean 15s at 250ms and 120s at 2000ms while the chart
+        // keeps claiming a 60-second window. Samples are appended in time
+        // order, so the expired ones are exactly the leading run.
+        let cutoff = now_secs - history_window_secs();
+        let expired = self.bandwidth_history.partition_point(|(t, _)| *t < cutoff);
+        self.bandwidth_history.drain(0..expired);
+    }
+
+    fn select_previous_device(&mut self) {
+        let device_keys = self.device_keys();
+        let Some(last_index) = device_keys.len().checked_sub(1) else {
+            return;
+        };
+
+        // Nothing selected yet wraps onto the last row, as does the first row.
+        let new_index = match self.current_selection_index(&device_keys) {
+            Some(0) | None => last_index,
+            Some(index) => index - 1,
+        };
+
+        self.selected_device = Some(device_keys[new_index].clone());
+    }
+
+    fn select_next_device(&mut self) {
+        let device_keys = self.device_keys();
+        if device_keys.is_empty() {
+            return;
+        }
+
+        // Nothing selected yet lands on the first row.
+        let new_index = match self.current_selection_index(&device_keys) {
+            Some(index) => (index + 1) % device_keys.len(),
+            None => 0,
+        };
+
+        self.selected_device = Some(device_keys[new_index].clone());
+    }
+
+    fn current_selection_index(&self, device_keys: &[String]) -> Option<usize> {
+        let selected = self.selected_device.as_ref()?;
+        device_keys.iter().position(|key| key == selected)
+    }
+
+    /// Keep `list_scroll` following the selected device's line: scroll up if
+    /// the selection is above the visible window, down if it's below, and
+    /// leave it untouched otherwise (so it doesn't chase when nothing is
+    /// selected). Always clamped to the current content length afterwards,
+    /// so a shrunk list or a stale offset can't scroll past its end.
+    ///
+    /// `total_lines`/`selected_line` come from `device_list_lines_with_selection`
+    /// (headings count toward both); `visible_height` is the render area's
+    /// height minus its block's borders, computed by the caller since only it
+    /// knows the area.
+    fn follow_selection_in_list(
+        &mut self,
+        total_lines: usize,
+        selected_line: Option<usize>,
+        visible_height: u16,
+    ) {
+        if let Some(index) = selected_line {
+            let index = index as u16;
+            if index < self.list_scroll {
+                self.list_scroll = index;
+            } else if visible_height > 0 && index >= self.list_scroll.saturating_add(visible_height)
+            {
+                self.list_scroll = index.saturating_sub(visible_height.saturating_sub(1));
+            }
+        }
+
+        let max_scroll = (total_lines as u16).saturating_sub(visible_height);
+        self.list_scroll = self.list_scroll.min(max_scroll);
+    }
+}
+
+/// What a key press leaves the event loop owing the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyOutcome {
+    /// The session is over.
+    Quit,
+    /// App state changed; the screen is stale until the next frame.
+    Redraw,
+    /// A search keystroke changed which devices should show: the filtered
+    /// view must be rebuilt from the manager before the repaint, so the
+    /// search box filters as you type instead of only at the next refresh
+    /// tick (up to a whole `--refresh` interval away). Implies a redraw.
+    Resync,
+    /// The screen itself is suspect (Ctrl-L): wipe it, then repaint.
+    ClearAndRedraw,
+    /// The key means nothing here; the screen is still correct.
+    None,
+}
+
+/// Apply one key event to `app` and report what the loop owes the screen.
+///
+/// Kept apart from the loop so every binding is testable without a terminal.
+pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
+    // Terminals that report repeat and release (kitty protocol, Windows) send
+    // several events per physical press; only the press acts.
+    if key.kind != KeyEventKind::Press {
+        return KeyOutcome::None;
+    }
+
+    // The snapshot prompt takes every key while it's open, ahead of the
+    // ordinary bindings below -- e.g. 'q' during Confirm cancels the prompt
+    // rather than quitting. This is the same "owns the screen while it's up"
+    // precedence `show_help` gets in `draw_ui`, just enforced on the input
+    // side instead of the render side because the prompt (unlike help) has
+    // its own key bindings to intercept.
+    if let Some(prompt) = app.snapshot_prompt.take() {
+        app.snapshot_prompt = match prompt {
+            SnapshotPrompt::Confirm(snapshot) => {
+                if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                    Some(confirm_snapshot(app, snapshot))
+                } else {
+                    None
+                }
+            }
+            SnapshotPrompt::Done(_) => None,
+        };
+        return KeyOutcome::Redraw;
+    }
+
+    // While the search box is open for editing, it owns the key entirely --
+    // the same "owns the screen while its state is active" precedence the
+    // snapshot prompt gets above -- except Ctrl-C, which always quits (see
+    // the general Ctrl-C arm below): chars append to the query, Backspace
+    // pops the last one, Enter commits and closes input, Esc clears the
+    // query and closes input. Any other key (arrows, Ctrl-L, `h`...) is
+    // swallowed with no effect rather than falling through to the ordinary
+    // bindings, so e.g. `Up` cannot walk the selection while the query is
+    // still being typed. Every control chord other than Ctrl-C is likewise
+    // swallowed with no effect (Clarified 2026-08-25): Backspace, Enter, and
+    // Esc all carry the same plain-or-shifted guard the char arm uses, so
+    // e.g. Ctrl-Backspace does not silently act like a plain Backspace.
+    if let SearchState::Editing(query) = &app.search {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return KeyOutcome::Quit;
+        }
+        // Cloned out of the borrow rather than taken by `mem::replace`: the
+        // default arm below leaves `app.search` untouched, and touching it
+        // unconditionally first (the way the snapshot prompt's `.take()`
+        // can, since `Option::None` is a safe default) would risk clobbering
+        // a state this `if let` never actually matched.
+        let mut query = query.clone();
+        // Shared by the four arms below: `difference` strips a SHIFT bit if
+        // present and leaves the rest; anything left over (CONTROL, ALT,
+        // ...) routes to the no-op catch-all instead of acting.
+        let plain_or_shifted = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+        return match key.code {
+            // Only plain and shifted characters enter the query (Clarified
+            // 2026-08-25): a control-modified chord other than Ctrl-C (which
+            // quits above) must not insert its bare letter -- Ctrl-L typing
+            // 'l' being the motivating case.
+            KeyCode::Char(c) if plain_or_shifted => {
+                query.push(c);
+                app.search = SearchState::Editing(query);
+                KeyOutcome::Resync
+            }
+            KeyCode::Backspace if plain_or_shifted => {
+                query.pop();
+                app.search = SearchState::Editing(query);
+                KeyOutcome::Resync
+            }
+            // An empty query has nothing to filter on, so committing it
+            // would leave `Committed("")` -- a vacuous filter state
+            // indistinguishable in effect from `Off` but requiring an extra
+            // Esc to leave. Enter on an empty query goes straight to `Off`
+            // instead (Clarified 2026-08-25).
+            KeyCode::Enter if plain_or_shifted => {
+                app.search = if query.is_empty() {
+                    SearchState::Off
+                } else {
+                    SearchState::Committed(query)
+                };
+                KeyOutcome::Redraw
+            }
+            KeyCode::Esc if plain_or_shifted => {
+                app.search = SearchState::Off;
+                KeyOutcome::Resync
+            }
+            _ => KeyOutcome::None,
+        };
+    }
+
+    match key.code {
+        // Checked before the bare letters so Ctrl-L stays a redraw request.
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyOutcome::ClearAndRedraw
+        }
+        // Raw mode turns off ISIG, so the terminal never turns ^C into a
+        // SIGINT. It arrives as this key event, and it still means quit --
+        // even with help open, this is the only way out of raw mode short of
+        // a real signal, so help does not get to intercept it.
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyOutcome::Quit,
+        // Help owns q/Esc while it's open -- they close the overlay instead
+        // of quitting the session, the same "owns the screen while it's up"
+        // precedence the snapshot prompt gets above.
+        KeyCode::Char('q') | KeyCode::Esc if app.show_help => {
+            app.show_help = false;
+            KeyOutcome::Redraw
+        }
+        // Opens search input, prefilled with the last committed query
+        // (empty from `Off`). Also closes help when it was open -- one less
+        // stuck state, rather than making the user close help first. Never
+        // reached while already `Editing`: that state is consumed above, so
+        // `/` there is just another character appended to the query.
+        KeyCode::Char('/') => {
+            let prefill = if let SearchState::Committed(query) = &app.search {
+                query.clone()
+            } else {
+                String::new()
+            };
+            app.search = SearchState::Editing(prefill);
+            app.show_help = false;
+            KeyOutcome::Redraw
+        }
+        // A committed query's Esc clears it outright instead of quitting --
+        // checked ahead of the quit arm below, the same "state owns Esc
+        // while it's active" precedence `show_help` gets just above.
+        KeyCode::Esc if matches!(app.search, SearchState::Committed(_)) => {
+            app.search = SearchState::Off;
+            KeyOutcome::Resync
+        }
+        // A committed query is normal browsing, so `q` quits here same as
+        // `Off` -- only `Editing` captures `q` as a letter, and it's
+        // consumed above before this arm is ever reached. An `Esc` reaching
+        // this arm is always `Off`: `Esc` while `Committed` was already
+        // claimed by the clearing arm just above.
+        KeyCode::Char('q') | KeyCode::Esc => KeyOutcome::Quit,
+        KeyCode::Char('h') => {
+            app.show_help = !app.show_help;
+            KeyOutcome::Redraw
+        }
+        KeyCode::Up => {
+            app.select_previous_device();
+            KeyOutcome::Redraw
+        }
+        KeyCode::Down => {
+            app.select_next_device();
+            KeyOutcome::Redraw
+        }
+        KeyCode::Char('i') => {
+            app.toggle_hide_idle();
+            KeyOutcome::Redraw
+        }
+        // Crossterm reports Shift-s as `Char('S')`, not `Char('s')` plus a
+        // SHIFT modifier check, so this arm never collides with a lowercase
+        // binding. The real sysfs read stays out of this function's own
+        // tests via `open_snapshot_prompt`, which they call directly with a
+        // fixture result instead.
+        KeyCode::Char('S') => {
+            open_snapshot_prompt(app, Snapshot::capture(None));
+            KeyOutcome::Redraw
+        }
+        _ => KeyOutcome::None,
+    }
+}
+
+/// Turn a capture attempt into the confirmation prompt, or -- on failure --
+/// straight into the `Done` message. Factored out of `apply_key`'s
+/// `KeyCode::Char('S')` arm so tests can drive the prompt with a fixture
+/// `Result` instead of `Snapshot::capture`'s real `/sys` read.
+fn open_snapshot_prompt(app: &mut UsbTopApp, captured: std::io::Result<Snapshot>) {
+    app.snapshot_prompt = Some(match captured {
+        Ok(snapshot) => SnapshotPrompt::Confirm(snapshot),
+        Err(e) => SnapshotPrompt::Done(format!("could not capture the snapshot: {e}")),
+    });
+}
+
+/// `y`/`Y` inside the confirmation prompt: write `snapshot` to
+/// `app.snapshot_dest` and, on success, hand it to the event loop through
+/// `pending_internal_snapshot` (see `tui::run_app`, which restamps the
+/// manager with it right after this call returns). A missing destination or
+/// a write failure both land in `Done` with an explanatory message instead
+/// of panicking or dropping the capture silently -- per the spec, a write
+/// failure logs a warning and the session keeps running.
+fn confirm_snapshot(app: &mut UsbTopApp, snapshot: Snapshot) -> SnapshotPrompt {
+    let Some(dest) = app.snapshot_dest.clone() else {
+        return SnapshotPrompt::Done(
+            "could not write the snapshot: no destination (HOME could not be resolved)".to_string(),
+        );
+    };
+    // `write_to` does not create its parent directory (see its doc
+    // comment); this mirrors the `--snapshot-internal` CLI handler in
+    // main.rs, the only other caller.
+    if let Some(parent) = dest.parent() {
+        if let Err(e) = crate::config::ensure_private_config_dir(parent) {
+            log::warn!("could not create the snapshot directory: {e}");
+            return SnapshotPrompt::Done(format!("could not write the snapshot: {e}"));
+        }
+    }
+    if let Err(e) = snapshot.write_to(&dest) {
+        log::warn!("could not write the internal-device snapshot: {e}");
+        return SnapshotPrompt::Done(format!("could not write the snapshot: {e}"));
+    }
+    // `write_to` itself chowns the file to the invoking user under sudo
+    // (fd-based, via `crate::config::replace_file_owned`); no separate call
+    // needed here.
+    let count = snapshot.devices.len();
+    app.pending_internal_snapshot = Some(Arc::new(snapshot));
+    SnapshotPrompt::Done(format!(
+        "{count} devices recorded as internal. {}",
+        crate::snapshot::REMOVABLE_HINT
+    ))
+}
+
+/// Sum of `rx_bps` and `tx_bps` over `rows`.
+fn sum_rates<'a>(rows: impl Iterator<Item = &'a DeviceRow>) -> (f64, f64) {
+    rows.fold((0.0, 0.0), |(rx, tx), row| {
+        (
+            rx + row.device.bandwidth_stats.rx_bps,
+            tx + row.device.bandwidth_stats.tx_bps,
+        )
+    })
+}
+
+/// A bus's summary line with no rows yet; `sync_from` adds the rows nothing
+/// places on a connector.
+fn bus_view(bus: &UsbBus) -> BusView {
+    BusView {
+        bus_id: bus.bus_id,
+        speed: bus.speed.clone(),
+        side_label: side_label(&bus.speed),
+        devices: Vec::new(),
+        busy_percentage: bus.busy_percentage(),
+        rx_bps: 0.0,
+        tx_bps: 0.0,
+    }
+}
+
+/// The last component of a device's sysfs path: `3-1.4`, `usb3`.
+fn sysfs_name(device: &UsbDevice) -> Option<&str> {
+    device.sysfs_path.as_deref()?.file_name()?.to_str()
+}
+
+/// `1.4.2` for a chain, the Port column's and the connector label's form.
+fn chain_text(chain: &[u32]) -> String {
+    chain
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Where a device row goes: the connector it joins (by key), what the
+/// heading shows, and the render order. See the spec's "Sides and label"
+/// and "Fallbacks".
+struct Placement {
+    key: String,
+    label: String,
+    buses: Vec<u8>,
+    sort_key: (Vec<u32>, u8),
+}
+
+/// `None` for a row nothing places on a connector: a root hub (empty chain)
+/// or a device whose sysfs entry did not resolve. Otherwise the port pair
+/// from the index or, when the port object is absent (a tree without port
+/// objects, or a hub still enumerating), a single connector synthesized from
+/// the device's own chain and bus.
+fn connector_placement(
+    index: &PortIndex,
+    row: &DeviceRow,
+    bus_speed: impl Fn(u8) -> Option<UsbSpeed>,
+) -> Option<Placement> {
+    let chain = row.port_chain.as_ref().filter(|chain| !chain.is_empty())?;
+    let name = sysfs_name(&row.device)?;
+    let bus_id = row.device.bus_id;
+    let Some((own, peer)) = index.connector_of(name) else {
+        return Some(Placement {
+            key: format!("device:{name}"),
+            label: format!("Port {}", chain_text(chain)),
+            buses: vec![bus_id],
+            sort_key: (chain.clone(), bus_id),
+        });
+    };
+    let (primary, secondary) = order_sides(own, peer, bus_speed);
+    let mut buses = vec![primary.bus];
+    buses.extend(secondary.as_ref().map(|s| s.bus));
+    buses.sort_unstable();
+    buses.dedup();
+    let label = match &secondary {
+        Some(s) if s.chain != primary.chain => format!(
+            "Port {} (USB3 side: {})",
+            chain_text(&primary.chain),
+            chain_text(&s.chain)
+        ),
+        _ => format!("Port {}", chain_text(&primary.chain)),
+    };
+    let mut names = vec![primary.name.clone()];
+    names.extend(secondary.as_ref().map(|s| s.name.clone()));
+    names.sort();
+    Some(Placement {
+        key: names.join("+"),
+        label,
+        sort_key: (primary.chain, buses[0]),
+        buses,
+    })
+}
+
+/// Which port of a pair is the USB2 side: the one whose bus speed is known
+/// and at most 480 Mbps (the `side_label` rule; unknown never qualifies).
+/// When exactly one qualifies it leads; otherwise the lower bus number does.
+fn order_sides(
+    own: PortRef,
+    peer: Option<PortRef>,
+    bus_speed: impl Fn(u8) -> Option<UsbSpeed>,
+) -> (PortRef, Option<PortRef>) {
+    let Some(peer) = peer else {
+        return (own, None);
+    };
+    let usb2 = |bus: u8| {
+        bus_speed(bus).is_some_and(|speed| {
+            let mbps = speed.to_mbps();
+            mbps > 0.0 && mbps <= 480.0
+        })
+    };
+    let own_first = match (usb2(own.bus), usb2(peer.bus)) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => own.bus <= peer.bus,
+    };
+    if own_first {
+        (own, Some(peer))
+    } else {
+        (peer, Some(own))
+    }
+}
+
+/// Which physical side of a shared xHCI controller a bus lives on: USB2 root
+/// hubs top out at 480 Mbps, everything faster is the USB3 side. An unknown
+/// bus speed gets no label.
+fn side_label(speed: &UsbSpeed) -> &'static str {
+    let mbps = speed.to_mbps();
+    if mbps <= 0.0 {
+        ""
+    } else if mbps <= 480.0 {
+        "USB2 side"
+    } else {
+        "USB3 side"
+    }
+}
+
+/// Apply up to `batch` queued packets to the manager and report how many were
+/// applied. Any `try_recv` error (empty or disconnected) means "nothing to
+/// drain", which keeps the UI alive in --force mode with no usbmon readers.
+pub(crate) fn drain_packets(
+    manager: &mut DeviceManager,
+    packets: &Receiver<UsbPacket>,
+    batch: usize,
+) -> usize {
+    let mut applied = 0;
+    while applied < batch {
+        match packets.try_recv() {
+            Ok(packet) => {
+                manager.apply_packet(&packet);
+                applied += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    applied
+}
+
+/// Apply up to `batch` queued items from `capture` to `manager`, dispatching
+/// on which capture backend produced them: usbmon's `UsbPacket`s via
+/// [`drain_packets`] (unchanged -- this only adds a dispatch in front of
+/// it), the eBPF backend's `TrafficDelta`s via [`drain_deltas`].
+pub(crate) fn drain_capture(
+    manager: &mut DeviceManager,
+    capture: &CaptureStream,
+    batch: usize,
+) -> usize {
+    match capture {
+        CaptureStream::Packets(packets) => drain_packets(manager, packets, batch),
+        CaptureStream::Deltas(deltas) => drain_deltas(manager, deltas, batch),
+    }
+}
+
+/// [`drain_capture`]'s `Deltas` arm: the same bounded-batch shape as
+/// [`drain_packets`], routed through `apply_delta` instead of
+/// `apply_packet`.
+fn drain_deltas(
+    manager: &mut DeviceManager,
+    deltas: &Receiver<TrafficDelta>,
+    batch: usize,
+) -> usize {
+    let mut applied = 0;
+    while applied < batch {
+        match deltas.try_recv() {
+            Ok(delta) => {
+                manager.apply_delta(&delta);
+                applied += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    applied
+}
+
+pub(crate) fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
+    if app.snapshot_prompt.is_some() {
+        draw_snapshot_prompt(f, app);
+        return;
+    }
+    if app.show_help {
+        draw_help_overlay(f);
+        return;
+    }
+
+    let size = f.area();
+
+    // Create main layout
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            // Four, not three: the header is a title line and a stats line
+            // inside a border, and a row short of that clips the stats line —
+            // which is where `dropped:` and `shed:` are reported.
+            Constraint::Length(4), // Header
+            Constraint::Length(8), // Bandwidth graph
+            Constraint::Min(10),   // Device list
+            Constraint::Length(4), // Controls
+        ])
+        .split(size);
+
+    let chart_chunks = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+
+    draw_header(f, chunks[0], app);
+    draw_bandwidth_graph(f, chart_chunks[0], app);
+    draw_device_chart(f, chart_chunks[1], app);
+    draw_device_list(f, chunks[2], app);
+    draw_color_reference(f, chunks[3], app);
+}
+
+/// Bytes per second as MB/s, floored at zero. Bandwidth is never negative, so
+/// this also keeps a `-0.0` sum from rendering as "-0.0 MB/s".
+fn to_mbps(bytes_per_second: f64) -> f64 {
+    let mbps = bytes_per_second / 1_000_000.0;
+    if mbps <= 0.0 {
+        0.0
+    } else {
+        mbps
+    }
+}
+
+/// The header's two lines: the title, then the stats line (`Total`, `Peak`,
+/// `Devices`, and the conditional `dropped`/`shed` counters). Split out from
+/// `draw_header` so tests can inspect the spans -- styles included -- without
+/// scraping rendered terminal cells.
+fn header_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
+    let mut stats_line = vec![
+        Span::raw("Total: "),
+        Span::styled(
+            format!("{:.1} MB/s", to_mbps(app.total_bandwidth)),
+            Style::default()
+                .fg(PRIMARY_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" | Peak: "),
+        Span::styled(
+            format!("{:.1} MB/s", to_mbps(app.peak_bandwidth)),
+            Style::default()
+                .fg(SECONDARY_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" | Devices: "),
+        Span::styled(
+            app.device_keys().len().to_string(),
+            Style::default()
+                .fg(SUCCESS_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    // Only shown once something was actually lost: the figures above are then
+    // an undercount, and silence about that would be the real bug. Styled in
+    // WARNING_COLOR, not SECONDARY_COLOR, so this reads as the alert it is
+    // instead of blending in with the Peak figure next to it.
+    let dropped = app.dropped_packets();
+    if dropped > 0 {
+        stats_line.push(Span::raw(" | dropped: "));
+        stats_line.push(Span::styled(
+            dropped.to_string(),
+            Style::default()
+                .fg(WARNING_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Kernel-side drops the mmap ring reported through `MON_IOCG_STATS` --
+    // traffic the kernel itself discarded before this process ever saw it,
+    // which is a different loss from `dropped` above (a full channel, after
+    // delivery). Kept as its own counter so the two loss sources never blur
+    // together into one number that can't say which one happened.
+    let kernel_dropped = app.kernel_dropped_packets();
+    if kernel_dropped > 0 {
+        stats_line.push(Span::raw(" | kdropped: "));
+        stats_line.push(Span::styled(
+            kernel_dropped.to_string(),
+            Style::default()
+                .fg(WARNING_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Same bargain one layer out: these numbers were measured, but the screen
+    // showing them is behind by this many frames.
+    let shed = app.shed_frames();
+    if shed > 0 {
+        stats_line.push(Span::raw(" | shed: "));
+        stats_line.push(Span::styled(
+            shed.to_string(),
+            Style::default()
+                .fg(WARNING_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    vec![
+        Line::from(vec![
+            Span::styled(
+                "usbtop-ng",
+                Style::default()
+                    .fg(ACCENT_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" - live USB bandwidth monitor"),
+        ]),
+        Line::from(stats_line),
+    ]
+}
+
+fn draw_header(f: &mut Frame, area: Rect, app: &UsbTopApp) {
+    let header = Paragraph::new(header_lines(app))
+        .block(Block::default().borders(Borders::ALL).title(" usbtop-ng "));
+
+    f.render_widget(header, area);
+}
+
+fn draw_bandwidth_graph(f: &mut Frame, area: Rect, app: &UsbTopApp) {
+    if app.bandwidth_history.is_empty() {
+        let empty_graph = Paragraph::new("No bandwidth data yet...").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Bandwidth History "),
+        );
+        f.render_widget(empty_graph, area);
+        return;
+    }
+
+    // History carries raw bytes/s against session seconds; the chart is drawn in
+    // MB/s over a 60-second sliding window, so convert once here.
+    let data: Vec<(f64, f64)> = app
+        .bandwidth_history
+        .iter()
+        .map(|(t, bps)| (*t, bps / 1_000_000.0))
+        .collect();
+    let latest_t = data.last().map(|(t, _)| *t).unwrap_or(0.0);
+    let x_min = (latest_t - history_window_secs()).max(0.0);
+    let x_max = latest_t.max(history_window_secs());
+    let max_mbps = data.iter().map(|(_, m)| *m).fold(0.0, f64::max).max(1.0);
+
+    let datasets = vec![Dataset::default()
+        .marker(symbols::Marker::Braille)
+        .style(Style::default().fg(PRIMARY_COLOR))
+        .data(&data)];
+
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Bandwidth History (MB/s) "),
+        )
+        .x_axis(
+            Axis::default()
+                .title("Time (s)")
+                .style(Style::default().fg(TEXT_COLOR))
+                .bounds([x_min, x_max]),
+        )
+        .y_axis(
+            Axis::default()
+                .title("MB/s")
+                .style(Style::default().fg(TEXT_COLOR))
+                .bounds([0.0, max_mbps]),
+        );
+
+    f.render_widget(chart, area);
+}
+
+/// Find the currently selected device's row (plus its bus id, since
+/// `DeviceRow` doesn't carry one) by matching `app.selected_device` against
+/// the same "bus:dev" key used to build it in `device_keys`.
+fn find_selected_device(app: &UsbTopApp) -> Option<(u8, &DeviceRow)> {
+    let selected = app.selected_device.as_ref()?;
+    app.controllers
+        .iter()
+        .flat_map(ControllerView::rows)
+        .find(|row| format!("{}:{}", row.device.bus_id, row.device.device_id) == *selected)
+        .map(|row| (row.device.bus_id, row))
+}
+
+/// Right-hand chart of the strip: the selected device's rx/tx rate history
+/// over the last 60 seconds, or a placeholder when nothing is selected (or
+/// the selection vanished, e.g. the device was unplugged).
+fn draw_device_chart(f: &mut Frame, area: Rect, app: &UsbTopApp) {
+    let Some((bus_id, row)) = find_selected_device(app) else {
+        let placeholder = Paragraph::new("Select a device with ↑/↓").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Device rx/tx "),
+        );
+        f.render_widget(placeholder, area);
+        return;
+    };
+
+    let now = Instant::now();
+    // rate_history carries raw bytes/s against sample instants; plot MB/s
+    // against seconds-ago (0 = now, -60 = a minute back), matching the
+    // aggregate chart's units but anchored to "now" instead of session time.
+    let to_series = |pick: fn(&(Instant, f64, f64)) -> f64| -> Vec<(f64, f64)> {
+        row.device
+            .bandwidth_stats
+            .rate_history
+            .iter()
+            .map(|sample| (-(now - sample.0).as_secs_f64(), pick(sample) / 1_000_000.0))
+            .collect()
+    };
+    let rx_data = to_series(|(_, rx, _)| *rx);
+    let tx_data = to_series(|(_, _, tx)| *tx);
+
+    let max_mbps = rx_data
+        .iter()
+        .chain(tx_data.iter())
+        .map(|(_, mbps)| *mbps)
+        .fold(0.0, f64::max)
+        .max(0.001);
+
+    let datasets = vec![
+        Dataset::default()
+            .name("rx")
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(PRIMARY_COLOR))
+            .data(&rx_data),
+        Dataset::default()
+            .name("tx")
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(SECONDARY_COLOR))
+            .data(&tx_data),
+    ];
+
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {}:{} rx/tx ", bus_id, row.device.device_id)),
+        )
+        .x_axis(
+            Axis::default()
+                .title("Time (s)")
+                .style(Style::default().fg(TEXT_COLOR))
+                .bounds([-history_window_secs(), 0.0]),
+        )
+        .y_axis(
+            Axis::default()
+                .title("MB/s")
+                .style(Style::default().fg(TEXT_COLOR))
+                .bounds([0.0, max_mbps]),
+        );
+
+    f.render_widget(chart, area);
+}
+
+/// Column widths, in terminal cells, for the device rows: Port, Device, Speed,
+/// Vendor, Product, Bw↓, Bw↑, %busy, !. Controller and bus headings span the
+/// whole line, which a `Table` cannot do, so the list is laid out as lines of
+/// pre-padded per-cell spans instead.
+const DEVICE_COLUMNS: [usize; 9] = [8, 8, 10, 14, 18, 10, 10, 7, 3];
+
+/// One padded cell per column, separated by single-space spans. Columns are
+/// measured in terminal cells, not chars: a CJK vendor string is twice as wide
+/// as its char count, and padding by chars would shove every later column
+/// rightwards on that row only.
+///
+/// `port_style`, when given, styles the Port cell (column 0) -- e.g. the
+/// internal-device blue (see `INTERNAL_COLOR`). Heading/header callers pass
+/// `None`.
+fn device_columns(cells: [&str; 9], port_style: Option<Style>) -> Vec<Span<'static>> {
+    let mut spans = Vec::with_capacity(DEVICE_COLUMNS.len() * 2 - 1);
+    for (index, (cell, width)) in cells.iter().zip(DEVICE_COLUMNS).enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let text = fit_to_display_width(cell, width);
+        spans.push(match (index, port_style) {
+            (0, Some(style)) => Span::styled(text, style),
+            _ => Span::raw(text),
+        });
+    }
+    spans
+}
+
+/// Clip `text` to at most `width` terminal cells, then pad it to exactly that
+/// many. Truncated text loses its last cell to a `…` marker instead of just
+/// vanishing silently, so the column still says something was cut off; a
+/// zero-width column stays empty since there's no room for even that.
+fn fit_to_display_width(text: &str, width: usize) -> String {
+    // Each entry is a fitted char plus its own display width, not just a
+    // char: a popped CJK character frees 2 cells, not 1, and only tracking
+    // per-char widths lets the ellipsis fixup below account for that.
+    let mut fitted: Vec<(char, usize)> = Vec::new();
+    let mut used = 0;
+    let mut buffer = [0u8; 4];
+    let mut truncated = false;
+    for character in text.chars() {
+        let cells = Span::raw(&*character.encode_utf8(&mut buffer)).width();
+        if used + cells > width {
+            truncated = true;
+            break;
+        }
+        fitted.push((character, cells));
+        used += cells;
+    }
+
+    if truncated && width > 0 {
+        while used > width - 1 {
+            let (_, cells) = fitted
+                .pop()
+                .expect("width > 0 leaves room for at least the ellipsis alone");
+            used -= cells;
+        }
+        fitted.push(('…', 1));
+        used += 1;
+    }
+
+    let mut result: String = fitted.into_iter().map(|(character, _)| character).collect();
+    result.push_str(&" ".repeat(width - used));
+    result
+}
+
+/// Speed is the 3rd column (index 2) of `DEVICE_COLUMNS`; the `!` indicator is
+/// the last (index 8). `device_columns` emits one separator span before every
+/// column after the first, so a cell at column index `i` lands at span index
+/// `2 * i` in its output.
+const SPEED_SPAN_INDEX: usize = 2 * 2;
+const INDICATOR_SPAN_INDEX: usize = 2 * 8;
+
+/// Style that paints text in a speed's reference color (see
+/// `UsbSpeed::color_code`), used for both the bus header's Mbps figure and
+/// the device row's Speed cell.
+fn speed_style(speed: &UsbSpeed) -> Style {
+    let (r, g, b) = speed.color_code();
+    Style::default().fg(Color::Rgb(r, g, b))
+}
+
+/// Bytes per second as a fixed-precision "X.Y KB/s" string. Shared by device
+/// rows' Bw↓/Bw↑ cells and the bus heading's rx/tx totals, so the two never
+/// drift onto different units.
+fn format_rate(bytes_per_second: f64) -> String {
+    format!("{:.1} KB/s", bytes_per_second / 1000.0)
+}
+
+/// Device row's Bw↓/Bw↑ cell text: the formatted rate, `~`-prefixed when
+/// `estimated` is set. The text interface's isochronous figure is a sampled
+/// estimate from the printed descriptors (within about 1% of the binary
+/// interface on the two cameras measured), so a device with iso traffic
+/// under a text source has its rate flagged as an estimate rather than an
+/// exact measurement (see `UsbTopApp::text_source_active`,
+/// `UsbDevice::has_iso_traffic`, and the same convention in
+/// `headless::render_text`).
+fn rate_cell(bytes_per_second: f64, estimated: bool) -> String {
+    let rate = format_rate(bytes_per_second);
+    if estimated {
+        format!("~{rate}")
+    } else {
+        rate
+    }
+}
+
+/// Style every endpoint row gets, so the hierarchy under the selected device
+/// reads at a glance: dimmed relative to the device row above it, the same
+/// whole-line `Line::style` idiom the heading and device rows use.
+fn endpoint_row_style() -> Style {
+    Style::default().add_modifier(Modifier::DIM)
+}
+
+/// One row per (endpoint number, direction) on `row`'s device, in
+/// `UsbDevice::endpoints`' order -- OUT before IN per endpoint number, since
+/// the map is keyed `(number, is_in)`. Called by
+/// `device_list_lines_with_selection` right after it pushes the selected
+/// device's own row, so these lines sit directly under it; the device is not
+/// selectable through them.
+///
+/// `text_active` is `UsbTopApp::text_source_active()`. Unlike the device
+/// row's `estimated` flag (which also checks `UsbDevice::has_iso_traffic`),
+/// each endpoint carries its own transfer type, so the per-row check needs
+/// no such indirection: the `~` marker applies exactly when a text source is
+/// active and this endpoint is isochronous.
+fn endpoint_lines(row: &DeviceRow, text_active: bool) -> Vec<Line<'static>> {
+    row.device
+        .endpoints
+        .iter()
+        .map(|(&(number, dir_in), stats)| {
+            let dir = if dir_in { "in" } else { "out" };
+            let estimated = text_active && stats.transfer_type == TransferType::Isochronous;
+            let rate = rate_cell(stats.counter.bps(), estimated);
+            let (rx_cell, tx_cell): (&str, &str) = if dir_in {
+                (rate.as_str(), "")
+            } else {
+                ("", rate.as_str())
+            };
+            let spans = device_columns(
+                [
+                    "",
+                    &format!("ep{number} {dir}"),
+                    stats.transfer_type.label(),
+                    "",
+                    "",
+                    rx_cell,
+                    tx_cell,
+                    "",
+                    "",
+                ],
+                None,
+            );
+            Line::from(spans).style(endpoint_row_style())
+        })
+        .collect()
+}
+
+/// %busy cell text for a device row: a numeric percentage normally, or a
+/// width-matched "--" when the device's speed is unknown and therefore has
+/// no meaningful bandwidth denominator. Mirrors `BusView::busy_percentage`'s
+/// `None` case (see `UsbBus::busy_percentage`) — without this, an
+/// Unknown-speed device with real traffic renders a misleading "0.0" instead
+/// of the bus row's honest "--".
+fn busy_cell(device: &UsbDevice) -> String {
+    if device.speed.is_unknown() {
+        format!("{:>5}", "--")
+    } else {
+        format!("{:5.1}", device.get_busy_percentage())
+    }
+}
+
+/// Port column text: "1.4.2" for a hub chain, "-" for a root hub, "?" when the
+/// device could not be located in sysfs.
+fn port_label(port_chain: Option<&Vec<u32>>) -> String {
+    match port_chain.map(Vec::as_slice) {
+        None => "?".to_string(),
+        Some([]) => "-".to_string(),
+        Some(ports) => chain_text(ports),
+    }
+}
+
+/// True if `query_lower` is a substring of any of `row`'s searchable fields:
+/// the vendor name, the product name, `vid:pid` hex, the port chain joined
+/// with `.` (see `port_label`), or `bus:address` in the same zero-padded
+/// `{:03}:{:03}` form the Device column prints (see
+/// `device_list_lines_with_selection`) -- so what the table shows is what
+/// `/` searches. `bus_id` is a parameter rather than read off `row` so the
+/// tests can pin the Device column's zero-padded form directly; the sole
+/// production caller (`UsbTopApp::retain_searched_devices`) passes
+/// `row.device.bus_id`, the same source the Device column itself reads.
+///
+/// `query_lower` must already be lower-cased -- by the caller
+/// (`UsbTopApp::retain_searched_devices` folds it once per retention pass,
+/// not once per device here) -- this function only folds the case of each
+/// field's own text before comparing. An empty `query_lower` matches every
+/// device (every string contains the empty substring). A field the device
+/// has no value for -- no vendor string, no vendor/product ID pair, no
+/// resolved port chain -- simply cannot match through that field; it is
+/// never treated as matching or non-matching text of its own.
+fn device_matches_search(bus_id: u8, row: &DeviceRow, query_lower: &str) -> bool {
+    let device = &row.device;
+
+    let field_hit = |field: &Option<String>| {
+        field
+            .as_ref()
+            .is_some_and(|s| s.to_lowercase().contains(query_lower))
+    };
+    if field_hit(&device.vendor) || field_hit(&device.product) {
+        return true;
+    }
+
+    if let (Some(vid), Some(pid)) = (device.vendor_id, device.product_id) {
+        if format!("{vid:04x}:{pid:04x}").contains(query_lower) {
+            return true;
+        }
+    }
+
+    if let Some(chain) = &row.port_chain {
+        // Digits and dots only, so no case-folding is needed here.
+        let joined = chain
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(".");
+        if joined.contains(query_lower) {
+            return true;
+        }
+    }
+
+    format!("{bus_id:03}:{:03}", device.device_id).contains(query_lower)
+}
+
+/// Rendered lines minus the block's top and bottom border rows.
+fn inner_height(area: Rect) -> u16 {
+    area.height.saturating_sub(2)
+}
+
+fn draw_device_list(f: &mut Frame, area: Rect, app: &mut UsbTopApp) {
+    let (lines, selected_line) = device_list_lines_with_selection(app);
+    app.follow_selection_in_list(lines.len(), selected_line, inner_height(area));
+
+    let list = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" USB Devices "),
+        )
+        .scroll((app.list_scroll, 0));
+
+    f.render_widget(list, area);
+}
+
+/// The device list as rendered: a column header, then per controller a
+/// heading, per bus a summary line with the rows nothing places on a
+/// connector, then per connector a heading and its device rows. Also
+/// returns the line index of the selected device's row (headings count
+/// toward it), so the caller can keep it inside the visible scroll window.
+fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Option<usize>) {
+    let heading_style = Style::default()
+        .fg(ACCENT_COLOR)
+        .add_modifier(Modifier::BOLD);
+
+    let mut lines = vec![Line::from(device_columns(
+        [
+            "Port", "Device", "Speed", "Vendor", "Product", "Bw↓", "Bw↑", "%busy", "!",
+        ],
+        None,
+    ))
+    .style(heading_style)];
+    let mut selected_line = None;
+
+    for controller in &app.controllers {
+        lines.push(Line::styled(
+            format!("═ {} ═", controller.id),
+            heading_style,
+        ));
+
+        for bus in &controller.buses {
+            lines.push(bus_line(bus));
+            for row in &bus.devices {
+                push_device_row(&mut lines, app, row, &bus.speed, &mut selected_line);
+            }
+        }
+
+        for connector in &controller.connectors {
+            lines.push(connector_line(connector));
+            for row in &connector.devices {
+                // Present whenever the row is: a bus line survives pruning
+                // while any connector row on its bus does.
+                // So `UsbSpeed::UNKNOWN` below is unreachable -- see
+                // `prune_empty_groups`, whose `buses.retain` keeps a bus line
+                // for as long as any connector row names that bus.
+                let speed = controller
+                    .buses
+                    .iter()
+                    .find(|bus| bus.bus_id == row.device.bus_id)
+                    .map(|bus| bus.speed.clone())
+                    .unwrap_or(UsbSpeed::UNKNOWN);
+                push_device_row(&mut lines, app, row, &speed, &mut selected_line);
+            }
+        }
+    }
+
+    (lines, selected_line)
+}
+
+/// `▶ Bus 03 (USB2 side)  480 Mbps · 1.2% busy  rx … tx …`: the bus's side
+/// label, its speed in its speed color, its %busy or `--`, and its totals.
+fn bus_line(bus: &BusView) -> Line<'static> {
+    let busy_suffix = match bus.busy_percentage {
+        Some(pct) => format!(" · {pct:.1}% busy"),
+        None => " · -- busy".to_string(),
+    };
+    let side_paren = if bus.side_label.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", bus.side_label)
+    };
+    Line::from(vec![
+        Span::raw(format!("▶ Bus {:02}{}  ", bus.bus_id, side_paren)),
+        Span::styled(format_mbps(bus.speed.to_mbps()), speed_style(&bus.speed)),
+        Span::raw(busy_suffix),
+        Span::raw(format!(
+            "  rx {} tx {}",
+            format_rate(bus.rx_bps),
+            format_rate(bus.tx_bps)
+        )),
+    ])
+}
+
+/// `▶ Port 1.4 · bus 03 + 04 · hub  rx … tx …`: the connector's label, the
+/// buses it spans, `hub` when a device on it owns ports, and its totals.
+fn connector_line(connector: &ConnectorView) -> Line<'static> {
+    let span = connector
+        .buses
+        .iter()
+        .map(|bus| format!("{bus:02}"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let hub = if connector.is_hub { " · hub" } else { "" };
+    Line::from(vec![
+        Span::raw(format!("▶ {} · bus {span}{hub}  ", connector.label)),
+        Span::raw(format!(
+            "rx {} tx {}",
+            format_rate(connector.rx_bps),
+            format_rate(connector.tx_bps)
+        )),
+    ])
+}
+
+/// One device row (and, when it is the selected one, its endpoint rows),
+/// appended to `lines`; records the row's line index in `selected_line`
+/// when it is the selected device. `bus_speed` is the speed of the bus the
+/// device is on, for the `!` indicator.
+fn push_device_row(
+    lines: &mut Vec<Line<'static>>,
+    app: &UsbTopApp,
+    row: &DeviceRow,
+    bus_speed: &UsbSpeed,
+    selected_line: &mut Option<usize>,
+) {
+    let device = &row.device;
+    let device_key = format!("{}:{}", device.bus_id, device.device_id);
+    let is_selected = app.selected_device.as_ref() == Some(&device_key);
+    if is_selected {
+        *selected_line = Some(lines.len());
+    }
+    let indicator = device.get_speed_indicator(bus_speed);
+
+    let status_style = if device.is_disconnected {
+        Style::default().bg(Color::Gray).fg(Color::White)
+    } else if is_selected {
+        Style::default().bg(ACCENT_COLOR).fg(Color::Black)
+    } else {
+        Style::default().fg(TEXT_COLOR)
+    };
+
+    // The debugfs text interface can't report exact byte counts for
+    // isochronous transfers (see `rate_cell`), so a device carrying iso
+    // traffic under a text source has both its rate cells marked `~` rather
+    // than presented as exact.
+    let estimated = app.text_source_active() && device.has_iso_traffic();
+    // Selected/disconnected rows stay uniformly styled for readability;
+    // only a plain, connected row gets its Port, Speed, and indicator cells
+    // tinted by their reference colors.
+    let plain_row = !is_selected && !device.is_disconnected;
+    let port_style = (plain_row && device.is_internal).then(|| Style::default().fg(INTERNAL_COLOR));
+    let mut spans = device_columns(
+        [
+            &port_label(row.port_chain.as_ref()),
+            &format!("{:03}:{:03}", device.bus_id, device.device_id),
+            &format_mbps(device.speed.to_mbps()),
+            device.vendor.as_deref().unwrap_or("Unknown"),
+            device.product.as_deref().unwrap_or("Unknown"),
+            &rate_cell(device.bandwidth_stats.rx_bps, estimated),
+            &rate_cell(device.bandwidth_stats.tx_bps, estimated),
+            &busy_cell(device),
+            indicator.get_symbol(),
+        ],
+        port_style,
+    );
+
+    if plain_row {
+        spans[SPEED_SPAN_INDEX] = spans[SPEED_SPAN_INDEX]
+            .clone()
+            .style(speed_style(&device.speed));
+        let (r, g, b) = indicator.get_color();
+        spans[INDICATOR_SPAN_INDEX] = spans[INDICATOR_SPAN_INDEX]
+            .clone()
+            .style(Style::default().fg(Color::Rgb(r, g, b)));
+    }
+
+    lines.push(Line::from(spans).style(status_style));
+    if is_selected {
+        lines.extend(endpoint_lines(row, app.text_source_active()));
+    }
+}
+
+/// The controls bar's two lines: the speed legend, then either the ordinary
+/// keys line or -- while search is `Editing`/`Committed` -- the search line
+/// in its place, since there is only room for one. Split out from
+/// `draw_color_reference` so tests can inspect the spans without scraping
+/// rendered terminal cells, the same `header_lines` precedent.
+fn color_reference_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
+    let mut legend_spans = vec![
+        Span::raw("Legend: "),
+        Span::styled("●", speed_style(&UsbSpeed::from_mbps(1.5))),
+        Span::raw(" 1.5M  "),
+        Span::styled("●", speed_style(&UsbSpeed::from_mbps(12.0))),
+        Span::raw(" 12M  "),
+        Span::styled("●", speed_style(&UsbSpeed::from_mbps(480.0))),
+        Span::raw(" 480M  "),
+        Span::styled("●", speed_style(&UsbSpeed::from_mbps(5000.0))),
+        Span::raw(" 5G  "),
+        Span::styled("●", speed_style(&UsbSpeed::from_mbps(20000.0))),
+        Span::raw(" 10G+  "),
+        Span::styled("●", speed_style(&UsbSpeed::UNKNOWN)),
+        Span::raw(" ?"),
+    ];
+    // Only true while a debugfs text source backs the session: the `~`
+    // marker cannot appear under a binary source, so a legend entry for it
+    // then would describe a marker no row could ever show.
+    if app.text_source_active() {
+        legend_spans.push(Span::raw("  ~ = estimated rate (text source)"));
+    }
+
+    let accent_bold = Style::default()
+        .fg(ACCENT_COLOR)
+        .add_modifier(Modifier::BOLD);
+    let second_line = match &app.search {
+        SearchState::Editing(query) => Line::from(vec![
+            Span::raw("search: "),
+            Span::styled(format!("{query}▏"), accent_bold),
+        ]),
+        SearchState::Committed(query) => Line::from(vec![
+            Span::raw("search: "),
+            Span::styled(query.clone(), accent_bold),
+            Span::raw("  (Esc clears)"),
+        ]),
+        SearchState::Off => Line::from(vec![
+            Span::raw("Controls: "),
+            Span::styled("↑↓", accent_bold),
+            Span::raw(" Navigate  "),
+            Span::styled("h", accent_bold),
+            Span::raw(" Help  "),
+            Span::styled("i", accent_bold),
+            Span::raw(" Idle devices  "),
+            Span::styled("/", accent_bold),
+            Span::raw(" Search  "),
+            Span::styled("q/Esc", accent_bold),
+            Span::raw(" Quit"),
+        ]),
+    };
+
+    vec![Line::from(legend_spans), second_line]
+}
+
+fn draw_color_reference(f: &mut Frame, area: Rect, app: &UsbTopApp) {
+    let reference = Paragraph::new(color_reference_lines(app))
+        .block(Block::default().borders(Borders::ALL).title(" Controls "));
+
+    f.render_widget(reference, area);
+}
+
+fn draw_help_overlay(f: &mut Frame) {
+    let area = centered_rect(60, 70, f.area());
+
+    let help_text = vec![
+        Line::from(vec![Span::styled(
+            "usbtop-ng Help",
+            Style::default()
+                .fg(ACCENT_COLOR)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from("Controls:"),
+        Line::from(vec![
+            Span::styled("  ↑/↓", Style::default().fg(ACCENT_COLOR)),
+            Span::raw("      Select a device (list scrolls to keep it visible)"),
+        ]),
+        Line::from(
+            "  Selecting a device expands its endpoints below it, dimmed and not selectable",
+        ),
+        Line::from(vec![
+            Span::styled("  h", Style::default().fg(ACCENT_COLOR)),
+            Span::raw("        Toggle this help"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Ctrl-L", Style::default().fg(ACCENT_COLOR)),
+            Span::raw("   Wipe the screen and repaint it from scratch"),
+        ]),
+        Line::from(vec![
+            Span::styled("  i", Style::default().fg(ACCENT_COLOR)),
+            Span::raw("        Show or hide idle devices"),
+        ]),
+        Line::from(vec![
+            Span::styled("  /", Style::default().fg(ACCENT_COLOR)),
+            Span::raw(
+                "        Search devices by name, vid:pid, port, or bus:address; Enter keeps it, Esc clears it",
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  S", Style::default().fg(ACCENT_COLOR)),
+            Span::raw("        Snapshot attached devices as internal"),
+        ]),
+        Line::from(vec![
+            Span::styled("  q/Esc", Style::default().fg(ACCENT_COLOR)),
+            Span::raw("    Quit application"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Ctrl-C", Style::default().fg(ACCENT_COLOR)),
+            Span::raw("   Quit application"),
+        ]),
+        Line::from(
+            "  ~ marks estimated rates: isochronous bytes on the text interface are a sampled estimate, not an exact count.",
+        ),
+        Line::from(""),
+        Line::from("Features:"),
+        Line::from("  • Controller-grouped, port-ordered device list (USB2/USB3 sibling buses)"),
+        Line::from("  • Per-device and per-bus %busy"),
+        Line::from("  • ⚡ high-utilization indicator (>80% of practical bandwidth)"),
+        Line::from("  • 🔺 device declares USB 3.x support but linked slower — best-effort signal"),
+        Line::from("  • Header shows 'dropped: N' if packets were lost to a full queue"),
+        Line::from("  • Header shows 'kdropped: N' if the kernel's usbmon ring dropped packets"),
+        Line::from("  • Header shows 'shed: N' if frames were dropped to keep up with a slow"),
+        Line::from("    terminal — the numbers are current, the screen is N frames behind"),
+        Line::from("  • Color-coded USB link speeds"),
+        Line::from("  • Split charts: aggregate total, plus the selected device's rx/tx"),
+        Line::from("  • Device disconnect detection"),
+        Line::from("  • Linux only"),
+        Line::from(""),
+        Line::from("Press 'h' to close this help"),
+    ];
+
+    let help = Paragraph::new(help_text)
+        .block(Block::default().borders(Borders::ALL).title(" Help "))
+        .wrap(Wrap { trim: true });
+
+    f.render_widget(Clear, area); // Clear background
+    f.render_widget(help, area);
+}
+
+/// The `S` overlay: `Confirm` asks before capturing, `Done` reports what
+/// happened. Same Clear-widget overlay pattern as `draw_help_overlay`, and
+/// `draw_ui` gives it precedence over the help overlay for the same reason
+/// `show_help` gets precedence over the base screen -- it owns the input
+/// while it's open (see `apply_key`).
+fn draw_snapshot_prompt(f: &mut Frame, app: &UsbTopApp) {
+    let Some(prompt) = &app.snapshot_prompt else {
+        return;
+    };
+    let title_line = Line::from(vec![Span::styled(
+        "Snapshot internal devices",
+        Style::default()
+            .fg(ACCENT_COLOR)
+            .add_modifier(Modifier::BOLD),
+    )]);
+
+    let (text, area) = match prompt {
+        SnapshotPrompt::Confirm(snapshot) => {
+            let dest = app
+                .snapshot_dest
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(no destination -- HOME could not be resolved)".to_string());
+            let mut lines = vec![
+                title_line,
+                Line::from(""),
+                Line::from(format!(
+                    "{} device(s) currently attached will be recorded as internal.",
+                    snapshot.devices.len()
+                )),
+                Line::from(
+                    "Everything plugged in right now is captured, whether it belongs or not.",
+                ),
+                Line::from(""),
+            ];
+            for device_line in snapshot_device_lines(&snapshot.devices) {
+                lines.push(Line::from(format!("  {device_line}")));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!("File: {dest}")));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  y", Style::default().fg(ACCENT_COLOR)),
+                Span::raw(" = record, "),
+                Span::styled("n", Style::default().fg(ACCENT_COLOR)),
+                Span::raw(" = cancel"),
+            ]));
+            // Content-driven, unlike the fixed 60x40 below: the device
+            // listing's own length (capped by `snapshot_device_lines`) is
+            // what decides how tall this popup needs to be.
+            let area = centered_rect_for_lines(60, lines.len() as u16, f.area());
+            (lines, area)
+        }
+        SnapshotPrompt::Done(message) => {
+            let lines = vec![
+                title_line,
+                Line::from(""),
+                Line::from(message.clone()),
+                Line::from(""),
+                Line::from("press any key"),
+            ];
+            (lines, centered_rect(60, 40, f.area()))
+        }
+    };
+
+    let prompt_widget = Paragraph::new(text)
+        .block(Block::default().borders(Borders::ALL).title(" Snapshot "))
+        .wrap(Wrap { trim: true });
+
+    f.render_widget(Clear, area); // Clear background
+    f.render_widget(prompt_widget, area);
+}
+
+/// Most devices listed by name in the confirmation overlay before the rest
+/// collapse into a single "... and N more" line -- enough to be useful on a
+/// typical machine without letting a hub farm push the prompt off the
+/// bottom of the terminal (see `centered_rect_for_lines`, whose clamp is the
+/// other half of that guarantee).
+const MAX_LISTED_SNAPSHOT_DEVICES: usize = 12;
+
+/// One `port_path  vid:pid` line per device, in the same shape
+/// `--snapshot-internal`'s CLI handler prints (main.rs) minus the resolved
+/// name -- including its "----" placeholder for a missing vendor or product
+/// id, so the confirmation overlay and the CLI never disagree about what a
+/// captured device looks like. Capped at `MAX_LISTED_SNAPSHOT_DEVICES`, with
+/// a summary line for the remainder. Kept free of `ratatui` types so the cap
+/// and the placeholder are testable without a `Frame`.
+fn snapshot_device_lines(devices: &[SnapshotDevice]) -> Vec<String> {
+    let mut lines: Vec<String> = devices
+        .iter()
+        .take(MAX_LISTED_SNAPSHOT_DEVICES)
+        .map(|d| {
+            format!(
+                "{}  {}:{}",
+                d.port_path,
+                d.vendor_id.as_deref().unwrap_or("----"),
+                d.product_id.as_deref().unwrap_or("----"),
+            )
+        })
+        .collect();
+    if devices.len() > MAX_LISTED_SNAPSHOT_DEVICES {
+        lines.push(format!(
+            "… and {} more",
+            devices.len() - MAX_LISTED_SNAPSHOT_DEVICES
+        ));
+    }
+    lines
+}
+
+// Helper function to create centered rectangle
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+/// Rectangle centered horizontally at `percent_x`, sized vertically to fit
+/// `content_lines` rows of text plus the border -- unlike `centered_rect`'s
+/// fixed percentage, which is only right for content that never changes
+/// size (as `draw_help_overlay`'s is). Floored at 8 rows so a short prompt
+/// isn't cramped, ceilinged at the terminal's own height (minus a margin)
+/// so a long list can never run off screen; the listing's own cap is what
+/// keeps that ceiling from being hit in the first place.
+fn centered_rect_for_lines(percent_x: u16, content_lines: u16, r: Rect) -> Rect {
+    let ceiling = r.height.saturating_sub(2).max(8);
+    let height = content_lines.saturating_add(2).clamp(8, ceiling);
+    let top = r.height.saturating_sub(height) / 2;
+
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(top),
+            Constraint::Length(height),
+            Constraint::Min(0),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::usbmon::parser::parse_usbmon_text_line;
+    use ratatui::Terminal;
+
+    fn feed(mgr: &mut DeviceManager, lines: &[&str]) {
+        for l in lines {
+            mgr.apply_packet(&parse_usbmon_text_line(l).unwrap());
+        }
+        mgr.refresh();
+    }
+
+    /// A manager holding hand-built devices with fixed rates, so totals are
+    /// exact instead of depending on the sliding-window rate calculation.
+    fn manager_with_rates(entries: &[(u8, u8, f64)]) -> (tempfile::TempDir, DeviceManager) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        for &(bus_id, device_id, current_bps) in entries {
+            let mut device = UsbDevice::new(bus_id, device_id);
+            device.bandwidth_stats.current_bps = current_bps;
+            mgr.get_or_create_bus(bus_id)
+                .devices
+                .insert(device_id, device);
+        }
+        (temp, mgr)
+    }
+
+    fn topology_fixture() -> (tempfile::TempDir, DeviceManager) {
+        topology_fixture_named("0000:00:14.0")
+    }
+
+    /// Fake sysfs: a PCI controller directory holding the real root hubs, with
+    /// the flat `devices/` directory symlinking to them, so `canonicalize`
+    /// resolves a root hub back to its controller exactly like real sysfs.
+    fn topology_fixture_named(controller: &str) -> (tempfile::TempDir, DeviceManager) {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("devices");
+        let ctrl = temp.path().join(controller);
+        std::fs::create_dir_all(&base).unwrap();
+        for (hub, bus, dev, speed) in [("usb3", 3u8, 1u8, "480"), ("usb4", 4, 1, "5000")] {
+            let real = ctrl.join(hub);
+            std::fs::create_dir_all(&real).unwrap();
+            std::fs::write(real.join("busnum"), format!("{bus}\n")).unwrap();
+            std::fs::write(real.join("devnum"), format!("{dev}\n")).unwrap();
+            std::fs::write(real.join("speed"), format!("{speed}\n")).unwrap();
+            symlink(&real, base.join(hub)).unwrap();
+        }
+        let dev = |name: &str, bus: u8, devnum: u8, speed: &str| {
+            let d = base.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("busnum"), format!("{bus}\n")).unwrap();
+            std::fs::write(d.join("devnum"), format!("{devnum}\n")).unwrap();
+            std::fs::write(d.join("speed"), format!("{speed}\n")).unwrap();
+        };
+        dev("3-2", 3, 3, "480"); // root port 2
+        dev("3-1.4.1", 3, 6, "480"); // behind hub at port 1.4
+        dev("4-1.4.4", 4, 2, "5000");
+        let mgr = DeviceManager::with_sysfs_base(base);
+        (temp, mgr)
+    }
+
+    /// `topology_fixture` plus port objects: root ports 1 and 2 of usb3/usb4
+    /// paired, a USB3 hub on root port 1 whose halves `3-1` (dev 2) and
+    /// `4-1` (dev 2) own paired ports 1..4, device `4-1.1` (dev 3, 5000)
+    /// on hub port 1, `3-1.4` (dev 6, 12) on hub port 4, and `3-2` (dev 3,
+    /// 480) on root port 2. Every device carries busnum/devnum, so
+    /// `enumerate_present_devices` finds them all.
+    fn connector_fixture() -> (tempfile::TempDir, DeviceManager) {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("devices");
+        let ctrl = temp.path().join("0000:00:14.0");
+        std::fs::create_dir_all(&base).unwrap();
+        let write = |dir: &std::path::Path, attrs: &[(&str, &str)]| {
+            std::fs::create_dir_all(dir).unwrap();
+            for (k, v) in attrs {
+                std::fs::write(dir.join(k), format!("{v}\n")).unwrap();
+            }
+        };
+        let port = |hub_dir: &std::path::Path, hub: &str, n: u32| {
+            let dir = hub_dir
+                .join(format!("{hub}:1.0"))
+                .join(format!("{hub}-port{n}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        let pair = |a: &std::path::Path, b: &std::path::Path| {
+            symlink(b, a.join("peer")).unwrap();
+            symlink(a, b.join("peer")).unwrap();
+        };
+        let usb3 = ctrl.join("usb3");
+        let usb4 = ctrl.join("usb4");
+        write(&usb3, &[("busnum", "3"), ("devnum", "1"), ("speed", "480")]);
+        write(
+            &usb4,
+            &[("busnum", "4"), ("devnum", "1"), ("speed", "5000")],
+        );
+        symlink(&usb3, base.join("usb3")).unwrap();
+        symlink(&usb4, base.join("usb4")).unwrap();
+        for n in 1..=2 {
+            pair(&port(&usb3, "usb3", n), &port(&usb4, "usb4", n));
+        }
+        let hub3 = base.join("3-1");
+        let hub4 = base.join("4-1");
+        write(&hub3, &[("busnum", "3"), ("devnum", "2"), ("speed", "480")]);
+        write(
+            &hub4,
+            &[("busnum", "4"), ("devnum", "2"), ("speed", "5000")],
+        );
+        for n in 1..=4 {
+            pair(&port(&hub3, "3-1", n), &port(&hub4, "4-1", n));
+        }
+        write(
+            &base.join("4-1.1"),
+            &[("busnum", "4"), ("devnum", "3"), ("speed", "5000")],
+        );
+        write(
+            &base.join("3-1.4"),
+            &[("busnum", "3"), ("devnum", "6"), ("speed", "12")],
+        );
+        write(
+            &base.join("3-2"),
+            &[("busnum", "3"), ("devnum", "3"), ("speed", "480")],
+        );
+        let mut mgr = DeviceManager::with_sysfs_base(base);
+        mgr.enumerate_present_devices();
+        mgr.update_bus_speeds();
+        (temp, mgr)
+    }
+
+    /// Every connector of the first controller as `(label, buses, is_hub,
+    /// device keys)`, in render order.
+    fn connectors_of(app: &UsbTopApp) -> Vec<(String, Vec<u8>, bool, Vec<String>)> {
+        app.controllers[0]
+            .connectors
+            .iter()
+            .map(|c| {
+                (
+                    c.label.clone(),
+                    c.buses.clone(),
+                    c.is_hub,
+                    c.devices
+                        .iter()
+                        .map(|r| format!("{}:{}", r.device.bus_id, r.device.device_id))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn list_text(app: &UsbTopApp) -> String {
+        device_list_lines_with_selection(app)
+            .0
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn rows(app: &UsbTopApp) -> Vec<&DeviceRow> {
+        app.controllers
+            .iter()
+            .flat_map(ControllerView::rows)
+            .collect()
+    }
+
+    #[test]
+    fn packets_flow_from_parser_through_manager_into_app_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        feed(
+            &mut manager,
+            &[
+                "ffff0000eeee0001 100 C Bi:1:003:1 0 4096 <",
+                "ffff0000eeee0002 200 C Bi:1:003:1 0 4096 <",
+                "ffff0000eeee0003 300 C Bo:1:003:2 0 1024 >",
+            ],
+        );
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&manager);
+
+        assert_eq!(app.device_keys(), vec!["1:3".to_string()]);
+        let row = rows(&app)
+            .into_iter()
+            .find(|r| r.device.bus_id == 1 && r.device.device_id == 3)
+            .expect("device visible in app state");
+        assert_eq!(row.device.bandwidth_stats.total_rx_bytes, 8192);
+        assert_eq!(row.device.bandwidth_stats.total_tx_bytes, 1024);
+        assert!(app.total_bandwidth > 0.0);
+        assert_eq!(app.total_bandwidth, row.device.bandwidth_stats.current_bps);
+    }
+
+    #[test]
+    fn sync_from_recomputes_totals_instead_of_drifting() {
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 1000.0)]);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        assert_eq!(app.total_bandwidth, 1000.0);
+        assert_eq!(app.peak_bandwidth, 1000.0);
+
+        mgr.get_or_create_bus(1)
+            .devices
+            .get_mut(&3)
+            .unwrap()
+            .bandwidth_stats
+            .current_bps = 400.0;
+        app.sync_from(&mgr);
+        assert_eq!(app.total_bandwidth, 400.0);
+        assert_eq!(app.peak_bandwidth, 1000.0, "peak retains the max");
+
+        app.selected_device = Some("1:3".to_string());
+        mgr.get_or_create_bus(1).remove_device(3);
+        app.sync_from(&mgr);
+        assert_eq!(app.total_bandwidth, 0.0);
+        assert_eq!(
+            app.selected_device, None,
+            "selection drops when the device vanishes"
+        );
+    }
+
+    #[test]
+    fn hide_idle_devices_filters_zero_bandwidth_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        // Two devices in sysfs; only one gets traffic.
+        for (name, dev) in [("1-3", 3u8), ("1-4", 4u8)] {
+            let dir = temp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("busnum"), "1\n").unwrap();
+            std::fs::write(dir.join("devnum"), format!("{dev}\n")).unwrap();
+            std::fs::write(dir.join("speed"), "480\n").unwrap();
+        }
+        let mut manager =
+            crate::device::manager::DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        manager.enumerate_present_devices();
+        manager.apply_packet(
+            &crate::usbmon::parser::parse_usbmon_text_line("f 1 C Bi:1:003:1 0 4096 <").unwrap(),
+        );
+        manager.refresh();
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+
+        app.hide_idle_devices = false;
+        app.sync_from(&manager);
+        assert_eq!(
+            app.device_keys(),
+            vec!["1:3".to_string(), "1:4".to_string()]
+        );
+
+        app.hide_idle_devices = true;
+        app.sync_from(&manager);
+        assert_eq!(
+            app.device_keys(),
+            vec!["1:3".to_string()],
+            "idle 1:4 hidden"
+        );
+    }
+
+    #[test]
+    fn hiding_idle_devices_prunes_empty_buses_and_controllers() {
+        let (_t, mut mgr) = manager_with_rates(&[]);
+
+        // Bus 3, alone on its controller, has only an idle device: hiding
+        // idle devices should empty the bus and, since it's the only bus on
+        // that controller, prune the controller too.
+        let idle_bus = mgr.get_or_create_bus(3);
+        idle_bus.controller = Some("idle-controller".to_string());
+        idle_bus.devices.insert(1, UsbDevice::new(3, 1));
+
+        // Bus 4, on a different controller, has one device with traffic:
+        // both the bus and its controller must survive.
+        let busy_bus = mgr.get_or_create_bus(4);
+        busy_bus.controller = Some("busy-controller".to_string());
+        let mut busy_device = UsbDevice::new(4, 1);
+        busy_device.bandwidth_stats.current_bps = 500.0;
+        busy_bus.devices.insert(1, busy_device);
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+
+        app.hide_idle_devices = false;
+        app.sync_from(&mgr);
+        assert_eq!(
+            app.controllers.len(),
+            2,
+            "both controllers present while idle devices show"
+        );
+
+        app.hide_idle_devices = true;
+        app.sync_from(&mgr);
+        assert_eq!(
+            app.controllers.len(),
+            1,
+            "the idle-only controller is pruned, not left as a bare header"
+        );
+        assert_eq!(app.controllers[0].id, "busy-controller");
+        assert_eq!(app.controllers[0].buses.len(), 1);
+        assert_eq!(app.controllers[0].buses[0].bus_id, 4);
+        assert_eq!(
+            app.controllers[0].buses[0].devices.len(),
+            1,
+            "the busy row, under its bus line (no sysfs, so no connector)"
+        );
+        assert!(app.controllers[0].connectors.is_empty());
+    }
+
+    #[test]
+    fn filter_hides_non_matching_buses_and_prunes_empty_controllers() {
+        let (_t, mut mgr) = manager_with_rates(&[]);
+
+        // Bus 1, alone on its controller, matches the filter.
+        let matching_bus = mgr.get_or_create_bus(1);
+        matching_bus.controller = Some("matching-controller".to_string());
+        matching_bus.devices.insert(3, UsbDevice::new(1, 3));
+
+        // Bus 2, on a different controller, does not match: both the bus and
+        // its now-empty controller must be pruned.
+        let other_bus = mgr.get_or_create_bus(2);
+        other_bus.controller = Some("other-controller".to_string());
+        other_bus.devices.insert(5, UsbDevice::new(2, 5));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100))
+            .with_filter(FilterSet::parse(&["bus=1".into()]).unwrap());
+        app.sync_from(&mgr);
+
+        assert_eq!(
+            app.controllers.len(),
+            1,
+            "the non-matching controller is pruned, not left as a bare header"
+        );
+        assert_eq!(app.controllers[0].id, "matching-controller");
+        assert_eq!(app.controllers[0].buses.len(), 1);
+        assert_eq!(app.controllers[0].buses[0].bus_id, 1);
+        assert!(app.controllers[0].connectors.is_empty());
+        assert_eq!(app.device_keys(), vec!["1:3".to_string()]);
+    }
+
+    /// A bus line still answers the bus-level saturation question after the
+    /// connectors took its device rows: its totals sum its own rows (the
+    /// root hub) plus every connector row whose device is on that bus.
+    #[test]
+    fn bus_totals_sum_root_hub_and_connector_rows_on_that_bus() {
+        let (_t, mut mgr) = connector_fixture();
+        let rate = |mgr: &mut DeviceManager, bus: u8, dev: u8, rx: f64, tx: f64| {
+            let d = mgr.get_or_create_bus(bus).devices.get_mut(&dev).unwrap();
+            d.bandwidth_stats.rx_bps = rx;
+            d.bandwidth_stats.tx_bps = tx;
+        };
+        rate(&mut mgr, 3, 1, 1.0, 2.0); // root hub usb3
+        rate(&mut mgr, 3, 2, 10.0, 20.0); // hub half 3-1
+        rate(&mut mgr, 3, 6, 100.0, 200.0); // 3-1.4
+        rate(&mut mgr, 4, 3, 1000.0, 2000.0); // 4-1.1
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        let ctrl = &app.controllers[0];
+        assert_eq!(
+            (ctrl.buses[0].rx_bps, ctrl.buses[0].tx_bps),
+            (111.0, 222.0),
+            "bus 3: root + 3-1 + 3-1.4"
+        );
+        assert_eq!(
+            (ctrl.buses[1].rx_bps, ctrl.buses[1].tx_bps),
+            (1000.0, 2000.0),
+            "bus 4: 4-1.1 only (4-1 idle)"
+        );
+        let hub = ctrl
+            .connectors
+            .iter()
+            .find(|c| c.label == "Port 1")
+            .unwrap();
+        assert_eq!(
+            (hub.rx_bps, hub.tx_bps),
+            (10.0, 20.0),
+            "the hub connector sums its two halves"
+        );
+    }
+
+    /// Pins the ordering `sync_from` must follow: `bus_view` sums every
+    /// device present at snapshot time, but hide-idle retention prunes rows
+    /// afterwards, so the bus totals have to be recomputed post-retention or
+    /// a hidden device's rate would silently keep counting.
+    #[test]
+    fn bus_rates_only_reflect_devices_that_survive_hide_idle_retention() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+
+        let mut idle = UsbDevice::new(1, 3);
+        idle.bandwidth_stats.current_bps = 0.0; // hidden once hide-idle is on
+        idle.bandwidth_stats.rx_bps = 999.0; // must not leak into the bus sum
+        idle.bandwidth_stats.tx_bps = 999.0;
+
+        let mut active = UsbDevice::new(1, 4);
+        active.bandwidth_stats.current_bps = 500.0;
+        active.bandwidth_stats.rx_bps = 300.0;
+        active.bandwidth_stats.tx_bps = 200.0;
+
+        let bus = mgr.get_or_create_bus(1);
+        bus.devices.insert(3, idle);
+        bus.devices.insert(4, active);
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.hide_idle_devices = true;
+        app.sync_from(&mgr);
+
+        assert_eq!(
+            app.device_keys(),
+            vec!["1:4".to_string()],
+            "idle device 1:3 hidden"
+        );
+        let bus_view = &app.controllers[0].buses[0];
+        assert_eq!(
+            bus_view.rx_bps, 300.0,
+            "the hidden device's rx_bps must not survive into the bus sum"
+        );
+        assert_eq!(
+            bus_view.tx_bps, 200.0,
+            "the hidden device's tx_bps must not survive into the bus sum"
+        );
+    }
+
+    #[test]
+    fn pressing_i_toggles_and_saves_the_preference() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.toml");
+        let prefs = crate::config::Preferences {
+            auto_load_usbmon: true,
+            unload_usbmon_on_exit: false,
+            hide_idle_devices: false,
+            usbids_path: None,
+        };
+        let mut app = UsbTopApp::new(Duration::from_millis(100)).with_idle_setting(
+            false,
+            path.clone(),
+            prefs,
+        );
+
+        let outcome = apply_key(&mut app, KeyEvent::from(KeyCode::Char('i')));
+        assert!(matches!(outcome, KeyOutcome::Redraw));
+        assert!(app.hide_idle_devices);
+
+        let saved = crate::config::load_or_create_default_at(&path).unwrap();
+        assert!(saved.hide_idle_devices, "written to disk");
+        assert!(saved.auto_load_usbmon, "other keys preserved");
+    }
+
+    #[test]
+    fn toggling_without_a_config_path_stays_in_memory() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        apply_key(&mut app, KeyEvent::from(KeyCode::Char('i')));
+        assert!(
+            app.hide_idle_devices,
+            "flips even with no persistence attached"
+        );
+    }
+
+    #[test]
+    fn totals_do_not_accumulate_float_error_across_syncs() {
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.1), (1, 4, 0.2)]);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        mgr.get_or_create_bus(1).remove_device(4);
+        app.sync_from(&mgr);
+        assert_eq!(
+            app.total_bandwidth, 0.1,
+            "total must be recomputed from the snapshot, not patched incrementally"
+        );
+    }
+
+    #[test]
+    fn sync_from_groups_by_controller_and_orders_by_port() {
+        let (_t, mut mgr) = topology_fixture();
+        feed(
+            &mut mgr,
+            &[
+                "f1 100 C Bi:3:006:1 0 64 <", // 3-1.4.1
+                "f2 200 C Bi:3:003:1 0 64 <", // 3-2
+                "f3 300 C Bi:4:002:1 0 64 <", // 4-1.4.4
+                "f4 400 C Bi:3:009:1 0 64 <", // unresolved devnum 9
+            ],
+        );
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        assert_eq!(app.controllers.len(), 1);
+        let ctrl = &app.controllers[0];
+        assert_eq!(ctrl.id, "0000:00:14.0");
+        assert_eq!(ctrl.buses.len(), 2);
+        assert_eq!(ctrl.buses[0].bus_id, 3);
+        assert_eq!(ctrl.buses[0].side_label, "USB2 side");
+        assert_eq!(ctrl.buses[1].side_label, "USB3 side");
+        // The unresolved device (devnum 9) stays under its bus line.
+        assert_eq!(
+            ctrl.buses[0]
+                .devices
+                .iter()
+                .map(|r| r.device.device_id)
+                .collect::<Vec<_>>(),
+            vec![9]
+        );
+        // Without port objects every resolved device is a single connector
+        // named from its own chain, in chain order across both buses.
+        assert_eq!(
+            connectors_of(&app),
+            vec![
+                (
+                    "Port 1.4.1".to_string(),
+                    vec![3],
+                    false,
+                    vec!["3:6".to_string()]
+                ),
+                (
+                    "Port 1.4.4".to_string(),
+                    vec![4],
+                    false,
+                    vec!["4:2".to_string()]
+                ),
+                (
+                    "Port 2".to_string(),
+                    vec![3],
+                    false,
+                    vec!["3:3".to_string()]
+                ),
+            ]
+        );
+        assert!(app.total_bandwidth > 0.0);
+    }
+
+    #[test]
+    fn root_hub_sorts_first_and_unknown_controller_sorts_last() {
+        // Controller id deliberately sorts after "unknown" alphabetically, so
+        // only an explicit move-to-end puts the unknown group last.
+        let (_t, mut mgr) = topology_fixture_named("zzzz:00:14.0");
+        feed(
+            &mut mgr,
+            &[
+                "f1 100 C Bi:3:003:1 0 64 <", // 3-2
+                "f2 200 C Bi:3:001:1 0 64 <", // root hub usb3, empty port chain
+                "f3 300 C Bi:9:005:1 0 64 <", // bus 9 has no root hub -> unknown controller
+            ],
+        );
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let ids: Vec<&str> = app.controllers.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["zzzz:00:14.0", "unknown"]);
+        let bus3 = &app.controllers[0].buses[0];
+        assert_eq!(bus3.devices.len(), 1);
+        assert_eq!(
+            bus3.devices[0].port_chain,
+            Some(vec![]),
+            "the root hub is the bus line's row"
+        );
+        assert_eq!(app.controllers[0].connectors[0].label, "Port 2");
+        assert_eq!(
+            app.device_keys(),
+            vec!["3:1".to_string(), "3:3".to_string(), "9:5".to_string()],
+            "root row before connector rows; unknown controller last"
+        );
+    }
+
+    // -- physical connectors ---------------------------------------------
+
+    #[test]
+    fn the_two_halves_of_a_hub_share_one_connector() {
+        let (_t, mgr) = connector_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        assert_eq!(
+            connectors_of(&app),
+            vec![
+                (
+                    "Port 1".to_string(),
+                    vec![3, 4],
+                    true,
+                    vec!["3:2".to_string(), "4:2".to_string()]
+                ),
+                (
+                    "Port 1.1".to_string(),
+                    vec![3, 4],
+                    false,
+                    vec!["4:3".to_string()]
+                ),
+                (
+                    "Port 1.4".to_string(),
+                    vec![3, 4],
+                    false,
+                    vec!["3:6".to_string()]
+                ),
+                (
+                    "Port 2".to_string(),
+                    vec![3, 4],
+                    false,
+                    vec!["3:3".to_string()]
+                ),
+            ]
+        );
+        let keys: Vec<&str> = app.controllers[0]
+            .connectors
+            .iter()
+            .map(|c| c.key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "usb3-port1+usb4-port1",
+                "3-1-port1+4-1-port1",
+                "3-1-port4+4-1-port4",
+                "usb3-port2+usb4-port2"
+            ]
+        );
+        // Root hubs are the bus lines' rows; nothing else is.
+        let ctrl = &app.controllers[0];
+        assert_eq!(
+            ctrl.buses
+                .iter()
+                .map(|b| b.devices.len())
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+        assert_eq!(
+            app.device_keys(),
+            ["3:1", "4:1", "3:2", "4:2", "4:3", "3:6", "3:3"].map(String::from)
+        );
+    }
+
+    #[test]
+    fn connector_headings_render_label_bus_span_hub_marker_and_totals() {
+        let (_t, mut mgr) = connector_fixture();
+        mgr.get_or_create_bus(3)
+            .devices
+            .get_mut(&6)
+            .unwrap()
+            .bandwidth_stats
+            .rx_bps = 400.0;
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        let text = list_text(&app);
+        assert!(
+            text.contains("▶ Port 1 · bus 03 + 04 · hub  rx 0.0 KB/s tx 0.0 KB/s"),
+            "{text}"
+        );
+        assert!(
+            text.contains("▶ Port 1.4 · bus 03 + 04  rx 0.4 KB/s tx 0.0 KB/s"),
+            "{text}"
+        );
+        assert!(text.contains("▶ Bus 03 (USB2 side)  480 Mbps"), "{text}");
+        // Render order: header, controller, bus 03 line + root row, bus 04
+        // line + root row, then the connectors.
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[2].starts_with("▶ Bus 03"), "{text}");
+        assert!(lines[4].starts_with("▶ Bus 04"), "{text}");
+        assert!(lines[6].starts_with("▶ Port 1 ·"), "{text}");
+        assert!(lines[7].starts_with("1 "), "the USB2 half's row: {text}");
+        assert!(lines[8].starts_with("1 "), "the USB3 half's row: {text}");
+        assert!(lines[9].starts_with("▶ Port 1.1"), "{text}");
+    }
+
+    #[test]
+    fn differing_side_chains_show_in_the_label_and_usb2_side_leads() {
+        // usb4-port2 <-> usb3-port1, as on a fleet laptop; the device links
+        // on the USB3 side (bus 4), yet the label leads with the USB2 side.
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("devices");
+        let ctrl = temp.path().join("0000:00:14.0");
+        std::fs::create_dir_all(&base).unwrap();
+        for (hub, bus, speed) in [("usb3", "3", "480"), ("usb4", "4", "10000")] {
+            let real = ctrl.join(hub);
+            std::fs::create_dir_all(&real).unwrap();
+            std::fs::write(real.join("busnum"), format!("{bus}\n")).unwrap();
+            std::fs::write(real.join("devnum"), "1\n").unwrap();
+            std::fs::write(real.join("speed"), format!("{speed}\n")).unwrap();
+            symlink(&real, base.join(hub)).unwrap();
+        }
+        let p3 = ctrl.join("usb3").join("3-0:1.0").join("usb3-port1");
+        let p4 = ctrl.join("usb4").join("4-0:1.0").join("usb4-port2");
+        std::fs::create_dir_all(&p3).unwrap();
+        std::fs::create_dir_all(&p4).unwrap();
+        symlink(&p4, p3.join("peer")).unwrap();
+        symlink(&p3, p4.join("peer")).unwrap();
+        let dev = base.join("4-2");
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("busnum"), "4\n").unwrap();
+        std::fs::write(dev.join("devnum"), "2\n").unwrap();
+        std::fs::write(dev.join("speed"), "5000\n").unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(base);
+        mgr.enumerate_present_devices();
+        mgr.update_bus_speeds();
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        assert_eq!(
+            connectors_of(&app),
+            vec![(
+                "Port 1 (USB3 side: 2)".to_string(),
+                vec![3, 4],
+                false,
+                vec!["4:2".to_string()]
+            )]
+        );
+        assert!(list_text(&app).contains("▶ Port 1 (USB3 side: 2) · bus 03 + 04  "));
+    }
+
+    #[test]
+    fn pairing_converges_once_port_objects_appear_with_the_device_set_unchanged() {
+        // A hub's device directory exists before its driver creates the port
+        // objects: the first tick shows two single connectors, and the next
+        // tick, with the ports and peer links now present and no device
+        // added or removed, shows one.
+        use std::os::unix::fs::symlink;
+        let (_t, mgr) = connector_fixture();
+        let base = mgr.buses[&3].devices[&2].sysfs_path.clone().unwrap();
+        let base = base.parent().unwrap().to_path_buf();
+        // Remove hub 3-1's and 4-1's port objects to model the pre-driver state.
+        std::fs::remove_dir_all(base.join("3-1").join("3-1:1.0")).unwrap();
+        std::fs::remove_dir_all(base.join("4-1").join("4-1:1.0")).unwrap();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        let before: Vec<(String, Vec<u8>)> = connectors_of(&app)
+            .into_iter()
+            .map(|(l, b, _, _)| (l, b))
+            .collect();
+        assert_eq!(
+            before,
+            vec![
+                ("Port 1".to_string(), vec![3, 4]),
+                ("Port 1.1".to_string(), vec![4]),
+                ("Port 1.4".to_string(), vec![3]),
+                ("Port 2".to_string(), vec![3, 4]),
+            ],
+            "hub downstream devices fall back to single connectors"
+        );
+        assert!(
+            !app.controllers[0].connectors[0].is_hub,
+            "no port objects, so 3-1 is not known as a hub yet"
+        );
+
+        for n in [1u32, 4] {
+            let a = base
+                .join("3-1")
+                .join("3-1:1.0")
+                .join(format!("3-1-port{n}"));
+            let b = base
+                .join("4-1")
+                .join("4-1:1.0")
+                .join(format!("4-1-port{n}"));
+            std::fs::create_dir_all(&a).unwrap();
+            std::fs::create_dir_all(&b).unwrap();
+            symlink(&b, a.join("peer")).unwrap();
+            symlink(&a, b.join("peer")).unwrap();
+        }
+        app.sync_from(&mgr);
+        let after: Vec<(String, Vec<u8>)> = connectors_of(&app)
+            .into_iter()
+            .map(|(l, b, _, _)| (l, b))
+            .collect();
+        assert_eq!(
+            after,
+            vec![
+                ("Port 1".to_string(), vec![3, 4]),
+                ("Port 1.1".to_string(), vec![3, 4]),
+                ("Port 1.4".to_string(), vec![3, 4]),
+                ("Port 2".to_string(), vec![3, 4]),
+            ],
+            "the very next tick pairs them"
+        );
+        assert!(app.controllers[0].connectors[0].is_hub);
+    }
+
+    #[test]
+    fn a_bus_line_survives_while_any_connector_row_on_its_bus_does() {
+        let (_t, mut mgr) = connector_fixture();
+        let rate = |mgr: &mut DeviceManager, bus: u8, dev: u8, current: f64, rx: f64, tx: f64| {
+            let d = mgr.get_or_create_bus(bus).devices.get_mut(&dev).unwrap();
+            d.bandwidth_stats.current_bps = current;
+            d.bandwidth_stats.rx_bps = rx;
+            d.bandwidth_stats.tx_bps = tx;
+        };
+        // Only 4-1.1 has current traffic. Every idle row carries a loud rate
+        // that hide-idle must strip before the totals are recomputed: the
+        // bus-line rows (both root hubs) and a connector row on bus 4 (the
+        // hub's USB3 half), so both halves of the bus line's sum are covered.
+        rate(&mut mgr, 4, 3, 5.0, 300.0, 200.0); // 4-1.1, on connector Port 1.1
+        rate(&mut mgr, 3, 1, 0.0, 999.0, 999.0); // idle root hub of bus 3
+        rate(&mut mgr, 4, 1, 0.0, 999.0, 999.0); // idle root hub of bus 4
+        rate(&mut mgr, 4, 2, 0.0, 999.0, 999.0); // idle hub half 4-1, on bus 4
+        rate(&mut mgr, 3, 6, 0.0, 999.0, 999.0); // idle 3-1.4
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.hide_idle_devices = true;
+        app.sync_from(&mgr);
+        let ctrl = &app.controllers[0];
+        assert_eq!(
+            ctrl.buses.iter().map(|b| b.bus_id).collect::<Vec<_>>(),
+            vec![4],
+            "bus 3 has no visible row; bus 4 keeps its line for 4-1.1"
+        );
+        assert!(
+            ctrl.buses[0].devices.is_empty(),
+            "the idle root hub row is gone, the line stays"
+        );
+        assert_eq!(
+            connectors_of(&app),
+            vec![(
+                "Port 1.1".to_string(),
+                vec![3, 4],
+                false,
+                vec!["4:3".to_string()]
+            )]
+        );
+        assert_eq!(
+            (ctrl.connectors[0].rx_bps, ctrl.connectors[0].tx_bps),
+            (300.0, 200.0),
+            "the connector totals only the row that survived hide-idle"
+        );
+        assert_eq!(
+            (ctrl.buses[0].rx_bps, ctrl.buses[0].tx_bps),
+            (300.0, 200.0),
+            "bus 04 counts its surviving connector row; neither the pruned \
+             root hub nor the pruned 4-1 half leaves its 999 behind"
+        );
+        assert_eq!(
+            list_text(&app).lines().count(),
+            5,
+            "header, controller, bus 04 line, connector heading, one row"
+        );
+    }
+
+    /// `--filter` prunes rows before the totals are recomputed: the hub
+    /// connector keeps only its USB2 half, and neither the filtered-out USB3
+    /// half nor anything else on bus 4 leaves a rate behind in the
+    /// connector's total or in the bus line's.
+    #[test]
+    fn connector_and_bus_totals_only_count_rows_that_survive_the_filter() {
+        let (_t, mut mgr) = connector_fixture();
+        let rate = |mgr: &mut DeviceManager, bus: u8, dev: u8, rx: f64, tx: f64| {
+            let d = mgr.get_or_create_bus(bus).devices.get_mut(&dev).unwrap();
+            d.bandwidth_stats.rx_bps = rx;
+            d.bandwidth_stats.tx_bps = tx;
+        };
+        rate(&mut mgr, 3, 1, 1.0, 2.0); // root hub of bus 3: a bus-line row
+        rate(&mut mgr, 3, 2, 10.0, 20.0); // hub half 3-1, on connector Port 1
+        rate(&mut mgr, 3, 6, 100.0, 200.0); // 3-1.4, on connector Port 1.4
+        rate(&mut mgr, 4, 2, 999.0, 999.0); // hub half 4-1: same connector, filtered
+        rate(&mut mgr, 4, 3, 999.0, 999.0); // 4-1.1: its connector goes entirely
+        rate(&mut mgr, 4, 1, 999.0, 999.0); // root hub of bus 4: filtered
+        let mut app = UsbTopApp::new(Duration::from_millis(100))
+            .with_filter(FilterSet::parse(&["bus=3".into()]).unwrap());
+        app.sync_from(&mgr);
+
+        let ctrl = &app.controllers[0];
+        let hub = ctrl
+            .connectors
+            .iter()
+            .find(|c| c.label == "Port 1")
+            .unwrap();
+        assert_eq!(
+            (hub.rx_bps, hub.tx_bps),
+            (10.0, 20.0),
+            "only the USB2 half's rate; the filtered USB3 half's 999 is gone"
+        );
+        assert!(
+            ctrl.connectors.iter().all(|c| c.label != "Port 1.1"),
+            "the connector whose only row was on bus 4 is pruned outright"
+        );
+        assert_eq!(
+            ctrl.buses.iter().map(|b| b.bus_id).collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(
+            (ctrl.buses[0].rx_bps, ctrl.buses[0].tx_bps),
+            (111.0, 222.0),
+            "the root-hub row (1/2) plus Port 1's 10/20 and Port 1.4's 100/200"
+        );
+    }
+
+    /// The same for `/` search, which retains last of the three passes: a
+    /// searched-out row must not keep counting toward the connector heading
+    /// it sat under or toward its bus line.
+    #[test]
+    fn connector_and_bus_totals_only_count_rows_that_survive_a_search() {
+        let (_t, mut mgr) = connector_fixture();
+        let set = |mgr: &mut DeviceManager, bus: u8, dev: u8, vendor: &str, rx: f64, tx: f64| {
+            let d = mgr.get_or_create_bus(bus).devices.get_mut(&dev).unwrap();
+            d.vendor = Some(vendor.to_string());
+            d.bandwidth_stats.rx_bps = rx;
+            d.bandwidth_stats.tx_bps = tx;
+        };
+        set(&mut mgr, 3, 1, "Kingston Technology", 1.0, 2.0); // root hub: a bus-line row
+        set(&mut mgr, 3, 6, "Kingston Technology", 300.0, 200.0); // 3-1.4, on Port 1.4
+        set(&mut mgr, 3, 2, "Logitech", 999.0, 999.0); // hub half on bus 3
+        set(&mut mgr, 3, 3, "Logitech", 999.0, 999.0);
+        set(&mut mgr, 4, 1, "Logitech", 999.0, 999.0);
+        set(&mut mgr, 4, 2, "Logitech", 999.0, 999.0);
+        set(&mut mgr, 4, 3, "Logitech", 999.0, 999.0);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("kingston".to_string());
+        app.sync_from(&mgr);
+
+        assert_eq!(
+            app.device_keys(),
+            vec!["3:1".to_string(), "3:6".to_string()],
+            "the root-hub row and one connector row survive"
+        );
+        assert_eq!(
+            connectors_of(&app),
+            vec![(
+                "Port 1.4".to_string(),
+                vec![3, 4],
+                false,
+                vec!["3:6".to_string()]
+            )]
+        );
+        let ctrl = &app.controllers[0];
+        assert_eq!(
+            (ctrl.connectors[0].rx_bps, ctrl.connectors[0].tx_bps),
+            (300.0, 200.0)
+        );
+        assert_eq!(
+            ctrl.buses.iter().map(|b| b.bus_id).collect::<Vec<_>>(),
+            vec![3],
+            "bus 04 has no surviving row of its own and none on a connector"
+        );
+        assert_eq!(
+            (ctrl.buses[0].rx_bps, ctrl.buses[0].tx_bps),
+            (301.0, 202.0),
+            "the root-hub row (1/2) plus its connector row (300/200), and \
+             none of the searched-out 999s"
+        );
+    }
+
+    #[test]
+    fn a_filter_on_one_bus_keeps_only_that_half_of_a_hub_connector() {
+        let (_t, mgr) = connector_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100))
+            .with_filter(FilterSet::parse(&["bus=3".into()]).unwrap());
+        app.sync_from(&mgr);
+        let hub = &app.controllers[0].connectors[0];
+        assert_eq!(hub.label, "Port 1");
+        assert_eq!(
+            hub.buses,
+            vec![3, 4],
+            "the physical span is a fact, not a count of visible rows"
+        );
+        assert_eq!(hub.devices.len(), 1);
+        assert_eq!(hub.devices[0].device.bus_id, 3);
+        assert_eq!(
+            app.controllers[0]
+                .buses
+                .iter()
+                .map(|b| b.bus_id)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn selection_walks_bus_rows_then_connector_rows_in_render_order() {
+        let (_t, mgr) = connector_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.select_next_device();
+        assert_eq!(
+            app.selected_device.as_deref(),
+            Some("3:1"),
+            "root hub of bus 3 first"
+        );
+        app.select_next_device();
+        assert_eq!(app.selected_device.as_deref(), Some("4:1"));
+        app.select_next_device();
+        assert_eq!(
+            app.selected_device.as_deref(),
+            Some("3:2"),
+            "then the first connector's USB2 half"
+        );
+        app.select_previous_device();
+        app.select_previous_device();
+        app.select_previous_device(); // wraps to the last connector row
+        assert_eq!(app.selected_device.as_deref(), Some("3:3"));
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        assert_eq!(
+            selected_line,
+            Some(lines.len() - 1),
+            "the last line is the selected row"
+        );
+        assert!(find_selected_device(&app)
+            .is_some_and(|(bus, row)| bus == 3 && row.device.device_id == 3));
+    }
+
+    #[test]
+    fn selection_walks_device_rows_across_groups() {
+        let (_t, mut mgr) = topology_fixture();
+        feed(
+            &mut mgr,
+            &["f1 100 C Bi:3:006:1 0 64 <", "f2 300 C Bi:4:002:1 0 64 <"],
+        );
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        assert_eq!(
+            app.device_keys(),
+            vec!["3:6".to_string(), "4:2".to_string()]
+        );
+        app.select_next_device();
+        assert_eq!(app.selected_device.as_deref(), Some("3:6"));
+        app.select_next_device();
+        assert_eq!(app.selected_device.as_deref(), Some("4:2"));
+        app.select_next_device(); // wraps
+        assert_eq!(app.selected_device.as_deref(), Some("3:6"));
+    }
+
+    #[test]
+    fn selection_walks_backwards_and_wraps() {
+        let (_t, mut mgr) = topology_fixture();
+        feed(
+            &mut mgr,
+            &["f1 100 C Bi:3:006:1 0 64 <", "f2 300 C Bi:4:002:1 0 64 <"],
+        );
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.select_previous_device();
+        assert_eq!(app.selected_device.as_deref(), Some("4:2"));
+        app.select_previous_device();
+        assert_eq!(app.selected_device.as_deref(), Some("3:6"));
+        app.select_previous_device(); // wraps
+        assert_eq!(app.selected_device.as_deref(), Some("4:2"));
+    }
+
+    /// A plain, unmodified key press.
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// The same key press with Control held.
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn quit_keys_end_the_session() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('q'))),
+            KeyOutcome::Quit
+        );
+        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Quit);
+    }
+
+    #[test]
+    fn ctrl_c_ends_the_session_too() {
+        // Raw mode turns off ISIG, so ^C never becomes a SIGINT: it arrives
+        // here as an ordinary key press and has to be honored as one.
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(
+            apply_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
+            KeyOutcome::Quit
+        );
+    }
+
+    #[test]
+    fn q_and_esc_close_the_help_overlay_instead_of_quitting() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.show_help = true;
+
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('q'))),
+            KeyOutcome::Redraw
+        );
+        assert!(!app.show_help, "q must close help, not reopen or leave it");
+
+        app.show_help = true;
+        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Redraw);
+        assert!(!app.show_help, "Esc must close help too");
+    }
+
+    #[test]
+    fn q_and_esc_still_quit_once_help_is_closed() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert!(!app.show_help);
+
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('q'))),
+            KeyOutcome::Quit
+        );
+        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Quit);
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_with_help_open() {
+        // The safety valve out of raw mode must not be swallowed by help's
+        // new q/Esc interception -- see the comment on that arm.
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.show_help = true;
+
+        assert_eq!(
+            apply_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
+            KeyOutcome::Quit
+        );
+    }
+
+    #[test]
+    fn ctrl_l_asks_for_a_wipe_and_a_repaint() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(
+            apply_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)
+            ),
+            KeyOutcome::ClearAndRedraw
+        );
+        // Bare "l" is an unbound letter, not a redraw request.
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('l'))),
+            KeyOutcome::None
+        );
+    }
+
+    #[test]
+    fn help_key_toggles_the_overlay() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('h'))),
+            KeyOutcome::Redraw
+        );
+        assert!(app.show_help);
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('h'))),
+            KeyOutcome::Redraw
+        );
+        assert!(!app.show_help);
+    }
+
+    /// The overlay is the only place the bindings are written down, so what it
+    /// says has to be what `apply_key` does — and it has to survive the layout,
+    /// which is the half a text-only assertion would miss.
+    #[test]
+    fn the_help_overlay_lists_the_bindings_that_exist() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.show_help = true;
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 60)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+
+        // Distinctive strings, not bare letters: a lone "h" would match
+        // anywhere on the screen and assert nothing.
+        for binding in [
+            "↑/↓",
+            "Toggle this help",
+            "Ctrl-L",
+            "Show or hide idle devices",
+            "q/Esc",
+            "Ctrl-C",
+        ] {
+            assert!(screen.contains(binding), "{binding} missing from {screen}");
+        }
+        // And both counters the header can spring on the user are explained.
+        assert!(screen.contains("dropped: N"), "{screen}");
+        assert!(screen.contains("shed: N"), "{screen}");
+        // The one platform claim the overlay makes, and the only one it may:
+        // the binary does not build anywhere else.
+        assert!(screen.contains("Linux only"), "{screen}");
+        // The `~` marker's meaning is documented unconditionally, unlike the
+        // legend line below (see `legend_only_mentions_the_estimate_marker_
+        // when_a_text_source_is_active`): the help overlay is static
+        // reference text, not a claim about the current session.
+        assert!(screen.contains("marks estimated rates"), "{screen}");
+
+        assert_eq!(
+            apply_key(&mut app, ctrl(KeyCode::Char('l'))),
+            KeyOutcome::ClearAndRedraw
+        );
+        assert_eq!(
+            apply_key(&mut app, ctrl(KeyCode::Char('c'))),
+            KeyOutcome::Quit
+        );
+    }
+
+    /// The legend must never mention a marker that cannot appear: under a
+    /// binary source (or no monitor attached at all, as in most tests) the
+    /// `~` estimate marker can never show up on a device row, so claiming
+    /// otherwise in the legend would be false.
+    #[test]
+    fn legend_only_mentions_the_estimate_marker_when_a_text_source_is_active() {
+        let render = |app: &UsbTopApp| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 6)).unwrap();
+            terminal
+                .draw(|f| draw_color_reference(f, f.area(), app))
+                .unwrap();
+            terminal.backend().to_string()
+        };
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let app =
+            UsbTopApp::new(Duration::from_millis(100)).with_text_source_flag(Arc::clone(&flag));
+        let screen = render(&app);
+        assert!(!screen.contains('~'), "no text source active: {screen}");
+
+        flag.store(true, Ordering::Relaxed);
+        let screen = render(&app);
+        assert!(
+            screen.contains("~ = estimated rate (text source)"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn unbound_keys_leave_the_screen_alone() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('x'))),
+            KeyOutcome::None
+        );
+    }
+
+    #[test]
+    fn only_presses_act() {
+        // Terminals that report key repeat and release (kitty protocol,
+        // Windows) would otherwise fire a binding up to three times per press.
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            let event = KeyEvent::new_with_kind(KeyCode::Char('q'), KeyModifiers::NONE, kind);
+            assert_eq!(apply_key(&mut app, event), KeyOutcome::None);
+        }
+    }
+
+    #[test]
+    fn arrow_keys_move_the_selection() {
+        let (_t, mut mgr) = topology_fixture();
+        feed(
+            &mut mgr,
+            &["f1 100 C Bi:3:006:1 0 64 <", "f2 300 C Bi:4:002:1 0 64 <"],
+        );
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        assert_eq!(apply_key(&mut app, key(KeyCode::Down)), KeyOutcome::Redraw);
+        assert_eq!(app.selected_device.as_deref(), Some("3:6"));
+        assert_eq!(apply_key(&mut app, key(KeyCode::Up)), KeyOutcome::Redraw);
+        assert_eq!(app.selected_device.as_deref(), Some("4:2"), "wraps to last");
+    }
+
+    /// A snapshot with one entry per given port path, IDs unset -- enough to
+    /// exercise `SnapshotPrompt` without touching the matching logic
+    /// `snapshot::Snapshot::is_internal` already owns its own tests for.
+    fn fixture_snapshot(port_paths: &[&str]) -> Snapshot {
+        Snapshot {
+            captured_unix: 0,
+            devices: port_paths
+                .iter()
+                .map(|p| crate::snapshot::SnapshotDevice {
+                    port_path: (*p).to_string(),
+                    vendor_id: None,
+                    product_id: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// `open_snapshot_prompt` is the seam `apply_key`'s `KeyCode::Char('S')`
+    /// arm calls with `Snapshot::capture(None)`'s real result; tests drive it
+    /// directly with a fixture `Result` instead, per the module's hermetic
+    /// rule against ever touching real `/sys`.
+    #[test]
+    fn open_snapshot_prompt_opens_confirm_with_the_captured_snapshot() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-4", "usb1"])));
+
+        match &app.snapshot_prompt {
+            Some(SnapshotPrompt::Confirm(snapshot)) => assert_eq!(snapshot.devices.len(), 2),
+            other => panic!("expected Confirm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_snapshot_prompt_lands_straight_in_done_on_a_capture_error() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+
+        open_snapshot_prompt(&mut app, Err(err));
+
+        match &app.snapshot_prompt {
+            Some(SnapshotPrompt::Done(message)) => assert!(message.contains("denied"), "{message}"),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirm_then_y_writes_the_file_and_hands_off_the_pending_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        // Nested: the confirm handler must create the parent directory
+        // itself, the same gap `write_to`'s doc comment leaves to its
+        // callers (see `confirm_snapshot`).
+        let dest = temp.path().join("nested").join("internal-devices.toml");
+        let mut app = UsbTopApp::new(Duration::from_millis(100)).with_snapshot_dest(dest.clone());
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-4"])));
+
+        let outcome = apply_key(&mut app, key(KeyCode::Char('y')));
+
+        assert_eq!(outcome, KeyOutcome::Redraw);
+        assert!(dest.exists(), "y must write the file");
+        let pending = app
+            .pending_internal_snapshot
+            .as_ref()
+            .expect("y hands the snapshot to the event loop's handoff seam");
+        assert_eq!(pending.devices.len(), 1);
+        match &app.snapshot_prompt {
+            Some(SnapshotPrompt::Done(message)) => {
+                assert!(
+                    message.starts_with("1 devices recorded as internal. "),
+                    "{message}"
+                );
+                assert!(
+                    message.contains(crate::snapshot::REMOVABLE_HINT),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirm_then_shift_y_also_writes() {
+        // Crossterm reports Shift-Y as `Char('Y')`, not `Char('y')` plus a
+        // modifier -- the spec's "y" is meant case-insensitively.
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("internal-devices.toml");
+        let mut app = UsbTopApp::new(Duration::from_millis(100)).with_snapshot_dest(dest.clone());
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-4"])));
+
+        apply_key(&mut app, key(KeyCode::Char('Y')));
+
+        assert!(dest.exists());
+        assert!(app.pending_internal_snapshot.is_some());
+    }
+
+    #[test]
+    fn confirm_then_any_other_key_cancels_writing_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("internal-devices.toml");
+        let mut app = UsbTopApp::new(Duration::from_millis(100)).with_snapshot_dest(dest.clone());
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-4"])));
+
+        let outcome = apply_key(&mut app, key(KeyCode::Char('n')));
+
+        assert_eq!(outcome, KeyOutcome::Redraw);
+        assert!(
+            app.snapshot_prompt.is_none(),
+            "cancelled, nothing left to show"
+        );
+        assert!(!dest.exists(), "cancel must not write");
+        assert!(app.pending_internal_snapshot.is_none());
+    }
+
+    /// The prompt intercepts every key while it's open, ahead of the
+    /// ordinary bindings -- 'q' during Confirm must cancel the prompt, not
+    /// quit the session.
+    #[test]
+    fn confirm_intercepts_a_key_that_would_otherwise_quit() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-4"])));
+
+        let outcome = apply_key(&mut app, key(KeyCode::Char('q')));
+
+        assert_eq!(outcome, KeyOutcome::Redraw, "the prompt owns the key");
+        assert!(
+            app.snapshot_prompt.is_none(),
+            "q cancels like any other key"
+        );
+    }
+
+    /// A second 'S' while the prompt is already open must not re-trigger a
+    /// capture: the intercept in `apply_key` runs before the `Char('S')`
+    /// binding is ever reached, so it reads as an ordinary cancel.
+    #[test]
+    fn s_while_the_prompt_is_open_cancels_instead_of_recapturing() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-4"])));
+
+        apply_key(&mut app, key(KeyCode::Char('S')));
+
+        assert!(app.snapshot_prompt.is_none());
+    }
+
+    #[test]
+    fn y_with_no_destination_lands_in_done_and_writes_nothing() {
+        // No `with_snapshot_dest`: the default in tests and whenever HOME
+        // could not be resolved.
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-4"])));
+
+        apply_key(&mut app, key(KeyCode::Char('y')));
+
+        assert!(app.pending_internal_snapshot.is_none());
+        match &app.snapshot_prompt {
+            Some(SnapshotPrompt::Done(message)) => {
+                assert!(message.contains("destination"), "{message}");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn done_prompt_closes_on_any_key() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.snapshot_prompt = Some(SnapshotPrompt::Done(
+            "5 devices recorded as internal".to_string(),
+        ));
+
+        let outcome = apply_key(&mut app, key(KeyCode::Char('x')));
+
+        assert_eq!(outcome, KeyOutcome::Redraw);
+        assert!(app.snapshot_prompt.is_none());
+    }
+
+    /// A device with both ids set, and one with neither -- exercises the
+    /// "----" placeholder `--snapshot-internal`'s CLI handler in main.rs
+    /// uses for a missing vendor or product id, which this listing mirrors.
+    fn device_with_ids(
+        port_path: &str,
+        vendor_id: Option<&str>,
+        product_id: Option<&str>,
+    ) -> SnapshotDevice {
+        SnapshotDevice {
+            port_path: port_path.to_string(),
+            vendor_id: vendor_id.map(str::to_string),
+            product_id: product_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn snapshot_device_lines_formats_port_path_and_ids() {
+        let devices = vec![
+            device_with_ids("1-4", Some("04f2"), Some("b71a")),
+            device_with_ids("usb1", None, None),
+        ];
+
+        let lines = snapshot_device_lines(&devices);
+
+        assert_eq!(lines, vec!["1-4  04f2:b71a", "usb1  ----:----"]);
+    }
+
+    #[test]
+    fn snapshot_device_lines_caps_the_listing_with_a_summary() {
+        let devices: Vec<SnapshotDevice> = (0..15)
+            .map(|i| device_with_ids(&format!("1-{i}"), None, None))
+            .collect();
+
+        let lines = snapshot_device_lines(&devices);
+
+        assert_eq!(lines.len(), MAX_LISTED_SNAPSHOT_DEVICES + 1);
+        for (i, line) in lines.iter().take(MAX_LISTED_SNAPSHOT_DEVICES).enumerate() {
+            assert_eq!(line, &format!("1-{i}  ----:----"));
+        }
+        assert_eq!(lines.last().unwrap(), "… and 3 more");
+    }
+
+    #[test]
+    fn snapshot_device_lines_omits_the_summary_line_at_exactly_the_cap() {
+        let devices: Vec<SnapshotDevice> = (0..MAX_LISTED_SNAPSHOT_DEVICES)
+            .map(|i| device_with_ids(&format!("1-{i}"), None, None))
+            .collect();
+
+        let lines = snapshot_device_lines(&devices);
+
+        assert_eq!(lines.len(), MAX_LISTED_SNAPSHOT_DEVICES);
+        assert!(!lines.last().unwrap().contains("more"));
+    }
+
+    /// The overlay names both keys (per the wording requirement) and lists
+    /// the devices it captured, not just the count.
+    #[test]
+    fn the_confirmation_overlay_lists_devices_and_names_both_keys() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-4", "usb1"])));
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 60)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(screen.contains("1-4  ----:----"), "{screen}");
+        assert!(screen.contains("usb1  ----:----"), "{screen}");
+        assert!(screen.contains('y'), "{screen}");
+        assert!(screen.contains("record"), "{screen}");
+        assert!(screen.contains('n'), "{screen}");
+        assert!(screen.contains("cancel"), "{screen}");
+    }
+
+    /// `centered_rect_for_lines`'s clamp has to hold even when the terminal
+    /// itself is smaller than the popup would like: a hub farm's device
+    /// count must not turn a tiny terminal into a panic.
+    #[test]
+    fn the_confirmation_overlay_does_not_panic_on_a_tiny_terminal_with_many_devices() {
+        let port_paths: Vec<String> = (0..20).map(|i| format!("1-{i}")).collect();
+        let port_paths: Vec<&str> = port_paths.iter().map(String::as_str).collect();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&port_paths)));
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(20, 5)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn fit_to_display_width_leaves_an_exact_fit_unchanged() {
+        assert_eq!(fit_to_display_width("Acme", 4), "Acme");
+    }
+
+    #[test]
+    fn fit_to_display_width_marks_ascii_truncation_with_an_ellipsis() {
+        let fitted = fit_to_display_width("HelloWorld", 5);
+        assert!(fitted.ends_with('…'), "{fitted}");
+        assert_eq!(Span::raw(&fitted).width(), 5, "{fitted}");
+    }
+
+    #[test]
+    fn fit_to_display_width_keeps_cjk_truncation_width_correct() {
+        // Each CJK char below is 2 display cells (Span::width()), so a naive
+        // "pop one char" fixup would free 2 cells and misalign the column;
+        // the fixup has to track each popped character's own width. Popping
+        // a 2-cell char to make room for the 1-cell ellipsis can leave one
+        // cell of padding after it, so unlike the ASCII case this doesn't
+        // necessarily end with the ellipsis -- only the total width is
+        // guaranteed.
+        let fitted = fit_to_display_width("東京デバイスカンパニー", 14);
+        assert!(fitted.contains('…'), "{fitted}");
+        assert_eq!(Span::raw(&fitted).width(), 14, "{fitted}");
+    }
+
+    #[test]
+    fn fit_to_display_width_of_one_with_oversized_text_is_just_the_ellipsis() {
+        assert_eq!(fit_to_display_width("HelloWorld", 1), "…");
+    }
+
+    #[test]
+    fn fit_to_display_width_of_zero_stays_empty() {
+        assert_eq!(fit_to_display_width("HelloWorld", 0), "");
+    }
+
+    /// Total display width of a device row: every column plus one space between.
+    fn device_row_width() -> usize {
+        DEVICE_COLUMNS.iter().sum::<usize>() + DEVICE_COLUMNS.len() - 1
+    }
+
+    #[test]
+    fn device_columns_pad_and_truncate_by_display_width() {
+        // "東京デバイス" is 6 chars but 12 terminal cells, so the 14-cell Vendor
+        // column takes 2 spaces of padding, not 8. The "⚡" indicator is a
+        // 2-cell glyph inside the 3-cell `!` column, exercising the same
+        // display-width padding there.
+        let wide = Line::from(device_columns(
+            [
+                "?",
+                "001:004",
+                "0.0 Mbps",
+                "東京デバイス",
+                "プローブ",
+                "0.0 KB/s",
+                "0.0 KB/s",
+                " 91.6",
+                "⚡",
+            ],
+            None,
+        ));
+        assert_eq!(wide.width(), device_row_width());
+
+        // Over-long cells are clipped to their column, again by display width.
+        // "🔺" is likewise a 2-cell glyph.
+        let clipped = Line::from(device_columns(
+            [
+                "?",
+                "001:004",
+                "0.0 Mbps",
+                "東京デバイスカンパニー",
+                "Product",
+                "0.0 KB/s",
+                "0.0 KB/s",
+                "100.0",
+                "🔺",
+            ],
+            None,
+        ));
+        assert_eq!(clipped.width(), device_row_width());
+    }
+
+    #[test]
+    fn device_rows_stay_aligned_with_wide_characters() {
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0), (1, 4, 0.0), (1, 5, 1_100_000.0)]);
+        {
+            let bus = mgr.get_or_create_bus(1);
+            let ascii = bus.devices.get_mut(&3).unwrap();
+            ascii.vendor = Some("Acme".to_string());
+            ascii.product = Some("Widget".to_string());
+            let wide = bus.devices.get_mut(&4).unwrap();
+            wide.vendor = Some("東京デバイス".to_string());
+            wide.product = Some("プローブ".to_string());
+            // Device 5: practical max for Full speed is 1.2 MB/s, so
+            // 1.1 MB/s crosses the 80% HighUtilization threshold and renders
+            // the 2-cell "⚡" glyph in the `!` column.
+            let indicator = bus.devices.get_mut(&5).unwrap();
+            indicator.speed = UsbSpeed::from_mbps(12.0);
+        }
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        let widths: Vec<usize> = lines.iter().map(Line::width).collect();
+        // Column header plus all three device rows occupy exactly the same
+        // cells; the controller heading and bus header are free-form.
+        assert_eq!(
+            widths,
+            vec![
+                device_row_width(),
+                widths[1],
+                widths[2],
+                device_row_width(),
+                device_row_width(),
+                device_row_width(),
+            ]
+        );
+
+        // Lock the ASCII geometry so column offsets cannot drift silently.
+        // Device 3 keeps the default UsbSpeed::UNKNOWN (never overridden
+        // above), so its %busy cell is the width-7 "--" fallback, not "0.0",
+        // and its Speed cell is the integral-bare "0 Mbps" (format_mbps),
+        // not the old `{:.1}` rounding's "0.0 Mbps".
+        assert_eq!(
+            lines[3].to_string(),
+            "?        001:003  0 Mbps     Acme           Widget             0.0 KB/s   0.0 KB/s      --      "
+        );
+
+        // The wide (2-cell) "⚡" indicator glyph must not push the row's
+        // total width off alignment with the others.
+        assert!(lines[5].to_string().contains('⚡'), "{}", lines[5]);
+    }
+
+    #[test]
+    fn bus_header_shows_busy_percentage_or_dashes() {
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0), (2, 4, 600_000.0)]);
+        {
+            // Bus 1 keeps the default UsbSpeed::UNKNOWN -> no meaningful
+            // denominator, so its header shows "-- busy".
+            let bus2 = mgr.get_or_create_bus(2);
+            bus2.speed = UsbSpeed::from_mbps(12.0); // practical max 1_200_000 bytes/s
+        }
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let text: String = device_list_lines_with_selection(&app)
+            .0
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("· -- busy"), "{text}");
+        assert!(text.contains("· 50.0% busy"), "{text}");
+    }
+
+    #[test]
+    fn bus_heading_omits_parens_when_the_speed_is_unknown() {
+        // Bus 1 keeps the default UsbSpeed::UNKNOWN, so `side_label` is
+        // empty; the heading must not print a bare, meaningless "()".
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0)]);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let text: String = device_list_lines_with_selection(&app)
+            .0
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("▶ Bus 01  "), "{text}");
+        assert!(!text.contains("Bus 01 ()"), "{text}");
+
+        // A known speed still gets its side label in parens.
+        mgr.get_or_create_bus(1).speed = UsbSpeed::from_mbps(480.0);
+        app.sync_from(&mgr);
+        let text: String = device_list_lines_with_selection(&app)
+            .0
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("▶ Bus 01 (USB2 side)  "), "{text}");
+    }
+
+    #[test]
+    fn bus_heading_line_shows_the_formatted_rx_tx_totals() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let mut device = UsbDevice::new(1, 3);
+        device.bandwidth_stats.rx_bps = 400.0; // -> 0.4 KB/s
+        device.bandwidth_stats.tx_bps = 300.0; // -> 0.3 KB/s
+        mgr.get_or_create_bus(1).devices.insert(3, device);
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let text: String = device_list_lines_with_selection(&app)
+            .0
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("rx 0.4 KB/s tx 0.3 KB/s"), "{text}");
+    }
+
+    /// Mirrors `headless::estimated_marks_iso_devices_only_when_text_is_active`:
+    /// the debugfs text interface's isochronous figure is a sampled estimate
+    /// from the printed descriptors (within about 1% of the binary interface
+    /// on the two cameras measured), so a device with iso traffic gets its
+    /// rate cells marked `~` only while a text source backs the session —
+    /// never under a binary source, and never for a non-iso device either
+    /// way.
+    #[test]
+    fn device_row_marks_iso_rate_as_estimated_only_when_a_text_source_is_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        feed(
+            &mut mgr,
+            &["ffff0000aaaa0001 200 C Zi:1:004:1 0:1:6672:0 32 27000 ="],
+        );
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut app =
+            UsbTopApp::new(Duration::from_millis(100)).with_text_source_flag(Arc::clone(&flag));
+        app.sync_from(&mgr);
+
+        // [0] column header, [1] controller heading, [2] bus header, [3] device row.
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        let device_line = lines[3].to_string();
+        assert!(
+            !device_line.contains('~'),
+            "no text source active: {device_line}"
+        );
+
+        flag.store(true, Ordering::Relaxed);
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        let device_line = lines[3].to_string();
+        assert!(
+            device_line.contains("~2.7 KB/s"),
+            "iso device's rx cell must be marked estimated: {device_line}"
+        );
+        assert!(
+            device_line.contains("~0.0 KB/s"),
+            "iso device's tx cell must be marked estimated too: {device_line}"
+        );
+    }
+
+    /// The brief's fixture: `record_endpoint` twice, ep1 IN isochronous
+    /// (1000 bytes -> 100 bytes/s over the 10s endpoint window -> "0.1
+    /// KB/s"), ep2 OUT bulk (2000 bytes -> "0.2 KB/s"). `endpoints`' keys
+    /// sort `(1, true)` before `(2, false)`, so ep1's row comes first.
+    fn device_with_two_endpoints(bus_id: u8, device_id: u8) -> UsbDevice {
+        let mut device = UsbDevice::new(bus_id, device_id);
+        device.record_endpoint(1, true, TransferType::Isochronous, 1_000);
+        device.record_endpoint(2, false, TransferType::Bulk, 2_000);
+        device
+    }
+
+    #[test]
+    fn selected_device_expands_into_its_endpoint_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        // [0] header, [1] controller heading, [2] bus header, [3] device
+        // row, [4] ep1 (IN, iso), [5] ep2 (OUT, bulk).
+        assert_eq!(
+            selected_line,
+            Some(3),
+            "the endpoint rows must not shift the device's own line index"
+        );
+        assert_eq!(
+            lines.len(),
+            6,
+            "one line per endpoint appended right after the device row"
+        );
+
+        let ep1 = &lines[4];
+        assert_eq!(ep1.spans[0].content, "        ", "Port cell is blank");
+        assert_eq!(ep1.spans[2].content, "ep1 in  ", "Device cell");
+        assert_eq!(ep1.spans[4].content, "iso       ", "Speed cell");
+        assert_eq!(ep1.spans[10].content, "0.1 KB/s  ", "rate lands in Bw down");
+        assert_eq!(ep1.spans[12].content, "          ", "Bw up stays blank");
+        assert_eq!(ep1.spans[14].content, "       ", "%busy is blank");
+        assert_eq!(ep1.spans[16].content, "   ", "! is blank");
+
+        let ep2 = &lines[5];
+        assert_eq!(ep2.spans[2].content, "ep2 out ", "Device cell");
+        assert_eq!(ep2.spans[4].content, "bulk      ", "Speed cell");
+        assert_eq!(ep2.spans[10].content, "          ", "Bw down stays blank");
+        assert_eq!(ep2.spans[12].content, "0.2 KB/s  ", "rate lands in Bw up");
+    }
+
+    #[test]
+    fn unselected_device_with_endpoints_yields_no_endpoint_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        // No selection made.
+
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        assert_eq!(selected_line, None);
+        assert_eq!(
+            lines.len(),
+            4,
+            "header + controller heading + bus header + the device row only"
+        );
+    }
+
+    #[test]
+    fn moving_the_selection_moves_which_devices_endpoint_rows_show() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(4, device_with_two_endpoints(1, 4));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        app.selected_device = Some("1:3".to_string());
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        // [3] device 3 (selected), [4]/[5] its endpoints, [6] device 4.
+        assert_eq!(selected_line, Some(3));
+        assert_eq!(
+            lines.len(),
+            7,
+            "both devices plus only the selected one's two endpoint rows"
+        );
+        assert!(lines[4].to_string().contains("ep1 in"));
+        assert!(lines[5].to_string().contains("ep2 out"));
+        assert!(
+            !lines[6].to_string().contains("ep1"),
+            "device 4's row carries no trailing endpoints while unselected: {}",
+            lines[6]
+        );
+
+        app.selected_device = Some("1:4".to_string());
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        // [3] device 3 (no longer selected), [4] device 4 (selected), [5]/[6] its endpoints.
+        assert_eq!(selected_line, Some(4));
+        assert_eq!(lines.len(), 7);
+        assert!(
+            !lines[3].to_string().contains("ep1"),
+            "device 3's row no longer trails endpoints once deselected: {}",
+            lines[3]
+        );
+        assert!(lines[5].to_string().contains("ep1 in"));
+        assert!(lines[6].to_string().contains("ep2 out"));
+    }
+
+    #[test]
+    fn endpoint_row_marks_only_the_isochronous_endpoint_as_estimated() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut app =
+            UsbTopApp::new(Duration::from_millis(100)).with_text_source_flag(Arc::clone(&flag));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        assert!(
+            !lines[4].to_string().contains('~'),
+            "no text source active yet: {}",
+            lines[4]
+        );
+        assert!(!lines[5].to_string().contains('~'));
+
+        flag.store(true, Ordering::Relaxed);
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        assert!(
+            lines[4].to_string().contains("~0.1 KB/s"),
+            "the iso endpoint's rate must be marked estimated: {}",
+            lines[4]
+        );
+        assert!(
+            !lines[5].to_string().contains('~'),
+            "the bulk endpoint must never be marked estimated: {}",
+            lines[5]
+        );
+    }
+
+    #[test]
+    fn endpoint_row_width_matches_the_device_row_width() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        assert_eq!(lines[4].width(), device_row_width());
+        assert_eq!(lines[5].width(), device_row_width());
+    }
+
+    #[test]
+    fn endpoint_rows_render_dimmed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        assert!(
+            lines[4].style.add_modifier.contains(Modifier::DIM),
+            "endpoint rows render dimmed relative to device rows"
+        );
+        assert!(lines[5].style.add_modifier.contains(Modifier::DIM));
+    }
+
+    /// A bus of `count` devices (as `manager_with_n_devices`), with the last
+    /// one also carrying the two-endpoint fixture.
+    fn manager_with_n_devices_last_has_endpoints(count: u8) -> (tempfile::TempDir, DeviceManager) {
+        let (temp, mut mgr) = manager_with_n_devices(count);
+        let bus = mgr.get_or_create_bus(1);
+        let device = bus.devices.get_mut(&count).unwrap();
+        device.record_endpoint(1, true, TransferType::Isochronous, 1_000);
+        device.record_endpoint(2, false, TransferType::Bulk, 2_000);
+        (temp, mgr)
+    }
+
+    /// Mirrors `selecting_last_device_scrolls_it_into_view`, but with a
+    /// stale scroll offset from further down than the total content: the
+    /// selection lands at the top of the visible window (the
+    /// `index < list_scroll` branch), so its endpoint rows -- which flow
+    /// through `follow_selection_in_list` as ordinary lines, no special
+    /// casing -- fall right below it in the same window rather than
+    /// scrolling out.
+    #[test]
+    fn endpoint_rows_stay_visible_with_the_selected_device_near_the_bottom() {
+        let (_t, mgr) = manager_with_n_devices_last_has_endpoints(5);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = app.device_keys().last().cloned();
+        app.list_scroll = 9; // stale, as if scrolled well past the selection already
+
+        // inner height 4 (backend height 6, minus the block's 2 border rows).
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 6)).unwrap();
+        terminal
+            .draw(|f| draw_device_list(f, f.area(), &mut app))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(
+            screen.contains("001:005"),
+            "selected device's own row: {screen}"
+        );
+        assert!(
+            screen.contains("ep1 in"),
+            "its first endpoint row: {screen}"
+        );
+        assert!(
+            screen.contains("ep2 out"),
+            "its second endpoint row: {screen}"
+        );
+    }
+
+    #[test]
+    fn device_row_shows_dashes_when_device_speed_is_unknown() {
+        // %busy is device-row column index 7; device_columns emits one
+        // separator span before every column after the first, so its content
+        // lands at span index 2 * 7 (see SPEED_SPAN_INDEX/INDICATOR_SPAN_INDEX
+        // above for the same pattern).
+        const BUSY_SPAN_INDEX: usize = 2 * 7;
+
+        // The device keeps UsbDevice::new's default UsbSpeed::UNKNOWN, but
+        // has real traffic (nonzero current_bps): without the fix this
+        // renders a misleading "0.0" instead of the bus header's honest "--".
+        let (_t, mgr) = manager_with_rates(&[(1, 3, 600_000.0)]);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        // [0] column header, [1] controller heading, [2] bus header, [3] device row.
+        let busy_span = &lines[3].spans[BUSY_SPAN_INDEX];
+        assert_eq!(
+            busy_span.content, "   --  ",
+            "unknown-speed device's %busy cell must be a width-7 '--', not '{}'",
+            lines[3]
+        );
+    }
+
+    #[test]
+    fn device_row_speed_cell_for_unknown_speed_is_bare_zero() {
+        // The device keeps UsbDevice::new's default UsbSpeed::UNKNOWN
+        // (to_mbps() == 0.0). format_mbps's integral-bare rule renders that
+        // "0 Mbps", not the old `{:.1}` rounding's "0.0 Mbps".
+        let (_t, mgr) = manager_with_rates(&[(1, 3, 0.0)]);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        // [0] column header, [1] controller heading, [2] bus header, [3] device row.
+        let speed_span = &lines[3].spans[SPEED_SPAN_INDEX];
+        assert_eq!(
+            speed_span.content, "0 Mbps    ",
+            "unknown-speed device's Speed cell must be bare '0 Mbps', not '{}'",
+            lines[3]
+        );
+    }
+
+    #[test]
+    fn speed_span_is_colored_unless_the_row_is_selected() {
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0), (1, 4, 0.0)]);
+        {
+            let bus = mgr.get_or_create_bus(1);
+            bus.devices.get_mut(&3).unwrap().speed = UsbSpeed::from_mbps(480.0);
+            bus.devices.get_mut(&4).unwrap().speed = UsbSpeed::from_mbps(5000.0);
+        }
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:4".to_string());
+
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        // [0] column header, [1] controller heading, [2] bus header,
+        // [3] device 3 (unselected), [4] device 4 (selected).
+        assert_eq!(selected_line, Some(4), "selected row's line index");
+        let unselected_speed = &lines[3].spans[SPEED_SPAN_INDEX];
+        assert_eq!(
+            unselected_speed.style.fg,
+            Some(Color::Rgb(255, 255, 0)), // SpeedClass::High (480 Mbps)
+            "unselected row's Speed span carries its speed color"
+        );
+
+        let selected_speed = &lines[4].spans[SPEED_SPAN_INDEX];
+        assert_ne!(
+            selected_speed.style.fg,
+            Some(Color::Rgb(0, 255, 0)), // SpeedClass::SuperSpeed (5000 Mbps)
+            "selected row keeps the uniform highlight instead of the speed color"
+        );
+    }
+
+    /// Mirrors `speed_span_is_colored_unless_the_row_is_selected`: the Port
+    /// cell (column 0, so span index 0) picks up `INTERNAL_COLOR` for a
+    /// device the snapshot marked internal, except on the selected row,
+    /// where the uniform highlight still wins.
+    #[test]
+    fn port_span_is_internal_colored_unless_the_row_is_selected() {
+        // Port is column index 0, so (per SPEED_SPAN_INDEX/INDICATOR_SPAN_INDEX's
+        // `2 * column index` rule above) its content is span index 0 too.
+        const PORT_SPAN_INDEX: usize = 0;
+
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0), (1, 4, 0.0)]);
+        {
+            let bus = mgr.get_or_create_bus(1);
+            bus.devices.get_mut(&3).unwrap().is_internal = true;
+            bus.devices.get_mut(&4).unwrap().is_internal = true;
+        }
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:4".to_string());
+
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        assert_eq!(selected_line, Some(4), "selected row's line index");
+
+        let unselected_port = &lines[3].spans[PORT_SPAN_INDEX];
+        assert_eq!(
+            unselected_port.style.fg,
+            Some(INTERNAL_COLOR),
+            "unselected internal row's Port span carries the internal color"
+        );
+
+        let selected_port = &lines[4].spans[PORT_SPAN_INDEX];
+        assert_ne!(
+            selected_port.style.fg,
+            Some(INTERNAL_COLOR),
+            "selected row keeps the uniform highlight instead of the internal color"
+        );
+    }
+
+    #[test]
+    fn port_span_is_uncolored_for_an_external_device() {
+        // `manager_with_rates` builds devices via `UsbDevice::new`, whose
+        // `is_internal` defaults to false -- no snapshot, nothing marked.
+        let (_t, mgr) = manager_with_rates(&[(1, 3, 0.0)]);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        let port_span = &lines[3].spans[0];
+        assert_ne!(
+            port_span.style.fg,
+            Some(INTERNAL_COLOR),
+            "external device's Port span must not be blue"
+        );
+    }
+
+    /// Disconnected rows stay uniformly grey (see the loop's `plain_row`
+    /// guard); an internal device that just vanished must not show a blue
+    /// Port cell against that grey background.
+    #[test]
+    fn port_span_stays_uniform_for_a_disconnected_internal_device() {
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0)]);
+        {
+            let device = mgr.get_or_create_bus(1).devices.get_mut(&3).unwrap();
+            device.is_internal = true;
+            device.is_disconnected = true;
+        }
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        let port_span = &lines[3].spans[0];
+        assert_ne!(
+            port_span.style.fg,
+            Some(INTERNAL_COLOR),
+            "a disconnected row keeps its uniform grey styling"
+        );
+    }
+
+    #[test]
+    fn device_list_renders_headings_above_port_ordered_rows() {
+        let (_t, mut mgr) = topology_fixture();
+        feed(
+            &mut mgr,
+            &[
+                "f1 100 C Bi:3:006:1 0 64 <", // 3-1.4.1
+                "f2 200 C Bi:3:003:1 0 64 <", // 3-2
+                "f3 300 C Bi:3:001:1 0 64 <", // root hub
+                "f4 400 C Bi:3:009:1 0 64 <", // unresolved
+            ],
+        );
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        // 9 content lines (header, controller, bus line, 2 bus rows, 2
+        // connector headings, 2 connector rows) plus the block's borders.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 11)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                draw_device_list(f, area, &mut app);
+            })
+            .unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(screen.contains("═ 0000:00:14.0 ═"), "{screen}");
+        assert!(
+            screen.contains("▶ Bus 03 (USB2 side)  480 Mbps"),
+            "{screen}"
+        );
+        assert!(screen.contains("▶ Port 1.4.1 · bus 03  "), "{screen}");
+        // First column of every device row, top to bottom: the bus line's
+        // own rows (root hub, then the unresolved device) lead, then the
+        // connector rows in chain order.
+        let ports: Vec<&str> = screen
+            .lines()
+            .filter_map(|line| line.trim_matches('"').strip_prefix('│'))
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|cell| ["-", "1.4.1", "2", "?"].contains(cell))
+            .collect();
+        assert_eq!(ports, vec!["-", "?", "1.4.1", "2"], "{screen}");
+    }
+
+    /// A single bus with `count` devices (no sysfs, so every port chain is
+    /// `None` and rows sort by device id ascending), used to build a device
+    /// list longer than a small `TestBackend` can show at once.
+    fn manager_with_n_devices(count: u8) -> (tempfile::TempDir, DeviceManager) {
+        let entries: Vec<(u8, u8, f64)> = (1..=count).map(|dev| (1u8, dev, 0.0)).collect();
+        manager_with_rates(&entries)
+    }
+
+    #[test]
+    fn selecting_last_device_scrolls_it_into_view() {
+        let (_t, mgr) = manager_with_n_devices(8);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = app.device_keys().last().cloned();
+
+        // 8 visible rows would need height 10+; this backend only shows 6.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 8)).unwrap();
+        terminal
+            .draw(|f| draw_device_list(f, f.area(), &mut app))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(
+            screen.contains("001:008"),
+            "selected (last) device's row must be visible: {screen}"
+        );
+        assert!(
+            !screen.contains("═ unknown ═"),
+            "first controller heading must have scrolled out: {screen}"
+        );
+    }
+
+    #[test]
+    fn scroll_stays_put_when_nothing_is_selected() {
+        let (_t, mgr) = manager_with_n_devices(8);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.list_scroll = 2; // as if a prior selection had scrolled the list
+        assert_eq!(app.selected_device, None);
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 8)).unwrap();
+        terminal
+            .draw(|f| draw_device_list(f, f.area(), &mut app))
+            .unwrap();
+
+        assert_eq!(
+            app.list_scroll, 2,
+            "offset must not chase a selection when there isn't one"
+        );
+    }
+
+    #[test]
+    fn scroll_clamps_to_content_length_when_list_shrinks() {
+        let (_t, mgr) = manager_with_n_devices(8);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.list_scroll = 50; // stale offset from a much longer list
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 8)).unwrap();
+        terminal
+            .draw(|f| draw_device_list(f, f.area(), &mut app))
+            .unwrap();
+
+        // 11 total lines (header + heading + bus header + 8 devices), 6 visible.
+        assert_eq!(app.list_scroll, 5, "clamped to the last full page");
+    }
+
+    #[test]
+    fn wraparound_selection_pulls_scroll_back_toward_top() {
+        let (_t, mgr) = manager_with_n_devices(8);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = app.device_keys().last().cloned(); // start at the last device
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 8)).unwrap();
+        terminal
+            .draw(|f| draw_device_list(f, f.area(), &mut app))
+            .unwrap();
+        assert_eq!(
+            app.list_scroll, 5,
+            "scrolled down to reveal the last device"
+        );
+
+        app.select_next_device(); // wraps from the last device back to the first
+        assert_eq!(app.selected_device.as_deref(), Some("1:1"));
+        terminal
+            .draw(|f| draw_device_list(f, f.area(), &mut app))
+            .unwrap();
+
+        assert!(
+            app.list_scroll < 5,
+            "scroll must move back toward the top after the wrap, was {}",
+            app.list_scroll
+        );
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("001:001"), "{screen}");
+    }
+
+    /// One pass may not stall the frame behind an unbounded backlog: whatever
+    /// is left over stays queued for the next pass, ~50ms later.
+    #[test]
+    fn drain_stops_at_the_batch_limit_and_leaves_the_rest_queued() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        for device_id in 1..=5u8 {
+            tx.send(
+                parse_usbmon_text_line(&format!(
+                    "ffff0000eeee000{device_id} 100 C Bi:1:00{device_id}:1 0 4096 <"
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(drain_packets(&mut manager, &rx, 2), 2);
+        assert_eq!(manager.buses[&1].devices.len(), 2);
+
+        // The leftovers are still there for the following pass.
+        assert_eq!(drain_packets(&mut manager, &rx, 8), 3);
+        assert_eq!(manager.buses[&1].devices.len(), 5);
+        assert_eq!(drain_packets(&mut manager, &rx, 8), 0, "empty channel");
+    }
+
+    /// A lossy session must never look like a clean one, but a clean session
+    /// must not carry a permanent "dropped: 0" either.
+    #[test]
+    fn header_reports_dropped_packets_only_once_some_were_dropped() {
+        let render = |app: &UsbTopApp| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(90, 4)).unwrap();
+            terminal.draw(|f| draw_header(f, f.area(), app)).unwrap();
+            terminal.backend().to_string()
+        };
+
+        let plain = UsbTopApp::new(Duration::from_millis(100));
+        assert!(!render(&plain).contains("dropped"), "no counter wired up");
+
+        let counter = Arc::new(AtomicU64::new(0));
+        let app =
+            UsbTopApp::new(Duration::from_millis(100)).with_dropped_counter(Arc::clone(&counter));
+        let screen = render(&app);
+        assert!(!screen.contains("dropped"), "nothing dropped yet: {screen}");
+
+        counter.store(42, Ordering::Relaxed);
+        let screen = render(&app);
+        assert!(screen.contains("dropped: 42"), "{screen}");
+    }
+
+    /// Mirrors `header_reports_dropped_packets_only_once_some_were_dropped`
+    /// for the mmap ring's kernel-side counter: a distinct loss source from
+    /// the channel `dropped:` counter, so it needs its own presence/absence
+    /// proof.
+    #[test]
+    fn header_reports_kernel_dropped_packets_only_once_some_were_dropped() {
+        let render = |app: &UsbTopApp| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(90, 4)).unwrap();
+            terminal.draw(|f| draw_header(f, f.area(), app)).unwrap();
+            terminal.backend().to_string()
+        };
+
+        let plain = UsbTopApp::new(Duration::from_millis(100));
+        assert!(!render(&plain).contains("kdropped"), "no counter wired up");
+
+        let counter = Arc::new(AtomicU64::new(0));
+        let app = UsbTopApp::new(Duration::from_millis(100))
+            .with_kernel_dropped_counter(Arc::clone(&counter));
+        let screen = render(&app);
+        assert!(
+            !screen.contains("kdropped"),
+            "nothing dropped yet: {screen}"
+        );
+
+        counter.store(5, Ordering::Relaxed);
+        let screen = render(&app);
+        assert!(screen.contains("kdropped: 5"), "{screen}");
+    }
+
+    /// A session whose terminal could not keep up is showing stale numbers,
+    /// and the header is the only place that can admit it.
+    #[test]
+    fn header_bandwidth_floors_at_positive_zero() {
+        assert_eq!(to_mbps(-0.0), 0.0);
+        assert!(to_mbps(-0.0).is_sign_positive(), "must not render as -0.0");
+        assert!(to_mbps(-5.0).is_sign_positive());
+        assert_eq!(to_mbps(48_000_000.0), 48.0);
+    }
+
+    #[test]
+    fn header_reports_shed_frames_only_once_some_were_shed() {
+        let render = |app: &UsbTopApp| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(90, 4)).unwrap();
+            terminal.draw(|f| draw_header(f, f.area(), app)).unwrap();
+            terminal.backend().to_string()
+        };
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert!(!render(&app).contains("shed"), "no counter wired up");
+
+        let counter = Arc::new(AtomicU64::new(0));
+        app.shed_counter = Some(Arc::clone(&counter));
+        let screen = render(&app);
+        assert!(!screen.contains("shed"), "nothing shed yet: {screen}");
+
+        counter.store(7, Ordering::Relaxed);
+        let screen = render(&app);
+        assert!(screen.contains("shed: 7"), "{screen}");
+    }
+
+    /// `dropped:`/`kdropped:`/`shed:` are warnings, not measurements like
+    /// Peak, so they carry WARNING_COLOR rather than sharing SECONDARY_COLOR
+    /// with it.
+    #[test]
+    fn dropped_and_shed_counters_use_warning_color_not_secondary() {
+        let dropped = Arc::new(AtomicU64::new(42));
+        let kernel_dropped = Arc::new(AtomicU64::new(5));
+        let shed = Arc::new(AtomicU64::new(7));
+        let mut app = UsbTopApp::new(Duration::from_millis(100))
+            .with_dropped_counter(Arc::clone(&dropped))
+            .with_kernel_dropped_counter(Arc::clone(&kernel_dropped));
+        app.shed_counter = Some(Arc::clone(&shed));
+
+        let lines = header_lines(&app);
+        let stats_line = &lines[1];
+
+        let dropped_value = stats_line
+            .spans
+            .iter()
+            .find(|span| span.content == "42")
+            .expect("dropped counter span");
+        assert_eq!(dropped_value.style.fg, Some(WARNING_COLOR));
+        assert_ne!(
+            dropped_value.style.fg,
+            Some(SECONDARY_COLOR),
+            "must not blend in with the Peak figure"
+        );
+
+        let kernel_dropped_value = stats_line
+            .spans
+            .iter()
+            .find(|span| span.content == "5")
+            .expect("kdropped counter span");
+        assert_eq!(kernel_dropped_value.style.fg, Some(WARNING_COLOR));
+
+        let shed_value = stats_line
+            .spans
+            .iter()
+            .find(|span| span.content == "7")
+            .expect("shed counter span");
+        assert_eq!(shed_value.style.fg, Some(WARNING_COLOR));
+    }
+
+    /// The two tests above draw the header into a rect of their own choosing,
+    /// which is exactly the blind spot this one closes: the header is two
+    /// content lines inside a border, so a layout that hands it any less than
+    /// four rows clips the stats line away — and every counter this program has
+    /// for admitting it is behind lives on that line.
+    #[test]
+    fn the_whole_ui_leaves_room_for_the_header_stats_line() {
+        let dropped = Arc::new(AtomicU64::new(42));
+        let kernel_dropped = Arc::new(AtomicU64::new(5));
+        let shed = Arc::new(AtomicU64::new(7));
+        let mut app = UsbTopApp::new(Duration::from_millis(100))
+            .with_dropped_counter(Arc::clone(&dropped))
+            .with_kernel_dropped_counter(Arc::clone(&kernel_dropped));
+        app.shed_counter = Some(Arc::clone(&shed));
+
+        // Drawn through `draw_ui`, not `draw_header`: the layout is the thing
+        // under test.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(screen.contains("Total: "), "{screen}");
+        assert!(screen.contains("Peak: "), "{screen}");
+        assert!(screen.contains("dropped: 42"), "{screen}");
+        assert!(screen.contains("kdropped: 5"), "{screen}");
+        assert!(screen.contains("shed: 7"), "{screen}");
+    }
+
+    /// The chart's x-axis is 60 seconds wide, so the history it plots is
+    /// trimmed by age. A 60-sample cap would mean 15s at `--refresh 250`.
+    /// Uses `update_bandwidth_history_at` with a synthetic `now_secs`, so
+    /// this test needs no real machine uptime.
+    #[test]
+    fn bandwidth_history_keeps_sixty_seconds_not_sixty_samples() {
+        let mut app = UsbTopApp::new(Duration::from_millis(250));
+        app.bandwidth_history.push((0.0, 1.0)); // 120s before now
+        app.bandwidth_history.push((100.0, 2.0)); // 20s before now
+
+        app.update_bandwidth_history_at(120.0);
+
+        let times: Vec<f64> = app.bandwidth_history.iter().map(|(t, _)| *t).collect();
+        assert_eq!(times.len(), 2, "only the out-of-window sample is dropped");
+        assert_eq!(times[0], 100.0);
+        assert_eq!(times[1], 120.0, "this tick's sample, at 120s");
+    }
+
+    #[test]
+    fn bandwidth_history_retains_more_than_sixty_recent_samples() {
+        let mut app = UsbTopApp::new(Duration::from_millis(250));
+        for _ in 0..100 {
+            app.update_bandwidth_history();
+        }
+        assert_eq!(
+            app.bandwidth_history.len(),
+            100,
+            "samples inside the 60s window are all kept, however fast the tick"
+        );
+    }
+
+    #[test]
+    fn history_window_secs_derives_from_the_stats_window_constant() {
+        // Pins the value the charts rely on: the 60-second window, read from
+        // `stats::RATE_HISTORY_WINDOW` rather than a second hard-coded 60.0.
+        assert_eq!(history_window_secs(), 60.0);
+    }
+
+    #[test]
+    fn device_chart_shows_placeholder_when_nothing_selected() {
+        let app = UsbTopApp::new(Duration::from_millis(100));
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|f| draw_device_chart(f, f.area(), &app))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(screen.contains("Select a device with"), "{screen}");
+        assert!(screen.contains("Device rx/tx"), "{screen}");
+    }
+
+    #[test]
+    fn device_chart_shows_placeholder_when_selection_vanishes() {
+        let (_t, mgr) = manager_with_rates(&[(1, 3, 0.0)]);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("9:9".to_string()); // no such device
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|f| draw_device_chart(f, f.area(), &app))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(screen.contains("Select a device with"), "{screen}");
+    }
+
+    #[test]
+    fn device_chart_titles_the_selected_device_when_present() {
+        let (_t, mgr) = manager_with_rates(&[(1, 3, 0.0)]);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|f| draw_device_chart(f, f.area(), &app))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(screen.contains(" 1:3 rx/tx "), "{screen}");
+        assert!(!screen.contains("Select a device with"), "{screen}");
+    }
+
+    // -- interactive search: key transitions ---------------------------
+
+    #[test]
+    fn slash_opens_editing_from_off_with_an_empty_query() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        assert_eq!(app.search, SearchState::Off);
+
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('/'))),
+            KeyOutcome::Redraw
+        );
+        assert_eq!(app.search, SearchState::Editing(String::new()));
+    }
+
+    #[test]
+    fn slash_from_committed_prefills_editing_with_the_committed_query() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("widget".to_string());
+
+        apply_key(&mut app, key(KeyCode::Char('/')));
+        assert_eq!(app.search, SearchState::Editing("widget".to_string()));
+    }
+
+    #[test]
+    fn slash_while_help_is_open_closes_help_and_opens_search() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.show_help = true;
+
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('/'))),
+            KeyOutcome::Redraw
+        );
+        assert!(!app.show_help, "help must close when search opens");
+        assert_eq!(app.search, SearchState::Editing(String::new()));
+    }
+
+    #[test]
+    fn typing_while_editing_appends_to_the_query_live() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        apply_key(&mut app, key(KeyCode::Char('/')));
+
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('a'))),
+            KeyOutcome::Resync,
+            "a typed character changes which rows match, so the view resyncs live"
+        );
+        assert_eq!(app.search, SearchState::Editing("a".to_string()));
+        apply_key(&mut app, key(KeyCode::Char('b')));
+        assert_eq!(app.search, SearchState::Editing("ab".to_string()));
+    }
+
+    #[test]
+    fn q_types_into_the_query_while_editing_instead_of_quitting() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        apply_key(&mut app, key(KeyCode::Char('/')));
+
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('q'))),
+            KeyOutcome::Resync
+        );
+        assert_eq!(app.search, SearchState::Editing("q".to_string()));
+    }
+
+    #[test]
+    fn backspace_pops_the_last_character_while_editing() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Backspace)),
+            KeyOutcome::Resync
+        );
+        assert_eq!(app.search, SearchState::Editing("a".to_string()));
+    }
+
+    #[test]
+    fn enter_commits_the_query_and_closes_editing() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+
+        assert_eq!(apply_key(&mut app, key(KeyCode::Enter)), KeyOutcome::Redraw);
+        assert_eq!(app.search, SearchState::Committed("ab".to_string()));
+    }
+
+    #[test]
+    fn esc_while_editing_clears_the_query_and_closes_input() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+
+        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Resync);
+        assert_eq!(app.search, SearchState::Off);
+    }
+
+    #[test]
+    fn esc_with_a_committed_query_clears_it_instead_of_quitting() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("ab".to_string());
+
+        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Resync);
+        assert_eq!(app.search, SearchState::Off);
+    }
+
+    #[test]
+    fn q_quits_in_off_and_committed_but_types_while_editing() {
+        // A committed query is normal browsing (Clarified 2026-08-25): `q`
+        // quits there exactly as it does with no search active. Only
+        // `Editing` captures `q` as a letter (see
+        // q_types_into_the_query_while_editing_instead_of_quitting).
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("ab".to_string());
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('q'))),
+            KeyOutcome::Quit,
+            "a committed query is normal browsing; q quits as usual"
+        );
+
+        app.search = SearchState::Off;
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('q'))),
+            KeyOutcome::Quit
+        );
+
+        app.search = SearchState::Editing("ab".to_string());
+        assert_eq!(
+            apply_key(&mut app, key(KeyCode::Char('q'))),
+            KeyOutcome::Resync,
+            "editing still captures q as a letter"
+        );
+        assert_eq!(app.search, SearchState::Editing("abq".to_string()));
+    }
+
+    #[test]
+    fn ctrl_c_quits_while_editing() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+
+        assert_eq!(
+            apply_key(&mut app, ctrl(KeyCode::Char('c'))),
+            KeyOutcome::Quit
+        );
+    }
+
+    #[test]
+    fn unrecognized_keys_while_editing_are_swallowed_without_changing_the_query() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+
+        assert_eq!(apply_key(&mut app, key(KeyCode::Up)), KeyOutcome::None);
+        assert_eq!(app.search, SearchState::Editing("ab".to_string()));
+    }
+
+    /// Clarified 2026-08-25: a control-modified chord other than Ctrl-C must
+    /// not insert its bare letter while editing -- Ctrl-L typing a literal
+    /// 'l' into the query was the motivating bug.
+    #[test]
+    fn ctrl_l_while_editing_is_consumed_without_changing_the_query() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+
+        assert_eq!(
+            apply_key(&mut app, ctrl(KeyCode::Char('l'))),
+            KeyOutcome::None,
+            "consumed with no effect, not a screen wipe and not a typed 'l'"
+        );
+        assert_eq!(app.search, SearchState::Editing("ab".to_string()));
+    }
+
+    /// Clarified 2026-08-25: every control chord other than Ctrl-C is
+    /// consumed with no effect while editing, not just the char arm --
+    /// Backspace, Enter, and Esc must not fall back to their plain
+    /// behavior just because `key.code` matches.
+    #[test]
+    fn ctrl_backspace_while_editing_is_consumed_without_changing_the_query() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+
+        assert_eq!(
+            apply_key(&mut app, ctrl(KeyCode::Backspace)),
+            KeyOutcome::None,
+            "consumed with no effect, not a pop of the last character"
+        );
+        assert_eq!(app.search, SearchState::Editing("ab".to_string()));
+    }
+
+    #[test]
+    fn enter_on_an_empty_query_returns_to_off_instead_of_committing_empty() {
+        // Committing "" would leave `Committed("")` -- a vacuous filter
+        // state that still requires an extra Esc to leave even though it
+        // filters nothing (Clarified 2026-08-25).
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing(String::new());
+
+        assert_eq!(apply_key(&mut app, key(KeyCode::Enter)), KeyOutcome::Redraw);
+        assert_eq!(app.search, SearchState::Off);
+    }
+
+    #[test]
+    fn a_shifted_letter_still_types_while_editing() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing(String::new());
+
+        let shifted = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
+        assert_eq!(apply_key(&mut app, shifted), KeyOutcome::Resync);
+        assert_eq!(app.search, SearchState::Editing("A".to_string()));
+    }
+
+    #[test]
+    fn help_still_owns_esc_over_a_committed_search() {
+        // The precedence the brief pins: prompt, then Editing search input,
+        // then help-close keys, then the rest -- so help closing wins over
+        // clearing a committed query when both are momentarily true.
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.show_help = true;
+        app.search = SearchState::Committed("ab".to_string());
+
+        assert_eq!(apply_key(&mut app, key(KeyCode::Esc)), KeyOutcome::Redraw);
+        assert!(!app.show_help, "Esc must close help first");
+        assert_eq!(
+            app.search,
+            SearchState::Committed("ab".to_string()),
+            "the committed query survives; help owned this Esc, not search"
+        );
+    }
+
+    // -- interactive search: match fields --------------------------------
+
+    fn named_device(
+        bus_id: u8,
+        device_id: u8,
+        vendor: Option<&str>,
+        product: Option<&str>,
+        vendor_id: Option<u16>,
+        product_id: Option<u16>,
+    ) -> UsbDevice {
+        let mut device = UsbDevice::new(bus_id, device_id);
+        device.vendor = vendor.map(str::to_string);
+        device.product = product.map(str::to_string);
+        device.vendor_id = vendor_id;
+        device.product_id = product_id;
+        device
+    }
+
+    #[test]
+    fn matches_by_vendor_name_case_insensitively() {
+        // device_matches_search takes an already-lowered query (see
+        // retain_searched_devices, which folds it once per retention pass);
+        // the field's own mixed-case text is what it still folds here.
+        let row = DeviceRow {
+            port_chain: Some(vec![]),
+            device: named_device(1, 3, Some("Kingston Technology"), None, None, None),
+        };
+        assert!(device_matches_search(1, &row, "kingston"));
+        assert!(!device_matches_search(1, &row, "logitech"));
+    }
+
+    #[test]
+    fn matches_by_product_name_case_insensitively() {
+        let row = DeviceRow {
+            port_chain: Some(vec![]),
+            device: named_device(1, 3, None, Some("DataTraveler"), None, None),
+        };
+        assert!(device_matches_search(1, &row, "traveler"));
+        assert!(!device_matches_search(1, &row, "mouse"));
+    }
+
+    #[test]
+    fn matches_by_vid_pid_hex() {
+        let row = DeviceRow {
+            port_chain: Some(vec![]),
+            device: named_device(1, 3, None, None, Some(0x04f2), Some(0xb71a)),
+        };
+        assert!(device_matches_search(1, &row, "04f2:b71a"));
+        assert!(
+            device_matches_search(1, &row, "b71a"),
+            "either half matches"
+        );
+        assert!(!device_matches_search(1, &row, "ffff:ffff"));
+    }
+
+    #[test]
+    fn matches_by_port_chain_joined_with_dots() {
+        let row = DeviceRow {
+            port_chain: Some(vec![1, 4, 2]),
+            device: named_device(1, 3, None, None, None, None),
+        };
+        assert!(device_matches_search(1, &row, "1.4.2"));
+        assert!(device_matches_search(1, &row, "4.2"));
+        assert!(!device_matches_search(1, &row, "1.4.3"));
+    }
+
+    #[test]
+    fn matches_by_bus_and_address_in_the_tables_own_display_form() {
+        let row = DeviceRow {
+            port_chain: Some(vec![]),
+            device: named_device(1, 3, None, None, None, None),
+        };
+        // Same "{:03}:{:03}" form the Device column prints (see
+        // device_list_lines_with_selection), so what you see is what you
+        // search -- a substring of that zero-padded text, not the bare
+        // "1:3" a caller might guess.
+        assert!(device_matches_search(1, &row, "001:003"));
+        assert!(
+            device_matches_search(1, &row, "01:00"),
+            "substring still hits"
+        );
+        assert!(!device_matches_search(1, &row, "002:003"));
+        assert!(
+            !device_matches_search(1, &row, "1:3"),
+            "not a substring of the zero-padded form"
+        );
+    }
+
+    #[test]
+    fn a_device_with_no_metadata_matches_only_through_the_fields_it_has() {
+        let row = DeviceRow {
+            port_chain: None,
+            device: named_device(9, 7, None, None, None, None),
+        };
+        // No vendor, no product, no vid:pid, no resolved port chain -- only
+        // bus:address is always present.
+        assert!(!device_matches_search(9, &row, "unknown"));
+        assert!(!device_matches_search(9, &row, "."));
+        assert!(device_matches_search(9, &row, "009:007"));
+    }
+
+    #[test]
+    fn empty_query_matches_every_device() {
+        let row = DeviceRow {
+            port_chain: None,
+            device: named_device(1, 3, None, None, None, None),
+        };
+        assert!(device_matches_search(1, &row, ""));
+    }
+
+    // -- interactive search: composition with sync_from ------------------
+
+    #[test]
+    fn committed_search_filters_out_non_matching_devices() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1).devices.insert(
+            3,
+            named_device(1, 3, Some("Kingston Technology"), None, None, None),
+        );
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(4, named_device(1, 4, Some("Logitech"), None, None, None));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("kingston".to_string());
+        app.sync_from(&mgr);
+
+        assert_eq!(app.device_keys(), vec!["1:3".to_string()]);
+    }
+
+    /// Query-side case-insensitivity now lives in `retain_searched_devices`
+    /// (it lowers the query once per retention pass -- see the MINOR fix in
+    /// the fix-round-1 report), not in `device_matches_search` itself. This
+    /// pins it end to end: an upper-case query still hits a title-cased
+    /// vendor string.
+    #[test]
+    fn a_committed_query_matches_regardless_of_its_own_case() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1).devices.insert(
+            3,
+            named_device(1, 3, Some("Kingston Technology"), None, None, None),
+        );
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("KINGSTON".to_string());
+        app.sync_from(&mgr);
+
+        assert_eq!(app.device_keys(), vec!["1:3".to_string()]);
+    }
+
+    #[test]
+    fn search_filters_live_while_still_editing_not_only_once_committed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1).devices.insert(
+            3,
+            named_device(1, 3, Some("Kingston Technology"), None, None, None),
+        );
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(4, named_device(1, 4, Some("Logitech"), None, None, None));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("logi".to_string());
+        app.sync_from(&mgr);
+
+        assert_eq!(
+            app.device_keys(),
+            vec!["1:4".to_string()],
+            "the table filters as the query changes, before Enter commits it"
+        );
+    }
+
+    #[test]
+    fn search_composes_with_hide_idle_both_apply() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let mut kingston_idle = named_device(1, 3, Some("Kingston Technology"), None, None, None);
+        kingston_idle.bandwidth_stats.current_bps = 0.0;
+        let mut kingston_active = named_device(1, 4, Some("Kingston Technology"), None, None, None);
+        kingston_active.bandwidth_stats.current_bps = 500.0;
+        mgr.get_or_create_bus(1).devices.insert(3, kingston_idle);
+        mgr.get_or_create_bus(1).devices.insert(4, kingston_active);
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(5, named_device(1, 5, Some("Logitech"), None, None, None));
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.hide_idle_devices = true;
+        app.search = SearchState::Committed("kingston".to_string());
+        app.sync_from(&mgr);
+
+        assert_eq!(
+            app.device_keys(),
+            vec!["1:4".to_string()],
+            "idle 1:3 hidden by hide-idle, 1:5 hidden by search"
+        );
+    }
+
+    #[test]
+    fn search_composes_with_the_filter_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1).devices.insert(
+            3,
+            named_device(1, 3, Some("Kingston Technology"), None, None, None),
+        );
+        mgr.get_or_create_bus(2).devices.insert(
+            5,
+            named_device(2, 5, Some("Kingston Technology"), None, None, None),
+        );
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100))
+            .with_filter(FilterSet::parse(&["bus=1".into()]).unwrap());
+        app.search = SearchState::Committed("kingston".to_string());
+        app.sync_from(&mgr);
+
+        assert_eq!(
+            app.device_keys(),
+            vec!["1:3".to_string()],
+            "bus=2 match is excluded by --filter even though the name matches"
+        );
+    }
+
+    #[test]
+    fn a_committed_query_matching_nothing_yields_an_empty_table_not_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1).devices.insert(
+            3,
+            named_device(1, 3, Some("Kingston Technology"), None, None, None),
+        );
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("nothing-matches-this".to_string());
+        app.sync_from(&mgr);
+
+        assert!(app.device_keys().is_empty());
+        assert!(app.controllers.is_empty());
+
+        // Must still render without panicking.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+    }
+
+    /// Pins the ordering `sync_from` must follow for search, mirroring
+    /// `bus_rates_only_reflect_devices_that_survive_hide_idle_retention`:
+    /// search retention has to run before `recompute_rates`, or a
+    /// search-hidden device's rate would keep counting toward its bus
+    /// heading's total.
+    #[test]
+    fn bus_rates_only_reflect_devices_that_survive_search_retention() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+
+        let mut hidden = named_device(1, 3, Some("Logitech"), None, None, None);
+        hidden.bandwidth_stats.rx_bps = 999.0; // must not leak into the bus sum
+        hidden.bandwidth_stats.tx_bps = 999.0;
+
+        let mut kept = named_device(1, 4, Some("Kingston Technology"), None, None, None);
+        kept.bandwidth_stats.rx_bps = 300.0;
+        kept.bandwidth_stats.tx_bps = 200.0;
+
+        let bus = mgr.get_or_create_bus(1);
+        bus.devices.insert(3, hidden);
+        bus.devices.insert(4, kept);
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("kingston".to_string());
+        app.sync_from(&mgr);
+
+        assert_eq!(app.device_keys(), vec!["1:4".to_string()]);
+        let bus_view = &app.controllers[0].buses[0];
+        assert_eq!(bus_view.rx_bps, 300.0);
+        assert_eq!(bus_view.tx_bps, 200.0);
+    }
+
+    #[test]
+    fn search_hiding_the_selected_device_clears_selection_and_its_endpoint_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let mut selected = device_with_two_endpoints(1, 3);
+        selected.vendor = Some("Logitech".to_string());
+        mgr.get_or_create_bus(1).devices.insert(3, selected);
+        mgr.get_or_create_bus(1).devices.insert(
+            4,
+            named_device(1, 4, Some("Kingston Technology"), None, None, None),
+        );
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        app.search = SearchState::Committed("kingston".to_string());
+        app.sync_from(&mgr);
+
+        assert_eq!(
+            app.selected_device, None,
+            "the searched-out device is no longer a valid selection"
+        );
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        assert_eq!(selected_line, None);
+        assert_eq!(
+            lines.len(),
+            4,
+            "header + controller heading + bus header + the one surviving device row"
+        );
+    }
+
+    // -- interactive search: controls bar ---------------------------------
+
+    #[test]
+    fn controls_bar_shows_ordinary_keys_when_search_is_off() {
+        let app = UsbTopApp::new(Duration::from_millis(100));
+        let lines = color_reference_lines(&app);
+        let second_line: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(second_line.contains("Controls:"));
+        assert!(second_line.contains("Search"), "{second_line}");
+        assert!(!second_line.contains("search:"), "{second_line}");
+    }
+
+    #[test]
+    fn controls_bar_shows_the_editing_query_with_a_cursor_mark() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("kingston".to_string());
+
+        let lines = color_reference_lines(&app);
+        let second_line: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(second_line, "search: kingston▏");
+    }
+
+    #[test]
+    fn controls_bar_shows_the_committed_query_and_the_clear_hint() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("kingston".to_string());
+
+        let lines = color_reference_lines(&app);
+        let second_line: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(second_line, "search: kingston  (Esc clears)");
+    }
+
+    #[test]
+    fn controls_bar_renders_the_search_line_on_screen_while_editing() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("kingston".to_string());
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 6)).unwrap();
+        terminal
+            .draw(|f| draw_color_reference(f, f.area(), &app))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("search: kingston"), "{screen}");
+    }
+
+    #[test]
+    fn help_overlay_explains_the_search_key() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.show_help = true;
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 60)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("Search devices by name"), "{screen}");
+    }
+}
+
+/// [`drain_capture`]'s dispatch, exercised with fixture receivers of both
+/// [`CaptureStream`] variants.
+///
+/// Gated on the `ebpf` feature -- not because the dispatch itself needs it
+/// (`CaptureStream::Deltas` is always a real, constructible variant, feature
+/// or no) -- but so that adding this backend's tests does not change the
+/// default or `--features integration` test counts: those configs already
+/// cover the `Packets` arm byte-for-byte (see `tests::drain_stops_at_the_batch_limit_and_leaves_the_rest_queued`
+/// above), and this module's job is to additionally prove the `Deltas` arm
+/// and the dispatch between them.
+#[cfg(all(test, feature = "ebpf"))]
+mod capture_dispatch_tests {
+    use super::*;
+    use std::sync::mpsc::sync_channel;
+
+    fn delta(device_id: u8, bytes: u64) -> TrafficDelta {
+        TrafficDelta {
+            bus_id: 1,
+            device_id,
+            endpoint: 1,
+            dir_in: true,
+            transfer_type: Some(TransferType::Bulk),
+            bytes,
+        }
+    }
+
+    #[test]
+    fn drain_capture_dispatches_a_packets_stream_to_apply_packet() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let (tx, rx) = sync_channel(4);
+        tx.send(
+            crate::usbmon::parser::parse_usbmon_text_line(
+                "ffff0000eeee0001 100 C Bi:1:004:1 0 4096 <",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let capture = CaptureStream::Packets(rx);
+
+        assert_eq!(drain_capture(&mut manager, &capture, 8), 1);
+        assert_eq!(
+            manager.buses[&1].devices[&4].bandwidth_stats.total_rx_bytes,
+            4096
+        );
+    }
+
+    #[test]
+    fn drain_capture_dispatches_a_deltas_stream_to_apply_delta() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let (tx, rx) = sync_channel(4);
+        tx.send(delta(4, 4096)).unwrap();
+        let capture = CaptureStream::Deltas(rx);
+
+        assert_eq!(drain_capture(&mut manager, &capture, 8), 1);
+        assert_eq!(
+            manager.buses[&1].devices[&4].bandwidth_stats.total_rx_bytes,
+            4096
+        );
+    }
+
+    #[test]
+    fn drain_capture_on_a_deltas_stream_respects_the_batch_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let (tx, rx) = sync_channel(8);
+        for device_id in 1..=5u8 {
+            tx.send(delta(device_id, 100)).unwrap();
+        }
+        let capture = CaptureStream::Deltas(rx);
+
+        assert_eq!(drain_capture(&mut manager, &capture, 2), 2);
+        assert_eq!(drain_capture(&mut manager, &capture, 8), 3);
+        assert_eq!(drain_capture(&mut manager, &capture, 8), 0, "empty channel");
+    }
+}

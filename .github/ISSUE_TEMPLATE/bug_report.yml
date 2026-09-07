@@ -1,0 +1,51 @@
+name: Bug report
+description: Something is wrong, or does not work as the documentation says
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Run `usbtop-ng --support` first (with `sudo` if you can, so it includes a short usbmon capture).
+        It writes a diagnostic bundle, prints a summary, and lists every file it gathered.
+        The bundle carries your devices' full details, including serial numbers, and nothing that
+        identifies the machine or you; review it before attaching it.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, including any error text, exactly as printed.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+  - type: input
+    id: command
+    attributes:
+      label: The exact command
+      placeholder: sudo usbtop-ng --once --json
+  - type: textarea
+    id: summary
+    attributes:
+      label: Support summary
+      description: Paste the block `usbtop-ng --support` printed, starting at "usbtop-ng support bundle".
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: bundle
+    attributes:
+      label: Support bundle
+      options:
+        - label: I attached the support bundle (the .tar.gz), or explained above why not
+          required: true
+  - type: textarea
+    id: terminal
+    attributes:
+      label: Terminal and SSH details
+      description: For a display problem, name the terminal program and say whether the session was over SSH.
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else

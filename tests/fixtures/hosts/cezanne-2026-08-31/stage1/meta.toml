@@ -1,0 +1,12 @@
+board = "ROG Strix G513QR_G513QR"
+soc = ""
+arch = "x86_64"
+kernel = "7.0.0-30-generic"
+os = "Linux Mint 22.3"
+usbtop_ng_version = "1.5.0"
+stage_id = 1
+captured_unix = 1788212721
+controllers = ["0000:06:00.3", "0000:06:00.4"]
+speed_classes = ["10000", "12", "480"]
+transfer_types = ["control", "interrupt"]
+sources = ["binary", "text"]

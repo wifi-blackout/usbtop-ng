@@ -1,0 +1,17 @@
+board = "Radxa ROCK 5C"
+soc = "radxa,rock-5c rockchip,rk3588"
+arch = "aarch64"
+kernel = "6.1.84-8-rk2410"
+os = "Debian GNU/Linux 12 (bookworm)"
+usbtop_ng_version = "1.5.0"
+stage_id = 1
+captured_unix = 1788711244
+binary_kernel_dropped = 0
+controllers = ["fc800000.usb", "fc840000.usb", "fc880000.usb", "fc8c0000.usb", "xhci-hcd.6.auto", "xhci-hcd.7.auto"]
+speed_classes = ["12", "480", "5000"]
+transfer_types = ["bulk"]
+sources = ["binary", "text"]
+
+[generator]
+kind = "ambient"
+note = "Ambient capture of the Radxa ROCK 5C (RK3588, six controllers, eight buses, kernel 6.1.84) with its USB2 hub and one device attached. Captured for the connector pairing corpus: the USB3 root port on bus 3 pairs with bus 6 (non-adjacent bus numbers) and buses 4, 5, 7, 8 are USB2-only with unpaired ports."

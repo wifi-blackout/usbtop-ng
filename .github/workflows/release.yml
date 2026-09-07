@@ -1,0 +1,32 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          dir="usbtop-ng-${GITHUB_REF_NAME}-x86_64-linux-gnu"
+          mkdir "$dir"
+          cp target/release/usbtop-ng README.md LICENSE CHANGELOG.md "$dir/"
+          target/release/usbtop-ng --print-man > "$dir/usbtop-ng.1"
+          tar czf "$dir.tar.gz" "$dir"
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="usbtop-ng-${GITHUB_REF_NAME}-x86_64-linux-gnu.tar.gz"
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes "$asset" \
+            || gh release upload "$GITHUB_REF_NAME" "$asset" --clobber

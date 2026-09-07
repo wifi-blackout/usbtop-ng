@@ -1,0 +1,12 @@
+board = "Radxa ROCK 5C"
+soc = "radxa,rock-5c rockchip,rk3588"
+arch = "aarch64"
+kernel = "6.1.84-8-rk2410"
+os = "Debian GNU/Linux 12 (bookworm)"
+usbtop_ng_version = "1.5.0"
+stage_id = 1
+captured_unix = 1788203348
+controllers = ["fc800000.usb", "fc840000.usb", "fc880000.usb", "fc8c0000.usb", "xhci-hcd.6.auto", "xhci-hcd.7.auto"]
+speed_classes = ["12", "480", "5000"]
+transfer_types = ["bulk"]
+sources = ["binary", "text"]

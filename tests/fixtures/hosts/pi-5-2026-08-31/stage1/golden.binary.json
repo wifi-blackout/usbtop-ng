@@ -1,0 +1,115 @@
+{
+  "buses": [
+    {
+      "bus": 1,
+      "controller": "xhci-hcd.0",
+      "devices": [
+        {
+          "address": 1,
+          "bus": 1,
+          "endpoints": [],
+          "estimated": false,
+          "internal": true,
+          "port": "",
+          "product": "xHCI Host Controller",
+          "product_id": "0002",
+          "rx_bps": 0.0,
+          "speed_mbps": 480.0,
+          "total_rx_bytes": 0,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": "Linux 6.6.31+rpt-rpi-2712 xhci-hcd",
+          "vendor_id": "1d6b"
+        }
+      ],
+      "rx_bps": 0.0,
+      "speed_mbps": 480.0,
+      "tx_bps": 0.0
+    },
+    {
+      "bus": 2,
+      "controller": "xhci-hcd.0",
+      "devices": [
+        {
+          "address": 1,
+          "bus": 2,
+          "endpoints": [],
+          "estimated": false,
+          "internal": true,
+          "port": "",
+          "product": "xHCI Host Controller",
+          "product_id": "0003",
+          "rx_bps": 0.0,
+          "speed_mbps": 5000.0,
+          "total_rx_bytes": 0,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": "Linux 6.6.31+rpt-rpi-2712 xhci-hcd",
+          "vendor_id": "1d6b"
+        }
+      ],
+      "rx_bps": 0.0,
+      "speed_mbps": 5000.0,
+      "tx_bps": 0.0
+    },
+    {
+      "bus": 3,
+      "controller": "xhci-hcd.1",
+      "devices": [
+        {
+          "address": 1,
+          "bus": 3,
+          "endpoints": [],
+          "estimated": false,
+          "internal": true,
+          "port": "",
+          "product": "xHCI Host Controller",
+          "product_id": "0002",
+          "rx_bps": 0.0,
+          "speed_mbps": 480.0,
+          "total_rx_bytes": 0,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": "Linux 6.6.31+rpt-rpi-2712 xhci-hcd",
+          "vendor_id": "1d6b"
+        }
+      ],
+      "rx_bps": 0.0,
+      "speed_mbps": 480.0,
+      "tx_bps": 0.0
+    },
+    {
+      "bus": 4,
+      "controller": "xhci-hcd.1",
+      "devices": [
+        {
+          "address": 1,
+          "bus": 4,
+          "endpoints": [],
+          "estimated": false,
+          "internal": true,
+          "port": "",
+          "product": "xHCI Host Controller",
+          "product_id": "0003",
+          "rx_bps": 0.0,
+          "speed_mbps": 5000.0,
+          "total_rx_bytes": 0,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": "Linux 6.6.31+rpt-rpi-2712 xhci-hcd",
+          "vendor_id": "1d6b"
+        }
+      ],
+      "rx_bps": 0.0,
+      "speed_mbps": 5000.0,
+      "tx_bps": 0.0
+    }
+  ],
+  "dropped_packets": 0,
+  "kernel_dropped_packets": 0,
+  "source": "binary",
+  "total_rx_bps": 0.0,
+  "total_tx_bps": 0.0,
+  "version": 1,
+  "window_seconds": 1.0
+}

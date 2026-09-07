@@ -1,0 +1,12 @@
+board = "Raspberry Pi 5 Model B Rev 1.0"
+soc = "raspberrypi,5-model-b brcm,bcm2712"
+arch = "aarch64"
+kernel = "6.6.31+rpt-rpi-2712"
+os = "Debian GNU/Linux 12 (bookworm)"
+usbtop_ng_version = "1.5.0"
+stage_id = 1
+captured_unix = 1788181302
+controllers = ["xhci-hcd.0", "xhci-hcd.1"]
+speed_classes = ["480", "5000"]
+transfer_types = []
+sources = ["binary", "text"]

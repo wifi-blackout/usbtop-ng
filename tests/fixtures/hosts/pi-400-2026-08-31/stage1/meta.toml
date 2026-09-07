@@ -1,0 +1,12 @@
+board = "Raspberry Pi 400 Rev 1.1"
+soc = "raspberrypi,400 brcm,bcm2711"
+arch = "aarch64"
+kernel = "6.18.39+rpt-rpi-v8"
+os = "Debian GNU/Linux 13 (trixie)"
+usbtop_ng_version = "1.5.0"
+stage_id = 1
+captured_unix = 1788181430
+controllers = ["0000:01:00.0"]
+speed_classes = ["1.5", "480", "5000"]
+transfer_types = ["bulk", "control"]
+sources = ["binary", "text"]

@@ -1,0 +1,26 @@
+# usbtop-ng preferences example
+#
+# usbtop-ng creates its default preference file at:
+#   ~/.usbtop-ng/preferences.toml
+#
+# You can copy this file there, or pass a custom path with:
+#   usbtop-ng --config /path/to/preferences.toml
+
+# If false, usbtop-ng asks before running `sudo modprobe usbmon` when usbmon is missing.
+# If true, usbtop-ng automatically tries to load usbmon when live monitoring needs it.
+auto_load_usbmon = false
+
+# If false, usbtop-ng asks on quit whether to unload usbmon when usbtop-ng loaded it.
+# If true, usbtop-ng automatically runs `sudo modprobe -r usbmon` on exit, but only
+# when usbtop-ng loaded usbmon for this session.
+unload_usbmon_on_exit = false
+
+# If false, idle devices (no active transfer) show in the device table.
+# If true, usbtop-ng hides idle devices. Press `i` in the UI to toggle this
+# and save the choice here.
+hide_idle_devices = false
+
+# Path to a usb.ids database file for device names. Overrides the downloaded
+# copy (~/.usbtop-ng/usb.ids) and the distro package; the --usbids flag
+# overrides this in turn. Unset by default (no line here).
+# usbids_path = "/path/to/usb.ids"

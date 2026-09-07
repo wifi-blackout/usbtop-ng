@@ -1,0 +1,17 @@
+board = "ZenBook UX363EA_UX363EA"
+soc = ""
+arch = "x86_64"
+kernel = "7.0.0-30-generic"
+os = "Linux Mint 22.3"
+usbtop_ng_version = "1.5.0"
+stage_id = 4
+captured_unix = 1788322037
+binary_kernel_dropped = 0
+controllers = ["0000:00:0d.0", "0000:00:14.0"]
+speed_classes = ["1.5", "10000", "12", "480", "5000"]
+transfer_types = ["bulk"]
+sources = ["binary", "text"]
+
+[generator]
+kind = "bulk-dd"
+note = "dd if=/dev/sdb of=/dev/null bs=4M iflag=direct from the FlashDisk (1aa6:0201, 963 MB, 480 Mbps) two hubs deep on bus 3 (root -> RTS5411 -> FE 2.1), ladder stage 7 behind-the-hub placement, bounded by timeout 24 inside the window: 264,270,844 bytes bulk IN, about 11 MB/s, with the text and binary goldens agreeing to the byte and binary_kernel_dropped = 0."

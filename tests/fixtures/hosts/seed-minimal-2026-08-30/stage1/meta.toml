@@ -1,0 +1,12 @@
+board = "seed"
+soc = ""
+arch = "x86_64"
+kernel = "seed"
+os = "seed"
+usbtop_ng_version = "0.0.0"
+stage_id = 1
+captured_unix = 0
+controllers = ["0000:00:14.0"]
+speed_classes = ["480"]
+transfer_types = ["bulk"]
+sources = ["binary", "text"]

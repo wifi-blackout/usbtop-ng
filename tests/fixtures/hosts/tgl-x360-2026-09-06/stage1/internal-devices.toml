@@ -1,0 +1,36 @@
+captured_unix = 1788714952
+
+[[devices]]
+port_path = "3-10"
+vendor_id = "8087"
+product_id = "0026"
+
+[[devices]]
+port_path = "3-6"
+vendor_id = "0408"
+product_id = "5423"
+
+[[devices]]
+port_path = "3-7"
+vendor_id = "04f3"
+product_id = "0c00"
+
+[[devices]]
+port_path = "usb1"
+vendor_id = "1d6b"
+product_id = "0002"
+
+[[devices]]
+port_path = "usb2"
+vendor_id = "1d6b"
+product_id = "0003"
+
+[[devices]]
+port_path = "usb3"
+vendor_id = "1d6b"
+product_id = "0002"
+
+[[devices]]
+port_path = "usb4"
+vendor_id = "1d6b"
+product_id = "0003"

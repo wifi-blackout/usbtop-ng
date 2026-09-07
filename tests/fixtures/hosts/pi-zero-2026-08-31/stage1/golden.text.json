@@ -1,0 +1,37 @@
+{
+  "buses": [
+    {
+      "bus": 1,
+      "controller": "20980000.usb",
+      "devices": [
+        {
+          "address": 1,
+          "bus": 1,
+          "endpoints": [],
+          "estimated": false,
+          "internal": true,
+          "port": "",
+          "product": "DWC OTG Controller",
+          "product_id": "0002",
+          "rx_bps": 0.0,
+          "speed_mbps": 480.0,
+          "total_rx_bytes": 0,
+          "total_tx_bytes": 0,
+          "tx_bps": 0.0,
+          "vendor": "Linux 6.12.96+rpt-rpi-v6 dwc_otg_hcd",
+          "vendor_id": "1d6b"
+        }
+      ],
+      "rx_bps": 0.0,
+      "speed_mbps": 480.0,
+      "tx_bps": 0.0
+    }
+  ],
+  "dropped_packets": 0,
+  "kernel_dropped_packets": 0,
+  "source": "text",
+  "total_rx_bps": 0.0,
+  "total_tx_bps": 0.0,
+  "version": 1,
+  "window_seconds": 1.0
+}
