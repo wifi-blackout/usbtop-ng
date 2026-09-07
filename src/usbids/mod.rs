@@ -588,12 +588,15 @@ fn check_payload_size(len: usize) -> Result<()> {
 /// original stale file if the remove somehow didn't clear it, a symlink an
 /// attacker planted, or a file an attacker recreated in the gap -- makes the
 /// open fail instead of being written through.
-fn write_quarantine_file(quarantine: &Path, payload: &str) -> Result<()> {
-    let _ = std::fs::remove_file(quarantine);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(quarantine)
+fn write_quarantine_file(
+    dir: &crate::config::PinnedDir,
+    name: &std::ffi::OsStr,
+    payload: &str,
+) -> Result<()> {
+    let quarantine = dir.join(name);
+    let _ = dir.unlink(name);
+    let mut file = dir
+        .create_new(name, 0o644)
         .with_context(|| format!("creating quarantine file {}", quarantine.display()))?;
     file.write_all(payload.as_bytes())
         .with_context(|| format!("writing quarantine file {}", quarantine.display()))?;
@@ -602,7 +605,7 @@ fn write_quarantine_file(quarantine: &Path, payload: &str) -> Result<()> {
     // eventual same-directory rename into `dest` (in `pull_usbids`, below)
     // preserves this ownership, so nothing needs to chown `dest` again after
     // the rename.
-    crate::config::chown_created_to_invoker(quarantine, file.as_raw_fd());
+    crate::config::chown_created_to_invoker(&quarantine, file.as_raw_fd());
     Ok(())
 }
 
@@ -663,8 +666,17 @@ pub fn pull_usbids(dest: &Path, chain_paths: &[&Path]) -> Result<()> {
     if let Some(parent) = dest.parent() {
         crate::config::ensure_private_config_dir(parent)?;
     }
+    // One directory, held open for the quarantine write and the rename that
+    // installs it: both name entries of that same open directory (see
+    // `config::PinnedDir`), so nothing between them can redirect either.
+    let dir = crate::config::PinnedDir::for_file(dest)
+        .with_context(|| format!("opening the directory of {}", dest.display()))?;
     let quarantine = dest.with_extension("ids.tmp");
-    write_quarantine_file(&quarantine, &payload)?;
+    let (Some(quarantine_name), Some(dest_name)) = (quarantine.file_name(), dest.file_name())
+    else {
+        anyhow::bail!("{} has no file name", dest.display());
+    };
+    write_quarantine_file(&dir, quarantine_name, &payload)?;
 
     // The floor is the newer of the file about to be replaced and the
     // active source in the chain (not the chain-wide newest). On a first
@@ -677,7 +689,7 @@ pub fn pull_usbids(dest: &Path, chain_paths: &[&Path]) -> Result<()> {
     let summary = match validated {
         Ok(s) => s,
         Err(e) => {
-            let _ = std::fs::remove_file(&quarantine);
+            let _ = dir.unlink(quarantine_name);
             return Err(e);
         }
     };
@@ -697,8 +709,8 @@ pub fn pull_usbids(dest: &Path, chain_paths: &[&Path]) -> Result<()> {
     // here -- doing one would mean re-resolving `dest` as a path after the
     // rename, exactly the kind of post-hoc path lookup this module no
     // longer does.
-    if let Err(e) = std::fs::rename(&quarantine, dest) {
-        let _ = std::fs::remove_file(&quarantine);
+    if let Err(e) = dir.rename(quarantine_name, dest_name) {
+        let _ = dir.unlink(quarantine_name);
         return Err(e).with_context(|| format!("installing {}", dest.display()));
     }
     println!("installed {} ({})", dest.display(), fmt_date(summary.date));
@@ -1241,8 +1253,12 @@ C 03  HID (Human Interface Device)
         let quarantine = temp.path().join("usb.ids.tmp");
         std::os::unix::fs::symlink(&canary, &quarantine).unwrap();
 
-        write_quarantine_file(&quarantine, "0430  Fujitsu Component Limited\n")
-            .expect("stale symlink is removed and replaced, not written through");
+        write_quarantine_file(
+            &crate::config::PinnedDir::for_file(&quarantine).unwrap(),
+            quarantine.file_name().unwrap(),
+            "0430  Fujitsu Component Limited\n",
+        )
+        .expect("stale symlink is removed and replaced, not written through");
 
         assert_eq!(
             std::fs::read_to_string(&canary).unwrap(),

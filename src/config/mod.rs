@@ -1,9 +1,11 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ffi::{CString, OsStr};
 use std::fs;
-use std::io::Write;
-use std::os::fd::{AsRawFd, RawFd};
+use std::io::{self, Write};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -73,7 +75,6 @@ fn home_of_uid(uid: u32) -> Option<PathBuf> {
 /// otherwise leave the retry unexercised).
 fn home_of_uid_with_buffer(uid: u32, mut capacity: usize) -> Option<PathBuf> {
     use std::ffi::CStr;
-    use std::os::unix::ffi::OsStrExt;
 
     loop {
         let mut buffer = vec![0u8; capacity];
@@ -269,6 +270,205 @@ pub fn chown_created_to_invoker(path: &Path, fd: RawFd) {
     }
 }
 
+/// What an `lstat` of a directory entry found.
+#[derive(Debug, PartialEq, Eq)]
+enum EntryKind {
+    Missing,
+    Symlink,
+    RegularFile,
+    Other,
+}
+
+/// A directory held open for the writes that follow, so that a check made
+/// on it and the create, rename, and unlink that trust that check all act
+/// on the same inode: swapping the directory for a symlink after the open
+/// changes nothing for an `openat(2)` or `renameat(2)` relative to the
+/// descriptor. Under sudo, a directory that lexically claims to sit inside
+/// the invoker's home is verified, through the very descriptor it was just
+/// opened as, to really be there (see [`PinnedDir::for_file`]). This is the
+/// support bundle's pinned-root pattern applied to the config directory.
+pub struct PinnedDir {
+    dir: fs::File,
+    path: PathBuf,
+}
+
+impl PinnedDir {
+    /// Open the directory that holds (or will hold) `file`.
+    ///
+    /// Ancestors may be symlinks -- a dotfiles checkout inside the home, or
+    /// `/home -> /var/home` -- so the open follows them; what is judged is
+    /// the directory actually opened. Under sudo, when `file` lexically
+    /// claims a place inside the invoker's home, the directory's real
+    /// location (read back through `/proc/self/fd`) must lie inside the
+    /// resolved home too, else the open is refused: root writes into the
+    /// invoker's home and nowhere else, and an `~/.usbtop-ng` swapped for a
+    /// link to somewhere else is caught at every write, not only at
+    /// startup. An explicit path outside the home (`--config`, `--usbids`)
+    /// is the invoker's own choice and is not second-guessed; without sudo
+    /// there is no privilege boundary at all.
+    pub fn for_file(file: &Path) -> io::Result<PinnedDir> {
+        let dir_path = match file.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let home = sudo_invoker().map(|invoker| invoker.home);
+        Self::open(&dir_path, file, home.as_deref())
+    }
+
+    /// [`PinnedDir::for_file`]'s body with the invoker's home as a
+    /// parameter, so the containment rule is testable without root.
+    fn open(dir_path: &Path, claimed: &Path, invoker_home: Option<&Path>) -> io::Result<PinnedDir> {
+        let dir = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(dir_path)?;
+        if let Some(home) = invoker_home {
+            if is_within(claimed, home) {
+                let actual = fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd()))?;
+                let home_resolved =
+                    resolve_for_containment_check(home).unwrap_or_else(|| home.to_path_buf());
+                if !is_within(&actual, &home_resolved) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "{} resolves to {}, outside the invoking user's home {}; \
+                             refusing to write there as root",
+                            dir_path.display(),
+                            actual.display(),
+                            home.display()
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(PinnedDir {
+            dir,
+            path: dir_path.to_path_buf(),
+        })
+    }
+
+    /// The path this directory was opened as, joined with `name`: for
+    /// messages, and for the chown *decision* (see
+    /// [`chown_created_to_invoker`], whose act is fd-based).
+    pub fn join(&self, name: &OsStr) -> PathBuf {
+        self.path.join(name)
+    }
+
+    fn c_name(name: &OsStr) -> io::Result<CString> {
+        CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "file name contains a NUL byte")
+        })
+    }
+
+    /// `lstat` of the entry `name`: a symlink is reported as itself.
+    fn entry_kind(&self, name: &OsStr) -> io::Result<EntryKind> {
+        let name = Self::c_name(name)?;
+        // SAFETY: `stat` is plain data for which all-zero is a valid value.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: matches sys/stat.h, `int fstatat(int dirfd, const char
+        // *pathname, struct stat *buf, int flags)`: `name` is NUL-terminated,
+        // `st` is valid for the write, `AT_SYMLINK_NOFOLLOW` reports a link
+        // as itself. Returns 0, else -1 with errno set.
+        let rc = unsafe {
+            libc::fstatat(
+                self.dir.as_raw_fd(),
+                name.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            let e = io::Error::last_os_error();
+            return if e.kind() == io::ErrorKind::NotFound {
+                Ok(EntryKind::Missing)
+            } else {
+                Err(e)
+            };
+        }
+        Ok(match st.st_mode & libc::S_IFMT {
+            libc::S_IFLNK => EntryKind::Symlink,
+            libc::S_IFREG => EntryKind::RegularFile,
+            _ => EntryKind::Other,
+        })
+    }
+
+    fn open_with(
+        &self,
+        name: &OsStr,
+        flags: libc::c_int,
+        mode: libc::mode_t,
+    ) -> io::Result<fs::File> {
+        let name = Self::c_name(name)?;
+        // SAFETY: matches fcntl.h, `int openat(int dirfd, const char
+        // *pathname, int flags, mode_t mode)`: `name` is NUL-terminated and
+        // the mode is the variadic argument `O_CREAT` requires. Returns a
+        // descriptor nobody else owns (so `from_raw_fd` may take it), else
+        // -1 with errno set. `O_NOFOLLOW` refuses a symlink at `name`.
+        let fd = unsafe {
+            libc::openat(
+                self.dir.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                mode as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a fresh descriptor this call owns.
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+
+    /// Create `name` for writing, failing if anything is there already.
+    pub fn create_new(&self, name: &OsStr, mode: libc::mode_t) -> io::Result<fs::File> {
+        self.open_with(name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, mode)
+    }
+
+    /// Open `name` read-write, creating it if absent; never truncates.
+    pub fn open_or_create(&self, name: &OsStr, mode: libc::mode_t) -> io::Result<fs::File> {
+        self.open_with(name, libc::O_RDWR | libc::O_CREAT, mode)
+    }
+
+    /// Remove the entry `name`; a symlink is removed as itself.
+    pub fn unlink(&self, name: &OsStr) -> io::Result<()> {
+        let name = Self::c_name(name)?;
+        // SAFETY: matches unistd.h, `int unlinkat(int dirfd, const char
+        // *pathname, int flags)`; flags 0 names a non-directory entry.
+        // Returns 0, else -1 with errno set.
+        if unsafe { libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Rename `from` to `to` inside this directory, atomically replacing
+    /// whatever `to` names.
+    pub fn rename(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        let from = Self::c_name(from)?;
+        let to = Self::c_name(to)?;
+        // SAFETY: matches stdio.h, `int renameat(int olddirfd, const char
+        // *oldpath, int newdirfd, const char *newpath)`, both relative to
+        // this one descriptor. Returns 0, else -1 with errno set.
+        let rc = unsafe {
+            libc::renameat(
+                self.dir.as_raw_fd(),
+                from.as_ptr(),
+                self.dir.as_raw_fd(),
+                to.as_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// `fsync` the directory itself, which is what makes a rename durable.
+    fn sync(&self) -> io::Result<()> {
+        self.dir.sync_all()
+    }
+}
+
 /// Replace the contents of `path` atomically: write `bytes` to a fresh
 /// temporary file in the same directory, fsync it, chown it to the invoking
 /// user via [`chown_created_to_invoker`], and rename it over `path`. At no
@@ -277,53 +477,51 @@ pub fn chown_created_to_invoker(path: &Path, fd: RawFd) {
 /// error and nothing else changes. `rename(2)` within one directory is
 /// atomic -- a reader sees either the old file or the new one, never a
 /// half-written one -- and the fsync before it is what makes the new
-/// contents durable rather than merely visible. Refuses a symlink present
-/// at `path` when the call starts (the rename would swap the link for a
-/// regular file, silently changing what the user pointed it at); that check
-/// is not atomic with the rename, so a symlink planted afterwards is
-/// replaced by it -- never written through, because `rename(2)` does not
-/// follow the final component of either operand.
+/// contents durable rather than merely visible.
 ///
-/// The temporary file is `<file_name>.<pid>.tmp` beside the target, created
-/// with `create_new` (`O_CREAT|O_EXCL`) and mode 0600. The pid is what makes
-/// concurrent replacements safe: a CLI `--forget-internal` and the TUI's `S`
-/// key running at once each rename only the inode they opened, instead of
-/// unlinking each other's in-flight temp file and renaming the wrong one
-/// over the target. Nothing belonging to a live writer is ever cleaned up on
-/// the way in; the one exception is a *regular file* already at this
-/// process's own temp name, which pid reuse makes possible and which can
-/// only be a dead run's leftover -- that one is removed and the create
-/// retried exactly once. Anything else there (a directory, a planted
-/// symlink) fails the call before a single byte is written. The
-/// parent directory is fsynced after the rename on a best-effort basis: the
-/// rename is already durable enough for the caller's purposes once it
-/// returns, and a failure there is logged, not raised.
-pub fn replace_file_owned(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("refusing to replace a symlink at {}", path.display()),
-        ));
-    }
+/// Every step is relative to the directory held open by [`PinnedDir`]: the
+/// symlink check on `path`, the temp file's create, the rename, and the
+/// cleanup all name entries of that one open directory, so a directory
+/// swapped for a symlink after the open (or, under sudo, one that never was
+/// inside the invoker's home -- see [`PinnedDir::for_file`]) cannot redirect
+/// any of them. Refuses a symlink present at `path` when the call starts
+/// (the rename would swap the link for a regular file and the link's target
+/// would never change, which is not what a caller replacing "the file at
+/// `path`" means).
+///
+/// The temporary file is `<name>.<pid>.tmp`, opened with `O_CREAT|O_EXCL`
+/// and mode 0600. The pid is what makes concurrent replacements safe: a CLI
+/// `--forget-internal` and the TUI's `S` key running at once each rename
+/// only the inode they opened, instead of unlinking each other's in-flight
+/// temp file and renaming the wrong one over the target. Nothing belonging
+/// to a live writer is ever cleaned up on the way in; the one exception is
+/// a *regular file* already at this process's own temp name, which pid
+/// reuse makes possible and which can only be a dead run's leftover -- that
+/// one is removed and the create retried exactly once. Anything else there
+/// (a directory, a planted symlink) fails the call before a single byte is
+/// written. The directory is fsynced after the rename on a best-effort
+/// basis: the rename is already durable enough for the caller's purposes
+/// once it returns, and a failure there is logged, not raised.
+pub fn replace_file_owned(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let Some(file_name) = path.file_name() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
             format!("{} has no file name", path.display()),
         ));
     };
+    let dir = PinnedDir::for_file(path)?;
+    if dir.entry_kind(file_name)? == EntryKind::Symlink {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to replace a symlink at {}", path.display()),
+        ));
+    }
     let mut tmp_name = file_name.to_os_string();
     tmp_name.push(format!(".{}.tmp", std::process::id()));
-    let tmp = path.with_file_name(tmp_name);
 
-    let mut options = fs::OpenOptions::new();
-    options
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW);
-    let mut file = match options.open(&tmp) {
+    let mut file = match dir.create_new(&tmp_name, 0o600) {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             // Pids are reused, so this name can already be taken: by a run
             // killed after creating its temp file, whose pid this process
             // now carries. No live process shares our pid, so a *regular
@@ -331,37 +529,36 @@ pub fn replace_file_owned(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             // it can only be that dead run's leftover -- and is safe to
             // clear before retrying the create exactly once. Anything else
             // is not ours to touch: a directory, a symlink someone planted
-            // (which `remove_file` would happily unlink), or metadata we
-            // cannot even read all fail the call, as does a retry that still
+            // (which an unlink would happily remove), or an entry we cannot
+            // even stat all fail the call, as does a retry that still
             // cannot create the file.
-            if !fs::symlink_metadata(&tmp)?.file_type().is_file() {
+            if dir.entry_kind(&tmp_name)? != EntryKind::RegularFile {
                 return Err(e);
             }
-            fs::remove_file(&tmp)?;
-            options.open(&tmp)?
+            dir.unlink(&tmp_name)?;
+            dir.create_new(&tmp_name, 0o600)?
         }
         Err(e) => return Err(e),
     };
     // The chown acts on the fd this call just created, not a re-resolved
     // path (see [`chown_created_to_invoker`]); `rename(2)` renames an entry,
     // it does not touch the inode's ownership, so `path` inherits it.
+    let tmp_path = dir.join(&tmp_name);
     let written = file
         .write_all(bytes)
         .and_then(|()| file.sync_all())
-        .map(|()| chown_created_to_invoker(&tmp, file.as_raw_fd()));
+        .map(|()| chown_created_to_invoker(&tmp_path, file.as_raw_fd()));
     drop(file);
-    if let Err(e) = written.and_then(|()| fs::rename(&tmp, path)) {
-        let _ = fs::remove_file(&tmp);
+    if let Err(e) = written.and_then(|()| dir.rename(&tmp_name, file_name)) {
+        let _ = dir.unlink(&tmp_name);
         return Err(e);
     }
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        if let Err(e) = fs::File::open(parent).and_then(|dir| dir.sync_all()) {
-            log::debug!(
-                "could not fsync {} after replacing {}: {e}",
-                parent.display(),
-                path.display()
-            );
-        }
+    if let Err(e) = dir.sync() {
+        log::debug!(
+            "could not fsync {} after replacing {}: {e}",
+            dir.path.display(),
+            path.display()
+        );
     }
     Ok(())
 }
@@ -494,6 +691,9 @@ pub fn ensure_private_config_dir(dir: &Path) -> Result<()> {
 /// already skips such a path (see [`chown_created_to_invoker`]); the writes
 /// must not proceed either. Both sides are resolved on the real filesystem
 /// so a symlinked home (`/home -> /var/home`) compares equal to itself.
+/// This startup check fails fast with a clear message; the guarantee that
+/// survives a directory swapped *after* startup is [`PinnedDir`], which
+/// every write goes through.
 fn refuse_escape_from_home(dir: &Path, home: &Path) -> Result<()> {
     let resolved = resolve_for_containment_check(dir)
         .ok_or_else(|| anyhow!("config directory {} could not be resolved", dir.display()))?;
@@ -651,6 +851,84 @@ mod tests {
             .to_string();
         assert!(err.contains("outside the invoking user's home"), "{err}");
         assert!(err.contains(&outside.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn pinned_dir_refuses_a_directory_that_escapes_the_invokers_home() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(home.join("dotfiles").join("usbtop-ng")).unwrap();
+        fs::create_dir_all(home.join(".plain")).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(
+            home.join("dotfiles").join("usbtop-ng"),
+            home.join(".inside-link"),
+        )
+        .unwrap();
+        symlink(&outside, home.join(".escape")).unwrap();
+
+        let open = |dir: PathBuf| {
+            let claimed = dir.join("preferences.toml");
+            PinnedDir::open(&dir, &claimed, Some(&home)).map(|_| ())
+        };
+        open(home.join(".plain")).expect("a real directory in home");
+        open(home.join(".inside-link")).expect("a link that stays inside home");
+        let err = open(home.join(".escape")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("outside the invoking user's home"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains(&outside.display().to_string()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn pinned_dir_has_no_boundary_without_a_sudo_invoker() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let escape = home.join(".escape");
+        symlink(&outside, &escape).unwrap();
+
+        // Not root acting for someone else: the user's own layout is theirs.
+        PinnedDir::open(&escape, &escape.join("preferences.toml"), None)
+            .expect("no privilege boundary, no refusal");
+    }
+
+    #[test]
+    fn pinned_dir_entries_are_created_renamed_and_unlinked_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = PinnedDir::for_file(&temp.path().join("x")).unwrap();
+        assert_eq!(dir.entry_kind(OsStr::new("a")).unwrap(), EntryKind::Missing);
+        let mut file = dir.create_new(OsStr::new("a"), 0o600).unwrap();
+        file.write_all(b"one").unwrap();
+        drop(file);
+        assert_eq!(
+            dir.entry_kind(OsStr::new("a")).unwrap(),
+            EntryKind::RegularFile
+        );
+        assert!(
+            dir.create_new(OsStr::new("a"), 0o600).is_err(),
+            "create_new must not clobber"
+        );
+        dir.rename(OsStr::new("a"), OsStr::new("b")).unwrap();
+        assert_eq!(fs::read_to_string(temp.path().join("b")).unwrap(), "one");
+        std::os::unix::fs::symlink(temp.path().join("b"), temp.path().join("l")).unwrap();
+        assert_eq!(dir.entry_kind(OsStr::new("l")).unwrap(), EntryKind::Symlink);
+        dir.unlink(OsStr::new("l")).unwrap();
+        assert!(
+            temp.path().join("b").exists(),
+            "unlinking a link leaves its target"
+        );
+        assert_eq!(dir.entry_kind(OsStr::new("l")).unwrap(), EntryKind::Missing);
     }
 
     #[test]

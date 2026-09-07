@@ -214,16 +214,17 @@ impl SnapshotLock {
 
     fn open(snapshot_path: &Path, extra_flock_flags: libc::c_int) -> std::io::Result<SnapshotLock> {
         use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
         let path = lock_path_for(snapshot_path);
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&path)?;
+        let name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "snapshot path has no name",
+            )
+        })?;
+        // Created relative to the pinned directory, so the same containment
+        // rule as the snapshot itself applies (see `config::PinnedDir`).
+        let dir = crate::config::PinnedDir::for_file(&path)?;
+        let file = dir.open_or_create(name, 0o600)?;
         crate::config::chown_created_to_invoker(&path, file.as_raw_fd());
         // SAFETY: `file` owns a valid open descriptor for the whole call;
         // `flock` takes the descriptor and an operation and touches no memory.
