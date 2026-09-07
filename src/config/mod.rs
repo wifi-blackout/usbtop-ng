@@ -25,16 +25,15 @@ pub struct Invoker {
 /// Pure decision logic: is this a root process acting on behalf of another
 /// user under `sudo`, and if so, who? `None` unless every one of these holds:
 /// `euid` is 0, both `sudo_uid` and `sudo_gid` are set and parse as `u32`,
-/// `sudo_uid` is not 0 (root sudo-ing to root changes nothing), and `passwd`
-/// is `Some` text with a line whose 3rd colon-separated field equals
-/// `sudo_uid` and whose 6th field (the home directory) is non-empty.
-/// Malformed lines (too few fields) are skipped, not fatal -- the scan keeps
-/// looking rather than aborting on the first bad line.
+/// `sudo_uid` is not 0 (root sudo-ing to root changes nothing), and
+/// `home_of` knows a non-empty home directory for that uid. `home_of` is the
+/// user-database lookup, injected so the decision can be exercised against
+/// a synthetic passwd table; production passes [`home_of_uid`].
 fn resolve_invoker(
     euid: u32,
     sudo_uid: Option<&str>,
     sudo_gid: Option<&str>,
-    passwd: Option<&str>,
+    home_of: impl Fn(u32) -> Option<PathBuf>,
 ) -> Option<Invoker> {
     if euid != 0 {
         return None;
@@ -44,36 +43,76 @@ fn resolve_invoker(
     if uid == 0 {
         return None;
     }
-    let passwd = passwd?;
-
-    for line in passwd.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() < 6 {
-            continue;
-        }
-        let Ok(line_uid) = fields[2].parse::<u32>() else {
-            continue;
-        };
-        if line_uid != uid {
-            continue;
-        }
-        let home = fields[5];
-        if home.is_empty() {
-            continue;
-        }
-        return Some(Invoker {
-            uid,
-            gid,
-            home: PathBuf::from(home),
-        });
+    let home = home_of(uid)?;
+    if home.as_os_str().is_empty() {
+        return None;
     }
-    None
+    Some(Invoker { uid, gid, home })
+}
+
+/// The home directory of `uid` according to the system's user database,
+/// looked up through `getpwuid_r(3)` so that the Name Service Switch is
+/// consulted: a user that lives in LDAP, SSSD, or another directory service
+/// has no `/etc/passwd` line, and a scan of that file alone would send
+/// their preferences into root's home. `None` when there is no such user,
+/// the entry has no home, or the lookup fails.
+fn home_of_uid(uid: u32) -> Option<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: sysconf(3) reads one scalar and touches no memory of ours.
+    // -1 means "no limit known"; glibc's own fallback is 1024, and 16 KiB is
+    // roomy for any gecos field without being wasteful.
+    let mut capacity = match unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) } {
+        n if n > 0 => n as usize,
+        _ => 16 * 1024,
+    };
+    loop {
+        let mut buffer = vec![0u8; capacity];
+        // SAFETY: `passwd` is a plain struct of integers and pointers, for
+        // which the all-zero bit pattern is a valid value.
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: matches pwd.h, `int getpwuid_r(uid_t, struct passwd *,
+        // char *buf, size_t buflen, struct passwd **result)`: `entry` and
+        // `result` are valid for writes, `buffer` is valid for `buffer.len()`
+        // bytes, and every string pointer the call stores in `entry` points
+        // into `buffer`, which outlives the reads below. Returns 0 on success
+        // (`result` NULL when there is no such uid), else an errno value;
+        // ERANGE means the buffer was too small.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut entry,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            if capacity >= 1 << 20 {
+                return None;
+            }
+            capacity *= 2;
+            continue;
+        }
+        if rc != 0 || result.is_null() || entry.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: `pw_dir` is a NUL-terminated string inside `buffer`
+        // (see above), still alive here.
+        let home = unsafe { CStr::from_ptr(entry.pw_dir) }.to_bytes();
+        if home.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(std::ffi::OsStr::from_bytes(home)));
+    }
 }
 
 /// Production wrapper around [`resolve_invoker`]: reads the real effective
-/// uid, the real `SUDO_UID`/`SUDO_GID` environment, and the real
-/// `/etc/passwd` (an unreadable file resolves the same as a missing one --
-/// `None`). These values cannot change mid-process, so the result is cached.
+/// uid and the real `SUDO_UID`/`SUDO_GID` environment, and resolves the home
+/// through the system user database ([`home_of_uid`]). These values cannot
+/// change mid-process, so the result is cached.
 pub fn sudo_invoker() -> Option<Invoker> {
     static INVOKER: OnceLock<Option<Invoker>> = OnceLock::new();
     INVOKER
@@ -83,13 +122,7 @@ pub fn sudo_invoker() -> Option<Invoker> {
             let euid = unsafe { libc::geteuid() };
             let sudo_uid = std::env::var("SUDO_UID").ok();
             let sudo_gid = std::env::var("SUDO_GID").ok();
-            let passwd = fs::read_to_string("/etc/passwd").ok();
-            resolve_invoker(
-                euid,
-                sudo_uid.as_deref(),
-                sudo_gid.as_deref(),
-                passwd.as_deref(),
-            )
+            resolve_invoker(euid, sudo_uid.as_deref(), sudo_gid.as_deref(), home_of_uid)
         })
         .clone()
 }
@@ -207,7 +240,7 @@ pub fn chown_created_to_invoker(path: &Path, fd: RawFd) {
     let Some(resolved_path) = resolve_for_containment_check(path) else {
         return;
     };
-    // `invoker.home` comes straight from /etc/passwd and is not guaranteed
+    // `invoker.home` comes straight from the user database and is not guaranteed
     // canonical (it could itself sit behind a symlinked ancestor); resolve
     // it the same way so the comparison is apples to apples. A home that
     // cannot be resolved at all falls back to its lexical form -- still
@@ -467,9 +500,26 @@ mod tests {
         malformed line without colons\n\
         alice:x:1000:1000:Alice Example:/home/alice:/bin/bash\n";
 
+    /// A synthetic user database for the resolver tests: the home of `uid`
+    /// from passwd-format text, so the decision logic is exercised without
+    /// the real NSS lookup. Malformed lines (too few fields) are skipped.
+    fn home_from_passwd_text(passwd: &str, uid: u32) -> Option<PathBuf> {
+        passwd.lines().find_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields.len() < 6 || fields[2].parse::<u32>().ok()? != uid {
+                return None;
+            }
+            Some(PathBuf::from(fields[5]))
+        })
+    }
+
+    fn table(uid: u32) -> Option<PathBuf> {
+        home_from_passwd_text(PASSWD, uid)
+    }
+
     #[test]
     fn resolver_finds_the_invoking_users_home() {
-        let inv = resolve_invoker(0, Some("1000"), Some("1000"), Some(PASSWD)).unwrap();
+        let inv = resolve_invoker(0, Some("1000"), Some("1000"), table).unwrap();
         assert_eq!(inv.uid, 1000);
         assert_eq!(inv.gid, 1000);
         assert_eq!(inv.home, PathBuf::from("/home/alice"));
@@ -478,29 +528,29 @@ mod tests {
     #[test]
     fn resolver_is_none_without_full_sudo_context() {
         assert!(
-            resolve_invoker(1000, Some("1000"), Some("1000"), Some(PASSWD)).is_none(),
+            resolve_invoker(1000, Some("1000"), Some("1000"), table).is_none(),
             "not root"
         );
-        assert!(resolve_invoker(0, None, Some("1000"), Some(PASSWD)).is_none());
-        assert!(resolve_invoker(0, Some("1000"), None, Some(PASSWD)).is_none());
+        assert!(resolve_invoker(0, None, Some("1000"), table).is_none());
+        assert!(resolve_invoker(0, Some("1000"), None, table).is_none());
         assert!(
-            resolve_invoker(0, Some("0"), Some("0"), Some(PASSWD)).is_none(),
+            resolve_invoker(0, Some("0"), Some("0"), table).is_none(),
             "root sudo root"
         );
-        assert!(resolve_invoker(0, Some("abc"), Some("1000"), Some(PASSWD)).is_none());
+        assert!(resolve_invoker(0, Some("abc"), Some("1000"), table).is_none());
         assert!(
-            resolve_invoker(0, Some("4242"), Some("4242"), Some(PASSWD)).is_none(),
-            "uid not in passwd"
+            resolve_invoker(0, Some("4242"), Some("4242"), table).is_none(),
+            "uid not in the user database"
         );
         assert!(
-            resolve_invoker(0, Some("1000"), Some("1000"), None).is_none(),
-            "passwd unreadable"
+            resolve_invoker(0, Some("1000"), Some("1000"), |_| None).is_none(),
+            "user database unavailable"
         );
     }
 
     #[test]
     fn resolver_skips_malformed_passwd_lines() {
-        let inv = resolve_invoker(0, Some("1000"), Some("1000"), Some(PASSWD));
+        let inv = resolve_invoker(0, Some("1000"), Some("1000"), table);
         assert!(
             inv.is_some(),
             "the malformed line above alice's must not abort the scan"
@@ -510,7 +560,27 @@ mod tests {
     #[test]
     fn resolver_rejects_an_empty_home_field() {
         let text = "ghost:x:1000:1000:g::/bin/bash\n";
-        assert!(resolve_invoker(0, Some("1000"), Some("1000"), Some(text)).is_none());
+        assert!(
+            resolve_invoker(0, Some("1000"), Some("1000"), |uid| home_from_passwd_text(
+                text, uid
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn home_of_uid_resolves_root_through_the_user_database() {
+        // Every Linux install has root in the user database, and its home
+        // is /root; this goes through getpwuid_r, so it also proves the
+        // buffer-sizing loop works on the real libc.
+        assert_eq!(home_of_uid(0), Some(PathBuf::from("/root")));
+    }
+
+    #[test]
+    fn home_of_uid_is_none_for_an_unknown_uid() {
+        // 0xFFFF_FFF0: far above any allocated range but below the
+        // sentinel (uid_t)-1 that some libcs treat specially.
+        assert_eq!(home_of_uid(0xFFFF_FFF0), None);
     }
 
     #[test]
