@@ -156,7 +156,13 @@ See [TUI chassis](#tui-chassis) for how these fit together.
 - The file is created with both keys set to `false` when it does not exist.
 - `ensure_private_config_dir` creates the default `~/.usbtop-ng` directory with
   mode 0700. An existing directory keeps its own mode, and so does a custom
-  `--config` parent.
+  `--config` parent. Under `sudo`, an existing directory that resolves outside
+  the invoking user's home is an error, at startup and again at each write:
+  every file in the directory is created, renamed, and removed relative to a
+  descriptor (`PinnedDir`) verified through `/proc/self/fd`, so a directory
+  swapped for a symlink cannot redirect a root write. A symlink that stays
+  inside the home is allowed; a `--config` or `--usbids` path is the
+  invoker's own choice and is not checked.
 - `HOME` locates the default path. usbtop-ng fails with a message naming `HOME`
   when it is unset.
 

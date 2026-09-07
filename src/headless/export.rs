@@ -113,10 +113,13 @@ impl ReportSink {
         // resolves. (`fs.protected_symlinks` already blocks the sticky-dir
         // case on most kernels; this closes the rest.)
         let file = if let Some(fd) = inherited_descriptor(path) {
-            // SAFETY: dup(2) takes one descriptor and returns a fresh one
-            // (or -1 with errno). The new descriptor is owned by nobody
-            // else, so `from_raw_fd` may take it over.
-            let duplicate = unsafe { libc::dup(fd) };
+            // SAFETY: matches fcntl.h, `int fcntl(int fd, int cmd, ...)`;
+            // `F_DUPFD_CLOEXEC` with a lowest-fd argument of 0 returns a
+            // fresh duplicate with close-on-exec set (plain `dup(2)` would
+            // clear it, and no child of this process should inherit the
+            // report file), or -1 with errno set. The new descriptor is
+            // owned by nobody else, so `from_raw_fd` may take it over.
+            let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
             if duplicate < 0 {
                 let e = io::Error::last_os_error();
                 return Err(io::Error::new(

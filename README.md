@@ -509,7 +509,11 @@ says, and the snapshot is the one list you control.
 - usbtop-ng reads the preferences file at `~/.usbtop-ng/preferences.toml` and
   creates it on first run.
 - usbtop-ng creates `~/.usbtop-ng` with mode 0700. An existing directory keeps
-  its own mode, and so does a directory named by `--config`.
+  its own mode, and so does a directory named by `--config`. Under `sudo`, an
+  existing `~/.usbtop-ng` that resolves outside the invoking user's home (a
+  symlink to another user's directory, or to another mount) is refused, at
+  startup and at every write; a symlink that stays inside the home is fine,
+  and `--config` names a preferences path that is not second-guessed.
 
 ### Tests
 

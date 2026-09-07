@@ -1168,7 +1168,11 @@ mod tests {
     }
 
     #[test]
-    fn ensure_private_config_dir_refuses_a_dangling_symlink_and_creates_nothing() {
+    fn ensure_private_config_dir_does_not_create_through_a_dangling_symlink() {
+        // Characterization, not a guard: `mkdir(2)` itself refuses a path
+        // that is a dangling link (EEXIST), so nothing is ever created at
+        // the link's target. The guard against a link to an existing
+        // directory is `set_private_dir_permissions_refuses_a_symlink...`.
         use std::os::unix::fs::symlink;
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("never-made");

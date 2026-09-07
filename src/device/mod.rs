@@ -61,8 +61,8 @@ pub struct UsbDevice {
 /// U+2066..=U+2069, U+200E, U+200F, U+061C), which are not controls but make
 /// a terminal draw the rest of the line backwards. Printable text, including
 /// non-ASCII, passes through untouched. The support bundle's device
-/// inventory deliberately keeps the raw text: TOML escapes control
-/// characters, and a bundle is evidence of what the device actually sent.
+/// inventory deliberately keeps the raw text: TOML escapes the C0 controls
+/// and DEL, and a bundle is evidence of what the device actually sent.
 fn printable(text: &str) -> String {
     fn reorders_text(c: char) -> bool {
         matches!(
