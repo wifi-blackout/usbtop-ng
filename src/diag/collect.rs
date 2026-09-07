@@ -559,7 +559,12 @@ pub fn collect_config(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| dir.join("preferences.toml"));
     let preferences = match std::fs::read_to_string(&preferences_file) {
-        Ok(text) => Some(redactor.text(&text)),
+        // Home paths first, then the user's free-form connector labels: the
+        // bundle is published, and a label can name a room or a person.
+        Ok(text) => {
+            let text = redactor.text(&text);
+            Some(redactor.connector_names(&text))
+        }
         Err(e) => {
             notes.push(note("preferences.toml", format!("could not read: {e}")));
             None
@@ -1010,6 +1015,49 @@ mod tests {
         );
         assert_eq!(info.sudo_resolution, "home resolved to ~ (sudo invoker)");
         assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// The preferences copy is published with the bundle: the user's
+    /// free-form connector labels must leave as `<redacted>`, keys intact,
+    /// after the home-path pass has already run over the same text.
+    #[test]
+    fn config_info_masks_connector_names_in_the_preferences_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home").join("alice");
+        let dir = home.join(".usbtop-ng");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("preferences.toml"),
+            format!(
+                "usbids_path = \"{}/usb.ids\"\n\n[connector_names]\n\"3:1\" = \"Alice's desk, room 12\"\n\"3-1-port4\" = \"Rear Right Type-C\"\n",
+                home.display()
+            ),
+        )
+        .unwrap();
+        let prefs = dir.join("preferences.toml");
+        let mut r = Redactor::new(Some(home.as_path()));
+        let (info, _) = collect_config(Some(dir.as_path()), Some(prefs.as_path()), false, &mut r);
+        let copy = info.preferences.expect("preferences copied");
+        let table: toml::Table = copy.parse().unwrap();
+        assert_eq!(table["usbids_path"].as_str(), Some("~/usb.ids"));
+        let names = table["connector_names"].as_table().unwrap();
+        assert_eq!(names.len(), 2, "{copy}");
+        assert!(
+            names.values().all(|v| v.as_str() == Some("<redacted>")),
+            "{copy}"
+        );
+        assert!(
+            !copy.contains("Alice") && !copy.contains("Rear Right"),
+            "{copy}"
+        );
+        // The summary also counts the home rewrites of the directory and the
+        // preferences path themselves, so only the connector count is exact.
+        let summary: std::collections::BTreeMap<String, usize> = r.summary().into_iter().collect();
+        assert_eq!(summary.get("connector_name"), Some(&2));
+        assert!(
+            summary.get("home_path").is_some_and(|&n| n >= 1),
+            "{summary:?}"
+        );
     }
 
     #[test]

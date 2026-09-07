@@ -858,6 +858,7 @@ fn redacted_line(redaction: &[(String, usize)]) -> String {
             "mac_address" => ("MAC address", "MAC addresses"),
             "fs_uuid" => ("filesystem UUID", "filesystem UUIDs"),
             "build_stamp" => ("build stamp", "build stamps"),
+            "connector_name" => ("connector name", "connector names"),
             other => (other, other),
         };
         format!("{n} {}", if n == 1 { one } else { many })

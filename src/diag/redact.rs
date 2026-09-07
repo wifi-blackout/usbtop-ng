@@ -3,7 +3,8 @@
 //! device serial or descriptor; it rewrites the user's home directory to
 //! `~`, masks the login name wherever it stands as a whole path component
 //! (a removable-media mount, say), masks host MAC addresses in kernel log
-//! lines, masks filesystem UUIDs in the kernel command line, and decides
+//! lines, masks filesystem UUIDs in the kernel command line, masks the
+//! user's free-form connector labels in the preferences copy, and decides
 //! which environment variables the bundle may record. Every substitution is
 //! counted so the manifest can say what was changed.
 
@@ -182,6 +183,51 @@ impl Redactor {
         tokens.join(" ")
     }
 
+    /// Masks every value of a `[connector_names]` table in a preferences
+    /// file as `"<redacted>"`, keeping the keys: a key is a port position or
+    /// a kernel port name and carries no identity, while the value is the
+    /// user's free-form label and can name a room, a desk, or a person.
+    /// TOML-aware, not line-based: the text is parsed, every value under the
+    /// table (whatever the header's spelling or trailing comment, and
+    /// whatever string form the value takes, multi-line included) is
+    /// replaced, and the document is re-serialized, which drops comments in
+    /// the copy. A file without the table is returned byte-for-byte. A file
+    /// that does not parse cannot be masked reliably: it is withheld with a
+    /// one-line note when it so much as mentions the table, and returned as
+    /// written otherwise. Counted under `connector_name`.
+    pub fn connector_names(&mut self, text: &str) -> String {
+        const MASK: &str = "<redacted>";
+        match text.parse::<toml::Table>() {
+            Ok(mut table) => {
+                let Some(names) = table.get_mut("connector_names") else {
+                    return text.to_string();
+                };
+                match names {
+                    toml::Value::Table(entries) => {
+                        for (_, value) in entries.iter_mut() {
+                            *value = toml::Value::String(MASK.to_string());
+                            self.bump("connector_name");
+                        }
+                    }
+                    other => {
+                        *other = toml::Value::String(MASK.to_string());
+                        self.bump("connector_name");
+                    }
+                }
+                toml::to_string(&table).unwrap_or_else(|_| {
+                    "# preferences.toml withheld: could not re-serialize it after masking connector names\n"
+                        .to_string()
+                })
+            }
+            Err(_) if text.to_ascii_lowercase().contains("connector_names") => {
+                self.bump("connector_name");
+                "# preferences.toml withheld: it does not parse as TOML and mentions connector_names\n"
+                    .to_string()
+            }
+            Err(_) => text.to_string(),
+        }
+    }
+
     /// Masks the first top-level parenthesized group containing `@` -- the
     /// `user@host` build stamp `/proc/version` carries right after the
     /// kernel release -- as `(<user>@<host>)`, counted under `build_stamp`.
@@ -260,6 +306,93 @@ fn is_mac(window: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The masked table as `(key, value)` pairs, read back through the TOML
+    /// parser so the assertions do not depend on the serializer's layout.
+    fn names_of(text: &str) -> Vec<(String, String)> {
+        let table: toml::Table = text.parse().unwrap();
+        table["connector_names"]
+            .as_table()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.as_str().unwrap_or("<not a string>").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn connector_name_values_are_masked_whatever_the_toml_spelling() {
+        let mut r = Redactor::new(None);
+        let prefs = "hide_idle_devices = false\n\n[connector_names] # office ports\n\"3:1\" = \"Left Type-A\"\n\"a=b\" = \"\"\"Alice's\ndesk\"\"\"\n[other]\nname = \"kept\"\n";
+        let out = r.connector_names(prefs);
+        assert_eq!(
+            names_of(&out),
+            vec![
+                ("3:1".to_string(), "<redacted>".to_string()),
+                ("a=b".to_string(), "<redacted>".to_string()),
+            ]
+        );
+        assert!(
+            !out.contains("Left Type-A") && !out.contains("Alice"),
+            "{out}"
+        );
+        let table: toml::Table = out.parse().unwrap();
+        assert_eq!(table["hide_idle_devices"].as_bool(), Some(false));
+        assert_eq!(table["other"]["name"].as_str(), Some("kept"));
+        assert_eq!(r.summary(), vec![("connector_name".to_string(), 2)]);
+
+        // A quoted header names the same table.
+        let mut r = Redactor::new(None);
+        let quoted = r.connector_names("[\"connector_names\"]\n\"3:1\" = \"Room 12\"\n");
+        assert_eq!(
+            names_of(&quoted),
+            vec![("3:1".to_string(), "<redacted>".to_string())]
+        );
+        assert!(!quoted.contains("Room 12"), "{quoted}");
+    }
+
+    #[test]
+    fn an_inline_connector_names_table_is_masked_too() {
+        let mut r = Redactor::new(None);
+        let out = r.connector_names(
+            "connector_names = { \"3:1\" = \"Room 12\", \"4:1\" = \"Desk\" }\nusbids_path = \"x\"\n",
+        );
+        assert_eq!(
+            names_of(&out),
+            vec![
+                ("3:1".to_string(), "<redacted>".to_string()),
+                ("4:1".to_string(), "<redacted>".to_string()),
+            ]
+        );
+        assert!(!out.contains("Room 12") && !out.contains("Desk"), "{out}");
+        let table: toml::Table = out.parse().unwrap();
+        assert_eq!(table["usbids_path"].as_str(), Some("x"));
+        assert_eq!(r.summary(), vec![("connector_name".to_string(), 2)]);
+    }
+
+    #[test]
+    fn a_file_without_connector_names_passes_through_untouched() {
+        let mut r = Redactor::new(None);
+        let prefs = "# a comment survives\nauto_load_usbmon = false\nunload_usbmon_on_exit = false\nhide_idle_devices = false\n";
+        assert_eq!(r.connector_names(prefs), prefs);
+        assert!(r.summary().is_empty());
+        // Unparsable and silent about the table: copied as written.
+        assert_eq!(r.connector_names("not [ valid"), "not [ valid");
+        assert!(r.summary().is_empty());
+    }
+
+    #[test]
+    fn an_unparsable_file_that_mentions_the_table_is_withheld() {
+        let mut r = Redactor::new(None);
+        let out = r.connector_names("[connector_names\n\"3:1\" = \"Alice's desk\"\n");
+        assert!(out.starts_with("# preferences.toml withheld"), "{out}");
+        assert!(!out.contains("Alice"), "{out}");
+        assert_eq!(r.summary(), vec![("connector_name".to_string(), 1)]);
+    }
 
     #[test]
     fn a_path_under_home_becomes_tilde() {

@@ -430,7 +430,8 @@ What the bundle holds: build and host details (`build.toml`, `host.toml`),
 the usbmon probe and the backend the monitor would select (`usbmon.toml`),
 the USB lines of the kernel log (`dmesg-usb.txt`), every device's full
 self-description with its raw descriptors (`inventory/`), your preferences
-and internal-device snapshot with home paths rewritten (`config/`), the
+and internal-device snapshot with home paths rewritten and connector
+labels masked (`config/`), the
 terminal setup (`terminal.toml`), the embedded fixture (`fixture/`, the same
 layout as `tests/fixtures/hosts/`), a replayed report (`report.json`), the
 printed summary saved as `SUMMARY.txt`, the run's debug log
