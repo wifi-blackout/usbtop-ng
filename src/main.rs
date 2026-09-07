@@ -442,10 +442,11 @@ fn main() -> Result<()> {
             bus: cli.bus,
             baseline: cli.baseline.as_deref().map(std::path::PathBuf::from),
         })?;
+        let sources = outcome.sources.len();
+        let noun = if sources == 1 { "source" } else { "sources" };
         eprintln!(
-            "captured fixture bundle at {outdir}: {} events from {} source(s){}",
+            "captured fixture bundle at {outdir}: {} events from {sources} {noun}{}",
             outcome.events,
-            outcome.sources.len(),
             outcome
                 .binary_kernel_dropped
                 .map(|n| format!(", kernel dropped {n}"))

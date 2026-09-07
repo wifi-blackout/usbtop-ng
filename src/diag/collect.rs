@@ -137,7 +137,18 @@ pub fn collect_host(
         None => {
             let vendor = read_trimmed(&dmi_root.join("sys_vendor")).unwrap_or_default();
             let product = read_trimmed(&dmi_root.join("product_name")).unwrap_or_default();
-            let joined = format!("{vendor} {product}");
+            // Some firmware repeats the vendor inside the product name (a
+            // desktop reports vendor `HP`, product `HP Pavilion …`); do not
+            // print it twice.
+            let repeats_vendor = !vendor.is_empty()
+                && product
+                    .to_ascii_lowercase()
+                    .starts_with(&vendor.to_ascii_lowercase());
+            let joined = if repeats_vendor {
+                product
+            } else {
+                format!("{vendor} {product}")
+            };
             let joined = joined.trim().to_string();
             if joined.is_empty() {
                 notes.push(note(
@@ -776,6 +787,41 @@ mod tests {
             "{:?}",
             r.summary()
         );
+    }
+
+    /// Firmware that repeats the vendor inside the product name must not
+    /// yield `HP HP Pavilion …`; a product that does not start with the
+    /// vendor keeps both, and an empty vendor contributes nothing.
+    #[test]
+    fn dmi_board_string_does_not_repeat_the_vendor() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let board_of = |vendor: &str, product: &str| {
+            let dmi = root.join(format!("dmi-{vendor}-{product}"));
+            std::fs::create_dir_all(&dmi).unwrap();
+            std::fs::write(dmi.join("sys_vendor"), format!("{vendor}\n")).unwrap();
+            std::fs::write(dmi.join("product_name"), format!("{product}\n")).unwrap();
+            let empty = root.join("empty");
+            std::fs::create_dir_all(&empty).unwrap();
+            let mut r = Redactor::new(None);
+            collect_host(&empty, &empty, &empty, &dmi, &empty, None, &mut r)
+                .0
+                .board
+        };
+        assert_eq!(
+            board_of("HP", "HP Pavilion Desktop TP01-2xxx"),
+            "HP Pavilion Desktop TP01-2xxx"
+        );
+        assert_eq!(
+            board_of("hp", "HP Pavilion"),
+            "HP Pavilion",
+            "case-insensitive"
+        );
+        assert_eq!(
+            board_of("Dell Inc.", "XPS 13 9310"),
+            "Dell Inc. XPS 13 9310"
+        );
+        assert_eq!(board_of("", "Standalone"), "Standalone");
     }
 
     #[test]

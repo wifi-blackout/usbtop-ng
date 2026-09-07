@@ -168,16 +168,34 @@ impl Redactor {
     }
 
     /// Masks the value after `UUID=` and `PARTUUID=` in a kernel command
-    /// line; every other token is kept whole.
+    /// line, and the identifying path component after `/dev/disk/by-uuid/`,
+    /// `by-partuuid/`, `by-id/` (which carries the drive's serial),
+    /// `by-label/`, and `by-partlabel/` (user-chosen names); every other
+    /// token is kept whole. All counted under `fs_uuid`.
     pub fn cmdline(&mut self, text: &str) -> String {
+        const BY_PREFIXES: [&str; 5] = [
+            "/dev/disk/by-uuid/",
+            "/dev/disk/by-partuuid/",
+            "/dev/disk/by-id/",
+            "/dev/disk/by-label/",
+            "/dev/disk/by-partlabel/",
+        ];
         let tokens: Vec<String> = text
             .split_whitespace()
-            .map(|token| match token.find("UUID=") {
-                Some(at) => {
+            .map(|token| {
+                if let Some(at) = token.find("UUID=") {
                     self.bump("fs_uuid");
-                    format!("{}UUID=<redacted>", &token[..at])
+                    return format!("{}UUID=<redacted>", &token[..at]);
                 }
-                None => token.to_string(),
+                for prefix in BY_PREFIXES {
+                    if let Some(at) = token.find(prefix) {
+                        self.bump("fs_uuid");
+                        let start = at + prefix.len();
+                        let end = token[start..].find('/').map_or(token.len(), |i| start + i);
+                        return format!("{}<redacted>{}", &token[..start], &token[end..]);
+                    }
+                }
+                token.to_string()
             })
             .collect();
         tokens.join(" ")
@@ -470,6 +488,27 @@ mod tests {
             "BOOT_IMAGE=/boot/vmlinuz root=UUID=<redacted> ro quiet resume=PARTUUID=<redacted>"
         );
         assert_eq!(r.summary(), vec![("fs_uuid".to_string(), 2)]);
+    }
+
+    /// The path forms identify the installation just as surely as `UUID=`:
+    /// a by-uuid or by-partuuid component is the filesystem's UUID, by-id
+    /// carries the drive's model and serial, by-label and by-partlabel are
+    /// user-chosen names. Plain device nodes stay.
+    #[test]
+    fn cmdline_masks_the_by_path_forms_of_disk_identity() {
+        let mut r = Redactor::new(None);
+        let cmd = "root=/dev/disk/by-uuid/307c1732-bacd-4ef4-9050-b4c9e99e5648 resume=/dev/disk/by-partuuid/abcd-1234 rd.luks=/dev/disk/by-id/nvme-Vendor_Model_S4EVNX0N123456-part2 home=/dev/disk/by-label/alices-home usr=/dev/disk/by-partlabel/usr swap=/dev/sda3 ro";
+        assert_eq!(
+            r.cmdline(cmd),
+            "root=/dev/disk/by-uuid/<redacted> resume=/dev/disk/by-partuuid/<redacted> rd.luks=/dev/disk/by-id/<redacted> home=/dev/disk/by-label/<redacted> usr=/dev/disk/by-partlabel/<redacted> swap=/dev/sda3 ro"
+        );
+        assert_eq!(r.summary(), vec![("fs_uuid".to_string(), 5)]);
+        // A trailing path after the identifying component is kept.
+        let mut r = Redactor::new(None);
+        assert_eq!(
+            r.cmdline("x=/dev/disk/by-id/ata-Model_123/extra"),
+            "x=/dev/disk/by-id/<redacted>/extra"
+        );
     }
 
     #[test]

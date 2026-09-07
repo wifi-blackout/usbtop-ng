@@ -7,11 +7,6 @@ schedule. Items move to [CHANGELOG.md](../CHANGELOG.md) when they ship.
 
 - A `connector` field in `--once`/`--batch` reports (text and JSON), so a
   script sees the physical port grouping the TUI shows since 2026-09.
-- User-named connectors in the preferences file (`front-left`, `rear
-  USB-C`) shown in place of the port position. Evaluated and deferred with
-  the connector rows: ACPI `physical_location` was the candidate for an
-  automatic name and reads as identical filler on every root port of the
-  development desktop, so a name has to come from the user.
 - Plugin system for custom monitors. Deferred: the versioned NDJSON
   stream is already the right boundary for external analysis tools.
 - Device disclosure audit. An opt-in, comprehensive probe of one device,
@@ -253,15 +248,6 @@ These came out of code review. Each is small and none blocks a release.
 
 Open, recorded 2026-09-07 so they do not get lost:
 
-- Privacy: `Redactor::cmdline` masks `UUID=` and `PARTUUID=` values in the
-  kernel command line but not the path forms `/dev/disk/by-uuid/<uuid>` and
-  `/dev/disk/by-partuuid/<uuid>`, which identify the installation just as
-  surely. Mask those too, with a test.
-- The DMI board string in the support bundle's host collector repeats the
-  vendor when `product_name` already starts with it (a desktop reports
-  `HP HP Pavilion …`); `capture::meta` already dedupes, the collector
-  should too.
-- `--capture-fixture` prints `1 source(s)`; pluralize properly.
 - One fd-anchored write primitive: the support bundle's `write_new_at` and
   the config writers (`write_file_owned`, `replace_file_owned`) duplicate
   the create-write-chown shape; and the preferences writer should replace
