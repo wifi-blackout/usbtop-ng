@@ -24,3 +24,11 @@ hide_idle_devices = false
 # copy (~/.usbtop-ng/usb.ids) and the distro package; the --usbids flag
 # overrides this in turn. Unset by default (no line here).
 # usbids_path = "/path/to/usb.ids"
+
+# Names for physical connectors, shown on the connector heading in the device
+# table as `Left Type-A (Port 1)`. A key is the position the table shows
+# (`<bus>:<chain>`, either side's bus) or the kernel's port object name
+# (`usb3-port1`, `3-1-port4`). Absent by default (no table here).
+# [connector_names]
+# "3:1" = "Left Type-A"
+# "3:1.4" = "Rear Right Type-C"

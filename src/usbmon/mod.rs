@@ -547,6 +547,7 @@ mod tests {
             unload_usbmon_on_exit: true,
             hide_idle_devices: false,
             usbids_path: None,
+            connector_names: std::collections::BTreeMap::new(),
         };
         assert_eq!(unload_mode(&auto), UnloadMode::Automatic);
         let ask = crate::config::Preferences::default();

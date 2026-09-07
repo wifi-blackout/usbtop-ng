@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
@@ -376,6 +377,13 @@ pub struct Preferences {
     /// copies; the `--usbids` flag overrides this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usbids_path: Option<String>,
+    /// User-given names for physical connectors, shown on the connector
+    /// heading in the device table. Keyed by position as the table shows it
+    /// (`"3:1"`, `"3:1.4"`, either side's bus) or by the kernel's port object
+    /// name (`usb3-port1`, `3-1-port4`). Absent by default and never written
+    /// back empty, so the default file keeps its three keys.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub connector_names: BTreeMap<String, String>,
 }
 
 pub fn preferences_path() -> Result<PathBuf> {
@@ -743,11 +751,51 @@ mod tests {
             unload_usbmon_on_exit: true,
             hide_idle_devices: true,
             usbids_path: None,
+            connector_names: std::collections::BTreeMap::new(),
         };
         write_preferences_at(&path, &prefs).unwrap();
 
         let read = load_or_create_default_at(&path).unwrap();
         assert_eq!(read, prefs);
+    }
+
+    #[test]
+    fn connector_names_table_loads_and_survives_the_idle_toggle_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.toml");
+        fs::write(
+            &path,
+            "auto_load_usbmon = false\nunload_usbmon_on_exit = false\nhide_idle_devices = false\n\n[connector_names]\n\"3:1\" = \"Left Type-A\"\n\"3-1-port4\" = \"Rear Right Type-C\"\n",
+        )
+        .unwrap();
+        let prefs = load_or_create_default_at(&path).unwrap();
+        assert_eq!(
+            prefs.connector_names.get("3:1").map(String::as_str),
+            Some("Left Type-A")
+        );
+        assert_eq!(
+            prefs.connector_names.get("3-1-port4").map(String::as_str),
+            Some("Rear Right Type-C")
+        );
+
+        // The `i` toggle rewrites the whole file: the table must survive it.
+        let mut toggled = prefs.clone();
+        toggled.hide_idle_devices = true;
+        write_preferences_at(&path, &toggled).unwrap();
+        let again = load_or_create_default_at(&path).unwrap();
+        assert_eq!(again, toggled);
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("[connector_names]"));
+    }
+
+    #[test]
+    fn preferences_without_names_serialize_without_the_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.toml");
+        write_preferences_at(&path, &Preferences::default()).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("connector_names"), "{text}");
     }
 
     #[test]
@@ -771,6 +819,7 @@ mod tests {
         let path = temp.path().join("prefs.toml");
         let prefs = Preferences {
             usbids_path: Some("/opt/custom/usb.ids".to_string()),
+            connector_names: std::collections::BTreeMap::new(),
             ..Preferences::default()
         };
         write_preferences_at(&path, &prefs).unwrap();

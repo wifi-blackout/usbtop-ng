@@ -749,6 +749,7 @@ fn main() -> Result<()> {
             preferences.clone(),
         )
         .with_filter(filter)
+        .with_connector_names(preferences.connector_names.clone())
         .with_text_source_flag(Arc::clone(&monitor.flags.text_active));
     // Mirrors the usbids/internal-snapshot home-copy pattern above: a
     // missing HOME must not fail the TUI, it just means `S`'s `y` has

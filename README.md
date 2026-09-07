@@ -149,6 +149,10 @@ key press and quits through the same teardown as `q`.
   every hub level. A port with no companion (a USB2-only bus) is a
   connector on its own. When the two sides use different port numbers the
   label says so: `Port 1 (USB3 side: 2)`.
+- Name a connector in your own words with a `[connector_names]` table in
+  the preferences file (see [Preferences file](#preferences-file)); the
+  heading then leads with the name and keeps the position:
+  `▶ Left Type-A (Port 1) · bus 03 + 04`.
 - usbtop-ng resolves the controller from the root hub's canonical sysfs
   parent directory. A bus whose controller does not resolve joins the
   `unknown` group, which sorts last.
@@ -540,6 +544,21 @@ hide_idle_devices = false
   distro copies in the [source order](#device-names). Unset by default, so
   the key is absent from the file above until you add it; the `--usbids`
   flag overrides it for one run.
+
+- `[connector_names]` names physical connectors in your own words, shown
+  on the connector heading in the device table. A key is the position the
+  table shows, `<bus>:<chain>` with either side's bus (`"3:1"` for the
+  heading `Port 1 · bus 03 + 04`, `"4:1"` names the same connector, `"3:1.4"`
+  for `Port 1.4`), or the kernel's port object name (`usb3-port1`,
+  `3-1-port4`). The USB2 side's name wins when both sides are named; a
+  name for a connector with no device on it is simply not shown. Absent by
+  default, and the `i` key's rewrite of the file keeps it:
+
+  ```toml
+  [connector_names]
+  "3:1" = "Left Type-A"
+  "3:1.4" = "Rear Right Type-C"
+  ```
 
 `example-config.toml` in the repository root holds the same keys with
 comments.

@@ -86,6 +86,10 @@ pub struct ConnectorView {
     pub key: String,
     /// `Port 1.4`, or `Port 1 (USB3 side: 2)` when the two sides' chains differ.
     pub label: String,
+    /// The user's name for the connector from the preferences file
+    /// (`[connector_names]`), when one of its ports is named; the heading
+    /// then leads with it, `Left Type-A (Port 1)`.
+    pub name: Option<String>,
     /// The bus numbers the connector spans, ascending: one or two.
     pub buses: Vec<u8>,
     /// Whether a device on this connector owns ports of its own.
@@ -192,6 +196,10 @@ pub struct UsbTopApp {
     /// search-interception branch (which owns every transition while
     /// `Editing`) and [`Self::retain_searched_devices`].
     pub(crate) search: SearchState,
+    /// The user's connector names from the preferences file, keys trimmed
+    /// (see `config::Preferences::connector_names` and
+    /// [`Self::with_connector_names`]); consulted by `connector_placement`.
+    connector_names: BTreeMap<String, String>,
 }
 
 /// State of the `/` search box (see `UsbTopApp::search`). `/` opens
@@ -260,7 +268,19 @@ impl UsbTopApp {
             pending_internal_snapshot: None,
             snapshot_dest: None,
             search: SearchState::Off,
+            connector_names: BTreeMap::new(),
         }
+    }
+
+    /// Attach the user's connector names (see
+    /// `config::Preferences::connector_names`). Keys are trimmed once here so
+    /// a stray space in the file does not silently unname a connector.
+    pub fn with_connector_names(mut self, names: BTreeMap<String, String>) -> Self {
+        self.connector_names = names
+            .into_iter()
+            .map(|(key, name)| (key.trim().to_string(), name))
+            .collect();
+        self
     }
 
     /// Attach the monitor's dropped-packet counter (see
@@ -399,7 +419,9 @@ impl UsbTopApp {
                     port_chain: device.port_chain(),
                     device: device.clone(),
                 };
-                let Some(placement) = connector_placement(&index, &row, bus_speed) else {
+                let Some(placement) =
+                    connector_placement(&index, &row, bus_speed, &self.connector_names)
+                else {
                     bus_line.devices.push(row);
                     continue;
                 };
@@ -410,6 +432,7 @@ impl UsbTopApp {
                         view.connectors.push(ConnectorView {
                             key: placement.key,
                             label: placement.label,
+                            name: placement.name,
                             buses: placement.buses,
                             is_hub: false,
                             devices: Vec::new(),
@@ -946,8 +969,29 @@ fn chain_text(chain: &[u32]) -> String {
 struct Placement {
     key: String,
     label: String,
+    name: Option<String>,
     buses: Vec<u8>,
     sort_key: (Vec<u32>, u8),
+}
+
+/// The two keys a user may name one side of a connector by: its position as
+/// the table shows it (`3:1.4`) and its kernel port object name (`3-1-port4`).
+fn connector_name_keys(port: &PortRef) -> [String; 2] {
+    [
+        format!("{}:{}", port.bus, chain_text(&port.chain)),
+        port.name.clone(),
+    ]
+}
+
+/// The user's name for the first candidate key present in `names`, in the
+/// order the candidates are given (the USB2 side's keys come first).
+fn connector_name(
+    names: &BTreeMap<String, String>,
+    candidates: impl IntoIterator<Item = String>,
+) -> Option<String> {
+    candidates
+        .into_iter()
+        .find_map(|key| names.get(&key).cloned())
 }
 
 /// `None` for a row nothing places on a connector: a root hub (empty chain)
@@ -959,14 +1003,22 @@ fn connector_placement(
     index: &PortIndex,
     row: &DeviceRow,
     bus_speed: impl Fn(u8) -> Option<UsbSpeed>,
+    names: &BTreeMap<String, String>,
 ) -> Option<Placement> {
     let chain = row.port_chain.as_ref().filter(|chain| !chain.is_empty())?;
     let name = sysfs_name(&row.device)?;
     let bus_id = row.device.bus_id;
     let Some((own, peer)) = index.connector_of(name) else {
+        // Without a port object the device's own name still says which port
+        // it sits on, so both key forms resolve exactly as they would with one.
+        let mut candidates = vec![format!("{bus_id}:{}", chain_text(chain))];
+        if let Some((hub, number)) = crate::connector::port_of_device(name) {
+            candidates.push(crate::connector::port_name(&hub, number));
+        }
         return Some(Placement {
             key: format!("device:{name}"),
             label: format!("Port {}", chain_text(chain)),
+            name: connector_name(names, candidates),
             buses: vec![bus_id],
             sort_key: (chain.clone(), bus_id),
         });
@@ -984,12 +1036,17 @@ fn connector_placement(
         ),
         _ => format!("Port {}", chain_text(&primary.chain)),
     };
-    let mut names = vec![primary.name.clone()];
-    names.extend(secondary.as_ref().map(|s| s.name.clone()));
-    names.sort();
+    let mut port_names = vec![primary.name.clone()];
+    port_names.extend(secondary.as_ref().map(|s| s.name.clone()));
+    port_names.sort();
+    let mut candidates = connector_name_keys(&primary).to_vec();
+    if let Some(s) = &secondary {
+        candidates.extend(connector_name_keys(s));
+    }
     Some(Placement {
-        key: names.join("+"),
+        key: port_names.join("+"),
         label,
+        name: connector_name(names, candidates),
         sort_key: (primary.chain, buses[0]),
         buses,
     })
@@ -1709,8 +1766,14 @@ fn connector_line(connector: &ConnectorView) -> Line<'static> {
         .collect::<Vec<_>>()
         .join(" + ");
     let hub = if connector.is_hub { " · hub" } else { "" };
+    // A user's name leads; the position stays in parentheses so the chain
+    // the Port column prints is still on the heading.
+    let heading = match &connector.name {
+        Some(name) => format!("{name} ({})", connector.label),
+        None => connector.label.clone(),
+    };
     Line::from(vec![
-        Span::raw(format!("▶ {} · bus {span}{hub}  ", connector.label)),
+        Span::raw(format!("▶ {heading} · bus {span}{hub}  ")),
         Span::raw(format!(
             "rx {} tx {}",
             format_rate(connector.rx_bps),
@@ -2523,6 +2586,7 @@ mod tests {
             unload_usbmon_on_exit: false,
             hide_idle_devices: false,
             usbids_path: None,
+            connector_names: std::collections::BTreeMap::new(),
         };
         let mut app = UsbTopApp::new(Duration::from_millis(100)).with_idle_setting(
             false,
@@ -2751,6 +2815,91 @@ mod tests {
         assert!(lines[7].starts_with("1 "), "the USB2 half's row: {text}");
         assert!(lines[8].starts_with("1 "), "the USB3 half's row: {text}");
         assert!(lines[9].starts_with("▶ Port 1.1"), "{text}");
+    }
+
+    fn names(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_connector_named_by_either_side_or_either_key_form_shows_the_name() {
+        for key in ["3:1", "4:1", "usb3-port1", "usb4-port1", " 3:1 "] {
+            let (_t, mgr) = connector_fixture();
+            let mut app = UsbTopApp::new(Duration::from_millis(100))
+                .with_connector_names(names(&[(key, "Left Type-A")]));
+            app.sync_from(&mgr);
+            let hub = &app.controllers[0].connectors[0];
+            assert_eq!(hub.label, "Port 1", "key {key:?}");
+            assert_eq!(hub.name.as_deref(), Some("Left Type-A"), "key {key:?}");
+            let text = list_text(&app);
+            assert!(
+                text.contains("▶ Left Type-A (Port 1) · bus 03 + 04 · hub  rx"),
+                "key {key:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_usb2_side_name_wins_when_both_sides_are_named() {
+        let (_t, mgr) = connector_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100))
+            .with_connector_names(names(&[("4:1", "SS side"), ("3:1", "USB2 side")]));
+        app.sync_from(&mgr);
+        assert_eq!(
+            app.controllers[0].connectors[0].name.as_deref(),
+            Some("USB2 side")
+        );
+    }
+
+    #[test]
+    fn a_nested_hub_port_and_a_fallback_device_are_nameable_by_position() {
+        let (_t, mgr) = connector_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100))
+            .with_connector_names(names(&[("3:1.4", "Rear Right Type-C")]));
+        app.sync_from(&mgr);
+        let nested = app.controllers[0]
+            .connectors
+            .iter()
+            .find(|c| c.label == "Port 1.4")
+            .unwrap();
+        assert_eq!(nested.name.as_deref(), Some("Rear Right Type-C"));
+        assert!(list_text(&app).contains("▶ Rear Right Type-C (Port 1.4) · bus 03 + 04  rx"));
+
+        // No port objects at all: the keys still follow from the device's
+        // own sysfs name, so a kernel without port objects is nameable too.
+        let (_t2, mut mgr2) = topology_fixture();
+        feed(&mut mgr2, &["f1 100 C Bi:3:003:1 0 64 <"]); // 3-2
+        for key in ["3:2", "usb3-port2"] {
+            let mut app2 = UsbTopApp::new(Duration::from_millis(100))
+                .with_connector_names(names(&[(key, "Front")]));
+            app2.sync_from(&mgr2);
+            let single = &app2.controllers[0].connectors[0];
+            assert_eq!(single.key, "device:3-2", "key {key:?}");
+            assert_eq!(single.name.as_deref(), Some("Front"), "key {key:?}");
+            assert!(
+                list_text(&app2).contains("▶ Front (Port 2) · bus 03  rx"),
+                "key {key:?}: {}",
+                list_text(&app2)
+            );
+        }
+    }
+
+    #[test]
+    fn unnamed_connectors_and_names_for_empty_connectors_change_nothing() {
+        let (_t, mgr) = connector_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100))
+            .with_connector_names(names(&[("3:9", "Nothing here")]));
+        app.sync_from(&mgr);
+        assert!(app.controllers[0]
+            .connectors
+            .iter()
+            .all(|c| c.name.is_none()));
+        let text = list_text(&app);
+        assert!(text.contains("▶ Port 1 · bus 03 + 04 · hub  rx"), "{text}");
+        assert!(!text.contains("Nothing here"), "{text}");
     }
 
     #[test]
