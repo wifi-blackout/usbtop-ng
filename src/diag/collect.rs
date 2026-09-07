@@ -139,11 +139,16 @@ pub fn collect_host(
             let product = read_trimmed(&dmi_root.join("product_name")).unwrap_or_default();
             // Some firmware repeats the vendor inside the product name (a
             // desktop reports vendor `HP`, product `HP Pavilion …`); do not
-            // print it twice.
-            let repeats_vendor = !vendor.is_empty()
-                && product
-                    .to_ascii_lowercase()
-                    .starts_with(&vendor.to_ascii_lowercase());
+            // print it twice. Only a whole leading word counts: `HPX
+            // Workstation` merely starts with the same letters as `HP`.
+            let repeats_vendor = {
+                let vendor_lc = vendor.to_ascii_lowercase();
+                let product_lc = product.to_ascii_lowercase();
+                !vendor.is_empty()
+                    && product_lc.strip_prefix(&vendor_lc).is_some_and(|rest| {
+                        rest.chars().next().is_none_or(|c| !c.is_alphanumeric())
+                    })
+            };
             let joined = if repeats_vendor {
                 product
             } else {
@@ -816,6 +821,16 @@ mod tests {
             board_of("hp", "HP Pavilion"),
             "HP Pavilion",
             "case-insensitive"
+        );
+        assert_eq!(
+            board_of("HP", "HP"),
+            "HP",
+            "the product is exactly the vendor"
+        );
+        assert_eq!(
+            board_of("HP", "HPX Workstation"),
+            "HP HPX Workstation",
+            "a product that merely starts with the vendor's letters keeps both"
         );
         assert_eq!(
             board_of("Dell Inc.", "XPS 13 9310"),
