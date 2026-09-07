@@ -729,16 +729,27 @@ pub fn ensure_private_config_dir(dir: &Path) -> Result<()> {
 /// Root acting for a sudo invoker writes into that user's home and nowhere
 /// else. An existing config directory is the invoker's to arrange (a
 /// symlink into a dotfiles checkout inside the home is fine), but one that
-/// resolves *outside* their home -- `~/.usbtop-ng` replaced by a link to a
-/// directory they cannot write themselves -- would have every later
-/// preferences, snapshot, and usb.ids write land there as root. The chown
-/// already skips such a path (see [`chown_created_to_invoker`]); the writes
-/// must not proceed either. Both sides are resolved on the real filesystem
-/// so a symlinked home (`/home -> /var/home`) compares equal to itself.
-/// This startup check fails fast with a clear message; the guarantee that
-/// survives a directory swapped *after* startup is [`PinnedDir`], which
-/// every write goes through.
+/// *claims* to be in their home yet resolves outside it -- `~/.usbtop-ng`
+/// replaced by a link to a directory they cannot write themselves -- would
+/// have every later preferences, snapshot, and usb.ids write land there as
+/// root. The chown already skips such a path (see
+/// [`chown_created_to_invoker`]); the writes must not proceed either. A
+/// directory that never claimed the home (an explicit path outside it) is
+/// the invoker's own choice and passes, the same rule [`PinnedDir::open`]
+/// applies. Both sides are resolved on the real filesystem so a symlinked
+/// home (`/home -> /var/home`) compares equal to itself. This startup check
+/// fails fast with a clear message; the guarantee that survives a directory
+/// swapped *after* startup is [`PinnedDir`], which every write goes
+/// through.
 fn refuse_escape_from_home(dir: &Path, home: &Path) -> Result<()> {
+    let claimed = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(dir)
+    };
+    if !is_within(&claimed, home) {
+        return Ok(());
+    }
     let resolved = resolve_for_containment_check(dir)
         .ok_or_else(|| anyhow!("config directory {} could not be resolved", dir.display()))?;
     let home_resolved = resolve_for_containment_check(home).unwrap_or_else(|| home.to_path_buf());
@@ -895,6 +906,12 @@ mod tests {
             .to_string();
         assert!(err.contains("outside the invoking user's home"), "{err}");
         assert!(err.contains(&outside.display().to_string()), "{err}");
+        // An explicit directory outside the home never claimed it: the
+        // invoker's own choice, not second-guessed.
+        assert!(
+            refuse_escape_from_home(&outside, &home).is_ok(),
+            "no claim on the home, nothing to refuse"
+        );
     }
 
     #[test]
