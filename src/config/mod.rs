@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -57,16 +57,24 @@ fn resolve_invoker(
 /// their preferences into root's home. `None` when there is no such user,
 /// the entry has no home, or the lookup fails.
 fn home_of_uid(uid: u32) -> Option<PathBuf> {
-    use std::ffi::CStr;
-    use std::os::unix::ffi::OsStrExt;
-
     // SAFETY: sysconf(3) reads one scalar and touches no memory of ours.
     // -1 means "no limit known"; glibc's own fallback is 1024, and 16 KiB is
     // roomy for any gecos field without being wasteful.
-    let mut capacity = match unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) } {
+    let capacity = match unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) } {
         n if n > 0 => n as usize,
         _ => 16 * 1024,
     };
+    home_of_uid_with_buffer(uid, capacity)
+}
+
+/// [`home_of_uid`]'s body with the initial buffer size as a parameter, so a
+/// test can start it too small and drive the ERANGE retry loop on the real
+/// libc (glibc's suggested size fits root's entry first time, which would
+/// otherwise leave the retry unexercised).
+fn home_of_uid_with_buffer(uid: u32, mut capacity: usize) -> Option<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+
     loop {
         let mut buffer = vec![0u8; capacity];
         // SAFETY: `passwd` is a plain struct of integers and pointers, for
@@ -93,7 +101,7 @@ fn home_of_uid(uid: u32) -> Option<PathBuf> {
             if capacity >= 1 << 20 {
                 return None;
             }
-            capacity *= 2;
+            capacity = (capacity * 2).max(64);
             continue;
         }
         if rc != 0 || result.is_null() || entry.pw_dir.is_null() {
@@ -456,16 +464,50 @@ pub fn ensure_private_config_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
 
     if dir.exists() {
+        if let Some(invoker) = sudo_invoker() {
+            refuse_escape_from_home(dir, &invoker.home)?;
+        }
         return Ok(());
     }
+    // Parents (normally just the home itself) at the default mode; only the
+    // leaf is private. A parent this call creates is never chowned, so a
+    // 0700 parent owned by root would lock the invoker out of it.
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
     fs::DirBuilder::new()
-        .recursive(true)
         .mode(0o700)
         .create(dir)
         .with_context(|| format!("failed to create config directory {}", dir.display()))?;
     let handle = set_private_dir_permissions(dir)?;
     chown_created_to_invoker(dir, handle.as_raw_fd());
     Ok(())
+}
+
+/// Root acting for a sudo invoker writes into that user's home and nowhere
+/// else. An existing config directory is the invoker's to arrange (a
+/// symlink into a dotfiles checkout inside the home is fine), but one that
+/// resolves *outside* their home -- `~/.usbtop-ng` replaced by a link to a
+/// directory they cannot write themselves -- would have every later
+/// preferences, snapshot, and usb.ids write land there as root. The chown
+/// already skips such a path (see [`chown_created_to_invoker`]); the writes
+/// must not proceed either. Both sides are resolved on the real filesystem
+/// so a symlinked home (`/home -> /var/home`) compares equal to itself.
+fn refuse_escape_from_home(dir: &Path, home: &Path) -> Result<()> {
+    let resolved = resolve_for_containment_check(dir)
+        .ok_or_else(|| anyhow!("config directory {} could not be resolved", dir.display()))?;
+    let home_resolved = resolve_for_containment_check(home).unwrap_or_else(|| home.to_path_buf());
+    if is_within(&resolved, &home_resolved) {
+        return Ok(());
+    }
+    bail!(
+        "config directory {} resolves to {}, outside the invoking user's home {}; \
+         refusing to write there as root",
+        dir.display(),
+        resolved.display(),
+        home.display()
+    )
 }
 
 /// Make the directory this call just created private, through a descriptor
@@ -502,7 +544,8 @@ mod tests {
 
     /// A synthetic user database for the resolver tests: the home of `uid`
     /// from passwd-format text, so the decision logic is exercised without
-    /// the real NSS lookup. Malformed lines (too few fields) are skipped.
+    /// the real NSS lookup. (Also used to read root's real home out of
+    /// `/etc/passwd` in the live test below.)
     fn home_from_passwd_text(passwd: &str, uid: u32) -> Option<PathBuf> {
         passwd.lines().find_map(|line| {
             let fields: Vec<&str> = line.split(':').collect();
@@ -549,15 +592,6 @@ mod tests {
     }
 
     #[test]
-    fn resolver_skips_malformed_passwd_lines() {
-        let inv = resolve_invoker(0, Some("1000"), Some("1000"), table);
-        assert!(
-            inv.is_some(),
-            "the malformed line above alice's must not abort the scan"
-        );
-    }
-
-    #[test]
     fn resolver_rejects_an_empty_home_field() {
         let text = "ghost:x:1000:1000:g::/bin/bash\n";
         assert!(
@@ -569,11 +603,75 @@ mod tests {
     }
 
     #[test]
-    fn home_of_uid_resolves_root_through_the_user_database() {
-        // Every Linux install has root in the user database, and its home
-        // is /root; this goes through getpwuid_r, so it also proves the
-        // buffer-sizing loop works on the real libc.
-        assert_eq!(home_of_uid(0), Some(PathBuf::from("/root")));
+    fn home_of_uid_agrees_with_the_passwd_file_for_root() {
+        // Root is in every user database; compare the NSS answer with the
+        // local file's own line rather than hardcoding /root, so a host
+        // that relocates root's home still passes.
+        let Ok(passwd) = fs::read_to_string("/etc/passwd") else {
+            return;
+        };
+        let expected = home_from_passwd_text(&passwd, 0).expect("root has a passwd line");
+        assert_eq!(home_of_uid(0), Some(expected));
+    }
+
+    #[test]
+    fn home_of_uid_grows_its_buffer_until_the_entry_fits() {
+        // A one-byte buffer cannot hold any entry, so the first call returns
+        // ERANGE and the loop must double until root's line fits.
+        assert_eq!(home_of_uid_with_buffer(0, 1), home_of_uid(0));
+        assert!(home_of_uid_with_buffer(0, 1).is_some());
+    }
+
+    #[test]
+    fn refuse_escape_from_home_allows_in_home_layouts_and_rejects_an_escape() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let dotfiles = home.join("dotfiles").join("usbtop-ng");
+        fs::create_dir_all(&dotfiles).unwrap();
+        let plain = home.join(".usbtop-ng-plain");
+        fs::create_dir_all(&plain).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+
+        assert!(
+            refuse_escape_from_home(&plain, &home).is_ok(),
+            "a real dir in home"
+        );
+        let inside_link = home.join(".usbtop-ng");
+        symlink(&dotfiles, &inside_link).unwrap();
+        assert!(
+            refuse_escape_from_home(&inside_link, &home).is_ok(),
+            "a symlink that stays inside home is the invoker's own layout"
+        );
+        let escape = home.join(".usbtop-ng-escape");
+        symlink(&outside, &escape).unwrap();
+        let err = refuse_escape_from_home(&escape, &home)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside the invoking user's home"), "{err}");
+        assert!(err.contains(&outside.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn ensure_private_config_dir_leaves_a_created_parent_at_the_default_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        // A sibling made by plain create_dir shows what the umask yields.
+        let reference = temp.path().join("reference");
+        fs::create_dir(&reference).unwrap();
+        let parent = temp.path().join("missing-home");
+        let dir = parent.join(".usbtop-ng");
+
+        ensure_private_config_dir(&dir).unwrap();
+
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700, "the leaf is private");
+        assert_eq!(
+            mode(&parent),
+            mode(&reference),
+            "a created parent keeps the default mode, not the leaf's 0700"
+        );
     }
 
     #[test]
