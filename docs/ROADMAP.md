@@ -274,7 +274,7 @@ These came out of code review. Each is small and none blocks a release.
 
 In-depth research and testing of usbtop-ng on small ARM hosts: Raspberry
 Pi Zero, Pi 4, Pi 400, and Pi 5, plus the Radxa ROCK 5C and the SOPHGO
-SOPHGO BM1684x board. usbmon is architecture-independent, so the questions are
+BM1684x board. usbmon is architecture-independent, so the questions are
 builds, vendor kernels, and controller behavior, not core capture logic.
 (The optional `ebpf` feature is the one exception: its BPF program has an
 x86-64-only `pt_regs` today and needs a per-architecture one before it
