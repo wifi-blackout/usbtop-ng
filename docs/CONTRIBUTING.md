@@ -69,7 +69,7 @@ Codex-review checkpoints).
    ```bash
    cargo test
    ```
-   The unit suite reports 576 passed; the `tests/` directory adds the
+   The unit suite reports 662 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 4. To run with debug output, use:
@@ -217,7 +217,7 @@ cargo test --all-targets
 ```
 
 `cargo test` and `cargo test --all-targets` run the same three suites, all
-hermetic. The unit suite reports 576 passed, working against
+hermetic. The unit suite reports 662 passed, working against
 fixture files, FIFOs, and `tempfile` paths, with no `/dev` and no debugfs
 access. The `tests/` directory adds two more: `restore_pipe.rs` (2 tests),
 proving the terminal-restore bytes reach a piped stdout while the process is
@@ -290,7 +290,7 @@ Rust toolchain.
    cargo clippy --features capture-fixture --all-targets -- -D warnings
    cargo test --features capture-fixture
    ```
-   The unit suite reports 576 passed under the feature, the same as
+   The unit suite reports 662 passed under the feature, the same as
    without it: the capture core it exercises is already part of the
    default build, and the feature adds only the `--capture-fixture`
    subcommand, not tests.
@@ -362,7 +362,7 @@ Cover these areas first:
    ```bash
    cargo test --all-targets
    ```
-   The unit suite reports 576 passed; the `tests/` directory adds the
+   The unit suite reports 662 passed; the `tests/` directory adds the
    pipe and PTY harnesses alongside it. A failure names the test. Fix it and
    repeat.
 6. Update the documentation your change affects.

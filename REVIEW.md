@@ -31,11 +31,11 @@ Findings are reported most-severe first.
 
 ## Independent-model reviews: when, and which variant
 
-Three distinct review engines look at every change that reaches the Deploy
-row below, and none of them is the final word:
+Three distinct review engines look at every change before it merges, and
+none of them is the final word:
 
-1. the **subagent reviewer** (a Claude subagent, per task, inside the session);
-2. **Codex** (OpenAI), at the SDLC points in the table;
+1. the **subagent reviewer** (a Claude subagent), per task during Build;
+2. **Codex** (OpenAI), at the Design and Deploy points in the table;
 3. **Antigravity** (Gemini, via the `agy` CLI), run at every point where a
    Codex review runs, over the same scope and in the same variant
    (`--adversarial` when the Codex review is adversarial).
@@ -63,6 +63,7 @@ when the approach is settled and only defects matter. Run large diffs in the
 background and tiny ones in the foreground. The whole-branch review before a
 feature merge is mandatory.
 
+Both are Claude Code plugin commands, not commands of the underlying CLIs.
 Invoke Codex with `/codex:review` (standard) or `/codex:adversarial-review`
 (adversarial), scoped with `--base main` for a branch, and Antigravity with
 `/antigravity:review` (add `--adversarial` for the adversarial variant), scoped

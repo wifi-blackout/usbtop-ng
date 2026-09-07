@@ -11,17 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - User-named connectors: a `[connector_names]` table in the preferences file labels a physical connector by its position (`"3:1" = "Left Type-A"`, either side's bus) or by its kernel port object name, and the device table's connector heading then leads with the name. A support bundle's copy of the preferences file masks these labels (they are free text and can name a room or a person) while keeping the keys. See the README's Preferences file section.
 
+### Fixed
+
+- Loading, unloading, and the debugfs mount no longer prepend `sudo` when the effective uid is already 0, so a root login, a container, or a rescue shell without `sudo` installed can load usbmon instead of failing with "No such file or directory". Both the load and the unload prompt name the command that will actually run, and a root run looks for `modprobe` and `mount` in their canonical locations before falling back to `PATH`.
+- Under `sudo`, the invoking user's home is now resolved through the system user database (`getpwuid_r`, so LDAP, SSSD, and other directory-backed accounts resolve) instead of a scan of `/etc/passwd`. Previously a directory-backed user's preferences, snapshot, and usb.ids copy landed in root's home, owned by root.
 ### Security
 
 - `--output PATH` no longer follows a symbolic link at `PATH`: the report file is opened with `O_NOFOLLOW`, so a link planted in a shared directory cannot redirect a root run's output onto another file. A symlink there is refused with an error that says so; a symlinked parent directory still resolves, and `/dev/stdout`, `/dev/stderr`, and `/dev/fd/N` keep working because the sink duplicates the descriptor they name instead of opening a path. The directories leading to `PATH` are trusted as given.
 - USB string descriptors (`manufacturer`, `product`, `serial`) are firmware-controlled, and usb.ids names come from an editable text file; any control character in either (a terminal escape, a BEL, a DEL) and any bidirectional override or isolate is now replaced with U+FFFD as the strings enter the process, so a hostile device or a tampered usb.ids cannot drive the terminal through the text report, reverse a line, or misalign the TUI's columns. Printable names, including non-ASCII, are unchanged.
 - The config directory (`~/.usbtop-ng`) is now created directly with mode 0700 and made private through a descriptor opened with `O_NOFOLLOW`, instead of a path-based chmod after a umask-wide `mkdir`. A symlink swapped in between the two steps is refused rather than followed, so a sudo invoker cannot have root chmod an arbitrary file.
 - Under `sudo`, an existing `~/.usbtop-ng` that resolves outside the invoking user's home (the directory replaced by a symlink to somewhere else) is refused before any write, with an error naming both paths. A symlink that stays inside the home, such as a dotfiles checkout, is fine. Previously only the chown was skipped for such a path; the preferences, snapshot, and usb.ids writes still landed there as root.
-
-### Fixed
-
-- Loading, unloading, and the debugfs mount no longer prepend `sudo` when the effective uid is already 0, so a root login, a container, or a rescue shell without `sudo` installed can load usbmon instead of failing with "No such file or directory". Both the load and the unload prompt name the command that will actually run, and a root run looks for `modprobe` and `mount` in their canonical locations before falling back to `PATH`.
-- Under `sudo`, the invoking user's home is now resolved through the system user database (`getpwuid_r`, so LDAP, SSSD, and other directory-backed accounts resolve) instead of a scan of `/etc/passwd`. Previously a directory-backed user's preferences, snapshot, and usb.ids copy landed in root's home, owned by root.
 
 ## [1.6.0] - 2026-09-07
 

@@ -252,6 +252,28 @@ Open, recorded 2026-09-07 so they do not get lost:
   path under the pinned `fixture/` directory of a support bundle; route
   those writes through the bundle's root descriptor like every other
   bundle file.
+- From the external audit of 2026-09-07, deferred with reasons:
+  - `--output` trusts the directories leading to `PATH` (only a symlink at
+    the leaf is refused). The complete cure, `openat2(2)` with
+    `RESOLVE_NO_SYMLINKS`, refuses every symlinked ancestor, which breaks
+    `/home -> /var/home` layouts and needs Linux 5.6 (the BM1684x board
+    runs 5.4). An opt-in strict mode, or an ancestor walk that refuses
+    only links owned by a third user, would close the gap without that.
+  - eBPF: the `bytes` map never drops a key, so a long run with many
+    distinct (bus, device, endpoint, direction) tuples can fill its 4096
+    slots. The loss is counted (`kdropped:`), not silent, and device
+    numbers recycle, so it needs an unusual fleet; still, delete the keys
+    of departed devices from the poller (`MapCore::delete`), and read the
+    map with `lookup_batch` (Linux 5.6+, with the per-key fallback) instead
+    of one syscall per key.
+  - The `read(2)` fallback reader discards captured payload in 512-byte
+    chunks (`DRAIN_CHUNK`); a larger chunk would cut syscalls on a
+    SuperSpeed bulk stream. Measure on the fallback path before changing
+    it: the mmap ring, the default, never drains this way.
+  - The debugfs text reader has no line-length cap. The kernel formats
+    each event into a fixed buffer (`drivers/usb/mon/mon_text.c`), so a
+    cap only guards a synthetic file handed to `--capture`/replay; add one
+    if that ever matters.
 - Connector rows leftovers: a dock fixture for the corpus when a dock is
   available. (Done 2026-09-07: the `/proc/self/fd/<n>/fixture` scrub is
   a pure function pinned by a hermetic test with a synthetic failing

@@ -513,7 +513,7 @@ says, and the snapshot is the one list you control.
 
 ### Tests
 
-- `cargo test --all-targets` runs the hermetic unit suite (576 tests)
+- `cargo test --all-targets` runs the hermetic unit suite (662 tests)
   against fixture files, FIFOs, and temporary paths, needing no `/dev` and
   no debugfs access, plus the two harnesses in `tests/` (3 and 2 tests): a
   PTY harness for the wedged-terminal checks (quit, `SIGHUP`, a terminal
