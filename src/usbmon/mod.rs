@@ -251,12 +251,18 @@ fn is_yes_response(input: &str) -> bool {
 }
 
 pub fn prompt_user_to_load_module() -> Result<bool> {
+    // Describe the command that will actually run: plain when already root.
+    let sudo = if effective_uid() == 0 { "" } else { "sudo " };
     println!("usbmon is not loaded, so usbtop-ng cannot read live USB traffic yet.");
-    println!("usbtop-ng can run 'sudo modprobe usbmon' for you now.");
+    println!("usbtop-ng can run '{sudo}modprobe usbmon' for you now.");
     println!("If debugfs is not mounted, it can also run:");
-    println!("  sudo mount -t debugfs none /sys/kernel/debug");
+    println!("  {sudo}mount -t debugfs none /sys/kernel/debug");
     println!();
-    println!("This may ask for your sudo password. Answer 'n' to leave the system unchanged.");
+    if sudo.is_empty() {
+        println!("Answer 'n' to leave the system unchanged.");
+    } else {
+        println!("This may ask for your sudo password. Answer 'n' to leave the system unchanged.");
+    }
     print!("Load usbmon now? (y/N): ");
     io::stdout().flush()?;
 
@@ -293,12 +299,34 @@ pub fn prompt_user_to_unload_module() -> Result<bool> {
     Ok(is_yes_response(&input))
 }
 
+/// The effective uid, the one privilege checks care about.
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid() takes no arguments, touches no memory, cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Build a command that needs root. With an effective uid of 0 (already
+/// under sudo, a root login, a container or rescue shell where `sudo` may
+/// not even be installed) the program runs directly; otherwise it is
+/// wrapped in `sudo`, which may prompt for a password.
+fn as_root(euid: u32, program: &str, args: &[&str]) -> Command {
+    let mut command = if euid == 0 {
+        Command::new(program)
+    } else {
+        let mut sudo = Command::new("sudo");
+        sudo.arg(program);
+        sudo
+    };
+    command.args(args);
+    command
+}
+
 pub fn attempt_load_usbmon() -> Result<()> {
     info!("attempting to load usbmon kernel module");
+    let euid = effective_uid();
 
     // Try to load usbmon module
-    let output = Command::new("sudo")
-        .args(["modprobe", "usbmon"])
+    let output = as_root(euid, "modprobe", &["usbmon"])
         .output()
         .map_err(|e| anyhow!("could not run modprobe: {}", e))?;
 
@@ -310,10 +338,13 @@ pub fn attempt_load_usbmon() -> Result<()> {
     // Try to mount debugfs if needed
     if !is_debugfs_mounted()? {
         info!("attempting to mount debugfs");
-        let output = Command::new("sudo")
-            .args(["mount", "-t", "debugfs", "none", "/sys/kernel/debug"])
-            .output()
-            .map_err(|e| anyhow!("could not mount debugfs: {}", e))?;
+        let output = as_root(
+            euid,
+            "mount",
+            &["-t", "debugfs", "none", "/sys/kernel/debug"],
+        )
+        .output()
+        .map_err(|e| anyhow!("could not mount debugfs: {}", e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -343,8 +374,7 @@ pub fn attempt_load_usbmon() -> Result<()> {
 pub fn attempt_unload_usbmon() -> Result<()> {
     debug!("attempting to unload usbmon kernel module");
 
-    let output = Command::new("sudo")
-        .args(["modprobe", "-r", "usbmon"])
+    let output = as_root(effective_uid(), "modprobe", &["-r", "usbmon"])
         .output()
         .map_err(|e| anyhow!("could not run modprobe -r: {}", e))?;
 
@@ -480,7 +510,9 @@ pub fn print_permission_remedy() {
 #[cfg(test)]
 mod tests {
     use super::is_yes_response;
-    use super::{announce_automatic_unload, unload_mode, UnloadMode, AUTOMATIC_UNLOAD_NOTICE};
+    use super::{
+        announce_automatic_unload, as_root, unload_mode, UnloadMode, AUTOMATIC_UNLOAD_NOTICE,
+    };
     use std::io::{self, Write};
 
     /// A terminal that has already gone away: every write fails, as writes to a
@@ -495,6 +527,29 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Err(io::Error::from(io::ErrorKind::BrokenPipe))
         }
+    }
+
+    #[test]
+    fn as_root_runs_the_program_directly_when_already_root() {
+        let command = as_root(0, "modprobe", &["usbmon"]);
+        assert_eq!(command.get_program(), "modprobe");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["usbmon"]);
+    }
+
+    #[test]
+    fn as_root_wraps_the_program_in_sudo_for_a_plain_user() {
+        let command = as_root(
+            1000,
+            "mount",
+            &["-t", "debugfs", "none", "/sys/kernel/debug"],
+        );
+        assert_eq!(command.get_program(), "sudo");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            ["mount", "-t", "debugfs", "none", "/sys/kernel/debug"]
+        );
     }
 
     #[test]

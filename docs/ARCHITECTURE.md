@@ -883,7 +883,7 @@ fn get_usbmon_path(bus_id: u8) -> PathBuf {
 - Device metadata from sysfs.
 - debugfs mount detection, by reading `/proc/mounts`.
 - Module detection, by reading `/proc/modules`, plus load and unload through
-  `sudo modprobe`.
+  `modprobe` (wrapped in `sudo` unless the effective uid is already 0).
 
 ## Performance
 
@@ -936,8 +936,10 @@ usbtop-ng needs elevated privileges to read usbmon.
 ### Security measures
 
 1. **No privilege changes inside the process.** usbtop-ng calls neither
-   `setuid` nor `setgid`. It runs `sudo modprobe` and `sudo mount` as child
-   processes, and it prints the command it wants to run before it asks.
+   `setuid` nor `setgid`. It runs `modprobe` and `mount` as child processes,
+   wrapped in `sudo` only when it is not already root (a root login, a
+   container, or a rescue shell may have no `sudo` at all), and it prints
+   the command it wants to run before it asks.
 2. **Parsing that rejects rather than guesses.** A malformed text line returns
    an error, which the reader logs and skips. The read()-based binary reader
    reads a fixed 48 byte header and drains exactly `len_cap` bytes. A
@@ -959,8 +961,8 @@ usbtop-ng needs elevated privileges to read usbmon.
 - **Kernel interface**: read-only access to the usbmon interfaces.
 - **Configuration**: TOML parsing, with both defaults false.
 - **Terminal**: output through ratatui and the `ShedWriter` stage.
-- **Child processes**: `sudo modprobe` and `sudo mount`, run with
-  `Command::output()`, which pipes their stdout and stderr.
+- **Child processes**: `modprobe` and `mount` (through `sudo` unless already
+  root), run with `Command::output()`, which pipes their stdout and stderr.
 
 ## Error handling
 

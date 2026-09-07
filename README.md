@@ -492,6 +492,8 @@ says, and the snapshot is the one list you control.
   ```bash
   sudo modprobe usbmon
   ```
+  When usbtop-ng is already root (a root login, a container, a rescue shell),
+  it runs `modprobe` directly and does not need `sudo` to be installed.
 - If debugfs is not mounted, the same step also runs:
   ```bash
   sudo mount -t debugfs none /sys/kernel/debug
