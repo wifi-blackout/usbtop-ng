@@ -287,9 +287,15 @@ enum EntryKind {
 /// the invoker's home is verified, through the very descriptor it was just
 /// opened as, to really be there (see [`PinnedDir::for_file`]). This is the
 /// support bundle's pinned-root pattern applied to the config directory.
+#[derive(Debug)]
 pub struct PinnedDir {
     dir: fs::File,
     path: PathBuf,
+    /// Verified at the open, through the descriptor: a sudo invoker exists
+    /// and this directory really lies inside their home. Every later
+    /// ownership handoff decides from this, never from a path resolved
+    /// again (see [`PinnedDir::chown_created`]).
+    in_home: bool,
 }
 
 impl PinnedDir {
@@ -322,6 +328,7 @@ impl PinnedDir {
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
             .open(dir_path)?;
+        let mut in_home = false;
         if let Some(home) = invoker_home {
             if is_within(claimed, home) {
                 let actual = fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd()))?;
@@ -339,12 +346,40 @@ impl PinnedDir {
                         ),
                     ));
                 }
+                in_home = true;
             }
         }
         Ok(PinnedDir {
             dir,
             path: dir_path.to_path_buf(),
+            in_home,
         })
+    }
+
+    /// Hand a file this process just created in this directory to the sudo
+    /// invoker, deciding from what the open verified rather than from a
+    /// path resolved now: a directory swapped after the open cannot turn
+    /// the decision into a wrong "outside the home, skip", which would
+    /// rename a root-owned file into the user's own directory. The act is
+    /// `fchown(2)` on `fd`, as in [`chown_created_to_invoker`], the
+    /// path-based sibling for creation sites that hold no pinned
+    /// directory; `path` is for the warning only. A no-op without a sudo
+    /// invoker or outside their home.
+    pub fn chown_created(&self, fd: RawFd, path: &Path) {
+        if !self.in_home {
+            return;
+        }
+        let Some(invoker) = sudo_invoker() else {
+            return;
+        };
+        if let Err(e) = fchown_fd(fd, invoker.uid, invoker.gid) {
+            log::warn!(
+                "could not set ownership of {} to uid {} gid {}: {e}",
+                path.display(),
+                invoker.uid,
+                invoker.gid
+            );
+        }
     }
 
     /// The path this directory was opened as, joined with `name`: for
@@ -540,14 +575,15 @@ pub fn replace_file_owned(path: &Path, bytes: &[u8]) -> io::Result<()> {
         }
         Err(e) => return Err(e),
     };
-    // The chown acts on the fd this call just created, not a re-resolved
-    // path (see [`chown_created_to_invoker`]); `rename(2)` renames an entry,
-    // it does not touch the inode's ownership, so `path` inherits it.
+    // The chown acts on the fd this call just created, and its decision on
+    // what the directory open verified (see [`PinnedDir::chown_created`]);
+    // `rename(2)` renames an entry, it does not touch the inode's
+    // ownership, so `path` inherits it.
     let tmp_path = dir.join(&tmp_name);
     let written = file
         .write_all(bytes)
         .and_then(|()| file.sync_all())
-        .map(|()| chown_created_to_invoker(&tmp_path, file.as_raw_fd()));
+        .map(|()| dir.chown_created(file.as_raw_fd(), &tmp_path));
     drop(file);
     if let Err(e) = written.and_then(|()| dir.rename(&tmp_name, file_name)) {
         let _ = dir.unlink(&tmp_name);
@@ -871,10 +907,23 @@ mod tests {
 
         let open = |dir: PathBuf| {
             let claimed = dir.join("preferences.toml");
-            PinnedDir::open(&dir, &claimed, Some(&home)).map(|_| ())
+            PinnedDir::open(&dir, &claimed, Some(&home))
         };
-        open(home.join(".plain")).expect("a real directory in home");
-        open(home.join(".inside-link")).expect("a link that stays inside home");
+        assert!(
+            open(home.join(".plain"))
+                .expect("a real directory in home")
+                .in_home,
+            "verified in home"
+        );
+        assert!(
+            open(home.join(".inside-link"))
+                .expect("a link that stays inside home")
+                .in_home
+        );
+        // An explicit path outside the home is the invoker's own choice:
+        // opened, not checked, and no ownership handoff.
+        let elsewhere = PinnedDir::open(&outside, &outside.join("usb.ids"), Some(&home)).unwrap();
+        assert!(!elsewhere.in_home);
         let err = open(home.join(".escape")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert!(
@@ -898,9 +947,11 @@ mod tests {
         let escape = home.join(".escape");
         symlink(&outside, &escape).unwrap();
 
-        // Not root acting for someone else: the user's own layout is theirs.
-        PinnedDir::open(&escape, &escape.join("preferences.toml"), None)
+        // Not root acting for someone else: the user's own layout is theirs,
+        // and there is nobody to hand ownership to.
+        let dir = PinnedDir::open(&escape, &escape.join("preferences.toml"), None)
             .expect("no privilege boundary, no refusal");
+        assert!(!dir.in_home);
     }
 
     #[test]

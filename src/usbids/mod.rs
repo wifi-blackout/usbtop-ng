@@ -600,12 +600,12 @@ fn write_quarantine_file(
         .with_context(|| format!("creating quarantine file {}", quarantine.display()))?;
     file.write_all(payload.as_bytes())
         .with_context(|| format!("writing quarantine file {}", quarantine.display()))?;
-    // Chowns the fd this call itself just created with `create_new`, not a
-    // re-resolved path -- see `chown_created_to_invoker`'s doc comment. The
-    // eventual same-directory rename into `dest` (in `pull_usbids`, below)
-    // preserves this ownership, so nothing needs to chown `dest` again after
-    // the rename.
-    crate::config::chown_created_to_invoker(&quarantine, file.as_raw_fd());
+    // Chowns the fd this call itself just created with `create_new`, decided
+    // from what the pinned directory's open verified -- see
+    // `PinnedDir::chown_created`. The eventual same-directory rename into
+    // `dest` (in `pull_usbids`, below) preserves this ownership, so nothing
+    // needs to chown `dest` again after the rename.
+    dir.chown_created(file.as_raw_fd(), &quarantine);
     Ok(())
 }
 

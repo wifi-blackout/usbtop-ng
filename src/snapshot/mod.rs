@@ -225,7 +225,7 @@ impl SnapshotLock {
         // rule as the snapshot itself applies (see `config::PinnedDir`).
         let dir = crate::config::PinnedDir::for_file(&path)?;
         let file = dir.open_or_create(name, 0o600)?;
-        crate::config::chown_created_to_invoker(&path, file.as_raw_fd());
+        dir.chown_created(file.as_raw_fd(), &path);
         // SAFETY: `file` owns a valid open descriptor for the whole call;
         // `flock` takes the descriptor and an operation and touches no memory.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | extra_flock_flags) };
