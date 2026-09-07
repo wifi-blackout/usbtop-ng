@@ -251,6 +251,37 @@ validation yet of that backend for high-throughput monitoring.
 
 These came out of code review. Each is small and none blocks a release.
 
+Open, recorded 2026-09-07 so they do not get lost:
+
+- Privacy: `Redactor::cmdline` masks `UUID=` and `PARTUUID=` values in the
+  kernel command line but not the path forms `/dev/disk/by-uuid/<uuid>` and
+  `/dev/disk/by-partuuid/<uuid>`, which identify the installation just as
+  surely. Mask those too, with a test.
+- The DMI board string in the support bundle's host collector repeats the
+  vendor when `product_name` already starts with it (a desktop reports
+  `HP HP Pavilion …`); `capture::meta` already dedupes, the collector
+  should too.
+- `--capture-fixture` prints `1 source(s)`; pluralize properly.
+- One fd-anchored write primitive: the support bundle's `write_new_at` and
+  the config writers (`write_file_owned`, `replace_file_owned`) duplicate
+  the create-write-chown shape; and the preferences writer should replace
+  atomically the way the snapshot writer now does.
+- The fixture-capture core (`capture::assemble_bundle`) still writes by
+  path under the pinned `fixture/` directory of a support bundle; route
+  those writes through the bundle's root descriptor like every other
+  bundle file.
+- An `integration` test that injects a synthetic failing capture note to
+  prove the `/proc/self/fd/<n>/fixture` scrub in the support orchestrator,
+  which today is only exercised by a real failure.
+- Connector rows leftovers: a shared attribute-copy helper for
+  `copy_attrs`/`copy_ports`; move the connector policy (`Placement`,
+  `connector_placement`, `order_sides`) from `src/ui/mod.rs` into
+  `src/ui/connectors.rs` and narrow `port_of_device`/`port_name`
+  visibility; a lock so `--forget-internal` and a concurrent TUI `S` cannot
+  lose each other's edit; two test nits (a literal `99999` pid in the
+  stale-temp test, a loose `err.kind() != NotFound` assertion); a dock
+  fixture for the corpus when a dock is available.
+
 - Fixed: error, prompt, and log strings follow the three shapes in [CONTRIBUTING](CONTRIBUTING.md#user-facing-text).
 - Fixed: the report `source` field mislabeled the mmap ring reader as
   `"binary"`. `capture_source_label` (src/headless/mod.rs) knew only
