@@ -584,6 +584,20 @@ fn check_payload_size(len: usize) -> Result<()> {
     Ok(())
 }
 
+/// The install below renames over `dest`, which would silently turn a
+/// symlink there (the home copy pointed at a distro file, say) into a
+/// regular file; the same refusal `config::replace_file_owned` makes.
+fn refuse_symlinked_dest(
+    dir: &crate::config::PinnedDir,
+    dest_name: &std::ffi::OsStr,
+    dest: &Path,
+) -> Result<()> {
+    if dir.entry_kind(dest_name)? == crate::config::EntryKind::Symlink {
+        anyhow::bail!("refusing to replace a symlink at {}", dest.display());
+    }
+    Ok(())
+}
+
 /// Write `payload` to `quarantine` without ever writing through a
 /// pre-existing symlink there. A leftover tmp file from an earlier,
 /// interrupted pull is removed first (errors ignored -- there may be
@@ -680,6 +694,7 @@ pub fn pull_usbids(dest: &Path, chain_paths: &[&Path]) -> Result<()> {
     else {
         anyhow::bail!("{} has no file name", dest.display());
     };
+    refuse_symlinked_dest(&dir, dest_name, dest)?;
     write_quarantine_file(&dir, quarantine_name, &payload)?;
 
     // The floor is the newer of the file about to be replaced and the
@@ -1257,6 +1272,32 @@ C 03  HID (Human Interface Device)
             "newer than the active source but older than the replaced copy must still fail",
         );
         assert!(err.to_string().contains("backdated") || err.to_string().contains("older"));
+    }
+
+    #[test]
+    fn install_refuses_a_symlinked_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared.ids");
+        std::fs::write(&shared, "0430  Fujitsu Component Limited\n").unwrap();
+        let dest = temp.path().join("usb.ids");
+        std::os::unix::fs::symlink(&shared, &dest).unwrap();
+        let dir = crate::config::PinnedDir::for_file(&dest).unwrap();
+
+        let err = refuse_symlinked_dest(&dir, dest.file_name().unwrap(), &dest).unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to replace a symlink"),
+            "{err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&dest)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the user's link is left alone"
+        );
+        let plain = temp.path().join("plain.ids");
+        std::fs::write(&plain, "x").unwrap();
+        refuse_symlinked_dest(&dir, plain.file_name().unwrap(), &plain).unwrap();
     }
 
     #[test]

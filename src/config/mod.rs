@@ -272,7 +272,7 @@ pub fn chown_created_to_invoker(path: &Path, fd: RawFd) {
 
 /// What an `lstat` of a directory entry found.
 #[derive(Debug, PartialEq, Eq)]
-enum EntryKind {
+pub(crate) enum EntryKind {
     Missing,
     Symlink,
     RegularFile,
@@ -404,7 +404,7 @@ impl PinnedDir {
     }
 
     /// `lstat` of the entry `name`: a symlink is reported as itself.
-    fn entry_kind(&self, name: &OsStr) -> io::Result<EntryKind> {
+    pub(crate) fn entry_kind(&self, name: &OsStr) -> io::Result<EntryKind> {
         let name = Self::c_name(name)?;
         // SAFETY: `stat` is plain data for which all-zero is a valid value.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -717,10 +717,24 @@ pub fn ensure_private_config_dir(dir: &Path) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(dir)
-        .with_context(|| format!("failed to create config directory {}", dir.display()))?;
+    match fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        // Two first runs at once (a TUI and a CLI, say) both saw no
+        // directory; the other one created it. That is the existing
+        // directory case, gated the same way -- but only if it really is a
+        // directory now: a dangling symlink also answers EEXIST here and
+        // must still fail rather than be treated as created.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => {
+            if let Some(invoker) = sudo_invoker() {
+                refuse_escape_from_home(dir, &invoker.home)?;
+            }
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("failed to create config directory {}", dir.display()));
+        }
+    }
     let handle = set_private_dir_permissions(dir)?;
     chown_created_to_invoker(dir, handle.as_raw_fd());
     Ok(())
