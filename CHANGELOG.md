@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `--output PATH` no longer follows a symbolic link at `PATH`: the report file is opened with `O_NOFOLLOW`, so a link planted in a shared directory cannot redirect a root run's output onto another file. A symlink there is refused with an error that says so; a symlinked parent directory still resolves.
 - USB string descriptors (`manufacturer`, `product`, `serial`) are firmware-controlled; any control character in them (a terminal escape, a BEL, a DEL) is now replaced with U+FFFD as the strings are read from sysfs, so a hostile device cannot drive the terminal through the text report or misalign the TUI's columns. Printable names are unchanged.
+- The config directory (`~/.usbtop-ng`) is now created directly with mode 0700 and made private through a descriptor opened with `O_NOFOLLOW`, instead of a path-based chmod after a umask-wide `mkdir`. A symlink swapped in between the two steps is refused rather than followed, so a sudo invoker cannot have root chmod an arbitrary file.
 
 ## [1.6.0] - 2026-09-07
 

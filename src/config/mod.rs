@@ -412,52 +412,50 @@ pub fn write_preferences_at(path: &Path, prefs: &Preferences) -> Result<()> {
 
 /// Create the default config directory with private (0700) permissions.
 /// Only chmods when this call creates the directory; an existing directory
-/// (or a user-supplied custom path) is never re-chmodded. The freshly
-/// created directory is chowned by reopening it (`O_DIRECTORY | O_NOFOLLOW`)
-/// and calling [`chown_created_to_invoker`] on that fresh handle -- the same
-/// fd-based pattern every creation site in this module uses.
+/// (or a user-supplied custom path) is never re-chmodded. The directory is
+/// born 0700 (`mkdir(2)` with that mode, so there is no umask-wide window
+/// before a later chmod), then reopened once (`O_DIRECTORY | O_NOFOLLOW`)
+/// and made private *and* chowned through that single fd -- the same
+/// fd-based pattern every creation site in this module uses. A directory
+/// that cannot be reopened that way was swapped out from under us between
+/// the mkdir and the reopen, and that is an error, not a warning.
 pub fn ensure_private_config_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
     if dir.exists() {
         return Ok(());
     }
-    fs::create_dir_all(dir)
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
         .with_context(|| format!("failed to create config directory {}", dir.display()))?;
-    set_private_dir_permissions(dir)?;
-    chown_created_dir_to_invoker(dir);
+    let handle = set_private_dir_permissions(dir)?;
+    chown_created_to_invoker(dir, handle.as_raw_fd());
     Ok(())
 }
 
-/// Reopen the directory this call just created purely to get a fresh,
-/// trustworthy fd to chown -- `fs::create_dir_all`/`fs::metadata` never hand
-/// one back. `O_DIRECTORY` refuses anything that is not (by now) actually a
-/// directory; `O_NOFOLLOW` refuses a symlinked final component. A failure to
-/// reopen is logged and skipped, the same best-effort contract
-/// [`chown_created_to_invoker`] itself has -- ownership drift must never
-/// fail the run.
-fn chown_created_dir_to_invoker(dir: &Path) {
-    match fs::OpenOptions::new()
+/// Make the directory this call just created private, through a descriptor
+/// rather than a path, and hand that descriptor back so ownership can be set
+/// on the very same one. `O_DIRECTORY` refuses anything that is not (by now)
+/// actually a directory; `O_NOFOLLOW` refuses a symlinked final component,
+/// so a link swapped in after the mkdir is an error here instead of a
+/// `chmod(2)` that follows it and locks down whatever it points at.
+/// `fchmod(2)` then acts on the open directory and nothing else.
+fn set_private_dir_permissions(path: &Path) -> Result<fs::File> {
+    let handle = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(dir)
-    {
-        Ok(handle) => chown_created_to_invoker(dir, handle.as_raw_fd()),
-        Err(e) => {
-            log::warn!(
-                "could not reopen {} to set its ownership: {e}",
-                dir.display()
-            );
-        }
+        .open(path)
+        .with_context(|| format!("could not reopen {} to make it private", path.display()))?;
+    // SAFETY: `fchmod(int fd, mode_t mode)` (sys/stat.h) reads only its two
+    // scalar arguments; `handle` keeps the descriptor open for the call.
+    // It returns 0 on success, else -1 with errno set.
+    if unsafe { libc::fchmod(handle.as_raw_fd(), 0o700) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to set permissions on {}", path.display()));
     }
-}
-
-fn set_private_dir_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = fs::metadata(path)?.permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(path, permissions)
-        .with_context(|| format!("failed to set permissions on {}", path.display()))?;
-    Ok(())
+    Ok(handle)
 }
 
 #[cfg(test)]
@@ -700,6 +698,39 @@ mod tests {
 
         let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "existing dir must not be re-chmodded");
+    }
+
+    #[test]
+    fn set_private_dir_permissions_refuses_a_symlink_and_leaves_its_target_alone() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("elsewhere");
+        fs::create_dir_all(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = temp.path().join(".usbtop-ng");
+        symlink(&target, &link).unwrap();
+
+        // The race this guards: root creates the directory, the invoker swaps
+        // it for a symlink before the chmod lands. A path-based chmod would
+        // follow the link and lock down whatever it points at.
+        assert!(
+            set_private_dir_permissions(&link).is_err(),
+            "a symlink must be refused, not chmodded through"
+        );
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the link target must keep its own mode");
+    }
+
+    #[test]
+    fn ensure_private_config_dir_refuses_a_dangling_symlink_and_creates_nothing() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("never-made");
+        let link = temp.path().join(".usbtop-ng");
+        symlink(&target, &link).unwrap();
+
+        assert!(ensure_private_config_dir(&link).is_err());
+        assert!(!target.exists(), "nothing may be created through the link");
     }
 
     #[test]
