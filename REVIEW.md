@@ -29,11 +29,26 @@ human approves it. An agent never approves its own change.
 
 Findings are reported most-severe first.
 
-## Codex reviews: when, and which variant
+## Independent-model reviews: when, and which variant
 
-A Codex review is a separate gate from the per-task subagent review. The
-subagent reviewer gates each task inside a session; a Codex review looks at the
-assembled work with an independent model.
+Three distinct review engines look at every change that reaches the Deploy
+row below, and none of them is the final word:
+
+1. the **subagent reviewer** (a Claude subagent, per task, inside the session);
+2. **Codex** (OpenAI), at the SDLC points in the table;
+3. **Antigravity** (Gemini, via the `agy` CLI), run at every point where a
+   Codex review runs, over the same scope and in the same variant
+   (`--adversarial` when the Codex review is adversarial).
+
+Codex and Antigravity are separate gates from the per-task subagent review:
+the subagent reviewer gates each task inside a session; the two external
+models look at the assembled work. Whenever a Codex review is performed, an
+Antigravity review is performed too, so no change is assessed by fewer than
+three engines. The session's Claude then reconciles every finding from all
+three against the actual code, drops what does not hold, and is the **final
+arbiter**: agreement across model families is a strong signal, disagreement is
+a prompt to look closer, and a finding is neither accepted nor dismissed on
+an engine's say-so alone.
 
 | SDLC point | Review | Variant | When it applies |
 |---|---|---|---|
@@ -48,5 +63,9 @@ when the approach is settled and only defects matter. Run large diffs in the
 background and tiny ones in the foreground. The whole-branch review before a
 feature merge is mandatory.
 
-Invoke with `/codex:review` (standard) or `/codex:adversarial-review`
-(adversarial), scoped with `--base main` for a branch.
+Invoke Codex with `/codex:review` (standard) or `/codex:adversarial-review`
+(adversarial), scoped with `--base main` for a branch, and Antigravity with
+`/antigravity:review` (add `--adversarial` for the adversarial variant), scoped
+to the same range (`main...HEAD` for a branch). The Antigravity diff is piped
+by the session itself, never by a subagent (the delegate subagent's gate
+refuses pipelines by design). Run the two in parallel, then reconcile.
