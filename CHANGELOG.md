@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Loading, unloading, and the debugfs mount no longer prepend `sudo` when the effective uid is already 0, so a root login, a container, or a rescue shell without `sudo` installed can load usbmon instead of failing with "No such file or directory". Both the load and the unload prompt name the command that will actually run, and a root run looks for `modprobe` and `mount` in their canonical locations before falling back to `PATH`.
 - Under `sudo`, the invoking user's home is now resolved through the system user database (`getpwuid_r`, so LDAP, SSSD, and other directory-backed accounts resolve) instead of a scan of `/etc/passwd`. Previously a directory-backed user's preferences, snapshot, and usb.ids copy landed in root's home, owned by root.
+
 ### Security
 
 - `--output PATH` no longer follows a symbolic link at `PATH`: the report file is opened with `O_NOFOLLOW`, so a link planted in a shared directory cannot redirect a root run's output onto another file. A symlink there is refused with an error that says so; a symlinked parent directory still resolves, and `/dev/stdout`, `/dev/stderr`, and `/dev/fd/N` keep working because the sink duplicates the descriptor they name instead of opening a path. The directories leading to `PATH` are trusted as given.
