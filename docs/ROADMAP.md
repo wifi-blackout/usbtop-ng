@@ -252,7 +252,16 @@ Open, recorded 2026-09-07 so they do not get lost:
   path under the pinned `fixture/` directory of a support bundle; route
   those writes through the bundle's root descriptor like every other
   bundle file.
-- From the external audit of 2026-09-07, deferred with reasons:
+- From the external audit of 2026-09-07. It raised ten findings; five held
+  and shipped on 2026-09-07 (`--output` opened with `O_NOFOLLOW`, control
+  and bidi characters replaced in descriptor and usb.ids names, the config
+  directory pinned on a verified descriptor with every write relative to
+  it, `modprobe`/`mount` without `sudo` at uid 0, the sudo invoker's home
+  from `getpwuid_r`), and five were rejected on inspection (a debugfs line
+  cap, the per-tick port rescan the connector spec chose deliberately, the
+  per-packet clock read, the eBPF map-full loss that the `kdropped:` field
+  already surfaces, and the 512-byte drain chunk as stated). Deferred with
+  reasons:
   - `--output` trusts the directories leading to `PATH` (only a symlink at
     the leaf is refused). The complete cure, `openat2(2)` with
     `RESOLVE_NO_SYMLINKS`, refuses every symlinked ancestor, which breaks

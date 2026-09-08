@@ -59,9 +59,10 @@ Regression floor: `bash evals/run.sh` (see `evals/`).
 
 ## Reviews
 
-The review policy — the passes every change gets, the severity levels, and when
-a Codex review runs and whether it is standard or adversarial — is in
-`REVIEW.md`.
+The review policy — the passes every change gets, the severity levels, when
+the Codex and Antigravity reviews run and in which variant, and that the
+session's Claude reconciles all three engines' findings as the final
+arbiter — is in `REVIEW.md`.
 
 ## Commit trailers
 

@@ -5,7 +5,7 @@ pass, and how to send it.
 
 Before contributing, read `CLAUDE.md` at the repo root (the one-page build,
 gate, and discipline contract) and `REVIEW.md` (the review policy and the
-Codex-review checkpoints).
+Codex and Antigravity review checkpoints).
 
 ## Table of contents
 
