@@ -219,7 +219,7 @@ A file export starts with a run record so the file describes the run it
 came from. In JSON it is the first line:
 
 ```json
-{"record":"run","usbtop_ng":"1.5.0","features":[],"started_unix":1788354946,"window_seconds":1.0,"batch":true,"filters":[],"command":["usbtop-ng","--batch","--json","--window","1","--output","run.ndjson"],"backend":"mmap","kernel":"7.0.0-30-generic","os":"Linux Mint 22.3","arch":"x86_64","buses":[0,1,2,3,4]}
+{"record":"run","usbtop_ng":"1.7.0","features":[],"started_unix":1788354946,"window_seconds":1.0,"batch":true,"filters":[],"command":["usbtop-ng","--batch","--json","--window","1","--output","run.ndjson"],"backend":"mmap","kernel":"7.0.0-30-generic","os":"Linux Mint 22.3","arch":"x86_64","buses":[0,1,2,3,4]}
 ```
 
 | Field | Type | Meaning |

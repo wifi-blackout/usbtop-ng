@@ -69,9 +69,9 @@ Codex and Antigravity review checkpoints).
    ```bash
    cargo test
    ```
-   The unit suite reports 667 passed; the `tests/` directory adds the
-   pipe and PTY harnesses alongside it. A failure names the test. Fix it and
-   repeat.
+   The unit suite reports several hundred tests passed and none failed; the
+   `tests/` directory adds the pipe and PTY harnesses alongside it. A failure
+   names the test. Fix it and repeat.
 4. To run with debug output, use:
    ```bash
    RUST_LOG=debug cargo run -- --verbose
@@ -217,7 +217,7 @@ cargo test --all-targets
 ```
 
 `cargo test` and `cargo test --all-targets` run the same three suites, all
-hermetic. The unit suite reports 667 passed, working against
+hermetic. The unit suite runs several hundred tests, working against
 fixture files, FIFOs, and `tempfile` paths, with no `/dev` and no debugfs
 access. The `tests/` directory adds two more: `restore_pipe.rs` (2 tests),
 proving the terminal-restore bytes reach a piped stdout while the process is
@@ -290,10 +290,10 @@ Rust toolchain.
    cargo clippy --features capture-fixture --all-targets -- -D warnings
    cargo test --features capture-fixture
    ```
-   The unit suite reports 667 passed under the feature, the same as
-   without it: the capture core it exercises is already part of the
-   default build, and the feature adds only the `--capture-fixture`
-   subcommand, not tests.
+   The unit suite reports one more test passed than the default build
+   (the feature's own hermetic test): the capture core it exercises is
+   already part of the default build, and the feature adds the
+   `--capture-fixture` subcommand.
 
 Like `ebpf`, CI builds and hermetic-tests this feature on every push:
 `cargo clippy --features capture-fixture --all-targets -- -D warnings` and
@@ -362,9 +362,9 @@ Cover these areas first:
    ```bash
    cargo test --all-targets
    ```
-   The unit suite reports 667 passed; the `tests/` directory adds the
-   pipe and PTY harnesses alongside it. A failure names the test. Fix it and
-   repeat.
+   The unit suite reports several hundred tests passed and none failed; the
+   `tests/` directory adds the pipe and PTY harnesses alongside it. A failure
+   names the test. Fix it and repeat.
 6. Update the documentation your change affects.
 7. Add tests for new behavior.
 
