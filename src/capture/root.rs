@@ -17,7 +17,6 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use crate::config::chown_created_to_invoker;
 use crate::diag::bundle;
 
 /// A fixture directory pinned on a descriptor (see the module doc).
@@ -28,8 +27,8 @@ pub struct FixtureRoot {
     /// [`read_base_for`]) so every reader and every message keys on the
     /// same base.
     read_base: PathBuf,
-    /// The path the directory was named by: for the ownership decision
-    /// (see [`chown_created_to_invoker`]) and the ownership pass; no write
+    /// The path the directory was named by: for the ownership pass at the
+    /// end (`own_tree`) and the procfs-less read fallback; no write
     /// resolves it.
     logical: PathBuf,
     /// How messages name the directory: the path as the user gave it, or
@@ -89,7 +88,7 @@ impl FixtureRoot {
         })
     }
 
-    /// The path this directory was named by (ownership decision and pass).
+    /// The path this directory was named by (for the ownership pass).
     pub fn logical(&self) -> &Path {
         &self.logical
     }
@@ -122,15 +121,17 @@ impl FixtureRoot {
 
     /// Create the file `rel` (bundle-relative, `/`-separated) fresh --
     /// an entry already there is an error, never truncated -- creating
-    /// directories on the way, and write `bytes`; the file is handed to the
-    /// sudo invoker like every other bundle file.
+    /// directories on the way, and write `bytes`. The file stays root's
+    /// until the ownership pass that runs after every re-check and replay
+    /// has read the finished tree (`own_tree`, from the `--capture-fixture`
+    /// handler or at the end of a support bundle): handing it over here,
+    /// while the privileged process still reads it back, would let the
+    /// invoker rewrite a trace between its write and its replay.
     pub fn write(&self, rel: &str, bytes: &[u8]) -> io::Result<()> {
         let mut file =
             bundle::create_new_file_at(self.fd.as_fd(), rel, self.dir_mode, self.file_mode)?;
         file.write_all(bytes)?;
-        file.flush()?;
-        chown_created_to_invoker(&self.logical.join(rel), file.as_raw_fd());
-        Ok(())
+        file.flush()
     }
 
     /// Create the directory `rel` and every directory on the way.

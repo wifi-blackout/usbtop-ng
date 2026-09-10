@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `--capture-fixture <DIR>`: the fixture is created readable (`0755`/`0644`, the umask applying) and handed to the sudo invoker like a support bundle, where it used to stay root-owned; a symlink at `DIR` itself is refused, and a file already present at any name the capturer writes is an error rather than overwritten (use a fresh directory, as the stale-`sysfs` rule already required).
+- `--capture-fixture <DIR>`: the fixture is created readable (`0755`/`0644`, the umask applying) and handed to the sudo invoker once the capture has finished and been checked, like a support bundle, where it used to stay root-owned; a symlink at `DIR` itself is refused, and a file already present at any name the capturer writes is an error rather than overwritten (use a fresh directory, as the stale-`sysfs` rule already required).
 
 ### Security
 
