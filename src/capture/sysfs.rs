@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
+use crate::capture::FixtureRoot;
+
 /// The attribute files usbtop-ng reads (see `device::read_metadata_from` and
 /// `enumerate_present_devices`), except `serial`: a bundle is published, a
 /// device serial identifies its owner's hardware, and no replay reads it, so
@@ -31,14 +33,14 @@ const ATTRS: [&str; 8] = [
 /// relative in-bundle link once every port is known.
 const PORT_ATTRS: [&str; 2] = ["connect_type", "location"];
 
-pub fn materialize_sysfs(src_base: &Path, dst_sysfs: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dst_sysfs)
-        .with_context(|| format!("create {}", dst_sysfs.display()))?;
+pub fn materialize_sysfs(src_base: &Path, out: &FixtureRoot, dst_rel: &str) -> anyhow::Result<()> {
+    out.mkdir_all(dst_rel)
+        .with_context(|| format!("create {}", out.logical().join(dst_rel).display()))?;
 
-    // Every copied port's bundle directory by port name, and every `peer`
-    // seen as (port, peer name); the links are written last, relative,
-    // once both ends' bundle paths are known.
-    let mut port_dirs: BTreeMap<String, PathBuf> = BTreeMap::new();
+    // Every copied port's bundle directory (bundle-relative) by port name,
+    // and every `peer` seen as (port, peer name); the links are written
+    // last, relative, once both ends' bundle paths are known.
+    let mut port_dirs: BTreeMap<String, String> = BTreeMap::new();
     let mut peers: Vec<(String, String)> = Vec::new();
 
     for entry in std::fs::read_dir(src_base)
@@ -58,12 +60,12 @@ pub fn materialize_sysfs(src_base: &Path, dst_sysfs: &Path) -> anyhow::Result<()
             // stand-in `<controller>/usbN/` plus a relative `usbN` symlink.
             match resolve_controller(&src_dir) {
                 Some(controller) => {
-                    let stand_in = dst_sysfs.join(&controller).join(name.as_ref());
-                    copy_attrs(&src_dir, &stand_in)?;
-                    let link = dst_sysfs.join(name.as_ref());
+                    let stand_in = format!("{dst_rel}/{controller}/{name}");
+                    copy_attrs(&src_dir, out, &stand_in)?;
+                    let link = format!("{dst_rel}/{name}");
                     let target = Path::new(&controller).join(name.as_ref());
-                    std::os::unix::fs::symlink(&target, &link)
-                        .with_context(|| format!("symlink {}", link.display()))?;
+                    out.symlink(&link, &target)
+                        .with_context(|| format!("symlink {link}"))?;
                     stand_in
                 }
                 None => {
@@ -79,17 +81,17 @@ pub fn materialize_sysfs(src_base: &Path, dst_sysfs: &Path) -> anyhow::Result<()
                     // and not `None`. That synthetic value is visibly not a
                     // PCI/platform id, but it is what both golden generation
                     // and test replay resolve to here, so golden==replay holds.
-                    let plain = dst_sysfs.join(name.as_ref());
-                    copy_attrs(&src_dir, &plain)?;
+                    let plain = format!("{dst_rel}/{name}");
+                    copy_attrs(&src_dir, out, &plain)?;
                     plain
                 }
             }
         } else {
-            let plain = dst_sysfs.join(name.as_ref());
-            copy_attrs(&src_dir, &plain)?;
+            let plain = format!("{dst_rel}/{name}");
+            copy_attrs(&src_dir, out, &plain)?;
             plain
         };
-        copy_ports(&src_dir, &name, &dst_dir, &mut port_dirs, &mut peers)?;
+        copy_ports(&src_dir, &name, out, &dst_dir, &mut port_dirs, &mut peers)?;
     }
 
     for (port, peer) in peers {
@@ -104,22 +106,24 @@ pub fn materialize_sysfs(src_base: &Path, dst_sysfs: &Path) -> anyhow::Result<()
             // there is nothing to record -- skip the pair.
             continue;
         }
-        let link = from.join("peer");
-        std::os::unix::fs::symlink(relative_path(from, to), &link)
-            .with_context(|| format!("symlink {}", link.display()))?;
+        let link = format!("{from}/peer");
+        out.symlink(&link, &relative_path(Path::new(from), Path::new(to)))
+            .with_context(|| format!("symlink {link}"))?;
     }
     Ok(())
 }
 
 /// Copy the hub port objects under `src_dev`'s interface directories into
-/// `dst_dev`, keeping the `<interface>/<hub>-port<N>/` shape with exactly
-/// [`PORT_ATTRS`] inside each (those that exist). Records each port's bundle
-/// directory and the name its `peer` link points at.
+/// the bundle directory `dst_dev`, keeping the `<interface>/<hub>-port<N>/`
+/// shape with exactly [`PORT_ATTRS`] inside each (those that exist).
+/// Records each port's bundle directory and the name its `peer` link
+/// points at.
 fn copy_ports(
     src_dev: &Path,
     hub: &str,
-    dst_dev: &Path,
-    port_dirs: &mut BTreeMap<String, PathBuf>,
+    out: &FixtureRoot,
+    dst_dev: &str,
+    port_dirs: &mut BTreeMap<String, String>,
     peers: &mut Vec<(String, String)>,
 ) -> anyhow::Result<()> {
     let Ok(children) = std::fs::read_dir(src_dev) else {
@@ -144,8 +148,8 @@ fn copy_ports(
             {
                 continue;
             }
-            let dst_port = dst_dev.join(interface_name.as_ref()).join(&port_name);
-            copy_named(&port.path(), &dst_port, &PORT_ATTRS)?;
+            let dst_port = format!("{dst_dev}/{interface_name}/{port_name}");
+            copy_named(&port.path(), out, &dst_port, &PORT_ATTRS)?;
             if let Some(peer) = std::fs::read_link(port.path().join("peer"))
                 .ok()
                 .and_then(|t| t.file_name().map(|f| f.to_string_lossy().into_owned()))
@@ -188,22 +192,24 @@ fn resolve_controller(src_dir: &Path) -> Option<String> {
     Some(real.parent()?.file_name()?.to_string_lossy().into_owned())
 }
 
-/// Copy a device's known attribute files (those that exist) into a fresh real
-/// dir `dst`.
-fn copy_attrs(src: &Path, dst: &Path) -> anyhow::Result<()> {
-    copy_named(src, dst, &ATTRS)
+/// Copy a device's known attribute files (those that exist) into the fresh
+/// bundle dir `dst`.
+fn copy_attrs(src: &Path, out: &FixtureRoot, dst: &str) -> anyhow::Result<()> {
+    copy_named(src, out, dst, &ATTRS)
 }
 
-/// Copy the named attribute files (those that exist) from `src` into a fresh
-/// real dir `dst`. `fs::read` is used, not `fs::copy`, because sysfs files
-/// report a 4096-byte size but return fewer bytes; `read` loops to EOF.
-fn copy_named(src: &Path, dst: &Path, attrs: &[&str]) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dst).with_context(|| format!("create {}", dst.display()))?;
+/// Copy the named attribute files (those that exist) from `src` into the
+/// fresh bundle dir `dst`, through the pinned root. `fs::read` is used, not
+/// `fs::copy`, because sysfs files report a 4096-byte size but return fewer
+/// bytes; `read` loops to EOF.
+fn copy_named(src: &Path, out: &FixtureRoot, dst: &str, attrs: &[&str]) -> anyhow::Result<()> {
+    out.mkdir_all(dst)
+        .with_context(|| format!("create {dst}"))?;
     for attr in attrs {
         let from = src.join(attr);
         if let Ok(bytes) = std::fs::read(&from) {
-            std::fs::write(dst.join(attr), &bytes)
-                .with_context(|| format!("write {}", dst.join(attr).display()))?;
+            out.write(&format!("{dst}/{attr}"), &bytes)
+                .with_context(|| format!("write {dst}/{attr}"))?;
         }
     }
     Ok(())
@@ -250,7 +256,12 @@ mod tests {
         std::fs::create_dir_all(temp.path().join("devices")).unwrap();
         build_src(temp.path());
         let dst = temp.path().join("bundle").join("sysfs");
-        materialize_sysfs(&temp.path().join("devices"), &dst).unwrap();
+        materialize_sysfs(
+            &temp.path().join("devices"),
+            &FixtureRoot::create(&temp.path().join("bundle")).unwrap(),
+            "sysfs",
+        )
+        .unwrap();
 
         // The ordinary device is a real dir of copied attributes.
         assert_eq!(
@@ -319,7 +330,7 @@ mod tests {
         // Destination named "sysfs" so the enclosing-dir-name assertion below
         // has a known, checkable value.
         let dst = temp.path().join("sysfs");
-        materialize_sysfs(&src, &dst).unwrap();
+        materialize_sysfs(&src, &FixtureRoot::create(temp.path()).unwrap(), "sysfs").unwrap();
 
         // usb1 is a real (empty) dir, not a symlink: the fallback fired.
         let meta = std::fs::symlink_metadata(dst.join("usb1")).unwrap();
@@ -431,7 +442,12 @@ mod tests {
         std::fs::create_dir_all(temp.path().join("devices")).unwrap();
         build_src_with_ports(temp.path());
         let dst = temp.path().join("bundle").join("sysfs");
-        materialize_sysfs(&temp.path().join("devices"), &dst).unwrap();
+        materialize_sysfs(
+            &temp.path().join("devices"),
+            &FixtureRoot::create(&temp.path().join("bundle")).unwrap(),
+            "sysfs",
+        )
+        .unwrap();
 
         // Root-hub ports live under the controller stand-in, exactly the
         // attribute files allowed and nothing else.
@@ -513,7 +529,12 @@ mod tests {
         std::os::unix::fs::symlink(&port_dir, port_dir.join("peer")).unwrap();
 
         let dst = temp.path().join("bundle").join("sysfs");
-        materialize_sysfs(&temp.path().join("devices"), &dst).unwrap();
+        materialize_sysfs(
+            &temp.path().join("devices"),
+            &FixtureRoot::create(&temp.path().join("bundle")).unwrap(),
+            "sysfs",
+        )
+        .unwrap();
 
         let out = dst.join("1-1/1-1:1.0/1-1-port1");
         assert_eq!(

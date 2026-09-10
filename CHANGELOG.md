@@ -5,6 +5,12 @@ All notable changes to usbtop-ng are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- The fixture capturer (`--capture-fixture`, and the fixture a `--support` bundle embeds) now writes every file, directory, and symlink of the fixture tree relative to one pinned directory descriptor, resolving each path component without following links, and reads back what it wrote through that descriptor. Previously the support bundle pinned only its root and handed the capturer a `/proc/self/fd/<n>/fixture` path, so a link swapped in beneath `fixture/` by the bundle's owner during the run could redirect a root-owned write. A directory swapped for a symlink anywhere in the tree is now refused.
+
 ## [1.7.0] - 2026-09-08
 
 ### Added

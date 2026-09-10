@@ -248,10 +248,12 @@ These came out of code review. Each is small and none blocks a release.
 
 Open, recorded 2026-09-07 so they do not get lost:
 
-- The fixture-capture core (`capture::assemble_bundle`) still writes by
-  path under the pinned `fixture/` directory of a support bundle; route
-  those writes through the bundle's root descriptor like every other
-  bundle file.
+- Done 2026-09-09: the fixture-capture core writes through a pinned
+  directory descriptor (`capture::FixtureRoot`): every attribute file,
+  `usbN` and `peer` link, trace, golden, and `meta.toml` is created
+  relative to it with `O_NOFOLLOW` at each component, and the goldens are
+  replayed back through `/proc/self/fd/<n>`. The support bundle hands the
+  capturer that descriptor instead of a proc path.
 - From the external audit of 2026-09-07. It raised ten findings; five held
   and shipped on 2026-09-07 (`--output` opened with `O_NOFOLLOW`, control
   and bidi characters replaced in descriptor and usb.ids names, the config

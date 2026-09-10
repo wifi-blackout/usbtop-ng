@@ -440,8 +440,10 @@ fn main() -> Result<()> {
             eprintln!("error: {e}");
             process::exit(2);
         });
+        let out = capture::FixtureRoot::create(std::path::Path::new(outdir))
+            .map_err(|e| anyhow::anyhow!("could not create {outdir}: {e}"))?;
         let outcome = capture::run_capture_fixture(capture::CaptureFixtureOpts {
-            outdir: std::path::PathBuf::from(outdir),
+            out: &out,
             window,
             bus: cli.bus,
             baseline: cli.baseline.as_deref().map(std::path::PathBuf::from),

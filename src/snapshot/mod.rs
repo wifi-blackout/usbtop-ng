@@ -73,8 +73,14 @@ impl Snapshot {
     /// the invoking user under sudo (fd-based -- see that function's doc
     /// comment), so callers need no separate chown call; still refuses a
     /// symlink at `path`.
+    /// The snapshot as TOML text, exactly what [`Snapshot::write_to`] writes
+    /// (the fixture capturer writes it through its own pinned directory).
+    pub fn to_toml(&self) -> Result<String> {
+        toml::to_string(self).context("could not serialize the snapshot")
+    }
+
     pub fn write_to(&self, path: &Path) -> Result<()> {
-        let text = toml::to_string(self).context("could not serialize the snapshot")?;
+        let text = self.to_toml()?;
         crate::config::replace_file_owned(path, text.as_bytes())
             .with_context(|| format!("could not write {}", path.display()))
     }

@@ -8,7 +8,7 @@
 
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -22,7 +22,7 @@ use super::collect::{self, BackendInfo, BuildInfo, HostInfo, TerminalInfo, Usbmo
 use super::inventory::{self, AttrDump, UsbInventory};
 use super::redact::Redactor;
 use super::{note, Note};
-use crate::capture::{self, BaselineSource, CaptureFixtureOpts};
+use crate::capture::{self, BaselineSource, CaptureFixtureOpts, FixtureRoot};
 use crate::config;
 use crate::fixture_replay::{replay_fixture_with_elapsed, FixtureSource};
 use crate::headless::export::{enabled_features, ReportSink, RunRecord};
@@ -362,6 +362,26 @@ fn note_static_fixture_written(state: &mut CaptureState) {
     }
 }
 
+/// Empty the pinned fixture directory after a failed assembly so the static
+/// assembly that follows starts clean. Path-based only beneath the
+/// descriptor's own read side (`/proc/self/fd/<n>`), so a swapped bundle
+/// path cannot redirect the removal either; best-effort.
+fn clear_fixture(fixture: &FixtureRoot) {
+    let base = fixture.read_base();
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_dir = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
+        let _ = if is_dir {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+}
+
 /// Embed the fixture: a live capture when [`Environment::capture_decision`]
 /// allows it, else (or after a capture failure) a static bundle from the
 /// sysfs tree alone. Returns what happened; failures become notes.
@@ -369,7 +389,7 @@ fn write_fixture(
     opts: &SupportOpts,
     roots: &Roots,
     env: &Environment,
-    fixture_dir: &Path,
+    fixture: &FixtureRoot,
     notes: &mut Vec<Note>,
 ) -> CaptureState {
     let mut state = match env.capture_decision(opts.no_capture) {
@@ -379,7 +399,7 @@ fn write_fixture(
                 opts.window.as_secs_f64()
             );
             match capture::run_capture_fixture(CaptureFixtureOpts {
-                outdir: fixture_dir.to_path_buf(),
+                out: fixture,
                 window: opts.window,
                 bus: None,
                 baseline: None,
@@ -393,7 +413,7 @@ fn write_fixture(
                     }
                 }
                 Err(e) => {
-                    let _ = std::fs::remove_dir_all(fixture_dir);
+                    clear_fixture(fixture);
                     CaptureState::Failed(format!("failed: {e:#}"))
                 }
             }
@@ -405,14 +425,14 @@ fn write_fixture(
     // would be false whenever this assembly itself then fails.
     match capture::assemble_bundle(
         &roots.sysfs_devices,
-        fixture_dir,
+        fixture,
         &[],
         &BaselineSource::CaptureFrom(roots.sysfs_devices.clone()),
         None,
     ) {
         Ok(()) => note_static_fixture_written(&mut state),
         Err(e) => {
-            let _ = std::fs::remove_dir_all(fixture_dir);
+            clear_fixture(fixture);
             notes.push(note(
                 "fixture",
                 format!("could not write the static fixture: {e:#}"),
@@ -551,30 +571,33 @@ pub fn run_support(
 
     writer.write_toml("terminal.toml", &env.terminal)?;
 
-    // Pin `fixture/` as a genuine child of the bundle root, then resolve every
-    // capture write through the pinned root fd (`/proc/self/fd/<n>/fixture`)
-    // instead of the swappable `dir` pathname. Because that magic path always
-    // resolves to the inode we pinned at creation, a rename of `dir` mid-run
-    // cannot redirect a root-owned write out of the bundle -- closing the
-    // capture sub-path of the finding. procfs is always mounted on Linux.
-    writer.mkdir_at("fixture").with_context(|| {
-        format!(
-            "could not create the fixture directory in {}",
-            dir.display()
-        )
-    })?;
-    let fixture_proc = format!("/proc/self/fd/{}/fixture", prepared.root_fd.as_raw_fd());
-    let fixture_dir = PathBuf::from(&fixture_proc);
-    // Any collector message that captured the fd base is mapped back to a
-    // clean `fixture` display so the bundle text never carries the fd path.
-    let scrub_fixture = |s: &str| scrub_fixture_paths(s, &fixture_proc);
+    // Pin `fixture/` as a genuine child of the bundle root and hand the
+    // capturer that descriptor: every fixture write -- attribute files, the
+    // `usbN` and `peer` links, traces, goldens, meta -- resolves component by
+    // component relative to it (see `capture::FixtureRoot`), never through
+    // the swappable `dir` pathname, so neither a rename of `dir` mid-run nor
+    // a link swapped in beneath `fixture/` can redirect a root-owned write.
+    let fixture = FixtureRoot::beneath(prepared.root_fd.as_fd(), "fixture", dir.join("fixture"))
+        .with_context(|| {
+            format!(
+                "could not create the fixture directory in {}",
+                dir.display()
+            )
+        })?;
+    // The read side (`/proc/self/fd/<n>`) is what the replay, the invariant
+    // checks, and the capturer's own reads resolve through. Any message that
+    // captured it is mapped back to a clean `fixture` display so the bundle
+    // text never carries the descriptor path.
+    let fixture_base = fixture.read_base();
+    let fixture_base_text = fixture_base.display().to_string();
+    let scrub_fixture = |s: &str| scrub_fixture_paths(s, &fixture_base_text);
 
     // Revalidate the pin right before writing traces: if `dir` no longer names
     // the inode we pinned (a mid-run swap), skip capture and the fixture
     // entirely with a note rather than write anything. The bundle still ships,
     // just without traces.
     let mut capture_state = if bundle::path_pins_same_inode(prepared.root_fd.as_fd(), dir) {
-        write_fixture(opts, roots, env, &fixture_dir, &mut notes)
+        write_fixture(opts, roots, env, &fixture, &mut notes)
     } else {
         let reason = "skipped: the bundle directory was replaced during the run".to_string();
         notes.push(note("capture", reason.clone()));
@@ -583,8 +606,8 @@ pub fn run_support(
     if let CaptureState::Skipped(r) | CaptureState::Failed(r) = &mut capture_state {
         *r = scrub_fixture(r);
     }
-    if fixture_dir.join("meta.toml").exists() {
-        bundle::assert_fixture_invariants(&fixture_dir)
+    if fixture_base.join("meta.toml").exists() {
+        bundle::assert_fixture_invariants(&fixture_base)
             .map_err(|e| anyhow!("{}", scrub_fixture(&format!("{e:#}"))))?;
         // record_dir reads the fixture subtree via the real `dir` path (it is
         // read-only, symlink-aware, and never follows links). It is bracketed
@@ -599,7 +622,7 @@ pub fn run_support(
                 .or_else(|| sources.first().copied()),
             _ => None,
         };
-        match replay_fixture_with_elapsed(&fixture_dir, source, opts.window) {
+        match replay_fixture_with_elapsed(&fixture_base, source, opts.window) {
             Ok(report) => {
                 let run = RunRecord {
                     record: "run",
@@ -637,8 +660,9 @@ pub fn run_support(
     // directory), and the manifest and SUMMARY.txt are the only text this
     // pipeline writes without already going through `BundleWriter::write_text`
     // or `write_toml`, both of which redact on the way out. A fixture note may
-    // also carry the `/proc/self/fd/<n>/fixture` write base, so it is scrubbed
-    // back to a `fixture`-relative form before the redactor runs.
+    // also carry the `/proc/self/fd/<n>` read base of the pinned fixture, so
+    // it is scrubbed back to a `fixture`-relative form before the redactor
+    // runs.
     let notes: Vec<Note> = notes
         .iter()
         .map(|n| Note {
@@ -987,11 +1011,12 @@ pub fn init_logger(verbose: bool, tee: Option<TeeWriter>) {
     builder.init();
 }
 
-/// Map every occurrence of the pinned `/proc/self/fd/<n>/fixture` base back
-/// to the plain `fixture` display, so no bundle text (a capture failure, a
-/// collector note, an invariant error) carries the descriptor path.
-fn scrub_fixture_paths(text: &str, fixture_proc: &str) -> String {
-    text.replace(fixture_proc, "fixture")
+/// Map every occurrence of the pinned fixture's `/proc/self/fd/<n>` read
+/// base back to the plain `fixture` display, so no bundle text (a capture
+/// failure, a collector note, an invariant error) carries the descriptor
+/// path.
+fn scrub_fixture_paths(text: &str, fixture_base: &str) -> String {
+    text.replace(fixture_base, "fixture")
 }
 
 #[cfg(test)]
@@ -1004,17 +1029,17 @@ mod tests {
     /// note, since a real one needs root and a broken usbmon.
     #[test]
     fn a_failing_capture_note_never_carries_the_fd_path() {
-        let fixture_proc = "/proc/self/fd/7/fixture";
+        let fixture_base = "/proc/self/fd/7";
         let note = format!(
-            "failed: could not open {fixture_proc}/trace.bin: Permission denied; static fixture written instead ({fixture_proc}/sysfs)"
+            "failed: could not open {fixture_base}/trace.bin: Permission denied; static fixture written instead ({fixture_base}/sysfs)"
         );
         assert_eq!(
-            scrub_fixture_paths(&note, fixture_proc),
+            scrub_fixture_paths(&note, fixture_base),
             "failed: could not open fixture/trace.bin: Permission denied; static fixture written instead (fixture/sysfs)"
         );
-        assert!(!scrub_fixture_paths(&note, fixture_proc).contains("/proc/self/fd"));
+        assert!(!scrub_fixture_paths(&note, fixture_base).contains("/proc/self/fd"));
         assert_eq!(
-            scrub_fixture_paths("nothing to scrub", fixture_proc),
+            scrub_fixture_paths("nothing to scrub", fixture_base),
             "nothing to scrub"
         );
     }

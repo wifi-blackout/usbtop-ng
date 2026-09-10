@@ -5,9 +5,12 @@
 //! over a bundle on disk.
 
 pub mod meta;
+pub mod root;
 pub mod sanitize;
 pub mod sysfs;
 pub mod trace;
+
+pub use root::FixtureRoot;
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -56,50 +59,51 @@ pub enum BaselineSource {
 /// already-sanitized traces: materialize sysfs, resolve the baseline, write the
 /// traces (asserting SEC-1), generate each golden by replaying the bundle, and
 /// write meta.toml. Pure of any live device, so it is fully unit-tested.
+/// Every write goes through `out` (see [`FixtureRoot`]); every read of what
+/// was just written goes through its descriptor too.
 pub fn assemble_bundle(
     src_sysfs: &Path,
-    outdir: &Path,
+    out: &FixtureRoot,
     traces: &[CapturedTrace],
     baseline: &BaselineSource,
     stage_id: Option<u32>,
 ) -> anyhow::Result<()> {
-    std::fs::create_dir_all(outdir).with_context(|| format!("create {}", outdir.display()))?;
+    let base = out.read_base();
 
     // Refuse a pre-existing, non-empty sysfs/: materializing into it would
     // merge in stale device dirs left over from a prior partial run, silently
     // mixing two captures into one bundle.
-    let sysfs_out = outdir.join("sysfs");
+    let sysfs_out = base.join("sysfs");
     if let Ok(mut entries) = std::fs::read_dir(&sysfs_out) {
         if entries.next().is_some() {
             return Err(anyhow!(
                 "{} already exists and is not empty (stale from a prior run?); use a fresh outdir",
-                sysfs_out.display()
+                out.logical().join("sysfs").display()
             ));
         }
     }
 
-    sysfs::materialize_sysfs(src_sysfs, &sysfs_out)?;
+    sysfs::materialize_sysfs(src_sysfs, out, "sysfs")?;
     assert_sysfs_contained(&sysfs_out)?; // SEC-2, capturer side
 
     // Baseline internal-devices snapshot (bare-board; reused across stages).
-    let internal = outdir.join("internal-devices.toml");
-    match baseline {
-        BaselineSource::CaptureFrom(base) => {
-            Snapshot::capture(Some(base))
-                .with_context(|| format!("snapshot {}", base.display()))?
-                .write_to(&internal)?;
-        }
+    let internal = match baseline {
+        BaselineSource::CaptureFrom(base) => Snapshot::capture(Some(base))
+            .with_context(|| format!("snapshot {}", base.display()))?
+            .to_toml()?
+            .into_bytes(),
         BaselineSource::CopyFile(path) => {
-            std::fs::copy(path, &internal)
-                .with_context(|| format!("copy baseline {}", path.display()))?;
+            std::fs::read(path).with_context(|| format!("read baseline {}", path.display()))?
         }
-    }
+    };
+    out.write("internal-devices.toml", &internal)
+        .context("write internal-devices.toml")?;
 
     // Write each sanitized trace, asserting SEC-1 first.
     let mut sources = Vec::new();
     for trace in traces {
         assert_payload_free(trace)?;
-        std::fs::write(outdir.join(trace.source.trace_filename()), &trace.bytes)
+        out.write(trace.source.trace_filename(), &trace.bytes)
             .with_context(|| format!("write {}", trace.source.trace_filename()))?;
         sources.push(trace.source);
     }
@@ -109,25 +113,25 @@ pub fn assemble_bundle(
     // alone, so meta.toml still carries the coverage tags.
     let mut report_for_meta = None;
     for &source in &sources {
-        let report = replay_fixture(outdir, source)?;
-        std::fs::write(
-            outdir.join(source.golden_filename()),
-            report_to_golden_json(&report)?,
+        let report = replay_fixture(&base, source)?;
+        out.write(
+            source.golden_filename(),
+            report_to_golden_json(&report)?.as_bytes(),
         )
         .with_context(|| format!("write {}", source.golden_filename()))?;
         report_for_meta.get_or_insert(report);
     }
     let report = match report_for_meta {
         Some(report) => report,
-        None => replay_fixture_with_elapsed(outdir, None, FIXED_ELAPSED)?,
+        None => replay_fixture_with_elapsed(&base, None, FIXED_ELAPSED)?,
     };
     let binary_kernel_dropped = traces
         .iter()
         .find(|t| t.source == FixtureSource::Binary)
         .and_then(|t| t.kernel_dropped);
-    std::fs::write(
-        outdir.join("meta.toml"),
-        meta::build_meta(&report, &sources, stage_id, binary_kernel_dropped)?,
+    out.write(
+        "meta.toml",
+        meta::build_meta(&report, &sources, stage_id, binary_kernel_dropped)?.as_bytes(),
     )
     .context("write meta.toml")?;
     Ok(())
@@ -239,8 +243,9 @@ pub struct CaptureOutcome {
 }
 
 /// `--capture-fixture` options (from the CLI).
-pub struct CaptureFixtureOpts {
-    pub outdir: PathBuf,
+pub struct CaptureFixtureOpts<'a> {
+    /// The pinned directory every write goes into (see [`FixtureRoot`]).
+    pub out: &'a FixtureRoot,
     pub window: Duration,
     /// usbmon interface to read: `None` = the aggregate (bus 0), which carries
     /// every bus's events in one stream.
@@ -253,7 +258,7 @@ pub struct CaptureFixtureOpts {
 /// Live entry point: open the binary and text usbmon interfaces, capture one
 /// shared window of raw events concurrently, sanitize them, and assemble the
 /// bundle. Needs root.
-pub fn run_capture_fixture(opts: CaptureFixtureOpts) -> anyhow::Result<CaptureOutcome> {
+pub fn run_capture_fixture(opts: CaptureFixtureOpts<'_>) -> anyhow::Result<CaptureOutcome> {
     let bus = opts.bus.unwrap_or(0);
     let stop = AtomicBool::new(false);
 
@@ -321,17 +326,16 @@ pub fn run_capture_fixture(opts: CaptureFixtureOpts) -> anyhow::Result<CaptureOu
         Some(path) => BaselineSource::CopyFile(path.clone()),
         None => BaselineSource::CaptureFrom(src_sysfs.to_path_buf()),
     };
-    let stage_id = stage_id_from_outdir(&opts.outdir);
-    assemble_bundle(src_sysfs, &opts.outdir, &traces, &baseline, stage_id)?;
+    let stage_id = stage_id_from_outdir(opts.out.logical());
+    assemble_bundle(src_sysfs, opts.out, &traces, &baseline, stage_id)?;
     // Re-check what's now on disk, the same SEC-1 recheck `--support` will
     // run over the bundle it embeds; also gives the live path itself a
     // non-test caller of the guard.
-    assert_bundle_payload_free(&opts.outdir)?;
+    assert_bundle_payload_free(&opts.out.read_base())?;
     // The human "captured fixture bundle at <dir>" line is left to the
     // caller: the `--capture-fixture` CLI prints it with the real output
-    // path, while `--support` stays silent here because its `outdir` is a
-    // `/proc/self/fd/<n>/fixture` handle (never a name to show a user) and it
-    // reports the capture through its own logger and SUMMARY instead.
+    // path, while `--support` reports the capture through its own logger
+    // and SUMMARY instead.
     Ok(CaptureOutcome {
         sources: traces.iter().map(|t| t.source).collect(),
         events: count_events(&traces),
@@ -533,7 +537,7 @@ mod tests {
         ];
         assemble_bundle(
             &temp.path().join("devices"),
-            &outdir,
+            &FixtureRoot::create(&outdir).unwrap(),
             &traces,
             &BaselineSource::CaptureFrom(temp.path().join("devices")),
             Some(3),
@@ -575,6 +579,38 @@ mod tests {
     }
 
     #[test]
+    fn assemble_bundle_refuses_a_symlinked_sysfs_dir_and_writes_nothing_outside() {
+        // The sudo invoker owns the bundle directory, so between the bundle
+        // root being pinned and the capture core writing, `fixture/sysfs`
+        // can be swapped for a link out of the bundle. Nothing may be
+        // written through it as root.
+        let temp = tempfile::tempdir().unwrap();
+        build_src_sysfs(temp.path());
+        let outdir = temp.path().join("bundle");
+        std::fs::create_dir_all(&outdir).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, outdir.join("sysfs")).unwrap();
+
+        let result = assemble_bundle(
+            &temp.path().join("devices"),
+            &FixtureRoot::create(&outdir).unwrap(),
+            &[],
+            &BaselineSource::CaptureFrom(temp.path().join("devices")),
+            None,
+        );
+
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "a write escaped through the symlinked sysfs dir"
+        );
+        assert!(
+            result.is_err(),
+            "the swapped-in link must fail the assembly"
+        );
+    }
+
+    #[test]
     fn assemble_bundle_rejects_a_binary_trace_carrying_payload() {
         let temp = tempfile::tempdir().unwrap();
         build_src_sysfs(temp.path());
@@ -589,7 +625,7 @@ mod tests {
         }];
         let err = assemble_bundle(
             &temp.path().join("devices"),
-            &outdir,
+            &FixtureRoot::create(&outdir).unwrap(),
             &traces,
             &BaselineSource::CaptureFrom(temp.path().join("devices")),
             None,
@@ -633,7 +669,7 @@ mod tests {
         }];
         let err = assemble_bundle(
             &temp.path().join("devices"),
-            &outdir,
+            &FixtureRoot::create(&outdir).unwrap(),
             &traces,
             &BaselineSource::CaptureFrom(temp.path().join("devices")),
             None,
@@ -656,7 +692,7 @@ mod tests {
         let outdir = temp.path().join("bundle");
         assemble_bundle(
             &temp.path().join("devices"),
-            &outdir,
+            &FixtureRoot::create(&outdir).unwrap(),
             &[],
             &BaselineSource::CaptureFrom(temp.path().join("devices")),
             None,
@@ -699,7 +735,7 @@ mod tests {
         let outdir = temp.path().join("bundle");
         assemble_bundle(
             &temp.path().join("devices"),
-            &outdir,
+            &FixtureRoot::create(&outdir).unwrap(),
             &[],
             &BaselineSource::CopyFile(baseline.clone()),
             Some(2),
@@ -779,7 +815,7 @@ mod tests {
         }];
         assemble_bundle(
             &temp.path().join("devices"),
-            &outdir,
+            &FixtureRoot::create(&outdir).unwrap(),
             &traces,
             &BaselineSource::CaptureFrom(temp.path().join("devices")),
             Some(2),

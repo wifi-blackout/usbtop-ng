@@ -215,6 +215,55 @@ pub fn create_file_at(root_fd: BorrowedFd, rel: &str) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+/// Create every directory of the relative bundle path `rel` beneath
+/// `root_fd` (mode `0o700`, existing ones tolerated), refusing a symlink at
+/// any step.
+pub fn mkdir_all_at(root_fd: BorrowedFd, rel: &str) -> io::Result<()> {
+    let comps = split_bundle_rel(rel)?;
+    walk_dirs(root_fd, &comps)?;
+    Ok(())
+}
+
+/// Open the directory `name` directly beneath `parent_fd`, creating it
+/// (mode `0o700`) when absent and refusing a symlink or any non-directory
+/// there. The fixture capturer pins its own subtree with this.
+pub fn open_subdir_at(parent_fd: BorrowedFd, name: &str) -> io::Result<OwnedFd> {
+    let cname = component_cstring(name)?;
+    mkdirat_tolerant(parent_fd, &cname)?;
+    open_dir_at(parent_fd, &cname)
+}
+
+/// Create the symlink `rel` -> `target` beneath `root_fd`. `target` is
+/// stored verbatim (the fixture wants the kernel's own relative shape), so
+/// nothing about it is resolved here; the link's own path is walked
+/// component by component with `O_NOFOLLOW`, and an entry already at `rel`
+/// is an error rather than replaced.
+pub fn symlink_at(root_fd: BorrowedFd, rel: &str, target: &Path) -> io::Result<()> {
+    let comps = split_bundle_rel(rel)?;
+    let (last, dirs) = comps
+        .split_last()
+        .expect("split_bundle_rel rejects an empty path");
+    let dir_fd = walk_dirs(root_fd, dirs)?;
+    let name = component_cstring(last)?;
+    let target = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "symlink target {} contains an interior NUL",
+                target.display()
+            ),
+        )
+    })?;
+    // SAFETY: matches unistd.h, `int symlinkat(const char *target, int
+    // newdirfd, const char *linkpath)`: both strings are NUL-terminated and
+    // `dir_fd` stays open for the call; the target text is stored, never
+    // resolved. Returns 0, else -1 with errno set.
+    if unsafe { libc::symlinkat(target.as_ptr(), dir_fd.as_raw_fd(), name.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Create or truncate `rel` beneath `root_fd`, write `bytes`, and hand the
 /// file to the sudo invoker when there is one. `logical` is the bundle-root
 /// join of `rel`, used only for [`chown_created_to_invoker`]'s (fd-based)
@@ -356,15 +405,6 @@ impl BundleWriter {
     /// the log tee) that writes its own bytes and is recorded later.
     pub fn open_new_file(&self, rel: &str) -> io::Result<File> {
         create_file_at(self.root_fd.as_fd(), rel)
-    }
-
-    /// Create the directory `rel` (nested components included) beneath the
-    /// anchor, refusing a symlink at any step. Used to pin `fixture/` before
-    /// the capturer writes into it.
-    pub fn mkdir_at(&self, rel: &str) -> io::Result<()> {
-        let comps = split_bundle_rel(rel)?;
-        walk_dirs(self.root_fd.as_fd(), &comps)?;
-        Ok(())
     }
 
     pub fn redactor(&mut self) -> &mut Redactor {

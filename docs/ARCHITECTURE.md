@@ -201,7 +201,13 @@ See [TUI chassis](#tui-chassis) for how these fit together.
   capturer's assembly and guards are what `--support` embeds, and the replay
   path is shared with the corpus tests so a golden equals a replay by
   construction. Only the `--capture-fixture` subcommand stays behind the
-  `capture-fixture` feature.
+  `capture-fixture` feature. Every write the capturer makes goes through
+  `capture::FixtureRoot`, a directory descriptor pinned once (the bundle's
+  `fixture/` child for `--support`, the output directory for
+  `--capture-fixture`) with each path component resolved `O_NOFOLLOW`, and
+  the goldens are replayed back through `/proc/self/fd/<n>`, so a link
+  swapped in anywhere beneath the fixture cannot redirect a root-owned
+  write or feed the replay something other than what was written.
 - `headless/export.rs`: the `ReportSink` behind `--output` and the support
   bundle's `report.json`, and the run record that leads every file export.
 
