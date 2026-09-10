@@ -35,7 +35,7 @@ const PORT_ATTRS: [&str; 2] = ["connect_type", "location"];
 
 pub fn materialize_sysfs(src_base: &Path, out: &FixtureRoot, dst_rel: &str) -> anyhow::Result<()> {
     out.mkdir_all(dst_rel)
-        .with_context(|| format!("create {}", out.logical().join(dst_rel).display()))?;
+        .with_context(|| format!("create {}/{dst_rel}", out.display()))?;
 
     // Every copied port's bundle directory (bundle-relative) by port name,
     // and every `peer` seen as (port, peer name); the links are written

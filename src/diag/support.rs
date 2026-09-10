@@ -606,7 +606,12 @@ pub fn run_support(
     if let CaptureState::Skipped(r) | CaptureState::Failed(r) = &mut capture_state {
         *r = scrub_fixture(r);
     }
-    if fixture_base.join("meta.toml").exists() {
+    if !fixture_base.join("meta.toml").exists() {
+        // No fixture at all (the capture and the static assembly both
+        // failed, or the pin check skipped them): leave no empty `fixture/`
+        // behind. Relative to the pinned root, like its creation.
+        let _ = bundle::rmdir_at(prepared.root_fd.as_fd(), "fixture");
+    } else {
         bundle::assert_fixture_invariants(&fixture_base)
             .map_err(|e| anyhow!("{}", scrub_fixture(&format!("{e:#}"))))?;
         // record_dir reads the fixture subtree via the real `dir` path (it is

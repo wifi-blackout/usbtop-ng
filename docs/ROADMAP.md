@@ -248,12 +248,16 @@ These came out of code review. Each is small and none blocks a release.
 
 Open, recorded 2026-09-07 so they do not get lost:
 
-- Done 2026-09-09: the fixture-capture core writes through a pinned
-  directory descriptor (`capture::FixtureRoot`): every attribute file,
-  `usbN` and `peer` link, trace, golden, and `meta.toml` is created
-  relative to it with `O_NOFOLLOW` at each component, and the goldens are
-  replayed back through `/proc/self/fd/<n>`. The support bundle hands the
-  capturer that descriptor instead of a proc path.
+- The fixture's read side pins only its root. The capturer's writes go
+  through a pinned descriptor since 2026-09-09 (`capture::FixtureRoot`:
+  every attribute file, `usbN` and `peer` link, trace, golden, and
+  `meta.toml` created relative to it, `O_NOFOLLOW` at each component,
+  `O_EXCL` for every file), but the golden replay and the SEC-2 self-check
+  read the tree beneath `/proc/self/fd/<n>` by path, and the check
+  canonicalizes -- the same mechanism as before. A descriptor-relative read
+  walk (`open_read_at` exists in `diag::bundle`) for the replay's sysfs
+  reader and the SEC-2 check would close that; the writes cannot be
+  redirected either way, so a wrong verdict there can only fail a run.
 - From the external audit of 2026-09-07. It raised ten findings; five held
   and shipped on 2026-09-07 (`--output` opened with `O_NOFOLLOW`, control
   and bidi characters replaced in descriptor and usb.ids names, the config

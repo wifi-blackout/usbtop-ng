@@ -204,10 +204,12 @@ See [TUI chassis](#tui-chassis) for how these fit together.
   `capture-fixture` feature. Every write the capturer makes goes through
   `capture::FixtureRoot`, a directory descriptor pinned once (the bundle's
   `fixture/` child for `--support`, the output directory for
-  `--capture-fixture`) with each path component resolved `O_NOFOLLOW`, and
-  the goldens are replayed back through `/proc/self/fd/<n>`, so a link
-  swapped in anywhere beneath the fixture cannot redirect a root-owned
-  write or feed the replay something other than what was written.
+  `--capture-fixture`) with each path component resolved `O_NOFOLLOW` and
+  every file created fresh (`O_EXCL`), so a link or a stale entry anywhere
+  beneath the fixture cannot redirect a root-owned write or be truncated in
+  place. The read side pins only the fixture root: the goldens are replayed
+  through `/proc/self/fd/<n>` and read the tree beneath it as written, by
+  path.
 - `headless/export.rs`: the `ReportSink` behind `--output` and the support
   bundle's `report.json`, and the run record that leads every file export.
 

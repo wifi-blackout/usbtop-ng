@@ -133,12 +133,12 @@ fn split_bundle_rel(rel: &str) -> io::Result<Vec<&str>> {
     Ok(comps)
 }
 
-/// `mkdirat(dirfd, name, 0o700)`, tolerating an already-existing entry.
-fn mkdirat_tolerant(dirfd: BorrowedFd, name: &CString) -> io::Result<()> {
+/// `mkdirat(dirfd, name, mode)`, tolerating an already-existing entry.
+fn mkdirat_tolerant(dirfd: BorrowedFd, name: &CString, mode: libc::mode_t) -> io::Result<()> {
     // SAFETY: `dirfd` is a valid open directory descriptor for the whole
     // call; `name` is a valid NUL-terminated C string. `mkdirat` reads no
     // other memory.
-    let rc = unsafe { libc::mkdirat(dirfd.as_raw_fd(), name.as_ptr(), 0o700) };
+    let rc = unsafe { libc::mkdirat(dirfd.as_raw_fd(), name.as_ptr(), mode) };
     if rc == 0 {
         return Ok(());
     }
@@ -170,15 +170,16 @@ fn open_dir_at(dirfd: BorrowedFd, name: &CString) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Walk `comps` beneath `root_fd`, creating and opening each as a directory
-/// (`O_DIRECTORY|O_NOFOLLOW`), and return a descriptor to the deepest one. An
-/// empty `comps` yields a dup of `root_fd`. Every step refuses a symlink, so
-/// no intermediate component can be followed off the pinned tree.
-fn walk_dirs(root_fd: BorrowedFd, comps: &[&str]) -> io::Result<OwnedFd> {
+/// Walk `comps` beneath `root_fd`, creating (mode `dir_mode`) and opening
+/// each as a directory (`O_DIRECTORY|O_NOFOLLOW`), and return a descriptor
+/// to the deepest one. An empty `comps` yields a dup of `root_fd`. Every
+/// step refuses a symlink, so no intermediate component can be followed off
+/// the pinned tree.
+fn walk_dirs(root_fd: BorrowedFd, comps: &[&str], dir_mode: libc::mode_t) -> io::Result<OwnedFd> {
     let mut cur = root_fd.try_clone_to_owned()?;
     for comp in comps {
         let name = component_cstring(comp)?;
-        mkdirat_tolerant(cur.as_fd(), &name)?;
+        mkdirat_tolerant(cur.as_fd(), &name, dir_mode)?;
         cur = open_dir_at(cur.as_fd(), &name)?;
     }
     Ok(cur)
@@ -191,11 +192,36 @@ fn walk_dirs(root_fd: BorrowedFd, comps: &[&str]) -> io::Result<OwnedFd> {
 /// file is opened `O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW|O_CLOEXEC` at `0o600`.
 /// Ownership fixup is the caller's job (it needs the logical path).
 pub fn create_file_at(root_fd: BorrowedFd, rel: &str) -> io::Result<File> {
+    open_new_at(root_fd, rel, libc::O_TRUNC, 0o700, 0o600)
+}
+
+/// Like [`create_file_at`], but the file must not exist yet (`O_EXCL`
+/// instead of `O_TRUNC`): an entry already at `rel` -- a stale file, a
+/// planted symlink, a hard link to some inode elsewhere -- is an error
+/// rather than truncated and written through. Directories created on the
+/// way get `dir_mode`; the file gets `file_mode` (the umask applies to
+/// both). The fixture capturer writes every file this way.
+pub fn create_new_file_at(
+    root_fd: BorrowedFd,
+    rel: &str,
+    dir_mode: libc::mode_t,
+    file_mode: libc::mode_t,
+) -> io::Result<File> {
+    open_new_at(root_fd, rel, libc::O_EXCL, dir_mode, file_mode)
+}
+
+fn open_new_at(
+    root_fd: BorrowedFd,
+    rel: &str,
+    disposition: libc::c_int,
+    dir_mode: libc::mode_t,
+    file_mode: libc::mode_t,
+) -> io::Result<File> {
     let comps = split_bundle_rel(rel)?;
     let (last, dirs) = comps
         .split_last()
         .expect("split_bundle_rel rejects an empty path");
-    let dir_fd = walk_dirs(root_fd, dirs)?;
+    let dir_fd = walk_dirs(root_fd, dirs, dir_mode)?;
     let name = component_cstring(last)?;
     // SAFETY: `dir_fd` is a valid open directory descriptor; `name` is a
     // valid C string; the mode argument matches `O_CREAT`. `openat` returns a
@@ -204,8 +230,8 @@ pub fn create_file_at(root_fd: BorrowedFd, rel: &str) -> io::Result<File> {
         libc::openat(
             dir_fd.as_raw_fd(),
             name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600 as libc::c_uint,
+            libc::O_WRONLY | libc::O_CREAT | disposition | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            file_mode as libc::c_uint,
         )
     };
     if fd < 0 {
@@ -216,34 +242,56 @@ pub fn create_file_at(root_fd: BorrowedFd, rel: &str) -> io::Result<File> {
 }
 
 /// Create every directory of the relative bundle path `rel` beneath
-/// `root_fd` (mode `0o700`, existing ones tolerated), refusing a symlink at
-/// any step.
-pub fn mkdir_all_at(root_fd: BorrowedFd, rel: &str) -> io::Result<()> {
+/// `root_fd` (mode `dir_mode`, existing ones tolerated), refusing a symlink
+/// at any step.
+pub fn mkdir_all_at(root_fd: BorrowedFd, rel: &str, dir_mode: libc::mode_t) -> io::Result<()> {
     let comps = split_bundle_rel(rel)?;
-    walk_dirs(root_fd, &comps)?;
+    walk_dirs(root_fd, &comps, dir_mode)?;
     Ok(())
 }
 
 /// Open the directory `name` directly beneath `parent_fd`, creating it
-/// (mode `0o700`) when absent and refusing a symlink or any non-directory
-/// there. The fixture capturer pins its own subtree with this.
-pub fn open_subdir_at(parent_fd: BorrowedFd, name: &str) -> io::Result<OwnedFd> {
+/// (mode `dir_mode`) when absent and refusing a symlink or any
+/// non-directory there. The fixture capturer pins its own subtree with this.
+pub fn open_subdir_at(
+    parent_fd: BorrowedFd,
+    name: &str,
+    dir_mode: libc::mode_t,
+) -> io::Result<OwnedFd> {
     let cname = component_cstring(name)?;
-    mkdirat_tolerant(parent_fd, &cname)?;
+    mkdirat_tolerant(parent_fd, &cname, dir_mode)?;
     open_dir_at(parent_fd, &cname)
+}
+
+/// Remove the empty directory `name` directly beneath `parent_fd`.
+pub fn rmdir_at(parent_fd: BorrowedFd, name: &str) -> io::Result<()> {
+    let cname = component_cstring(name)?;
+    // SAFETY: matches unistd.h, `int unlinkat(int dirfd, const char
+    // *pathname, int flags)`; `AT_REMOVEDIR` makes it an `rmdir` of that
+    // entry, which never follows a symlink. Returns 0, else -1 with errno.
+    if unsafe { libc::unlinkat(parent_fd.as_raw_fd(), cname.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Create the symlink `rel` -> `target` beneath `root_fd`. `target` is
 /// stored verbatim (the fixture wants the kernel's own relative shape), so
 /// nothing about it is resolved here; the link's own path is walked
-/// component by component with `O_NOFOLLOW`, and an entry already at `rel`
-/// is an error rather than replaced.
-pub fn symlink_at(root_fd: BorrowedFd, rel: &str, target: &Path) -> io::Result<()> {
+/// component by component with `O_NOFOLLOW` (directories created on the
+/// way get `dir_mode`), and an entry already at `rel` is an error rather
+/// than replaced.
+pub fn symlink_at(
+    root_fd: BorrowedFd,
+    rel: &str,
+    target: &Path,
+    dir_mode: libc::mode_t,
+) -> io::Result<()> {
     let comps = split_bundle_rel(rel)?;
     let (last, dirs) = comps
         .split_last()
         .expect("split_bundle_rel rejects an empty path");
-    let dir_fd = walk_dirs(root_fd, dirs)?;
+    let dir_fd = walk_dirs(root_fd, dirs, dir_mode)?;
     let name = component_cstring(last)?;
     let target = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
         io::Error::new(

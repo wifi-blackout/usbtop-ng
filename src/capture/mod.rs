@@ -68,17 +68,35 @@ pub fn assemble_bundle(
     baseline: &BaselineSource,
     stage_id: Option<u32>,
 ) -> anyhow::Result<()> {
+    assemble_into(src_sysfs, out, traces, baseline, stage_id).map_err(|e| out.describe(e))
+}
+
+fn assemble_into(
+    src_sysfs: &Path,
+    out: &FixtureRoot,
+    traces: &[CapturedTrace],
+    baseline: &BaselineSource,
+    stage_id: Option<u32>,
+) -> anyhow::Result<()> {
     let base = out.read_base();
 
-    // Refuse a pre-existing, non-empty sysfs/: materializing into it would
-    // merge in stale device dirs left over from a prior partial run, silently
-    // mixing two captures into one bundle.
+    // Refuse a pre-existing sysfs/ that is not an empty directory: a symlink
+    // there is not ours (every write below would refuse it anyway), and
+    // materializing into a non-empty one would merge in stale device dirs
+    // left over from a prior partial run, silently mixing two captures into
+    // one bundle. `symlink_metadata` does not follow the final component.
     let sysfs_out = base.join("sysfs");
-    if let Ok(mut entries) = std::fs::read_dir(&sysfs_out) {
-        if entries.next().is_some() {
+    if let Ok(meta) = std::fs::symlink_metadata(&sysfs_out) {
+        if meta.file_type().is_symlink() {
             return Err(anyhow!(
-                "{} already exists and is not empty (stale from a prior run?); use a fresh outdir",
-                out.logical().join("sysfs").display()
+                "{}/sysfs is a symlink, not a directory this capture made; use a fresh outdir",
+                out.display()
+            ));
+        }
+        if std::fs::read_dir(&sysfs_out).is_ok_and(|mut entries| entries.next().is_some()) {
+            return Err(anyhow!(
+                "{}/sysfs already exists and is not empty (stale from a prior run?); use a fresh outdir",
+                out.display()
             ));
         }
     }
@@ -88,8 +106,8 @@ pub fn assemble_bundle(
 
     // Baseline internal-devices snapshot (bare-board; reused across stages).
     let internal = match baseline {
-        BaselineSource::CaptureFrom(base) => Snapshot::capture(Some(base))
-            .with_context(|| format!("snapshot {}", base.display()))?
+        BaselineSource::CaptureFrom(sysfs_base) => Snapshot::capture(Some(sysfs_base))
+            .with_context(|| format!("snapshot {}", sysfs_base.display()))?
             .to_toml()?
             .into_bytes(),
         BaselineSource::CopyFile(path) => {
@@ -134,6 +152,10 @@ pub fn assemble_bundle(
         meta::build_meta(&report, &sources, stage_id, binary_kernel_dropped)?.as_bytes(),
     )
     .context("write meta.toml")?;
+    // Under sudo, hand the tree to the invoker: a fixture captured to be
+    // committed must be theirs to read and add. Best-effort, in-home only
+    // (see `own_tree`); `--support` repeats it over the whole bundle.
+    crate::diag::bundle::own_tree(out.logical());
     Ok(())
 }
 
@@ -331,7 +353,7 @@ pub fn run_capture_fixture(opts: CaptureFixtureOpts<'_>) -> anyhow::Result<Captu
     // Re-check what's now on disk, the same SEC-1 recheck `--support` will
     // run over the bundle it embeds; also gives the live path itself a
     // non-test caller of the guard.
-    assert_bundle_payload_free(&opts.out.read_base())?;
+    assert_bundle_payload_free(&opts.out.read_base()).map_err(|e| opts.out.describe(e))?;
     // The human "captured fixture bundle at <dir>" line is left to the
     // caller: the `--capture-fixture` CLI prints it with the real output
     // path, while `--support` reports the capture through its own logger

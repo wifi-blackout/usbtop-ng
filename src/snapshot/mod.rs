@@ -59,6 +59,12 @@ impl Snapshot {
         })
     }
 
+    /// The snapshot as TOML text, exactly what [`Snapshot::write_to`] writes
+    /// (the fixture capturer writes it through its own pinned directory).
+    pub fn to_toml(&self) -> Result<String> {
+        toml::to_string(self).context("could not serialize the snapshot")
+    }
+
     /// Does not create `path`'s parent directory -- it errors like a plain
     /// `fs::write` would if that directory does not exist yet. The caller
     /// owns directory creation (e.g. the CLI handler calls
@@ -73,12 +79,6 @@ impl Snapshot {
     /// the invoking user under sudo (fd-based -- see that function's doc
     /// comment), so callers need no separate chown call; still refuses a
     /// symlink at `path`.
-    /// The snapshot as TOML text, exactly what [`Snapshot::write_to`] writes
-    /// (the fixture capturer writes it through its own pinned directory).
-    pub fn to_toml(&self) -> Result<String> {
-        toml::to_string(self).context("could not serialize the snapshot")
-    }
-
     pub fn write_to(&self, path: &Path) -> Result<()> {
         let text = self.to_toml()?;
         crate::config::replace_file_owned(path, text.as_bytes())

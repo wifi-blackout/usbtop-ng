@@ -2,11 +2,14 @@
 //! attribute file, the `usbN` and `peer` symlinks, a trace, a golden,
 //! `meta.toml`, the baseline snapshot -- goes through [`FixtureRoot`],
 //! relative to one directory descriptor held for the whole assembly, with
-//! every path component resolved `O_NOFOLLOW`. A directory swapped for a
-//! symlink after the pin, at the root or anywhere beneath it, changes
-//! nothing about where the bytes land: the descriptor names an inode, not a
-//! path. This is the support bundle's own pinned-root pattern
-//! ([`crate::diag::bundle`]) extended to the subtree the capturer owns.
+//! every path component resolved `O_NOFOLLOW` and every file created fresh
+//! (`O_EXCL`). A directory swapped for a symlink after the pin, at the root
+//! or anywhere beneath it, changes nothing about where the bytes land: the
+//! descriptor names an inode, not a path. This is the support bundle's own
+//! pinned-root pattern ([`crate::diag::bundle`]) extended to the subtree
+//! the capturer owns. The read side ([`FixtureRoot::read_base`]) pins the
+//! fixture root the same way and reads the tree beneath it as written, by
+//! path.
 
 use std::io::{self, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -21,44 +24,80 @@ use crate::diag::bundle;
 #[derive(Debug)]
 pub struct FixtureRoot {
     fd: OwnedFd,
-    /// The path the directory was named by: for messages and for the
-    /// ownership decision only (see [`chown_created_to_invoker`]); no write
+    /// The path the directory was named by: for the ownership decision
+    /// (see [`chown_created_to_invoker`]) and the ownership pass; no write
     /// resolves it.
     logical: PathBuf,
+    /// How messages name the directory: the path as the user gave it, or
+    /// `fixture` inside a support bundle. Never the descriptor path.
+    display: String,
+    /// Modes for what this root creates (the umask applies): private
+    /// inside a support bundle, readable for a fixture meant to be
+    /// committed.
+    dir_mode: libc::mode_t,
+    file_mode: libc::mode_t,
 }
 
 impl FixtureRoot {
     /// For `--capture-fixture <DIR>`: create `dir` when absent and pin it.
     /// The path is the invoker's own choice, so its ancestors are followed
-    /// as given, once, here; from this point on nothing is. Only that
-    /// feature-gated subcommand (and the tests) name a directory; `--support`
-    /// pins a child of its bundle root with [`FixtureRoot::beneath`].
+    /// as given, once, here -- but a symlink at `dir` itself is refused, the
+    /// same rule `--output` applies -- and from this point on nothing is
+    /// followed. A fixture captured this way is meant to be read and
+    /// committed, so it is created readable (`0755`/`0644`, the umask
+    /// applying) and handed to the sudo invoker by the ownership pass at
+    /// the end of the assembly. Only that feature-gated subcommand (and the
+    /// tests) name a directory; `--support` pins a child of its bundle root
+    /// with [`FixtureRoot::beneath`].
     #[cfg(any(feature = "capture-fixture", test))]
     pub fn create(dir: &Path) -> io::Result<FixtureRoot> {
         std::fs::create_dir_all(dir)?;
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(dir)?;
         Ok(FixtureRoot {
             fd: file.into(),
             logical: dir.to_path_buf(),
+            display: dir.display().to_string(),
+            dir_mode: 0o755,
+            file_mode: 0o644,
         })
     }
 
     /// For `--support`: the directory `name` directly beneath an already
     /// pinned bundle root, created when absent and refused when a symlink
     /// sits there. `logical` is the bundle directory joined with `name`.
+    /// Private like the rest of the bundle (`0700`/`0600`).
     pub fn beneath(parent_fd: BorrowedFd, name: &str, logical: PathBuf) -> io::Result<FixtureRoot> {
         Ok(FixtureRoot {
-            fd: bundle::open_subdir_at(parent_fd, name)?,
+            fd: bundle::open_subdir_at(parent_fd, name, 0o700)?,
             logical,
+            display: name.to_string(),
+            dir_mode: 0o700,
+            file_mode: 0o600,
         })
     }
 
-    /// The path this directory was named by (messages, ownership decision).
+    /// The path this directory was named by (ownership decision and pass).
     pub fn logical(&self) -> &Path {
         &self.logical
+    }
+
+    /// How messages name this directory (see the field).
+    pub fn display(&self) -> &str {
+        &self.display
+    }
+
+    /// Reword an error that captured the descriptor path (a replay or an
+    /// invariant check reads through [`FixtureRoot::read_base`]) so it names
+    /// the directory the way the user knows it.
+    pub fn describe(&self, err: anyhow::Error) -> anyhow::Error {
+        let text = format!("{err:#}");
+        anyhow::anyhow!(
+            "{}",
+            text.replace(&self.read_base().display().to_string(), &self.display)
+        )
     }
 
     /// The read side: `/proc/self/fd/<n>` resolves to the pinned inode
@@ -70,11 +109,13 @@ impl FixtureRoot {
         PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd()))
     }
 
-    /// Create or truncate the file `rel` (bundle-relative, `/`-separated),
-    /// creating directories on the way, and write `bytes`; the file is
-    /// handed to the sudo invoker like every other bundle file.
+    /// Create the file `rel` (bundle-relative, `/`-separated) fresh --
+    /// an entry already there is an error, never truncated -- creating
+    /// directories on the way, and write `bytes`; the file is handed to the
+    /// sudo invoker like every other bundle file.
     pub fn write(&self, rel: &str, bytes: &[u8]) -> io::Result<()> {
-        let mut file = bundle::create_file_at(self.fd.as_fd(), rel)?;
+        let mut file =
+            bundle::create_new_file_at(self.fd.as_fd(), rel, self.dir_mode, self.file_mode)?;
         file.write_all(bytes)?;
         file.flush()?;
         chown_created_to_invoker(&self.logical.join(rel), file.as_raw_fd());
@@ -83,12 +124,12 @@ impl FixtureRoot {
 
     /// Create the directory `rel` and every directory on the way.
     pub fn mkdir_all(&self, rel: &str) -> io::Result<()> {
-        bundle::mkdir_all_at(self.fd.as_fd(), rel)
+        bundle::mkdir_all_at(self.fd.as_fd(), rel, self.dir_mode)
     }
 
     /// Create the symlink `rel` -> `target`, `target` stored verbatim.
     pub fn symlink(&self, rel: &str, target: &Path) -> io::Result<()> {
-        bundle::symlink_at(self.fd.as_fd(), rel, target)
+        bundle::symlink_at(self.fd.as_fd(), rel, target, self.dir_mode)
     }
 }
 
@@ -167,6 +208,75 @@ mod tests {
 
         assert_eq!(std::fs::read(moved.join("meta.toml")).unwrap(), b"x");
         assert!(!outside.join("meta.toml").exists());
+    }
+
+    #[test]
+    fn create_refuses_a_symlink_at_the_output_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        let link = temp.path().join("out");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = FixtureRoot::create(&link).unwrap_err();
+        assert!(
+            matches!(err.raw_os_error(), Some(e) if e == libc::ELOOP || e == libc::ENOTDIR),
+            "expected ELOOP/ENOTDIR, got {err:?}"
+        );
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn a_pre_existing_entry_at_a_write_target_is_refused_and_left_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("bundle");
+        let root = FixtureRoot::create(&bundle).unwrap();
+        root.write("meta.toml", b"first").unwrap();
+
+        let err = root.write("meta.toml", b"second").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(bundle.join("meta.toml")).unwrap(), b"first");
+
+        // A hard link planted at an expected name points at an inode
+        // elsewhere; a truncating open would have emptied that inode.
+        let canary = temp.path().join("canary");
+        std::fs::write(&canary, b"precious").unwrap();
+        std::fs::hard_link(&canary, bundle.join("trace.bin")).unwrap();
+        assert!(root.write("trace.bin", b"x").is_err());
+        assert_eq!(std::fs::read(&canary).unwrap(), b"precious");
+    }
+
+    #[test]
+    fn a_fixture_meant_to_be_committed_is_created_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("bundle");
+        let root = FixtureRoot::create(&bundle).unwrap();
+        root.write("sysfs/1-1/busnum", b"1\n").unwrap();
+
+        let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        // Whatever the umask took away, group and other read stay possible,
+        // unlike the bundle's private 0700/0600.
+        assert_eq!(mode(bundle.join("sysfs")) & 0o700, 0o700);
+        assert_ne!(
+            mode(bundle.join("sysfs")),
+            0o700,
+            "not the bundle's private mode"
+        );
+        assert_eq!(mode(bundle.join("sysfs/1-1/busnum")) & 0o600, 0o600);
+        assert_ne!(mode(bundle.join("sysfs/1-1/busnum")), 0o600);
+    }
+
+    #[test]
+    fn errors_name_the_directory_as_given_not_the_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = FixtureRoot::create(&temp.path().join("out")).unwrap();
+        let base = root.read_base().display().to_string();
+        let err = anyhow::anyhow!("payload found in {base}/trace.bin");
+
+        let text = format!("{:#}", root.describe(err));
+        assert!(!text.contains("/proc/self/fd"), "{text}");
+        assert!(text.ends_with("/out/trace.bin"), "{text}");
     }
 
     #[test]
