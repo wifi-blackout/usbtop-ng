@@ -448,6 +448,10 @@ fn main() -> Result<()> {
             bus: cli.bus,
             baseline: cli.baseline.as_deref().map(std::path::PathBuf::from),
         })?;
+        // Under sudo, hand the finished fixture to the invoker: captured to
+        // be committed, it must be theirs to read and add. Best-effort and
+        // in-home only, like a support bundle's own pass at its very end.
+        diag::bundle::own_tree(out.logical());
         let sources = outcome.sources.len();
         let noun = if sources == 1 { "source" } else { "sources" };
         eprintln!(

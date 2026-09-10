@@ -89,13 +89,13 @@ fn assemble_into(
     if let Ok(meta) = std::fs::symlink_metadata(&sysfs_out) {
         if meta.file_type().is_symlink() {
             return Err(anyhow!(
-                "{}/sysfs is a symlink, not a directory this capture made; use a fresh outdir",
+                "{}/sysfs is a symlink, not a directory this capture made; use a fresh directory",
                 out.display()
             ));
         }
         if std::fs::read_dir(&sysfs_out).is_ok_and(|mut entries| entries.next().is_some()) {
             return Err(anyhow!(
-                "{}/sysfs already exists and is not empty (stale from a prior run?); use a fresh outdir",
+                "{}/sysfs already exists and is not empty (stale from a prior run?); use a fresh directory",
                 out.display()
             ));
         }
@@ -152,10 +152,6 @@ fn assemble_into(
         meta::build_meta(&report, &sources, stage_id, binary_kernel_dropped)?.as_bytes(),
     )
     .context("write meta.toml")?;
-    // Under sudo, hand the tree to the invoker: a fixture captured to be
-    // committed must be theirs to read and add. Best-effort, in-home only
-    // (see `own_tree`); `--support` repeats it over the whole bundle.
-    crate::diag::bundle::own_tree(out.logical());
     Ok(())
 }
 
@@ -699,7 +695,7 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("sysfs"), "{msg}");
-        assert!(msg.contains("fresh outdir"), "{msg}");
+        assert!(msg.contains("fresh directory"), "{msg}");
         // Nothing else got written: the stale dir was the only thing there.
         assert!(!outdir.join("meta.toml").exists());
     }

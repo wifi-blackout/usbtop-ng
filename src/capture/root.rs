@@ -24,6 +24,10 @@ use crate::diag::bundle;
 #[derive(Debug)]
 pub struct FixtureRoot {
     fd: OwnedFd,
+    /// Where reads of the written tree resolve; fixed at construction (see
+    /// [`read_base_for`]) so every reader and every message keys on the
+    /// same base.
+    read_base: PathBuf,
     /// The path the directory was named by: for the ownership decision
     /// (see [`chown_created_to_invoker`]) and the ownership pass; no write
     /// resolves it.
@@ -56,8 +60,11 @@ impl FixtureRoot {
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(dir)?;
+        let fd: OwnedFd = file.into();
+        let read_base = read_base_for(fd.as_fd(), dir, procfs_serves(fd.as_fd()), false)?;
         Ok(FixtureRoot {
-            fd: file.into(),
+            fd,
+            read_base,
             logical: dir.to_path_buf(),
             display: dir.display().to_string(),
             dir_mode: 0o755,
@@ -70,8 +77,11 @@ impl FixtureRoot {
     /// sits there. `logical` is the bundle directory joined with `name`.
     /// Private like the rest of the bundle (`0700`/`0600`).
     pub fn beneath(parent_fd: BorrowedFd, name: &str, logical: PathBuf) -> io::Result<FixtureRoot> {
+        let fd = bundle::open_subdir_at(parent_fd, name, 0o700)?;
+        let read_base = read_base_for(fd.as_fd(), &logical, procfs_serves(fd.as_fd()), true)?;
         Ok(FixtureRoot {
-            fd: bundle::open_subdir_at(parent_fd, name, 0o700)?,
+            fd,
+            read_base,
             logical,
             display: name.to_string(),
             dir_mode: 0o700,
@@ -100,23 +110,14 @@ impl FixtureRoot {
         )
     }
 
-    /// The read side: `/proc/self/fd/<n>` resolves to the pinned inode
-    /// whatever the logical path names by now, so the replay that
-    /// generates each golden, the SEC-1 and SEC-2 re-checks, and the
-    /// stale-tree check all read what was actually written. Without procfs
-    /// (a chroot or container that mounts `/sys` and `/dev/usbmon*` but not
-    /// `/proc`, where `--capture-fixture` still works) the reads fall back
-    /// to the path the directory was named by -- for the CLI the invoker's
-    /// own choice, exactly what the reads used before the pin existed.
-    /// `--support` needs procfs regardless (its archive step does), so it
-    /// never takes the fallback.
+    /// The read side, fixed at construction: normally `/proc/self/fd/<n>`,
+    /// which resolves to the pinned inode whatever the logical path names by
+    /// now, so the replay that generates each golden, the SEC-1 and SEC-2
+    /// re-checks, and the stale-tree check read the tree beneath the pinned
+    /// root as written (by path below that root). See [`read_base_for`] for
+    /// the one case without procfs.
     pub fn read_base(&self) -> PathBuf {
-        let through_descriptor = PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd()));
-        if through_descriptor.exists() {
-            through_descriptor
-        } else {
-            self.logical.clone()
-        }
+        self.read_base.clone()
     }
 
     /// Create the file `rel` (bundle-relative, `/`-separated) fresh --
@@ -141,6 +142,38 @@ impl FixtureRoot {
     pub fn symlink(&self, rel: &str, target: &Path) -> io::Result<()> {
         bundle::symlink_at(self.fd.as_fd(), rel, target, self.dir_mode)
     }
+}
+
+/// Whether procfs exposes `fd` at `/proc/self/fd/<n>`.
+fn procfs_serves(fd: BorrowedFd) -> bool {
+    Path::new(&format!("/proc/self/fd/{}", fd.as_raw_fd())).exists()
+}
+
+/// The read base for a root: `/proc/self/fd/<n>` whenever procfs serves it.
+/// Without procfs -- a chroot or container that mounts `/sys` and
+/// `/dev/usbmon*` but not `/proc` -- a `--capture-fixture` root
+/// (`private == false`) reads by the path the invoker named, exactly what
+/// the reads used before the pin existed and a directory that is their own
+/// choice; a bundle's fixture (`private == true`) is refused instead, since
+/// its reads and its cleanup must never resolve the swappable bundle path,
+/// and `--support` needs procfs for its archive step anyway. Decided once,
+/// here, so readers and messages never disagree on the base.
+fn read_base_for(
+    fd: BorrowedFd,
+    logical: &Path,
+    procfs_available: bool,
+    private: bool,
+) -> io::Result<PathBuf> {
+    if procfs_available {
+        return Ok(PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())));
+    }
+    if private {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "procfs is not mounted; the support bundle's fixture needs /proc/self/fd",
+        ));
+    }
+    Ok(logical.to_path_buf())
 }
 
 #[cfg(test)]
@@ -257,34 +290,49 @@ mod tests {
     }
 
     #[test]
-    fn a_fixture_meant_to_be_committed_is_created_readable() {
+    fn a_fixture_meant_to_be_committed_asks_for_readable_modes() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let bundle = temp.path().join("bundle");
-        let root = FixtureRoot::create(&bundle).unwrap();
-        root.write("sysfs/1-1/busnum", b"1\n").unwrap();
+        std::fs::create_dir(&bundle).unwrap();
+        let root_fd = bundle::open_bundle_root(&bundle).unwrap();
 
+        let committed = FixtureRoot::create(&temp.path().join("out")).unwrap();
+        let private =
+            FixtureRoot::beneath(root_fd.as_fd(), "fixture", bundle.join("fixture")).unwrap();
+        // The policy itself; what lands on disk is that minus the umask,
+        // which this test does not control.
+        assert_eq!((committed.dir_mode, committed.file_mode), (0o755, 0o644));
+        assert_eq!((private.dir_mode, private.file_mode), (0o700, 0o600));
+
+        committed.write("sysfs/1-1/busnum", b"1\n").unwrap();
         let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        // Whatever the umask took away, group and other read stay possible,
-        // unlike the bundle's private 0700/0600.
-        assert_eq!(mode(bundle.join("sysfs")) & 0o700, 0o700);
-        assert_ne!(
-            mode(bundle.join("sysfs")),
-            0o700,
-            "not the bundle's private mode"
+        assert_eq!(mode(temp.path().join("out/sysfs")) & 0o700, 0o700);
+        assert_eq!(
+            mode(temp.path().join("out/sysfs/1-1/busnum")) & 0o600,
+            0o600
         );
-        assert_eq!(mode(bundle.join("sysfs/1-1/busnum")) & 0o600, 0o600);
-        assert_ne!(mode(bundle.join("sysfs/1-1/busnum")), 0o600);
     }
 
     #[test]
-    fn the_read_side_goes_through_the_descriptor_when_procfs_is_there() {
+    fn the_read_base_is_the_descriptor_with_procfs_and_never_a_bundle_path_without() {
         let temp = tempfile::tempdir().unwrap();
         let root = FixtureRoot::create(&temp.path().join("out")).unwrap();
-        // procfs is mounted on every host that runs this suite; the
-        // fallback branch is the same path the reads used before the pin.
+        // procfs is mounted on every host that runs this suite.
         assert!(root.read_base().starts_with("/proc/self/fd/"));
         assert!(root.read_base().exists());
+
+        let logical = temp.path().join("out");
+        let with = read_base_for(root.fd.as_fd(), &logical, true, true).unwrap();
+        assert!(with.starts_with("/proc/self/fd/"));
+        // Without procfs: the CLI reads its own directory by name; a
+        // bundle's fixture is refused rather than read by a swappable path.
+        assert_eq!(
+            read_base_for(root.fd.as_fd(), &logical, false, false).unwrap(),
+            logical
+        );
+        let err = read_base_for(root.fd.as_fd(), &logical, false, true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
     #[test]
