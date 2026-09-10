@@ -103,10 +103,20 @@ impl FixtureRoot {
     /// The read side: `/proc/self/fd/<n>` resolves to the pinned inode
     /// whatever the logical path names by now, so the replay that
     /// generates each golden, the SEC-1 and SEC-2 re-checks, and the
-    /// stale-tree check all read what was actually written. procfs is
-    /// always mounted on Linux.
+    /// stale-tree check all read what was actually written. Without procfs
+    /// (a chroot or container that mounts `/sys` and `/dev/usbmon*` but not
+    /// `/proc`, where `--capture-fixture` still works) the reads fall back
+    /// to the path the directory was named by -- for the CLI the invoker's
+    /// own choice, exactly what the reads used before the pin existed.
+    /// `--support` needs procfs regardless (its archive step does), so it
+    /// never takes the fallback.
     pub fn read_base(&self) -> PathBuf {
-        PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd()))
+        let through_descriptor = PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd()));
+        if through_descriptor.exists() {
+            through_descriptor
+        } else {
+            self.logical.clone()
+        }
     }
 
     /// Create the file `rel` (bundle-relative, `/`-separated) fresh --
@@ -265,6 +275,16 @@ mod tests {
         );
         assert_eq!(mode(bundle.join("sysfs/1-1/busnum")) & 0o600, 0o600);
         assert_ne!(mode(bundle.join("sysfs/1-1/busnum")), 0o600);
+    }
+
+    #[test]
+    fn the_read_side_goes_through_the_descriptor_when_procfs_is_there() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = FixtureRoot::create(&temp.path().join("out")).unwrap();
+        // procfs is mounted on every host that runs this suite; the
+        // fallback branch is the same path the reads used before the pin.
+        assert!(root.read_base().starts_with("/proc/self/fd/"));
+        assert!(root.read_base().exists());
     }
 
     #[test]
