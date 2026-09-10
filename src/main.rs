@@ -442,16 +442,19 @@ fn main() -> Result<()> {
         });
         let out = capture::FixtureRoot::create(std::path::Path::new(outdir))
             .map_err(|e| anyhow::anyhow!("could not create {outdir}: {e}"))?;
-        let outcome = capture::run_capture_fixture(capture::CaptureFixtureOpts {
+        let result = capture::run_capture_fixture(capture::CaptureFixtureOpts {
             out: &out,
             window,
             bus: cli.bus,
             baseline: cli.baseline.as_deref().map(std::path::PathBuf::from),
-        })?;
-        // Under sudo, hand the finished fixture to the invoker: captured to
-        // be committed, it must be theirs to read and add. Best-effort and
-        // in-home only, like a support bundle's own pass at its very end.
+        });
+        // Under sudo, hand the fixture to the invoker: captured to be
+        // committed, it must be theirs to read and add -- and a partial one
+        // left by a failure must be theirs to delete. Best-effort and
+        // in-home only, like a support bundle's own pass at its very end,
+        // and only now, after every re-check and replay has read the tree.
         diag::bundle::own_tree(out.logical());
+        let outcome = result?;
         let sources = outcome.sources.len();
         let noun = if sources == 1 { "source" } else { "sources" };
         eprintln!(
