@@ -27,10 +27,22 @@ pub struct FixtureRoot {
     /// [`read_base_for`]) so every reader and every message keys on the
     /// same base.
     read_base: PathBuf,
-    /// The path the directory was named by: for the ownership pass at the
-    /// end (`own_tree`) and the procfs-less read fallback; no write
-    /// resolves it.
+    /// The path the directory was named by; no write resolves it.
     logical: PathBuf,
+    /// The topmost directory this root's creation itself made, `None`
+    /// when the named directory already existed. With the top-level names
+    /// written below (`created`), it defines what the ownership pass at
+    /// the end hands over: exactly what the run created, so a date
+    /// directory made on the way to `<board>-<date>/stage<N>` goes too, and
+    /// nothing that was already in a pre-existing directory does. Only the
+    /// `--capture-fixture` handler (and the tests) ask; a bundle runs its
+    /// own pass.
+    #[cfg(any(feature = "capture-fixture", test))]
+    created_top: Option<PathBuf>,
+    /// The topmost entry (a bundle-relative prefix) each write through this
+    /// root created, recorded the moment it existed.
+    #[cfg(any(feature = "capture-fixture", test))]
+    created: std::cell::RefCell<std::collections::BTreeSet<String>>,
     /// How messages name the directory: the path as the user gave it, or
     /// `fixture` inside a support bundle. Never the descriptor path.
     display: String,
@@ -55,17 +67,48 @@ impl FixtureRoot {
     /// (see [`read_base_for`]).
     #[cfg(any(feature = "capture-fixture", test))]
     pub fn create(dir: &Path) -> io::Result<FixtureRoot> {
-        std::fs::create_dir_all(dir)?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(dir)?;
-        let fd: OwnedFd = file.into();
-        let read_base = read_base_for(fd.as_fd(), procfs_serves(fd.as_fd()))?;
+        // `new/../fixture` would create and record `new` while the fixture
+        // lands beside it; the bundle refuses `..` in its own paths, and so
+        // does the output directory.
+        if dir
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the output directory {} contains `..`; give it as a plain path",
+                    dir.display()
+                ),
+            ));
+        }
+        let mut created_top = None;
+        let root = create_dirs_recording_top(dir, &mut created_top).and_then(|()| {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(dir)?;
+            let fd: OwnedFd = file.into();
+            let read_base = read_base_for(fd.as_fd(), procfs_serves(fd.as_fd()))?;
+            Ok((fd, read_base))
+        });
+        let (fd, read_base) = match root {
+            Ok(parts) => parts,
+            Err(e) => {
+                // Whatever this call already made is handed over before the
+                // failure surfaces, so nothing root-owned is left behind.
+                if let Some(top) = &created_top {
+                    bundle::own_tree(top);
+                }
+                return Err(e);
+            }
+        };
         Ok(FixtureRoot {
             fd,
             read_base,
             logical: dir.to_path_buf(),
+            created_top,
+            created: Default::default(),
             display: dir.display().to_string(),
             dir_mode: 0o755,
             file_mode: 0o644,
@@ -82,6 +125,10 @@ impl FixtureRoot {
         Ok(FixtureRoot {
             fd,
             read_base,
+            #[cfg(any(feature = "capture-fixture", test))]
+            created_top: None,
+            #[cfg(any(feature = "capture-fixture", test))]
+            created: Default::default(),
             logical,
             display: name.to_string(),
             dir_mode: 0o700,
@@ -89,9 +136,43 @@ impl FixtureRoot {
         })
     }
 
-    /// The path this directory was named by (for the ownership pass).
+    /// The path this directory was named by.
     pub fn logical(&self) -> &Path {
         &self.logical
+    }
+
+    /// What the ownership pass at the end should hand over: the topmost
+    /// directory this run created when it created one, else the topmost
+    /// entry each write created inside the pre-existing directory (a
+    /// directory made on the way, or the file or link itself), with an
+    /// entry beneath another recorded one folded into it -- never anything
+    /// that was already there.
+    #[cfg(any(feature = "capture-fixture", test))]
+    pub fn owned_paths(&self) -> Vec<PathBuf> {
+        if let Some(top) = &self.created_top {
+            return vec![top.clone()];
+        }
+        let created = self.created.borrow();
+        created
+            .iter()
+            .filter(|rel| {
+                !created
+                    .iter()
+                    .any(|other| other.len() < rel.len() && rel.starts_with(&format!("{other}/")))
+            })
+            .map(|rel| self.logical.join(rel))
+            .collect()
+    }
+
+    /// Remember the topmost entry a write of `rel` created: the first
+    /// `index + 1` components. Recorded the moment the helper reports the
+    /// creation, before any later step that could fail, so a partial
+    /// result is handed over too; never called for an entry that already
+    /// existed or a path the helper rejected.
+    #[cfg(any(feature = "capture-fixture", test))]
+    fn note_created(&self, rel: &str, index: usize) {
+        let prefix: Vec<&str> = rel.split('/').take(index + 1).collect();
+        self.created.borrow_mut().insert(prefix.join("/"));
     }
 
     /// How messages name this directory (see the field).
@@ -129,21 +210,73 @@ impl FixtureRoot {
     /// while the privileged process still reads it back, would let the
     /// invoker rewrite a trace between its write and its replay.
     pub fn write(&self, rel: &str, bytes: &[u8]) -> io::Result<()> {
-        let mut file =
-            bundle::create_new_file_at(self.fd.as_fd(), rel, self.dir_mode, self.file_mode)?;
+        let mut created = None;
+        let opened = bundle::create_new_file_at(
+            self.fd.as_fd(),
+            rel,
+            self.dir_mode,
+            self.file_mode,
+            &mut created,
+        );
+        self.record(rel, created);
+        let mut file = opened?;
         file.write_all(bytes)?;
         file.flush()
     }
 
     /// Create the directory `rel` and every directory on the way.
     pub fn mkdir_all(&self, rel: &str) -> io::Result<()> {
-        bundle::mkdir_all_at(self.fd.as_fd(), rel, self.dir_mode)
+        let mut created = None;
+        let result = bundle::mkdir_all_at(self.fd.as_fd(), rel, self.dir_mode, &mut created);
+        self.record(rel, created);
+        result
     }
 
     /// Create the symlink `rel` -> `target`, `target` stored verbatim.
     pub fn symlink(&self, rel: &str, target: &Path) -> io::Result<()> {
-        bundle::symlink_at(self.fd.as_fd(), rel, target, self.dir_mode)
+        let mut created = None;
+        let result = bundle::symlink_at(self.fd.as_fd(), rel, target, self.dir_mode, &mut created);
+        self.record(rel, created);
+        result
     }
+
+    /// Record what a helper reported creating along `rel`, whether or not
+    /// the helper then succeeded. Present in every build so the callers
+    /// read the same in all of them; only the `--capture-fixture` handler
+    /// (and the tests) ever ask for the result.
+    fn record(&self, rel: &str, created: Option<usize>) {
+        #[cfg(any(feature = "capture-fixture", test))]
+        if let Some(index) = created {
+            self.note_created(rel, index);
+        }
+        #[cfg(not(any(feature = "capture-fixture", test)))]
+        let _ = (rel, created);
+    }
+}
+
+/// Create `dir` and any missing ancestors, top down. `top` receives the
+/// topmost directory this call itself created (left `None` when every
+/// ancestor and `dir` already existed), set the moment it is created so a
+/// failure further down still reports it. Judged by the outcome of each
+/// `mkdir`, not by an existence check beforehand, so a directory someone
+/// else creates in between is never counted as ours.
+#[cfg(any(feature = "capture-fixture", test))]
+fn create_dirs_recording_top(dir: &Path, top: &mut Option<PathBuf>) -> io::Result<()> {
+    let mut chain: Vec<&Path> = dir.ancestors().collect();
+    chain.reverse();
+    for ancestor in chain {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        match std::fs::create_dir(ancestor) {
+            Ok(()) => {
+                top.get_or_insert_with(|| ancestor.to_path_buf());
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Whether procfs exposes `fd` at `/proc/self/fd/<n>`.
@@ -247,6 +380,18 @@ mod tests {
     }
 
     #[test]
+    fn create_refuses_a_parent_component_in_the_output_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let err = FixtureRoot::create(&temp.path().join("new/../fixture")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            !temp.path().join("new").exists(),
+            "nothing may be created on the way"
+        );
+        assert!(!temp.path().join("fixture").exists());
+    }
+
+    #[test]
     fn create_refuses_a_symlink_at_the_output_directory() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("elsewhere");
@@ -322,6 +467,55 @@ mod tests {
         // names by then: refused.
         let err = read_base_for(root.fd.as_fd(), false).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn the_ownership_pass_hands_over_exactly_what_the_run_created() {
+        let temp = tempfile::tempdir().unwrap();
+        // `<board>-<date>/stage2` where the date directory does not exist
+        // yet: the pass must start at the date directory, or a root-owned
+        // parent would trap the invoker's own fixture.
+        let dir = temp.path().join("tgl-2026-09-12").join("stage2");
+        let root = FixtureRoot::create(&dir).unwrap();
+        assert_eq!(root.owned_paths(), vec![temp.path().join("tgl-2026-09-12")]);
+        assert!(dir.is_dir());
+
+        // With the parent there, the named directory is the top.
+        let stage3 = temp.path().join("tgl-2026-09-12").join("stage3");
+        let again = FixtureRoot::create(&stage3).unwrap();
+        assert_eq!(again.owned_paths(), vec![stage3.clone()]);
+
+        // A directory that already existed, with something else in it: only
+        // what this run creates is handed over, never the rest -- not a
+        // pre-existing (empty) sysfs/ that merely receives entries, only the
+        // topmost entry made beneath it; not a file a write refused because
+        // it was already there; not a path the helper rejected.
+        let existing = temp.path().join("existing");
+        std::fs::create_dir_all(existing.join("sysfs")).unwrap();
+        std::fs::write(existing.join("other"), "not ours").unwrap();
+        std::fs::write(existing.join("trace.bin"), "stale").unwrap();
+        let reused = FixtureRoot::create(&existing).unwrap();
+        assert!(reused.owned_paths().is_empty(), "nothing written yet");
+        reused.mkdir_all("sysfs/1-1/ep").unwrap();
+        reused.mkdir_all("sysfs/1-1/ep2").unwrap();
+        reused.write("sysfs/1-1/busnum", b"1\n").unwrap();
+        reused
+            .symlink("sysfs/usb1", Path::new("ctrl/usb1"))
+            .unwrap();
+        assert!(reused.write("trace.bin", b"x").is_err());
+        assert!(reused.write("./meta.toml", b"x").is_err());
+        reused.write("meta.toml", b"x").unwrap();
+        reused.symlink("link", Path::new("meta.toml")).unwrap();
+        assert_eq!(
+            reused.owned_paths(),
+            vec![
+                existing.join("link"),
+                existing.join("meta.toml"),
+                existing.join("sysfs/1-1"),
+                existing.join("sysfs/usb1"),
+            ],
+            "the topmost entry each write created, with ep, ep2 and busnum folded into sysfs/1-1"
+        );
     }
 
     #[test]

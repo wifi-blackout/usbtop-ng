@@ -134,17 +134,18 @@ fn split_bundle_rel(rel: &str) -> io::Result<Vec<&str>> {
 }
 
 /// `mkdirat(dirfd, name, mode)`, tolerating an already-existing entry.
-fn mkdirat_tolerant(dirfd: BorrowedFd, name: &CString, mode: libc::mode_t) -> io::Result<()> {
+/// `true` when this call created the directory, `false` when it existed.
+fn mkdirat_tolerant(dirfd: BorrowedFd, name: &CString, mode: libc::mode_t) -> io::Result<bool> {
     // SAFETY: `dirfd` is a valid open directory descriptor for the whole
     // call; `name` is a valid NUL-terminated C string. `mkdirat` reads no
     // other memory.
     let rc = unsafe { libc::mkdirat(dirfd.as_raw_fd(), name.as_ptr(), mode) };
     if rc == 0 {
-        return Ok(());
+        return Ok(true);
     }
     let err = io::Error::last_os_error();
     if err.raw_os_error() == Some(libc::EEXIST) {
-        Ok(())
+        Ok(false)
     } else {
         Err(err)
     }
@@ -172,14 +173,24 @@ fn open_dir_at(dirfd: BorrowedFd, name: &CString) -> io::Result<OwnedFd> {
 
 /// Walk `comps` beneath `root_fd`, creating (mode `dir_mode`) and opening
 /// each as a directory (`O_DIRECTORY|O_NOFOLLOW`), and return a descriptor
-/// to the deepest one. An empty `comps` yields a dup of `root_fd`. Every
-/// step refuses a symlink, so no intermediate component can be followed off
-/// the pinned tree.
-fn walk_dirs(root_fd: BorrowedFd, comps: &[&str], dir_mode: libc::mode_t) -> io::Result<OwnedFd> {
+/// to the deepest one. `created` receives the index of the topmost
+/// component this walk created, set the moment it is created and left
+/// alone if it was already set, so a caller sees it even when a later
+/// step fails; an ownership hand-over keys on it. An empty `comps` yields
+/// a dup of `root_fd`. Every step refuses a symlink, so no intermediate
+/// component can be followed off the pinned tree.
+fn walk_dirs(
+    root_fd: BorrowedFd,
+    comps: &[&str],
+    dir_mode: libc::mode_t,
+    created: &mut Option<usize>,
+) -> io::Result<OwnedFd> {
     let mut cur = root_fd.try_clone_to_owned()?;
-    for comp in comps {
+    for (i, comp) in comps.iter().enumerate() {
         let name = component_cstring(comp)?;
-        mkdirat_tolerant(cur.as_fd(), &name, dir_mode)?;
+        if mkdirat_tolerant(cur.as_fd(), &name, dir_mode)? && created.is_none() {
+            *created = Some(i);
+        }
         cur = open_dir_at(cur.as_fd(), &name)?;
     }
     Ok(cur)
@@ -192,7 +203,8 @@ fn walk_dirs(root_fd: BorrowedFd, comps: &[&str], dir_mode: libc::mode_t) -> io:
 /// file is opened `O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW|O_CLOEXEC` at `0o600`.
 /// Ownership fixup is the caller's job (it needs the logical path).
 pub fn create_file_at(root_fd: BorrowedFd, rel: &str) -> io::Result<File> {
-    open_new_at(root_fd, rel, libc::O_TRUNC, 0o700, 0o600)
+    let mut created = None;
+    open_new_at(root_fd, rel, libc::O_TRUNC, 0o700, 0o600, &mut created)
 }
 
 /// Like [`create_file_at`], but the file must not exist yet (`O_EXCL`
@@ -200,14 +212,19 @@ pub fn create_file_at(root_fd: BorrowedFd, rel: &str) -> io::Result<File> {
 /// planted symlink, a hard link to some inode elsewhere -- is an error
 /// rather than truncated and written through. Directories created on the
 /// way get `dir_mode`; the file gets `file_mode` (the umask applies to
-/// both). The fixture capturer writes every file this way.
+/// both). The fixture capturer writes every file this way. `created`
+/// receives the index (into `rel`'s components) of the topmost entry this
+/// call created -- a directory on the way, or the file itself -- set the
+/// moment it exists, so the caller can hand it over even when a later
+/// step fails.
 pub fn create_new_file_at(
     root_fd: BorrowedFd,
     rel: &str,
     dir_mode: libc::mode_t,
     file_mode: libc::mode_t,
+    created: &mut Option<usize>,
 ) -> io::Result<File> {
-    open_new_at(root_fd, rel, libc::O_EXCL, dir_mode, file_mode)
+    open_new_at(root_fd, rel, libc::O_EXCL, dir_mode, file_mode, created)
 }
 
 fn open_new_at(
@@ -216,12 +233,13 @@ fn open_new_at(
     disposition: libc::c_int,
     dir_mode: libc::mode_t,
     file_mode: libc::mode_t,
+    created: &mut Option<usize>,
 ) -> io::Result<File> {
     let comps = split_bundle_rel(rel)?;
     let (last, dirs) = comps
         .split_last()
         .expect("split_bundle_rel rejects an empty path");
-    let dir_fd = walk_dirs(root_fd, dirs, dir_mode)?;
+    let dir_fd = walk_dirs(root_fd, dirs, dir_mode, created)?;
     let name = component_cstring(last)?;
     // SAFETY: `dir_fd` is a valid open directory descriptor; `name` is a
     // valid C string; the mode argument matches `O_CREAT`. `openat` returns a
@@ -237,16 +255,27 @@ fn open_new_at(
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // With `O_EXCL` a successful open is a creation; with `O_TRUNC` it may
+    // be a truncation of an existing file, which is not one.
+    if disposition == libc::O_EXCL && created.is_none() {
+        *created = Some(comps.len() - 1);
+    }
     // SAFETY: `fd` is a fresh, valid descriptor this process now owns.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 /// Create every directory of the relative bundle path `rel` beneath
 /// `root_fd` (mode `dir_mode`, existing ones tolerated), refusing a symlink
-/// at any step.
-pub fn mkdir_all_at(root_fd: BorrowedFd, rel: &str, dir_mode: libc::mode_t) -> io::Result<()> {
+/// at any step. `created` receives the index of the topmost component this
+/// call created (see [`walk_dirs`]).
+pub fn mkdir_all_at(
+    root_fd: BorrowedFd,
+    rel: &str,
+    dir_mode: libc::mode_t,
+    created: &mut Option<usize>,
+) -> io::Result<()> {
     let comps = split_bundle_rel(rel)?;
-    walk_dirs(root_fd, &comps, dir_mode)?;
+    walk_dirs(root_fd, &comps, dir_mode, created)?;
     Ok(())
 }
 
@@ -280,18 +309,20 @@ pub fn rmdir_at(parent_fd: BorrowedFd, name: &str) -> io::Result<()> {
 /// nothing about it is resolved here; the link's own path is walked
 /// component by component with `O_NOFOLLOW` (directories created on the
 /// way get `dir_mode`), and an entry already at `rel` is an error rather
-/// than replaced.
+/// than replaced. `created` receives the index of the topmost entry this
+/// call created: a directory on the way, or the link itself.
 pub fn symlink_at(
     root_fd: BorrowedFd,
     rel: &str,
     target: &Path,
     dir_mode: libc::mode_t,
+    created: &mut Option<usize>,
 ) -> io::Result<()> {
     let comps = split_bundle_rel(rel)?;
     let (last, dirs) = comps
         .split_last()
         .expect("split_bundle_rel rejects an empty path");
-    let dir_fd = walk_dirs(root_fd, dirs, dir_mode)?;
+    let dir_fd = walk_dirs(root_fd, dirs, dir_mode, created)?;
     let name = component_cstring(last)?;
     let target = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
         io::Error::new(
@@ -308,6 +339,9 @@ pub fn symlink_at(
     // resolved. Returns 0, else -1 with errno set.
     if unsafe { libc::symlinkat(target.as_ptr(), dir_fd.as_raw_fd(), name.as_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
+    }
+    if created.is_none() {
+        *created = Some(comps.len() - 1);
     }
     Ok(())
 }
@@ -718,29 +752,40 @@ pub fn own_tree(root: &Path) {
     walk_tree(root, chown_created_to_invoker);
 }
 
-/// Visit `root` and every directory and regular file beneath it, each opened
-/// relative to a descriptor of its parent (`openat` with `O_NOFOLLOW`),
-/// handing `visit` the logical path -- `root` joined with the relative name,
-/// for decisions and messages only -- and the open descriptor. `root` itself
-/// is opened `O_DIRECTORY|O_NOFOLLOW`, so a symlink swapped in there visits
-/// nothing at all rather than the link's target; a symlink beneath is
-/// skipped, and so is anything that is neither a directory nor a regular
-/// file. What an entry *is* is decided from the descriptor after the open
-/// (`fstat`), never from a look-up before it, so an entry swapped between
-/// the two is classified as what was actually opened; `O_NONBLOCK` keeps a
-/// FIFO swapped in from blocking that open. Entries are listed through
-/// `/proc/self/fd/<n>`, which resolves to the pinned inode. Depth-first,
-/// opening a child only when it is entered, so the descriptors held at once
-/// are bounded by the tree's depth, not its width. Best-effort: an entry that
-/// cannot be opened is skipped.
+/// Visit `root` and, when it is a directory, every directory and regular
+/// file beneath it, each opened relative to a descriptor of its parent
+/// (`openat` with `O_NOFOLLOW`), handing `visit` the logical path -- `root`
+/// joined with the relative name, for decisions and messages only -- and
+/// the open descriptor. `root` itself is opened `O_NOFOLLOW`, so a symlink
+/// swapped in there visits nothing at all rather than the link's target; a
+/// regular file there (a fixture file handed over on its own) is visited
+/// once. A symlink beneath is skipped, and so is anything that is neither a
+/// directory nor a regular file. What an entry *is* is decided from the
+/// descriptor after the open (`fstat`), never from a look-up before it, so
+/// an entry swapped between the two is classified as what was actually
+/// opened; `O_NONBLOCK` keeps a FIFO swapped in from blocking that open.
+/// Entries are listed through `/proc/self/fd/<n>`, which resolves to the
+/// pinned inode. Depth-first, opening a child only when it is entered, so
+/// the descriptors held at once are bounded by the tree's depth, not its
+/// width. Best-effort: an entry that cannot be opened is skipped.
 fn walk_tree(root: &Path, mut visit: impl FnMut(&Path, RawFd)) {
     let Ok(root_dir) = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(root)
     else {
         return;
     };
+    let Ok(meta) = root_dir.metadata() else {
+        return;
+    };
+    if meta.is_file() {
+        visit(root, root_dir.as_raw_fd());
+        return;
+    }
+    if !meta.is_dir() {
+        return;
+    }
     visit(root, root_dir.as_raw_fd());
     let names = entry_names(&root_dir);
     let mut stack: Vec<(File, PathBuf, Vec<std::ffi::OsString>)> =
@@ -1100,6 +1145,18 @@ mod tests {
         });
         assert_eq!(dirs, width + 1, "every directory plus the root");
         assert_eq!(files, width);
+    }
+
+    #[test]
+    fn walk_tree_visits_a_regular_file_root_once() {
+        // A fixture file handed over on its own (written into a directory
+        // that already existed) is a file root, not a directory.
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("meta.toml");
+        std::fs::write(&file, "x").unwrap();
+        let mut seen = Vec::new();
+        walk_tree(&file, |path, _| seen.push(path.to_path_buf()));
+        assert_eq!(seen, vec![file]);
     }
 
     #[test]

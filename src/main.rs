@@ -450,10 +450,14 @@ fn main() -> Result<()> {
         });
         // Under sudo, hand the fixture to the invoker: captured to be
         // committed, it must be theirs to read and add -- and a partial one
-        // left by a failure must be theirs to delete. Best-effort and
-        // in-home only, like a support bundle's own pass at its very end,
-        // and only now, after every re-check and replay has read the tree.
-        diag::bundle::own_tree(out.logical());
+        // left by a failure must be theirs to delete. Exactly what this run
+        // created, nothing a pre-existing directory already held.
+        // Best-effort and in-home only, like a support bundle's own pass at
+        // its very end, and only now, after every re-check and replay has
+        // read the tree.
+        for path in out.owned_paths() {
+            diag::bundle::own_tree(&path);
+        }
         let outcome = result?;
         let sources = outcome.sources.len();
         let noun = if sources == 1 { "source" } else { "sources" };
