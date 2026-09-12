@@ -35,7 +35,7 @@ the development host that contributes the ground-truth isochronous bundle
 | `pi-zero` | Raspberry Pi Zero W (BCM2835) | **armv6l** | 6.12.96+rpt-rpi-v6 | Raspbian 12 | module | single core, one `dwc_otg` OTG port at 480M; the 32-bit `gnueabihf` build target |
 | `rock5c` | Radxa ROCK 5C (Rockchip RK3588S2) | aarch64 | 6.1.84-8-rk2410 (vendor) | Debian 12 | built-in | usbmon built in, `/dev/usbmon0..8` live; eight buses (xhci + ehci/ohci-platform); the binary-only vendor-kernel path |
 | `bm1684x` | SOPHGO BM1684x | aarch64 | 5.4.217-bm1684 (vendor, dirty) | Ubuntu 20.04 | **absent** | no usbmon module in this kernel and no BTF -- not capturable as-is; Imaging Source 37UX273-ML camera attached; oldest kernel |
-| `tgl-tb4` | Intel Tiger Lake-LP, i5-1135G7 | x86_64 | 7.0.0-30-generic | Linux Mint 22.3 | module | Thunderbolt 4 (NHI + xHCI) plus a 10 Gbps USB bus; two IDS `1409:3270` USB3 cameras on a 10 Gbps hub (`usbfs`); eBPF-ready (BTF present) |
+| `tgl-tb4` | Intel Tiger Lake-LP, i5-1135G7 | x86_64 | 7.0.0-31-generic | Linux Mint 22.3 | module | Thunderbolt 4 (NHI + xHCI) plus a 10 Gbps USB bus; two IDS `1409:3270` USB3 cameras on a 10 Gbps hub (`usbfs`); a CalDigit Element Hub on Thunderbolt (added 2026-09-12) adds a tunneled xHCI `0000:2e:00.0` with buses 5 (480M) and 6 (10G); eBPF-ready (BTF present) |
 | `cezanne` | AMD Ryzen 9 5900HX (Cezanne) | x86_64 | 7.0.0-30-generic | Linux Mint 22.3 | module | AMD Renoir/Cezanne USB 3.1, two 10 Gbps + two 480M buses; eBPF-ready (BTF present); AMD, not Thunderbolt/USB4 |
 | `tgl-x360` | HP Pavilion x360 14-dw1xxx, Intel Tiger Lake-LP i5-1135G7 | x86_64 | 7.0.12+kali-amd64 | Kali GNU/Linux Rolling | module? | Tiger Lake TB4 USB controller (0000:00:0d.0) plus a 500-series 10 Gbps xHCI; Type-C/PD port free (no partner) but no Thunderbolt domain exposed; BTF present; **no passwordless sudo**, so it is the fleet's non-root test case; zsh login shell; HP webcam, Elan touch, AX201 BT internal |
 | `devhost` | Development host, AMD Ryzen 9 5900HX (Cezanne), xHCI 0000:06:00.3 and .4 | x86_64 | 7.0.0-30-generic | Linux Mint 22.3 | module | Chicony webcam on bus 1 (the ground-truth iso bundle); BTF present, eBPF runs |
@@ -95,8 +95,10 @@ there is blank rather than a confirmed absence.
 | `bm1684x` | bus2 | xhci | 4 | 5G | — | camera on 1; 3 free |
 | `tgl-tb4` | bus1 | xhci | 1 | 480M | — | 1 free |
 | `tgl-tb4` | bus2 | xhci | 4 | 10G | C·PD·TB | 4 free |
-| `tgl-tb4` | bus3 | xhci | 12 | 480M | — | hub + storage + webcam + BT; 8 free |
+| `tgl-tb4` | bus3 | xhci | 12 | 480M | — | Realtek hub carrying a Terminus 7-port chain (flash drive, a third IDS cam held at 480M, Cynthion, Bus Pirate 5, keyboard hub, mouse), webcam, BT; 9 root free |
 | `tgl-tb4` | bus4 | xhci | 4 | 10G | C·PD·TB | internal hub w/ 2 IDS cams; 3 root free |
+| `tgl-tb4` | bus5 | xhci (dock) | 2 | 480M | — | CalDigit Element Hub USB2 side: two internal hubs, the billboard device, the RTL9210 NVMe adapter linked at 480M; 1 root free |
+| `tgl-tb4` | bus6 | xhci (dock) | 2 | 10G | — | CalDigit Element Hub USB3 side: Intel 4-port hub + CalDigit 5-port hub, pairing non-adjacently with bus 5; 1 root free |
 | `cezanne` | bus1 | xhci | 4 | 480M | — | HID on 3; 3 free |
 | `cezanne` | bus2 | xhci | 2 | 10G | C·PD | 2 free |
 | `cezanne` | bus3 | xhci | 4 | 480M | — | BT on 4; 3 free |
@@ -107,7 +109,9 @@ there is blank rather than a confirmed absence.
 | `tgl-x360` | bus4 | xhci | 4 | 10G | — | 4 free |
 
 Both USB-C ports on `tgl-tb4` currently show a connected partner, so neither
-is free right now; `cezanne`'s single USB-C port (PD-capable, no TB) is
+is free right now; one of them carries the CalDigit Element Hub, which shows
+as Thunderbolt device 0-3 (generation 4, 20 Gb/s per lane) and tunnels its
+own xHCI. `cezanne`'s single USB-C port (PD-capable, no TB) is
 free, and so is `tgl-x360`'s (PD-capable, no partner, no TB domain).
 Only `tgl-tb4` exposes a Thunderbolt fabric. `usbfs_memory_mb` is
 raised to 1024 on `tgl-tb4`; every other host sits at the 16 MB default, so
@@ -156,6 +160,13 @@ Verified working in captures on the reference laptop.
 | 3-button mouse | 0430:0100 | 1.5 | low-speed display |
 | Bluetooth radio | 8087:0029 | 12 | interrupt + bulk mix, scan traffic |
 | Keyboard controllers, 2 units | 048d:ce00, 6005 | 12 | internal HID |
+| CalDigit Element Hub, Thunderbolt 4 dock | 2188:0034, 0031, 0035, 0032 plus Intel 8087:0b40 | tunneled xHCI, 480 + 10000 | tunneled topology, non-adjacent USB2/USB3 pairing, the dock fixture |
+| NVMe adapter, RTL9210 | 0bda:9210 | 10000 (linked at 480 today) | bulk at a device ceiling once a drive is fitted; the link-fallback display meanwhile |
+| Terminus 7-port USB2 hubs, 2 units | 1a40:0201 | 480 | MTT hub chains; a USB3 device held at USB2 by placement |
+| USB2 flash drive | 1aa6:0201 | 480 | high-speed bulk without USB3 wiring |
+| Bus Pirate 5 | 1209:7331 | 12 | full-speed CDC plus mass storage on one device |
+| Cynthion USB analyzer | 1d50:615b | 480 | vendor-class device, idle unless driven |
+| Keyboard behind its own hub | 0430:100e, 00a2 | 12 | full-speed HID two hubs deep |
 
 ### To acquire
 
@@ -163,10 +174,8 @@ Each fills a hole no on-hand device covers.
 
 | Item | Fills |
 | --- | --- |
-| USB 3.2 Gen 2 SSD enclosure (10 Gbps) | high-rate bulk near a real device ceiling |
+| An NVMe drive for the RTL9210 adapter (on hand, empty) | high-rate bulk near a real device ceiling |
 | USB 3.2 Gen 2x2 enclosure (20 Gbps) | the exact-speed model at 20000 |
-| USB4 or Thunderbolt dock | tunneled topology, the validation matrix |
-| USB2-only flash drive | high-speed bulk without USB3 wiring |
 | Powered USB2 OTG hub + micro-B adapter | the Pi Zero's single port |
 | E-marked USB-C cables, 3 A and 5 A rated | the future cable diagnostics |
 | SD card for the reader | makes the card reader a bulk source |

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Fixture bundle `tgl-tb4-2026-09-12`: the Thunderbolt 4 laptop with a CalDigit Element Hub attached. The dock tunnels its own xHCI, whose two buses pair non-adjacently, and the capture also holds an NVMe adapter linked below its capability and a USB 3 camera held at USB 2 speed by a USB 2-only hub chain.
+
 ### Changed
 
 - `--capture-fixture <DIR>`: the fixture is created readable (`0755`/`0644`, the umask applying) and handed to the sudo invoker once the capture has finished and been checked, like a support bundle, where it used to stay root-owned; a symlink at `DIR` itself is refused, and a file already present at any name the capturer writes is an error rather than overwritten (use a fresh directory, as the stale-`sysfs` rule already required). It needs procfs mounted, as `--support` always did: the written fixture is read back only through `/proc/self/fd`.
