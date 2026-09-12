@@ -725,9 +725,14 @@ pub fn own_tree(root: &Path) {
 /// is opened `O_DIRECTORY|O_NOFOLLOW`, so a symlink swapped in there visits
 /// nothing at all rather than the link's target; a symlink beneath is
 /// skipped, and so is anything that is neither a directory nor a regular
-/// file (opening a FIFO would block). Entries are listed through
-/// `/proc/self/fd/<n>`, which resolves to the pinned inode. Best-effort: an
-/// entry that cannot be examined or opened is skipped.
+/// file. What an entry *is* is decided from the descriptor after the open
+/// (`fstat`), never from a look-up before it, so an entry swapped between
+/// the two is classified as what was actually opened; `O_NONBLOCK` keeps a
+/// FIFO swapped in from blocking that open. Entries are listed through
+/// `/proc/self/fd/<n>`, which resolves to the pinned inode. Depth-first,
+/// opening a child only when it is entered, so the descriptors held at once
+/// are bounded by the tree's depth, not its width. Best-effort: an entry that
+/// cannot be opened is skipped.
 fn walk_tree(root: &Path, mut visit: impl FnMut(&Path, RawFd)) {
     let Ok(root_dir) = OpenOptions::new()
         .read(true)
@@ -737,64 +742,55 @@ fn walk_tree(root: &Path, mut visit: impl FnMut(&Path, RawFd)) {
         return;
     };
     visit(root, root_dir.as_raw_fd());
-    let mut stack: Vec<(File, PathBuf)> = vec![(root_dir, root.to_path_buf())];
-    while let Some((dir, logical)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd())) else {
+    let names = entry_names(&root_dir);
+    let mut stack: Vec<(File, PathBuf, Vec<std::ffi::OsString>)> =
+        vec![(root_dir, root.to_path_buf(), names)];
+    while let Some(top) = stack.last_mut() {
+        let Some(name) = top.2.pop() else {
+            stack.pop();
             continue;
         };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Ok(cname) = CString::new(name.as_bytes()) else {
-                continue;
-            };
-            // SAFETY: `stat` is plain data for which all-zero is valid.
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: matches sys/stat.h, `int fstatat(int dirfd, const char
-            // *pathname, struct stat *buf, int flags)`: `cname` is
-            // NUL-terminated, `st` is valid for the write, and
-            // `AT_SYMLINK_NOFOLLOW` reports a link as itself. Returns 0,
-            // else -1 with errno set.
-            let rc = unsafe {
-                libc::fstatat(
-                    dir.as_raw_fd(),
-                    cname.as_ptr(),
-                    &mut st,
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if rc != 0 {
-                continue;
-            }
-            let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
-            let flags = match st.st_mode & libc::S_IFMT {
-                libc::S_IFDIR => libc::O_RDONLY | libc::O_DIRECTORY,
-                libc::S_IFREG => libc::O_RDONLY,
-                _ => continue,
-            };
-            // SAFETY: matches fcntl.h, `int openat(int dirfd, const char
-            // *pathname, int flags)`: `cname` is NUL-terminated and no
-            // `O_CREAT` means no mode argument. Returns a fresh descriptor
-            // this process owns, else -1 with errno set; `O_NOFOLLOW` refuses
-            // a link raced in since the stat.
-            let fd = unsafe {
-                libc::openat(
-                    dir.as_raw_fd(),
-                    cname.as_ptr(),
-                    flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                continue;
-            }
-            // SAFETY: `fd` is a fresh, valid descriptor this process now owns.
-            let handle = unsafe { File::from_raw_fd(fd) };
-            let path = logical.join(&name);
+        let dir_fd = top.0.as_raw_fd();
+        let path = top.1.join(&name);
+        let Ok(cname) = CString::new(name.as_bytes()) else {
+            continue;
+        };
+        // SAFETY: matches fcntl.h, `int openat(int dirfd, const char
+        // *pathname, int flags)`: `cname` is NUL-terminated and no `O_CREAT`
+        // means no mode argument; `dir_fd` is held open by the stack entry.
+        // Returns a fresh descriptor this process owns, else -1 with errno
+        // set; `O_NOFOLLOW` refuses a symlink at the entry.
+        let fd = unsafe {
+            libc::openat(
+                dir_fd,
+                cname.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            continue;
+        }
+        // SAFETY: `fd` is a fresh, valid descriptor this process now owns.
+        let handle = unsafe { File::from_raw_fd(fd) };
+        let Ok(meta) = handle.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
             visit(&path, handle.as_raw_fd());
-            if is_dir {
-                stack.push((handle, path));
-            }
+            let names = entry_names(&handle);
+            stack.push((handle, path, names));
+        } else if meta.is_file() {
+            visit(&path, handle.as_raw_fd());
         }
     }
+}
+
+/// The names in the directory `dir` is open on, listed through
+/// `/proc/self/fd/<n>`; empty when the listing fails (best-effort walk).
+fn entry_names(dir: &File) -> Vec<std::ffi::OsString> {
+    std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+        .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1078,6 +1074,32 @@ mod tests {
         // The symlink is left alone and the FIFO is never opened (an
         // O_RDONLY open of it would block this test forever).
         assert_eq!(seen, vec![root.clone(), root.join("a"), root.join("a/f")]);
+    }
+
+    #[test]
+    fn walk_tree_holds_descriptors_by_depth_not_width() {
+        // Wider than the usual 1024 soft descriptor limit: opening every
+        // sibling before descending would run out and silently skip the
+        // rest of the tree.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("bundle");
+        let width = 1500;
+        for i in 0..width {
+            std::fs::create_dir_all(root.join(format!("d{i}"))).unwrap();
+            std::fs::write(root.join(format!("d{i}/f")), "x").unwrap();
+        }
+
+        let mut dirs = 0;
+        let mut files = 0;
+        walk_tree(&root, |path, _| {
+            if path.file_name().is_some_and(|n| n == "f") {
+                files += 1;
+            } else {
+                dirs += 1;
+            }
+        });
+        assert_eq!(dirs, width + 1, "every directory plus the root");
+        assert_eq!(files, width);
     }
 
     #[test]
