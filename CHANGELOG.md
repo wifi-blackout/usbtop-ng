@@ -9,11 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `--capture-fixture <DIR>`: the fixture is created readable (`0755`/`0644`, the umask applying) and handed to the sudo invoker once the capture has finished and been checked, like a support bundle, where it used to stay root-owned; a symlink at `DIR` itself is refused, and a file already present at any name the capturer writes is an error rather than overwritten (use a fresh directory, as the stale-`sysfs` rule already required).
+- `--capture-fixture <DIR>`: the fixture is created readable (`0755`/`0644`, the umask applying) and handed to the sudo invoker once the capture has finished and been checked, like a support bundle, where it used to stay root-owned; a symlink at `DIR` itself is refused, and a file already present at any name the capturer writes is an error rather than overwritten (use a fresh directory, as the stale-`sysfs` rule already required). It needs procfs mounted, as `--support` always did: the written fixture is read back only through `/proc/self/fd`.
 
 ### Security
 
-- The fixture capturer (`--capture-fixture`, and the fixture a `--support` bundle embeds) now writes every file, directory, and symlink of the fixture tree relative to one pinned directory descriptor, resolving each path component without following links and creating every file fresh, and replays the goldens through that descriptor. Previously the support bundle pinned only its root and the capturer wrote by path beneath `/proc/self/fd/<n>/fixture`. No reachable escape was identified in that code (the bundle root and `fixture/` stay root-owned and private until the ownership pass at the very end of the run), so this removes path-based writes as a class rather than fixing a known hole.
+- The fixture capturer (`--capture-fixture`, and the fixture a `--support` bundle embeds) now writes every file, directory, and symlink of the fixture tree relative to one pinned directory descriptor, resolving each path component without following links and creating every file fresh, and replays the goldens through that descriptor. Previously the support bundle pinned only its root and the capturer wrote by path beneath `/proc/self/fd/<n>/fixture`. No reachable escape was identified in that code (the bundle root and `fixture/` stay root-owned and private until the ownership pass at the very end of the run), so this removes path-based writes as a class rather than fixing a known hole. That ownership pass now walks the tree through descriptors too, each entry opened relative to its parent without following links, so a bundle or fixture directory swapped for a symlink before the pass is not followed into.
 
 ## [1.7.0] - 2026-09-08
 

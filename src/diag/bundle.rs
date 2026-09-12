@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -708,40 +708,90 @@ pub fn assert_fixture_invariants(fixture_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Under `sudo`, hand every directory and file under `root` to the invoking
-/// user, so a bundle written into their directory is theirs to delete.
-/// Best-effort and fd-based (see `config::chown_created_to_invoker`): a
-/// no-op when not under sudo or when `root` is outside the invoker's home;
-/// symlinks are left alone (removing one needs only the directory).
+/// Under `sudo`, hand every directory and regular file under `root` to the
+/// invoking user, so a bundle written into their directory is theirs to
+/// delete. Best-effort and fd-based (see `config::chown_created_to_invoker`):
+/// a no-op when not under sudo or when `root` is outside the invoker's
+/// home; symlinks are left alone (removing one needs only the directory).
+/// The walk itself never resolves a path (see [`walk_tree`]).
 pub fn own_tree(root: &Path) {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        if let Ok(handle) = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&dir)
-        {
-            chown_created_to_invoker(&dir, handle.as_raw_fd());
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    walk_tree(root, chown_created_to_invoker);
+}
+
+/// Visit `root` and every directory and regular file beneath it, each opened
+/// relative to a descriptor of its parent (`openat` with `O_NOFOLLOW`),
+/// handing `visit` the logical path -- `root` joined with the relative name,
+/// for decisions and messages only -- and the open descriptor. `root` itself
+/// is opened `O_DIRECTORY|O_NOFOLLOW`, so a symlink swapped in there visits
+/// nothing at all rather than the link's target; a symlink beneath is
+/// skipped, and so is anything that is neither a directory nor a regular
+/// file (opening a FIFO would block). Entries are listed through
+/// `/proc/self/fd/<n>`, which resolves to the pinned inode. Best-effort: an
+/// entry that cannot be examined or opened is skipped.
+fn walk_tree(root: &Path, mut visit: impl FnMut(&Path, RawFd)) {
+    let Ok(root_dir) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)
+    else {
+        return;
+    };
+    visit(root, root_dir.as_raw_fd());
+    let mut stack: Vec<(File, PathBuf)> = vec![(root_dir, root.to_path_buf())];
+    while let Some((dir, logical)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd())) else {
             continue;
         };
         for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            let name = entry.file_name();
+            let Ok(cname) = CString::new(name.as_bytes()) else {
                 continue;
             };
-            if meta.file_type().is_symlink() {
+            // SAFETY: `stat` is plain data for which all-zero is valid.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: matches sys/stat.h, `int fstatat(int dirfd, const char
+            // *pathname, struct stat *buf, int flags)`: `cname` is
+            // NUL-terminated, `st` is valid for the write, and
+            // `AT_SYMLINK_NOFOLLOW` reports a link as itself. Returns 0,
+            // else -1 with errno set.
+            let rc = unsafe {
+                libc::fstatat(
+                    dir.as_raw_fd(),
+                    cname.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
                 continue;
             }
-            if meta.is_dir() {
-                stack.push(path);
-            } else if let Ok(file) = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&path)
-            {
-                chown_created_to_invoker(&path, file.as_raw_fd());
+            let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
+            let flags = match st.st_mode & libc::S_IFMT {
+                libc::S_IFDIR => libc::O_RDONLY | libc::O_DIRECTORY,
+                libc::S_IFREG => libc::O_RDONLY,
+                _ => continue,
+            };
+            // SAFETY: matches fcntl.h, `int openat(int dirfd, const char
+            // *pathname, int flags)`: `cname` is NUL-terminated and no
+            // `O_CREAT` means no mode argument. Returns a fresh descriptor
+            // this process owns, else -1 with errno set; `O_NOFOLLOW` refuses
+            // a link raced in since the stat.
+            let fd = unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    cname.as_ptr(),
+                    flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                continue;
+            }
+            // SAFETY: `fd` is a fresh, valid descriptor this process now owns.
+            let handle = unsafe { File::from_raw_fd(fd) };
+            let path = logical.join(&name);
+            visit(&path, handle.as_raw_fd());
+            if is_dir {
+                stack.push((handle, path));
             }
         }
     }
@@ -1004,6 +1054,44 @@ mod tests {
         std::os::unix::fs::symlink(temp.path(), fixture.join("sysfs/escape")).unwrap();
         let err = assert_fixture_invariants(&fixture).unwrap_err();
         assert!(err.to_string().contains("SEC-2"), "{err}");
+    }
+
+    #[test]
+    fn walk_tree_visits_directories_and_regular_files_only_through_descriptors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("bundle");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/f"), "x").unwrap();
+        std::os::unix::fs::symlink("a", root.join("link")).unwrap();
+        let fifo = CString::new(root.join("fifo").as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is a NUL-terminated path; mkfifo(3) reads it and the
+        // mode and touches nothing else.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let mut seen = Vec::new();
+        walk_tree(&root, |path, fd| {
+            assert!(fd >= 0);
+            seen.push(path.to_path_buf());
+        });
+        seen.sort();
+
+        // The symlink is left alone and the FIFO is never opened (an
+        // O_RDONLY open of it would block this test forever).
+        assert_eq!(seen, vec![root.clone(), root.join("a"), root.join("a/f")]);
+    }
+
+    #[test]
+    fn walk_tree_visits_nothing_when_the_root_is_a_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        std::fs::write(real.join("sub/f"), "x").unwrap();
+        let root = temp.path().join("bundle");
+        std::os::unix::fs::symlink(&real, &root).unwrap();
+
+        let mut seen = 0;
+        walk_tree(&root, |_, _| seen += 1);
+        assert_eq!(seen, 0, "a swapped-in root must not be followed");
     }
 
     #[test]

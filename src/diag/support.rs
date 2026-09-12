@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use log::info;
+use log::{info, warn};
 use serde::Serialize;
 
 use super::bundle::{self, utc_stamp, BundleWriter};
@@ -371,7 +371,16 @@ fn clear_fixture(fixture: &FixtureRoot) {
     let Ok(entries) = std::fs::read_dir(&base) else {
         return;
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                // Whatever is left makes the static assembly's fresh-file
+                // creates fail with "already exists"; say why here.
+                warn!("could not list the fixture directory while clearing it: {e}");
+                continue;
+            }
+        };
         let path = entry.path();
         let is_dir = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
         let _ = if is_dir {

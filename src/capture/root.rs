@@ -51,7 +51,8 @@ impl FixtureRoot {
     /// applying) and handed to the sudo invoker by the ownership pass at
     /// the end of the assembly. Only that feature-gated subcommand (and the
     /// tests) name a directory; `--support` pins a child of its bundle root
-    /// with [`FixtureRoot::beneath`].
+    /// with [`FixtureRoot::beneath`]. Either way procfs must be mounted
+    /// (see [`read_base_for`]).
     #[cfg(any(feature = "capture-fixture", test))]
     pub fn create(dir: &Path) -> io::Result<FixtureRoot> {
         std::fs::create_dir_all(dir)?;
@@ -60,7 +61,7 @@ impl FixtureRoot {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(dir)?;
         let fd: OwnedFd = file.into();
-        let read_base = read_base_for(fd.as_fd(), dir, procfs_serves(fd.as_fd()), false)?;
+        let read_base = read_base_for(fd.as_fd(), procfs_serves(fd.as_fd()))?;
         Ok(FixtureRoot {
             fd,
             read_base,
@@ -77,7 +78,7 @@ impl FixtureRoot {
     /// Private like the rest of the bundle (`0700`/`0600`).
     pub fn beneath(parent_fd: BorrowedFd, name: &str, logical: PathBuf) -> io::Result<FixtureRoot> {
         let fd = bundle::open_subdir_at(parent_fd, name, 0o700)?;
-        let read_base = read_base_for(fd.as_fd(), &logical, procfs_serves(fd.as_fd()), true)?;
+        let read_base = read_base_for(fd.as_fd(), procfs_serves(fd.as_fd()))?;
         Ok(FixtureRoot {
             fd,
             read_base,
@@ -109,12 +110,12 @@ impl FixtureRoot {
         )
     }
 
-    /// The read side, fixed at construction: normally `/proc/self/fd/<n>`,
-    /// which resolves to the pinned inode whatever the logical path names by
-    /// now, so the replay that generates each golden, the SEC-1 and SEC-2
+    /// The read side, fixed at construction: `/proc/self/fd/<n>`, which
+    /// resolves to the pinned inode whatever the logical path names by now,
+    /// so the replay that generates each golden, the SEC-1 and SEC-2
     /// re-checks, and the stale-tree check read the tree beneath the pinned
-    /// root as written (by path below that root). See [`read_base_for`] for
-    /// the one case without procfs.
+    /// root as written (by path below that root). A root cannot be built
+    /// without it (see [`read_base_for`]).
     pub fn read_base(&self) -> PathBuf {
         self.read_base.clone()
     }
@@ -150,31 +151,22 @@ fn procfs_serves(fd: BorrowedFd) -> bool {
     Path::new(&format!("/proc/self/fd/{}", fd.as_raw_fd())).exists()
 }
 
-/// The read base for a root: `/proc/self/fd/<n>` whenever procfs serves it.
-/// Without procfs -- a chroot or container that mounts `/sys` and
-/// `/dev/usbmon*` but not `/proc` -- a `--capture-fixture` root
-/// (`private == false`) reads by the path the invoker named, exactly what
-/// the reads used before the pin existed and a directory that is their own
-/// choice; a bundle's fixture (`private == true`) is refused instead, since
-/// its reads and its cleanup must never resolve the swappable bundle path,
-/// and `--support` needs procfs for its archive step anyway. Decided once,
-/// here, so readers and messages never disagree on the base.
-fn read_base_for(
-    fd: BorrowedFd,
-    logical: &Path,
-    procfs_available: bool,
-    private: bool,
-) -> io::Result<PathBuf> {
+/// The read base for a root: `/proc/self/fd/<n>`, the one way to read the
+/// pinned inode by descriptor. Without procfs -- a chroot or container that
+/// mounts `/sys` and `/dev/usbmon*` but not `/proc` -- the alternative
+/// would be reading by name, which resolves whatever the path names by
+/// then, so the root is refused instead: the capturer needs procfs, as
+/// `--support` always did (its archive step hands `tar` a `/proc/self/fd`
+/// path). Decided once, here, so readers and messages never disagree on
+/// the base.
+fn read_base_for(fd: BorrowedFd, procfs_available: bool) -> io::Result<PathBuf> {
     if procfs_available {
         return Ok(PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())));
     }
-    if private {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "procfs is not mounted; the support bundle's fixture needs /proc/self/fd",
-        ));
-    }
-    Ok(logical.to_path_buf())
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "procfs is not mounted; the fixture capturer reads its output back through /proc/self/fd",
+    ))
 }
 
 #[cfg(test)]
@@ -316,23 +308,19 @@ mod tests {
     }
 
     #[test]
-    fn the_read_base_is_the_descriptor_with_procfs_and_never_a_bundle_path_without() {
+    fn the_read_base_is_the_descriptor_with_procfs_and_refused_without() {
         let temp = tempfile::tempdir().unwrap();
         let root = FixtureRoot::create(&temp.path().join("out")).unwrap();
         // procfs is mounted on every host that runs this suite.
         assert!(root.read_base().starts_with("/proc/self/fd/"));
         assert!(root.read_base().exists());
 
-        let logical = temp.path().join("out");
-        let with = read_base_for(root.fd.as_fd(), &logical, true, true).unwrap();
+        let with = read_base_for(root.fd.as_fd(), true).unwrap();
         assert!(with.starts_with("/proc/self/fd/"));
-        // Without procfs: the CLI reads its own directory by name; a
-        // bundle's fixture is refused rather than read by a swappable path.
-        assert_eq!(
-            read_base_for(root.fd.as_fd(), &logical, false, false).unwrap(),
-            logical
-        );
-        let err = read_base_for(root.fd.as_fd(), &logical, false, true).unwrap_err();
+        // Without procfs there is no way to read the pinned inode by
+        // descriptor, and reading by name would resolve whatever the path
+        // names by then: refused.
+        let err = read_base_for(root.fd.as_fd(), false).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
