@@ -161,8 +161,8 @@ Verified working in captures on the reference laptop.
 | Bluetooth radio | 8087:0029 | 12 | interrupt + bulk mix, scan traffic |
 | Keyboard controllers, 2 units | 048d:ce00, 6005 | 12 | internal HID |
 | CalDigit Element Hub, Thunderbolt 4 dock | 2188:0034, 0031, 0035, 0032 plus Intel 8087:0b40 | tunneled xHCI, 480 + 10000 | tunneled topology, non-adjacent USB2/USB3 pairing, the dock fixture |
-| NVMe adapter, RTL9210 | 0bda:9210 | 10000 (linked at 480 today) | bulk at a device ceiling once a drive is fitted; the link-fallback display meanwhile |
-| Terminus 7-port USB2 hubs, 2 units | 1a40:0201 | 480 | MTT hub chains; a USB3 device held at USB2 by placement |
+| NVMe adapter, RTL9210 | 0bda:9210 | 10000 (linked at 480 today) | bulk at a device ceiling once a drive is fitted; meanwhile the call-out fires on it, `superspeed_side_empty`, its BOS claiming 10000 against a 480 link |
+| Terminus 7-port USB2 hubs, 2 units | 1a40:0201 | 480 | MTT hub chains; a USB3 device held at USB2 by placement, which the call-out names as `upstream_hub_link` |
 | USB2 flash drive | 1aa6:0201 | 480 | high-speed bulk without USB3 wiring |
 | Bus Pirate 5 | 1209:7331 | 12 | full-speed CDC plus mass storage on one device |
 | Cynthion USB analyzer | 1d50:615b | 480 | vendor-class device, idle unless driven |
@@ -267,7 +267,9 @@ throwaway `stageN.json`.
    later), the one binary file in a bundle besides the traces, so a replay
    decides capability the way the live tool does; a bundle captured on an
    older kernel, or before 2026-09-12, carries none and its replay falls
-   back to bcdUSB.
+   back to bcdUSB. Only `tgl-tb4-2026-09-12/stage2` carries BOS blobs in
+   today's corpus -- it is the bundle that pins the two expected findings,
+   and every other bundle exercises the fallback and must replay to none.
 4. `bm1684x` contributes no fixtures. Its 5.4 vendor kernel carries no usbmon
    module, so the stage-0 gate fails before any capture is possible (see
    [Test hosts](#test-hosts)). That usbmon-absent state is a documented

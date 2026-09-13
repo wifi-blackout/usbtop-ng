@@ -51,6 +51,28 @@ Worth building, in dependency order:
   exonerate confidently, convict only a uniquely limiting party, and say
   nothing where attribution is ambiguous.
 
+Shipped 2026-09-12, that doctrine applied to the USB layer before the
+Type-C one: every device's capability now comes from its own BOS (sysfs
+`bos_descriptors`, Linux 6.9 and later), with bcdUSB 3.x standing in as a
+5 Gbps floor where the file is absent, and a findings engine calls out each
+device linked below it with the cause the topology proves -- an empty
+SuperSpeed side of the connector, a USB 2 only host port, a slower hub
+above, a host port ceiling, or an upstream that permits the speed. The hard
+part was matching a hub's two halves: the kernel pairs a hub's ports by port
+number with the ports of the hub on its upstream port's peer
+(`drivers/usb/core/port.c` `find_and_link_peer`), so a hub whose halves sit
+on different port numbers has its own ports left unpaired and its halves
+paired with empty ports. The engine therefore matches those halves by
+elimination and, where two candidates fit, says nothing at all.
+
+Next, part 3:
+
+- Shared uplink / bottleneck ranking under load. Several devices sharing one
+  uplink each show their own ceiling today; the useful verdict names the one
+  that is actually limiting the others, and only measured delivery can make
+  it. It waits on the dock carrying real traffic; the finding model already
+  leaves room for it, since the cause enum is open.
+
 Parked until Linux exposes them, not dropped. No stable kernel interface
 carries these today, and each becomes buildable the moment a mainline ABI
 or capable hardware lands:

@@ -18,6 +18,7 @@ anything, so both are safe inside a script or a cron job.
      1:1     1d6b:0002  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  Linux 7.0.0-29-generic xhci-hcd xHCI Host Controller
      1:3     05e3:0610  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  GenesysLogic USB2.1 Hub
      1:4  i  04f2:b71a  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  SunplusIT Inc HD Webcam
+   findings: none
    ```
    The first line carries the window's timestamp, length, packet source, the
    channel drop count, and the kernel-side ring drop count (`kdropped`,
@@ -26,9 +27,12 @@ anything, so both are safe inside a script or a cron job.
    1-wide origin cell (`i` when the device matches an internal-device
    snapshot, blank otherwise — see
    [The `internal` field](#the-internal-field)), `vendor_id:product_id`, link
-   speed, rx and tx rate, and the vendor/product string. This capture ran on
-   an idle bus, hence the all-zero rates; a device moving data reports its
-   rate here instead.
+   speed, rx and tx rate, and the vendor/product string. A `findings:`
+   section closes the report: `none`, or a count and one indented line per
+   device linked below the speed it supports (see
+   [The findings list](#the-findings-list)). This capture ran on an idle bus
+   with nothing to call out, hence the all-zero rates and the empty section;
+   a device moving data reports its rate here instead.
 
 ## `--batch`: one report per window, repeated
 
@@ -73,7 +77,7 @@ Report, the top-level document:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `version` | u32 | report schema version, currently 1 |
+| `version` | u32 | report schema version, currently 1; fields are only added, never renamed or removed, and an added field does not bump it |
 | `timestamp` | f64 | Unix time the report was built, seconds |
 | `window_seconds` | f64 | the sample window's length, seconds |
 | `source` | string | `"binary"` or `"text"`, the usbmon interface read |
@@ -82,6 +86,7 @@ Report, the top-level document:
 | `total_rx_bps` | f64 | sum of every bus's `rx_bps` |
 | `total_tx_bps` | f64 | sum of every bus's `tx_bps` |
 | `buses` | array | one entry per bus, sorted by bus number |
+| `findings` | array | devices linked below the speed they support, sorted by (bus, address); empty when there is nothing to call out. See [The findings list](#the-findings-list) |
 
 `buses[]`, one entry per bus:
 
@@ -112,6 +117,8 @@ Report, the top-level document:
 | `total_tx_bytes` | u64 | cumulative bytes transmitted this session |
 | `estimated` | bool | see [The `estimated` field](#the-estimated-field), below |
 | `internal` | bool? | `true` when the device matches the internal-device snapshot, `false` when it doesn't, `null` when no snapshot exists |
+| `capability_mbps` | f64? | the highest link rate the device says it supports, in Mbps; `null` when unknown. See [The findings list](#the-findings-list) |
+| `capability_source` | string? | `"bos"` when that figure was decoded from the device's BOS, `"bcd_usb"` when it is the bcdUSB floor; `null` when `capability_mbps` is |
 | `endpoints` | array | one entry per endpoint seen, ordered by (number, direction) |
 
 `buses[].devices[].endpoints[]`, one entry per endpoint the device has carried traffic on:
@@ -129,11 +136,34 @@ exact byte delta across the sample window, not from the TUI's 10 second
 sliding-window rate. A `--window 1` report and a `--window 30` report each
 report their own window's true average.
 
+`findings[]`, one entry per device linked below the speed it supports:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `bus` | u8 | bus number |
+| `address` | u8 | USB device number |
+| `path` | string | the device's sysfs name, `5-1.2` |
+| `port` | string? | the kernel port object the device is on, `5-1-port2`; `null` when the connector index does not know it |
+| `link_mbps` | f64 | the rate the link actually came up at, in Mbps |
+| `capability_mbps` | f64 | the rate the device says it supports, in Mbps |
+| `capability_source` | string | `"bos"` or `"bcd_usb"`, as on the device row |
+| `cause` | string? | `"superspeed_side_empty"`, `"usb2_only_host_port"`, `"upstream_hub_link"`, `"host_port_max"`, or `"upstream_permits"`; `null` when the topology proves none |
+| `peer_port` | string? | the empty SuperSpeed port, `6-1-port2`; set by `superspeed_side_empty` only, `null` otherwise |
+| `upstream` | string? | the hub above the device, `3-1.4`; set by `upstream_hub_link` only, `null` otherwise |
+| `limit_mbps` | f64? | the rate that limits the link: the upstream hub's own link for `upstream_hub_link`, the host port's ceiling for `host_port_max`; `null` for every other cause |
+| `message` | string | the one sentence the text report and the TUI show, `linked at 480M, supports 10G: <reason>` |
+
+A cause never sets a field another cause owns, so a consumer reads `cause`
+first and then only the fields that tag defines; everything else is `null`.
+
 ### Example document
 
-A representative document with one bus and one active isochronous device,
-matching the field names and shapes above, pretty-printed here for
-readability. `--once --json` prints each report as a single compact line:
+A representative document, trimmed to two buses with one device each,
+matching the field names and shapes above; it comes from the corpus's
+Thunderbolt 4 dock bundle, where both of those devices are linked below the
+speed they support, so the report carries two findings. Pretty-printed here
+for readability: `--once --json` prints each report as a single compact
+line:
 
 ```json
 {
@@ -143,42 +173,102 @@ readability. `--once --json` prints each report as a single compact line:
   "source": "binary",
   "dropped_packets": 0,
   "kernel_dropped_packets": 0,
-  "total_rx_bps": 20480.0,
+  "total_rx_bps": 720.0,
   "total_tx_bps": 0.0,
   "buses": [
     {
-      "bus": 1,
+      "bus": 3,
       "speed_mbps": 480.0,
-      "controller": "0000:06:00.3",
-      "rx_bps": 20480.0,
+      "controller": "0000:00:14.0",
+      "rx_bps": 720.0,
       "tx_bps": 0.0,
       "devices": [
         {
-          "bus": 1,
-          "address": 4,
-          "port": "4",
-          "vendor_id": "04f2",
-          "product_id": "b71a",
-          "vendor": "SunplusIT Inc",
-          "product": "HD Webcam",
+          "bus": 3,
+          "address": 51,
+          "port": "1.4.5",
+          "vendor_id": "1409",
+          "product_id": "3270",
+          "vendor": "Camera Manufacturer",
+          "product": "USB 3.0 Camera",
           "speed_mbps": 480.0,
-          "rx_bps": 20480.0,
+          "rx_bps": 720.0,
           "tx_bps": 0.0,
-          "total_rx_bytes": 20480,
+          "total_rx_bytes": 720,
           "total_tx_bytes": 0,
           "estimated": false,
-          "internal": true,
+          "internal": false,
+          "capability_mbps": 5000.0,
+          "capability_source": "bos",
           "endpoints": [
             {
               "endpoint": 1,
               "direction": "in",
-              "transfer_type": "iso",
-              "bps": 20480.0,
-              "total_bytes": 20480
+              "transfer_type": "bulk",
+              "bps": 720.0,
+              "total_bytes": 720
             }
           ]
         }
       ]
+    },
+    {
+      "bus": 5,
+      "speed_mbps": 480.0,
+      "controller": "0000:2e:00.0",
+      "rx_bps": 0.0,
+      "tx_bps": 0.0,
+      "devices": [
+        {
+          "bus": 5,
+          "address": 5,
+          "port": "1.2",
+          "vendor_id": "0bda",
+          "product_id": "9210",
+          "vendor": "SSK",
+          "product": "SSK Storage",
+          "speed_mbps": 480.0,
+          "rx_bps": 0.0,
+          "tx_bps": 0.0,
+          "total_rx_bytes": 0,
+          "total_tx_bytes": 0,
+          "estimated": false,
+          "internal": false,
+          "capability_mbps": 10000.0,
+          "capability_source": "bos",
+          "endpoints": []
+        }
+      ]
+    }
+  ],
+  "findings": [
+    {
+      "bus": 3,
+      "address": 51,
+      "path": "3-1.4.5",
+      "port": "3-1.4-port5",
+      "link_mbps": 480.0,
+      "capability_mbps": 5000.0,
+      "capability_source": "bos",
+      "cause": "upstream_hub_link",
+      "peer_port": null,
+      "upstream": "3-1.4",
+      "limit_mbps": 480.0,
+      "message": "linked at 480M, supports 5G: the hub above it (3-1.4) is linked at 480M; move it to a USB 3 port"
+    },
+    {
+      "bus": 5,
+      "address": 5,
+      "path": "5-1.2",
+      "port": "5-1-port2",
+      "link_mbps": 480.0,
+      "capability_mbps": 10000.0,
+      "capability_source": "bos",
+      "cause": "superspeed_side_empty",
+      "peer_port": "6-1-port2",
+      "upstream": null,
+      "limit_mbps": null,
+      "message": "linked at 480M, supports 10G: the SuperSpeed side of this connector (6-1-port2) is empty, so the link came up at USB 2 speed; check the cable or the port"
     }
   ]
 }
@@ -238,7 +328,9 @@ came from. In JSON it is the first line:
 | `arch` | string | target architecture |
 | `buses` | array | the usbmon buses available at start |
 
-The report lines that follow are unchanged, schema version 1. A consumer
+The report lines that follow are unchanged, schema version 1 — a version
+an added field does not bump, so a reader written against an older release
+keeps working and simply does not read the new keys. A consumer
 that only wants reports skips the record by key:
 
 ```bash
@@ -264,6 +356,44 @@ per line, before the first report. Stdout never carries the run record, so
   arrive — usbtop-ng prints an error to stderr and exits 1 instead of
   reporting zeros. `--force` on a host with no detected buses is the
   exception: no capture was expected, so its empty reports print normally.
+
+## The findings list
+
+`findings` is the top-level list of devices linked below the speed they
+support, with the cause where the topology proves one. It sits at the top
+level rather than nested under each device, so a script can ask
+`.findings | length` without walking the tree.
+
+The capability behind it is the device's own statement, read from the sysfs
+`bos_descriptors` attribute — the device's Binary device Object Store,
+exposed by Linux 6.9 and later. A SuperSpeedPlus capability there gives the
+largest sublink rate it advertises (10000 or 20000), a SuperSpeed capability
+alone gives 5000, and neither gives no capability at all: `capability_mbps`
+stays `null` and the device is never called out. Where the file does not
+exist — an older kernel, or a device with no BOS — bcdUSB 3.x stands in as
+a 5000 floor and nothing higher, so a device linked at 5 Gbps on such a host
+is never called out for a 10 Gbps ability the tool cannot see.
+`capability_source` says which of the two it was, and the `message` appends
+`(from bcdUSB)` for the floor.
+
+Two consequences worth knowing before scripting on this:
+
+- The BOS states lane rates, not lane counts, so `capability_mbps` is the
+  per-lane rate. A dual-lane 20 Gbps device linked single-lane at 10 Gbps
+  produces no finding.
+- A hub's USB 2 half advertises SuperSpeed even when it is working
+  perfectly, because its USB 3 half is a separate device on the peer bus.
+  Findings are therefore decided per connector, from the kernel's port
+  `peer` links and the device tree, not from the capability figure alone,
+  and a case the topology cannot attribute yields a finding with a `null`
+  `cause` or no finding at all rather than a guess.
+
+`--filter` narrows `findings` the same way it narrows the device rows: a
+device filtered out of `buses[].devices` is filtered out of `findings` too.
+
+```bash
+sudo usbtop-ng --once --json | jq -c '.findings[] | {path, cause, message}'
+```
 
 ## The `estimated` field
 

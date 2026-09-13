@@ -9,10 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Capability call-outs for a device linked below the speed it supports: the TUI marks its `!` column with 🔺, puts the reason on a line under the row, and counts the flagged devices as `findings: N` in the header; the JSON report gains a top-level `findings` list plus `capability_mbps` and `capability_source` on every device; the text report ends with a `findings` section, or `findings: none`. The capability is the device's own statement, decoded from its BOS (sysfs `bos_descriptors`, Linux 6.9 and later), with bcdUSB 3.x standing in as a 5 Gbps floor and never more where that file is absent, labelled as such wherever it shows. Each call-out names the cause the topology proves -- an empty SuperSpeed side of the connector, a USB 2 only host port, a slower hub above it, a host port ceiling, or an upstream that permits the speed -- and says nothing where attribution is ambiguous. The report schema stays version 1; the fields are additive. See the README's Findings section and [docs/SCRIPTING.md](docs/SCRIPTING.md#the-findings-list).
 - Fixture bundle `tgl-tb4-2026-09-12`: the Thunderbolt 4 laptop with a CalDigit Element Hub attached. The dock tunnels its own xHCI, whose two buses pair non-adjacently, and the capture also holds an NVMe adapter linked below its capability and a USB 3 camera held at USB 2 speed by a USB 2-only hub chain.
 
 ### Changed
 
+- `--capture-fixture` sysfs snapshots now copy each device's `bos_descriptors` where the kernel exposes it, the one binary attribute a bundle carries by design, so a replay decides capability the way the live tool does; every committed golden was regenerated for the added report fields, and the `tgl-tb4-2026-09-12` dock bundle was recaptured in place so the corpus holds real BOS bytes and pins its two expected findings. A bundle captured on an older kernel carries none and replays through the bcdUSB fallback, as before.
 - `--capture-fixture <DIR>`: the fixture is created readable (`0755`/`0644`, the umask applying) and handed to the sudo invoker once the capture has finished and been checked, like a support bundle, where it used to stay root-owned; a symlink at `DIR` itself is refused, and a file already present at any name the capturer writes is an error rather than overwritten (use a fresh directory, as the stale-`sysfs` rule already required). It needs procfs mounted, as `--support` always did: the written fixture is read back only through `/proc/self/fd`.
 
 ### Security

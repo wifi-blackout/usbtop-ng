@@ -103,9 +103,18 @@ treats them alike.
 #### 2. Device manager (`device/`)
 
 - `mod.rs`: the device structure and its lifecycle. It holds
-  `UsbDevice::get_busy_percentage`, `check_speed_mismatch`,
-  `get_speed_indicator`, and the best-effort capability signal read from sysfs
-  `version` (bcdUSB).
+  `UsbDevice::get_busy_percentage`, `get_speed_indicator`, and the capability
+  the device states for itself, `Option<Capability>`.
+- `bos.rs`: the device's Binary device Object Store, read from sysfs
+  `bos_descriptors` (Linux 6.9 and later). `capability_from_bos` walks the
+  descriptors — layouts verified against the kernel's uapi
+  `include/uapi/linux/usb/ch9.h` — and returns the largest rate the device
+  advertises: every SuperSpeedPlus sublink rate, and 5 Gbps for a SuperSpeed
+  capability. A malformed descriptor stops the walk rather than panicking.
+  `read_capability` falls back to bcdUSB 3.x, as a 5 Gbps floor and never
+  more, only when the file is absent, and records which of the two it was in
+  `Capability::source`. The BOS states lane rates and not lane counts, so the
+  figure is the per-lane rate.
 - `manager.rs`: routes usbmon packets into per-device bandwidth stats, and
   resolves device metadata from sysfs. When a usb.ids database is set
   (`set_usbids`), it overlays `UsbDevice::apply_usbids` on every newly
@@ -124,6 +133,8 @@ treats them alike.
 
 - `mod.rs`: app state (`UsbTopApp`), the per-interval render snapshot, key
   handling (`apply_key`), the packet drain (`drain_packets`), and every widget.
+- `connectors.rs`: the render model's connector grouping — building
+  `ConnectorView`s from the port index, their labels, and their ordering.
 - `colors.rs`: the color scheme.
 
 #### 4a. Connectors (`connector/`)
@@ -131,6 +142,16 @@ treats them alike.
 - `mod.rs`: `PortIndex`, the scan of each device's sysfs interface
   directories for `<hub>-port<N>` objects and their `peer` links, and the
   pairing rule the render model uses. Pure over paths.
+
+#### 4b. Findings (`findings/`)
+
+- `mod.rs`: `analyze(&DeviceManager, &PortIndex) -> Vec<Finding>`, the
+  call-outs for devices linked below the speed they support, and `Cause`,
+  the reason where the topology proves one. Pure over the manager's rows and
+  the port index; no sysfs reads of its own. `Finding::message` is the one
+  sentence the TUI line, the text report, and the JSON `message` field all
+  show; each surface supplies its own prefix. The rules are in
+  `docs/superpowers/specs/2026-09-12-capability-callouts-design.md`.
 
 #### 5. TUI chassis (`tui/`)
 
@@ -323,7 +344,7 @@ pub struct UsbDevice {
     pub bandwidth_stats: BandwidthStats,
     pub is_disconnected: bool,
     pub sysfs_path: Option<PathBuf>,
-    pub max_capability: Option<UsbSpeed>, // cached bcdUSB (sysfs `version`) signal
+    pub capability: Option<Capability>, // from its BOS, else the bcdUSB floor
     // ... metadata fields
 }
 
@@ -345,15 +366,23 @@ pub struct UsbBus {
   practical, overhead-adjusted bandwidth. `UsbBus::busy_percentage()` reports
   the bus aggregate, and returns `None` when the bus speed is unknown.
 - `UsbDevice::get_speed_indicator()` returns
-  `SpeedIndicator::HighUtilization` (⚡, above 80% busy) or `LimitedByBus`
-  (🔺, cached capability above both the bus speed and the current link speed).
-  `LimitedByBus` takes precedence.
-- The capability behind 🔺 is a best-effort signal, read once from the device's
-  sysfs `version` (bcdUSB). A value of 3.00 or higher means SuperSpeed-capable.
-  Anything else means no signal rather than no capability. A device linked
-  below its capability usually reports bcdUSB 2.10 on the USB2 bus, so the
-  absence of 🔺 proves nothing. That is why no descriptor guesswork
-  (`bcdDevice`, `bMaxPacketSize0`) manufactures one.
+  `SpeedIndicator::HighUtilization` (⚡, above 80% busy) or `BelowCapability`
+  (🔺, carrying the speed the device supports). `BelowCapability` takes
+  precedence. The device no longer decides for itself whether it is limited:
+  the caller passes the capability a finding proved, so `check_speed_mismatch`
+  and the bus-speed argument are gone.
+- The capability behind 🔺 is the device's own statement, decoded from its BOS
+  (`device::bos`, sysfs `bos_descriptors`, Linux 6.9 and later). Where that
+  file does not exist, bcdUSB 3.x stands in as a 5 Gbps floor and never more,
+  labelled `CapabilitySource::BcdUsb` wherever it shows, so the weaker source
+  is visible rather than dressed up as a measurement. No descriptor guesswork
+  (`bcdDevice`, `bMaxPacketSize0`) manufactures a capability, and a device
+  with neither signal is never called out — a missing 🔺 proves nothing.
+- Whether a capability above the link speed is a finding is not the device
+  module's call. A hub's USB 2 half advertises SuperSpeed even when it is
+  working perfectly, because its USB 3 half is a separate device on the peer
+  bus, so `findings::analyze` decides per connector from the port index and
+  the device tree, and says nothing where attribution is ambiguous.
 - Disconnect detection and tracking, with removal 5 seconds after the
   disconnect.
 
@@ -440,7 +469,11 @@ pub struct ConnectorView {
     pub devices: Vec<DeviceRow>,
     pub rx_bps: f64, pub tx_bps: f64,
 }
-pub struct DeviceRow { pub port_chain: Option<Vec<u32>>, pub device: UsbDevice }
+pub struct DeviceRow {
+    pub port_chain: Option<Vec<u32>>,
+    pub device: UsbDevice,
+    pub finding: Option<Finding>,      // the call-out rendered under the row
+}
 ```
 
 Rebuilding from scratch, rather than patching an incremental map, keeps totals,

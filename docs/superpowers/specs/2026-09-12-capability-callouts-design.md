@@ -204,9 +204,12 @@ has no cause:
     `UpstreamPermits`.
 
 **Messages** (`Finding::message()`, one string shared by the text report,
-the TUI line and the JSON `message` field): `"<path> linked at 480M,
-supports 10G"` with `" (from bcdUSB)"` appended for the fallback, then the
-cause: SuperSpeedSideEmpty "the SuperSpeed side of this connector
+the TUI line and the JSON `message` field): `"linked at 480M, supports
+10G"` with `" (from bcdUSB)"` appended for the fallback, then `": "` and the
+cause. The message carries no path of its own; each surface prefixes what it
+needs — the text report `bus:address path vid:pid`, the TUI line sits under
+its own row, and the JSON finding carries `path` as a field. The causes:
+SuperSpeedSideEmpty "the SuperSpeed side of this connector
 (<peer_port>) is empty, so the link came up at USB 2 speed; check the cable
 or the port"; Usb2OnlyHostPort "this host port is USB 2 only; move it to a
 USB 3 port"; UpstreamHubLink "the hub above it (<hub>) is linked at

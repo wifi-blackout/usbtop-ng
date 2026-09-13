@@ -164,9 +164,10 @@ key press and quits through the same teardown as `q`.
   come from sysfs too, unless a usb.ids database resolves a name for them;
   see [Device names](#device-names).
 - ⚡ marks the `!` column once a device passes 80% busy.
-- 🔺 marks the `!` column when the device's sysfs `version` reads 3.00 or
-  higher and both its bus and its link run slower than SuperSpeed. 🔺 takes
-  precedence over ⚡.
+- 🔺 marks the `!` column on a device linked below the speed it supports,
+  read from its BOS on Linux 6.9+ (bcdUSB 3.x as a floor elsewhere); the
+  line beneath the row says why, and the header counts the flagged devices
+  as `findings: N`. 🔺 takes precedence over ⚡. See [Findings](#findings).
 - Every link speed carries a color. It tints the Speed cell, the bus header's
   Mbps figure, and the controls bar legend. The legend reads 1.5M, 12M, 480M,
   5G, 10G+, and `?` for unknown.
@@ -347,6 +348,34 @@ says, and the snapshot is the one list you control.
   run record that names the version, backend, window, filters, and command.
 - See [docs/SCRIPTING.md](docs/SCRIPTING.md) for the full flag reference, the
   JSON field list, and an example document.
+
+### Findings
+
+- A device linked below the speed it supports is called out in all three
+  surfaces, with the cause when the topology proves it: an empty SuperSpeed
+  side of its connector, a USB 2 only host port, a slower hub above it, a
+  host port that tops out lower, or an upstream that permits the speed
+  while the link still came up slower. Where the topology cannot attribute
+  the shortfall — two hubs that could each be the missing SuperSpeed half of
+  the other side — the call-out is withheld rather than guessed, and a
+  device whose port the connector index does not know is reported with its
+  symptom and no cause.
+- The capability is the device's own statement, decoded from its BOS
+  (sysfs `bos_descriptors`, Linux 6.9 and later). Without that file, bcdUSB
+  3.x stands in as a 5 Gbps floor, never more, and the finding says
+  `(from bcdUSB)` so the weaker source is visible.
+- The TUI puts 🔺 in the `!` column, the reason on a line under the row, and
+  `findings: N` in the header. `--once`/`--batch` text reports end with a
+  `findings:` section, one line per call-out, `findings: none` when there
+  are none:
+  ```
+  findings: 2
+    3:51  3-1.4.5  1409:3270  linked at 480M, supports 5G: the hub above it (3-1.4) is linked at 480M; move it to a USB 3 port
+    5:5  5-1.2  0bda:9210  linked at 480M, supports 10G: the SuperSpeed side of this connector (6-1-port2) is empty, so the link came up at USB 2 speed; check the cable or the port
+  ```
+- `--json` carries the same call-outs as a top-level `findings` array, plus
+  `capability_mbps` and `capability_source` on every device row. See
+  [docs/SCRIPTING.md](docs/SCRIPTING.md#the-findings-list).
 
 ### Reporting a problem
 
@@ -648,8 +677,11 @@ them safe in a script or a cron job. See
   park a wedged terminal there.
 - The Rust runtime writes a panic message and backtrace to stderr, not
   usbtop-ng.
-- 🔺 is a best-effort signal. A device that declares no USB 3 support never
-  carries it, so a missing 🔺 proves nothing.
+- 🔺 is a best-effort signal. A device with no BOS — no `bos_descriptors`
+  file, because the kernel predates 6.9 or the device has none — and a
+  bcdUSB below 3 is never marked, so a missing 🔺 proves nothing. The BOS
+  states lane rates and not lane counts, so a dual-lane 20 Gbps device
+  linked single-lane at 10 Gbps is not marked either.
 
 ## Documentation
 
