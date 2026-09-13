@@ -220,10 +220,26 @@ impl<'a> Topology<'a> {
     /// on that peer port — a USB 2 mouse in the receptacle the kernel
     /// happens to pair with a hub half — leaves the half still unclaimed.
     fn peer_holds_a_hub(&self, hub: &str) -> bool {
-        self.peer_port_of(hub).is_some_and(|peer| {
-            self.device_on_port(&peer)
-                .is_some_and(|dev| self.ports.is_hub(dev.name))
-        })
+        self.claimed_half(hub).is_some()
+    }
+
+    /// The present hub on the reciprocal kernel peer of `hub`'s own port,
+    /// when that pairing can be trusted to mean one receptacle: always
+    /// under a root hub (root ports pair by the controller's raw port
+    /// numbers), and under another hub only when the two hubs share a
+    /// vendor, because the kernel pairs a hub's downstream ports by number
+    /// alone and a hub whose halves number their ports differently pairs
+    /// unrelated receptacles (the dock's outer hub does exactly that).
+    fn claimed_half(&self, hub: &str) -> Option<&'a Row<'a>> {
+        let peer = self.peer_port_of(hub)?;
+        let dev = self.device_on_port(&peer)?;
+        if !self.ports.is_hub(dev.name) {
+            return None;
+        }
+        let (parent, _) = port_of_device(hub)?;
+        let under_root = port_of_device(&parent).is_none();
+        let row = self.present(hub)?;
+        (under_root || row.vendor_agrees_with(dev)).then_some(dev)
     }
 
     /// The present hubs attached to `parent`'s ports, in row order.
@@ -288,16 +304,12 @@ impl<'a> Topology<'a> {
                     by_elimination: false,
                 });
         };
-        // Step 2: the kernel's own pairing.
-        if let Some(peer) = self.peer_port_of(hub) {
-            if let Some(dev) = self.device_on_port(&peer) {
-                if self.ports.is_hub(dev.name) {
-                    return Half::Known {
-                        name: dev.name.to_string(),
-                        by_elimination: false,
-                    };
-                }
-            }
+        // Step 2: the kernel's own pairing, where it can be trusted.
+        if let Some(dev) = self.claimed_half(hub) {
+            return Half::Known {
+                name: dev.name.to_string(),
+                by_elimination: false,
+            };
         }
         // Step 3: match by elimination under the parent pair.
         if !row.capable_above_high() {
@@ -311,27 +323,32 @@ impl<'a> Topology<'a> {
             Half::Missing => return Half::Missing,
             Half::Ambiguous => return Half::Ambiguous,
         };
-        // A SuperSpeed hub whose own port's kernel peer holds a present hub
-        // is that hub's half: kernel-paired ports are one receptacle, and
-        // only a hub can claim a hub (a plain device on that port claims
-        // nothing). With every such half struck out, an empty set means no
-        // SuperSpeed hub is left for this hub's half to be: it never
-        // enumerated, which is knowledge, not ignorance. More than one
-        // candidate on either side is ambiguity.
+        // Set B before any claimed half is struck out. Empty here means
+        // there is nothing on the SuperSpeed side at all, so this hub's half
+        // never enumerated: knowledge. Emptied only by the strike-out below
+        // means some other hub took every candidate through a pairing the
+        // kernel made by port number, which under a hub is not proof of a
+        // receptacle (see `claimed_half`); that is ambiguity, and ambiguity
+        // is silence rather than a conviction.
+        let b_pre: Vec<&Row> = self
+            .hubs_on(&parent_ss)
+            .into_iter()
+            .filter(|h| h.link.to_mbps() > HIGH_SPEED_MBPS)
+            .collect();
+        if b_pre.is_empty() {
+            return Half::Missing;
+        }
         let unclaimed_usb2: Vec<&Row> = self
             .hubs_on(&parent)
             .into_iter()
             .filter(|h| h.link.to_mbps() <= HIGH_SPEED_MBPS && h.capable_above_high())
             .filter(|h| !self.peer_holds_a_hub(h.name))
             .collect();
-        let unclaimed_ss: Vec<&Row> = self
-            .hubs_on(&parent_ss)
+        let unclaimed_ss: Vec<&Row> = b_pre
             .into_iter()
-            .filter(|h| h.link.to_mbps() > HIGH_SPEED_MBPS)
             .filter(|h| !self.peer_holds_a_hub(h.name))
             .collect();
         match (unclaimed_usb2.as_slice(), unclaimed_ss.as_slice()) {
-            (_, []) => Half::Missing,
             ([one], [half]) if one.name == hub && one.vendor_agrees_with(half) => Half::Known {
                 name: half.name.to_string(),
                 by_elimination: true,
@@ -788,11 +805,11 @@ mod tests {
     }
 
     /// Every SuperSpeed hub under the parent is spoken for by a hub on its
-    /// kernel peer port, so the one SuperSpeed-capable USB 2 hub left over
-    /// has a half that provably never enumerated: a call-out, naming its
-    /// own empty twin port, not silence.
+    /// kernel peer port. Under a hub that pairing is by port number and can
+    /// join unrelated receptacles, so the SuperSpeed-capable USB 2 hub left
+    /// over is ambiguous, not proven dead: silence, not a conviction.
     #[test]
-    fn a_hub_whose_only_candidates_are_claimed_by_other_hubs_is_named() {
+    fn a_hub_whose_only_candidates_are_claimed_by_other_hubs_is_silenced() {
         let t = Tree::new();
         let usb5 = t.root_hub(5, "480");
         let usb6 = t.root_hub(6, "10000");
@@ -812,14 +829,54 @@ mod tests {
         // A SuperSpeed-capable hub on port 1 whose SuperSpeed side is empty.
         let dead = t.device("5-1.1", "480", Some("2.10"), Some(SS));
         t.port(&dead, "5-1.1", 1);
+        assert_eq!(causes(&t.analyze()), vec![]);
+    }
+
+    /// The dock shape with a USB 2 only hub of another vendor on the outer
+    /// hub's port 4, the port the kernel pairs by number with the inner
+    /// hub's SuperSpeed half. A vendor that differs cannot claim that half,
+    /// so the inner hub stays matched and nothing is convicted wrongly; the
+    /// USB 2 only hub's own child is held by it, and says so.
+    #[test]
+    fn a_hub_of_another_vendor_on_the_wrongly_paired_port_claims_nothing() {
+        let t = Tree::new();
+        let usb5 = t.root_hub(5, "480");
+        let usb6 = t.root_hub(6, "10000");
+        t.pair(&t.port(&usb5, "usb5", 1), &t.port(&usb6, "usb6", 1));
+        let outer2 = t.device_of_vendor("5-1", "480", Some("2.10"), None, 0x2188);
+        let outer3 = t.device_of_vendor("6-1", "10000", Some("3.20"), Some(SSP), 0x8087);
+        for n in 1..=4 {
+            t.pair(&t.port(&outer2, "5-1", n), &t.port(&outer3, "6-1", n));
+        }
+        let inner2 = t.device_of_vendor("5-1.1", "480", Some("2.10"), Some(SSP), 0x2188);
+        let inner3 = t.device_of_vendor("6-1.4", "10000", Some("3.20"), Some(SSP), 0x2188);
+        for n in 1..=4 {
+            t.port(&inner2, "5-1.1", n);
+            t.port(&inner3, "6-1.4", n);
+        }
+        // A USB 2 only hub (no BOS, bcdUSB 2.00) of another vendor on 5-1.4.
+        let terminus = t.device_of_vendor("5-1.4", "480", Some("2.00"), None, 0x1a40);
+        t.port(&terminus, "5-1.4", 1);
+        t.device("5-1.4.1", "480", Some("2.10"), Some(SS));
+        // A 10 Gb/s device stuck at High Speed on the inner hub's port 2.
+        t.device("5-1.1.2", "480", Some("2.10"), Some(SSP));
         assert_eq!(
             causes(&t.analyze()),
-            vec![(
-                "5-1.1",
-                Some(&Cause::SuperSpeedSideEmpty {
-                    peer_port: "6-1-port1".into()
-                })
-            )]
+            vec![
+                (
+                    "5-1.4.1",
+                    Some(&Cause::UpstreamHubLink {
+                        hub: "5-1.4".into(),
+                        hub_link: UsbSpeed::from_mbps(480.0)
+                    })
+                ),
+                (
+                    "5-1.1.2",
+                    Some(&Cause::SuperSpeedSideEmpty {
+                        peer_port: "6-1.4-port2".into()
+                    })
+                ),
+            ]
         );
     }
 
