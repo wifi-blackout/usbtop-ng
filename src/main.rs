@@ -30,6 +30,8 @@ mod fixture_replay;
 mod headless;
 mod snapshot;
 mod stats;
+#[cfg(test)]
+mod test_tree;
 mod tui;
 mod ui;
 mod usbids;

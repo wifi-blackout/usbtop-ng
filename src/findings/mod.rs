@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use crate::connector::{device_name_of_port, port_name, port_of_device, PortIndex};
 use crate::device::manager::DeviceManager;
 use crate::device::{Capability, CapabilitySource};
-use crate::usbmon::parser::UsbSpeed;
+use crate::usbmon::parser::{short_mbps, UsbSpeed};
 
 /// Why a device is linked below its capability, when the topology proves it.
 #[derive(Debug, Clone, PartialEq)]
@@ -70,7 +70,7 @@ impl Cause {
             Cause::UpstreamHubLink { hub, hub_link } => {
                 let mut text = format!(
                     "the hub above it ({hub}) is linked at {}",
-                    short_speed(hub_link)
+                    short_mbps(hub_link.to_mbps())
                 );
                 // Advice only on a known USB 2 link: a hub the manager
                 // still lists as disconnected has no rate to argue from.
@@ -80,11 +80,11 @@ impl Cause {
                 text
             }
             Cause::HostPortMax { max } => {
-                format!("this host port tops out at {}", short_speed(max))
+                format!("this host port tops out at {}", short_mbps(max.to_mbps()))
             }
             Cause::UpstreamPermits => format!(
                 "the port above it allows {}; check the cable or the device",
-                short_speed(capability)
+                short_mbps(capability.to_mbps())
             ),
         }
     }
@@ -120,21 +120,9 @@ impl Finding {
         };
         format!(
             "linked at {}, supports {}{source}: {reason}",
-            short_speed(&self.link),
-            short_speed(&self.capability.speed)
+            short_mbps(self.link.to_mbps()),
+            short_mbps(self.capability.speed.to_mbps())
         )
-    }
-}
-
-/// `480M`, `5G`, `10G`; `?` for an unknown rate.
-pub fn short_speed(speed: &UsbSpeed) -> String {
-    let mbps = speed.to_mbps();
-    if mbps <= 0.0 {
-        "?".to_string()
-    } else if mbps >= 1000.0 {
-        format!("{}G", mbps / 1000.0)
-    } else {
-        format!("{mbps}M")
     }
 }
 
@@ -514,138 +502,13 @@ fn finding_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use crate::test_tree::{Tree, SS, SSP};
+    use std::path::PathBuf;
 
-    /// SuperSpeed only: 5 Gb/s (the camera's shape).
-    const SS: &[u8] = &[
-        0x05, 0x0f, 0x16, 0x00, 0x02, 0x07, 0x10, 0x02, 0x06, 0x00, 0x00, 0x00, 0x0a, 0x10, 0x03,
-        0x00, 0x0c, 0x00, 0x03, 0x0a, 0xff, 0x07,
-    ];
-    /// SuperSpeed plus SuperSpeedPlus at 10 Gb/s (the adapter's shape).
-    const SSP: &[u8] = &[
-        0x05, 0x0f, 0x2a, 0x00, 0x03, 0x07, 0x10, 0x02, 0x06, 0x00, 0x00, 0x00, 0x0a, 0x10, 0x03,
-        0x00, 0x0e, 0x00, 0x03, 0x0a, 0xff, 0x07, 0x14, 0x10, 0x0a, 0x00, 0x01, 0x00, 0x00, 0x00,
-        0x00, 0x11, 0x00, 0x00, 0x30, 0x40, 0x0a, 0x00, 0xb0, 0x40, 0x0a, 0x00,
-    ];
-
-    /// A fake `/sys/bus/usb/devices`: root hubs as symlinks into a
-    /// controller directory, devices as directories with `busnum`,
-    /// `devnum`, `speed`, optional `version` and `bos_descriptors`, hub
-    /// ports under `<hub>/<hub>:1.0/<hub>-port<N>/` with `peer` links.
-    struct Tree {
-        root: tempfile::TempDir,
-        next_devnum: std::cell::Cell<u8>,
-    }
-
-    impl Tree {
-        fn new() -> Tree {
-            let root = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(root.path().join("devices")).unwrap();
-            Tree {
-                root,
-                next_devnum: std::cell::Cell::new(2),
-            }
-        }
-
-        fn base(&self) -> PathBuf {
-            self.root.path().join("devices")
-        }
-
-        fn write(
-            dir: &Path,
-            bus: u8,
-            devnum: u8,
-            speed: &str,
-            version: Option<&str>,
-            bos: Option<&[u8]>,
-        ) {
-            std::fs::create_dir_all(dir).unwrap();
-            std::fs::write(dir.join("busnum"), format!("{bus}\n")).unwrap();
-            std::fs::write(dir.join("devnum"), format!("{devnum}\n")).unwrap();
-            std::fs::write(dir.join("speed"), format!("{speed}\n")).unwrap();
-            if let Some(version) = version {
-                std::fs::write(dir.join("version"), format!("{version}\n")).unwrap();
-            }
-            if let Some(bos) = bos {
-                std::fs::write(dir.join("bos_descriptors"), bos).unwrap();
-            }
-        }
-
-        /// A root hub `usbN` at `speed`, devnum 1, under a controller dir.
-        fn root_hub(&self, bus: u8, speed: &str) -> PathBuf {
-            let real = self
-                .root
-                .path()
-                .join("0000:00:14.0")
-                .join(format!("usb{bus}"));
-            Self::write(&real, bus, 1, speed, None, None);
-            std::os::unix::fs::symlink(&real, self.base().join(format!("usb{bus}"))).unwrap();
-            real
-        }
-
-        /// A device with the next devnum on its bus (taken from the name).
-        fn device(
-            &self,
-            name: &str,
-            speed: &str,
-            version: Option<&str>,
-            bos: Option<&[u8]>,
-        ) -> PathBuf {
-            let (bus, _) = crate::connector::parse_device_name(name).unwrap();
-            let devnum = self.next_devnum.get();
-            self.next_devnum.set(devnum + 1);
-            let dir = self.base().join(name);
-            Self::write(&dir, bus, devnum, speed, version, bos);
-            dir
-        }
-
-        /// A device that also states an `idVendor`, for the vendor
-        /// agreement rule inside rule H's elimination match.
-        fn device_of_vendor(
-            &self,
-            name: &str,
-            speed: &str,
-            version: Option<&str>,
-            bos: Option<&[u8]>,
-            vendor: u16,
-        ) -> PathBuf {
-            let dir = self.device(name, speed, version, bos);
-            std::fs::write(dir.join("idVendor"), format!("{vendor:04x}\n")).unwrap();
-            dir
-        }
-
-        fn port(&self, hub_dir: &Path, hub: &str, number: u32) -> PathBuf {
-            let dir = hub_dir
-                .join(format!("{hub}:1.0"))
-                .join(port_name(hub, number));
-            std::fs::create_dir_all(&dir).unwrap();
-            dir
-        }
-
-        fn pair(&self, a: &Path, b: &Path) {
-            std::os::unix::fs::symlink(b, a.join("peer")).unwrap();
-            std::os::unix::fs::symlink(a, b.join("peer")).unwrap();
-        }
-
-        /// The firmware's ACPI position of a port, as sysfs prints it; a
-        /// nonzero value marks a pairing the kernel made by location.
-        fn locate(&self, port_dir: &Path, location: u32) {
-            std::fs::write(port_dir.join("location"), format!("0x{location:08x}\n")).unwrap();
-        }
-
-        fn analyze(&self) -> Vec<Finding> {
-            let mut manager = DeviceManager::with_sysfs_base(self.base());
-            manager.enumerate_present_devices();
-            manager.update_bus_speeds();
-            let index = PortIndex::scan_devices(
-                manager
-                    .buses
-                    .values()
-                    .flat_map(|bus| bus.devices.values())
-                    .filter_map(|device| device.sysfs_path.as_deref()),
-            );
-            super::analyze(&manager, &index)
-        }
+    fn analyze_tree(t: &Tree) -> Vec<Finding> {
+        let manager = t.manager();
+        let index = Tree::port_index(&manager);
+        analyze(&manager, &index)
     }
 
     /// Paired root hubs 3 (480) and 4 (5000) with `n` root ports paired by
@@ -671,7 +534,7 @@ mod tests {
         let t = Tree::new();
         paired_roots(&t, 2);
         t.device("3-1", "480", Some("2.10"), Some(SSP));
-        let findings = t.analyze();
+        let findings = analyze_tree(&t);
         assert_eq!(
             causes(&findings),
             vec![(
@@ -705,7 +568,7 @@ mod tests {
         // A camera stuck at High Speed on hub port 2: its SuperSpeed side is empty.
         t.device("3-1.2", "480", Some("2.10"), Some(SS));
         assert_eq!(
-            causes(&t.analyze()),
+            causes(&analyze_tree(&t)),
             vec![(
                 "3-1.2",
                 Some(&Cause::SuperSpeedSideEmpty {
@@ -729,7 +592,7 @@ mod tests {
         t.port(&terminus, "3-1.4", 5);
         t.device("3-1.4.5", "480", Some("2.10"), Some(SS));
         let _ = (usb3, usb4);
-        let findings = t.analyze();
+        let findings = analyze_tree(&t);
         assert_eq!(
             causes(&findings),
             vec![(
@@ -785,7 +648,7 @@ mod tests {
         // (the USB 3 half owns four ports): that receptacle is USB 2 only,
         // which the matched half proves.
         t.device("5-1.1.7", "480", Some("2.10"), Some(SS));
-        let findings = t.analyze();
+        let findings = analyze_tree(&t);
         assert_eq!(
             causes(&findings),
             vec![
@@ -841,7 +704,7 @@ mod tests {
         // A SuperSpeed-capable hub on port 1 whose SuperSpeed side is empty.
         let dead = t.device("5-1.1", "480", Some("2.10"), Some(SS));
         t.port(&dead, "5-1.1", 1);
-        assert_eq!(causes(&t.analyze()), vec![]);
+        assert_eq!(causes(&analyze_tree(&t)), vec![]);
     }
 
     /// The dock shape with an unrelated SuperSpeed hub of the same vendor on
@@ -877,7 +740,7 @@ mod tests {
         t.port(&nested2, "5-1.1.2", 1);
         t.port(&nested3, "6-1.4.2", 1);
         t.device("5-1.1.2.1", "480", Some("2.10"), Some(SS));
-        assert_eq!(causes(&t.analyze()), vec![("5-1.1.2.1", None)]);
+        assert_eq!(causes(&analyze_tree(&t)), vec![("5-1.1.2.1", None)]);
     }
 
     /// A pairing the kernel made by ACPI location is physical evidence:
@@ -901,7 +764,7 @@ mod tests {
         t.pair(&t.port(&child2, "3-1.2", 1), &t.port(&child3, "4-1.2", 1));
         t.device("3-1.2.1", "480", Some("2.10"), Some(SS));
         assert_eq!(
-            causes(&t.analyze()),
+            causes(&analyze_tree(&t)),
             vec![(
                 "3-1.2.1",
                 Some(&Cause::SuperSpeedSideEmpty {
@@ -940,7 +803,7 @@ mod tests {
         // A 10 Gb/s device stuck at High Speed on the inner hub's port 2.
         t.device("5-1.1.2", "480", Some("2.10"), Some(SSP));
         assert_eq!(
-            causes(&t.analyze()),
+            causes(&analyze_tree(&t)),
             vec![
                 (
                     "5-1.4.1",
@@ -982,7 +845,7 @@ mod tests {
         t.port(&d, "6-1.4", 1);
         t.device("5-1.1.1", "480", Some("2.10"), Some(SS));
         assert_eq!(
-            causes(&t.analyze()),
+            causes(&analyze_tree(&t)),
             vec![("5-1.1.1", None)],
             "the hubs are ambiguous, so nothing above the child is attributable either"
         );
@@ -1002,7 +865,7 @@ mod tests {
         t.port(&hub, "3-1", 1);
         t.device("3-1.1", "480", Some("2.10"), Some(SS));
         assert_eq!(
-            causes(&t.analyze()),
+            causes(&analyze_tree(&t)),
             vec![
                 (
                     "3-1",
@@ -1034,7 +897,7 @@ mod tests {
         t.device("4-1.1", "5000", Some("3.20"), Some(SSP));
         t.device("4-1.2", "5000", Some("3.00"), Some(SS));
         assert_eq!(
-            causes(&t.analyze()),
+            causes(&analyze_tree(&t)),
             vec![
                 (
                     "4-1",
@@ -1060,7 +923,7 @@ mod tests {
         let usb4 = t.root_hub(4, "10000");
         t.pair(&t.port(&usb3, "usb3", 1), &t.port(&usb4, "usb4", 1));
         t.device("4-1", "5000", Some("3.20"), Some(SSP));
-        let findings = t.analyze();
+        let findings = analyze_tree(&t);
         assert_eq!(
             causes(&findings),
             vec![("4-1", Some(&Cause::UpstreamPermits))]
@@ -1080,7 +943,7 @@ mod tests {
         t.port(&hub, "1-1", 1);
         t.device("1-1.1", "480", Some("2.10"), Some(SS));
         assert_eq!(
-            causes(&t.analyze()),
+            causes(&analyze_tree(&t)),
             vec![
                 ("1-1", Some(&Cause::Usb2OnlyHostPort)),
                 (
@@ -1101,7 +964,7 @@ mod tests {
         t.port(&usb3, "usb3", 5);
         t.device("3-5", "480", Some("2.10"), Some(SS));
         assert_eq!(
-            causes(&t.analyze()),
+            causes(&analyze_tree(&t)),
             vec![("3-5", Some(&Cause::Usb2OnlyHostPort))]
         );
     }
@@ -1113,7 +976,7 @@ mod tests {
         let _ = (usb3, usb4);
         t.device("3-1", "480", Some("3.20"), None);
         t.device("4-2", "5000", Some("3.20"), None);
-        let findings = t.analyze();
+        let findings = analyze_tree(&t);
         assert_eq!(
             causes(&findings),
             vec![(
@@ -1140,16 +1003,8 @@ mod tests {
         let hub = t.device("3-1", "480", Some("2.10"), Some(SS));
         t.port(&hub, "3-1", 1);
         t.device("3-1.1", "480", Some("2.10"), Some(SS));
-        let mut manager = DeviceManager::with_sysfs_base(t.base());
-        manager.enumerate_present_devices();
-        manager.update_bus_speeds();
-        let index = PortIndex::scan_devices(
-            manager
-                .buses
-                .values()
-                .flat_map(|bus| bus.devices.values())
-                .filter_map(|device| device.sysfs_path.as_deref()),
-        );
+        let mut manager = t.manager();
+        let index = Tree::port_index(&manager);
         manager
             .buses
             .get_mut(&3)
@@ -1180,16 +1035,8 @@ mod tests {
         let t = Tree::new();
         paired_roots(&t, 1);
         t.device("3-1", "480", Some("2.10"), Some(SS));
-        let mut manager = DeviceManager::with_sysfs_base(t.base());
-        manager.enumerate_present_devices();
-        manager.update_bus_speeds();
-        let index = PortIndex::scan_devices(
-            manager
-                .buses
-                .values()
-                .flat_map(|bus| bus.devices.values())
-                .filter_map(|device| device.sysfs_path.as_deref()),
-        );
+        let mut manager = t.manager();
+        let index = Tree::port_index(&manager);
         assert_eq!(analyze(&manager, &index).len(), 1);
         manager
             .buses
@@ -1208,7 +1055,7 @@ mod tests {
         t.root_hub(3, "480");
         // No port objects at all (an old kernel or a bare fixture).
         t.device("3-1", "480", Some("3.00"), None);
-        let findings = t.analyze();
+        let findings = analyze_tree(&t);
         assert_eq!(causes(&findings), vec![("3-1", None)]);
         assert_eq!(findings[0].port, None);
         assert!(findings[0]
@@ -1224,7 +1071,7 @@ mod tests {
         t.device("3-3", "480", Some("2.10"), Some(SS));
         t.device("3-1", "480", Some("2.10"), Some(SS));
         t.device("3-2", "480", Some("2.10"), Some(SS));
-        let order: Vec<u8> = t.analyze().iter().map(|f| f.address).collect();
+        let order: Vec<u8> = analyze_tree(&t).iter().map(|f| f.address).collect();
         assert_eq!(order, vec![2, 3, 4]);
     }
 
@@ -1252,7 +1099,7 @@ mod tests {
         // only the port number: it must not exonerate `3-1`.
         occupied.device("4-1", "5000", Some("3.00"), Some(SS));
         assert_eq!(
-            causes(&occupied.analyze()),
+            causes(&analyze_tree(&occupied)),
             vec![(
                 "3-1",
                 Some(&Cause::SuperSpeedSideEmpty {
@@ -1265,7 +1112,7 @@ mod tests {
         cross_numbered_roots(&alone);
         alone.device("3-1", "480", Some("2.10"), Some(SS));
         assert_eq!(
-            causes(&alone.analyze()),
+            causes(&analyze_tree(&alone)),
             vec![(
                 "3-1",
                 Some(&Cause::SuperSpeedSideEmpty {
@@ -1284,7 +1131,7 @@ mod tests {
         // `usb3-port1`: the number must not be carried across under a root.
         t.device("3-2", "480", Some("2.10"), Some(SS));
         assert_eq!(
-            causes(&t.analyze()),
+            causes(&analyze_tree(&t)),
             vec![("3-2", Some(&Cause::Usb2OnlyHostPort))]
         );
     }
@@ -1317,7 +1164,7 @@ mod tests {
         t.device("5-1.4", "12", Some("2.00"), None);
         t.device("5-1.1.2", "480", Some("2.10"), Some(SSP));
         assert_eq!(
-            causes(&t.analyze()),
+            causes(&analyze_tree(&t)),
             vec![(
                 "5-1.1.2",
                 Some(&Cause::SuperSpeedSideEmpty {
@@ -1351,7 +1198,7 @@ mod tests {
         t.port(&y3, "6-1.2", 1);
         t.device("5-1.1.1", "480", Some("2.10"), Some(SS));
         assert_eq!(
-            causes(&t.analyze()),
+            causes(&analyze_tree(&t)),
             vec![("5-1.1.1", None)],
             "neither hub is named; the device under X gets no cause"
         );
@@ -1379,7 +1226,7 @@ mod tests {
             t
         };
         assert_eq!(
-            causes(&build(0x2222).analyze()),
+            causes(&analyze_tree(&build(0x2222))),
             vec![("5-1.1.1", None)],
             "different vendors cannot be two halves of one hub, so nothing is attributable"
         );
@@ -1388,7 +1235,7 @@ mod tests {
         // one vendor failing on opposite halves would pair here too; that
         // residue is accepted.
         assert_eq!(
-            causes(&build(0x1111).analyze()),
+            causes(&analyze_tree(&build(0x1111))),
             vec![(
                 "5-1.1.1",
                 Some(&Cause::SuperSpeedSideEmpty {
@@ -1431,7 +1278,7 @@ mod tests {
         }
         t.device("5-1.1.1.2", "480", Some("2.10"), Some(SS));
         assert_eq!(
-            causes(&t.analyze()),
+            causes(&analyze_tree(&t)),
             vec![(
                 "5-1.1.1.2",
                 Some(&Cause::SuperSpeedSideEmpty {
@@ -1448,16 +1295,8 @@ mod tests {
         let hub = t.device("4-1", "5000", Some("3.20"), Some(SSP));
         t.port(&hub, "4-1", 1);
         t.device("4-1.1", "5000", Some("3.20"), Some(SSP));
-        let mut manager = DeviceManager::with_sysfs_base(t.base());
-        manager.enumerate_present_devices();
-        manager.update_bus_speeds();
-        let index = PortIndex::scan_devices(
-            manager
-                .buses
-                .values()
-                .flat_map(|bus| bus.devices.values())
-                .filter_map(|device| device.sysfs_path.as_deref()),
-        );
+        let mut manager = t.manager();
+        let index = Tree::port_index(&manager);
         manager
             .buses
             .get_mut(&4)
@@ -1487,7 +1326,7 @@ mod tests {
         // Port 3 exists on the USB 2 half alone: a USB 2 only receptacle.
         t.port(&hub3, "3-1", 3);
         t.device("3-1.3", "480", Some("2.10"), Some(SS));
-        let findings = t.analyze();
+        let findings = analyze_tree(&t);
         assert_eq!(
             causes(&findings),
             vec![(
@@ -1502,16 +1341,5 @@ mod tests {
             findings[0].message(),
             "linked at 480M, supports 5G: port 3 of the hub above it (3-1) is USB 2 only; move it to a USB 3 port"
         );
-    }
-
-    #[test]
-    fn short_speed_is_compact() {
-        assert_eq!(short_speed(&UsbSpeed::from_mbps(480.0)), "480M");
-        assert_eq!(short_speed(&UsbSpeed::from_mbps(12.0)), "12M");
-        assert_eq!(short_speed(&UsbSpeed::from_mbps(1.5)), "1.5M");
-        assert_eq!(short_speed(&UsbSpeed::from_mbps(5000.0)), "5G");
-        assert_eq!(short_speed(&UsbSpeed::from_mbps(10000.0)), "10G");
-        assert_eq!(short_speed(&UsbSpeed::from_mbps(20000.0)), "20G");
-        assert_eq!(short_speed(&UsbSpeed::UNKNOWN), "?");
     }
 }

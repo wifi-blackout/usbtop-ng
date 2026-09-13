@@ -110,6 +110,18 @@ pub fn format_mbps(mbps: f64) -> String {
     }
 }
 
+/// `480M`, `5G`, `10G`; `?` for an unknown rate. The compact form the
+/// findings and choke-point messages use.
+pub fn short_mbps(mbps: f64) -> String {
+    if mbps <= 0.0 {
+        "?".to_string()
+    } else if mbps >= 1000.0 {
+        format!("{}G", mbps / 1000.0)
+    } else {
+        format!("{mbps}M")
+    }
+}
+
 impl SpeedClass {
     /// The overhead factors the enum carried; unchanged values.
     pub fn efficiency(&self) -> f64 {
@@ -660,6 +672,17 @@ mod tests {
         // 1.5 Mbps (Low Speed) is the case `{:.0}` used to round away to
         // "2 Mbps" -- the bug this formatter exists to fix.
         assert_eq!(format_mbps(1.5), "1.5 Mbps");
+    }
+
+    #[test]
+    fn short_mbps_is_compact() {
+        assert_eq!(short_mbps(480.0), "480M");
+        assert_eq!(short_mbps(12.0), "12M");
+        assert_eq!(short_mbps(1.5), "1.5M");
+        assert_eq!(short_mbps(5000.0), "5G");
+        assert_eq!(short_mbps(8500.0), "8.5G");
+        assert_eq!(short_mbps(10000.0), "10G");
+        assert_eq!(short_mbps(0.0), "?");
     }
 
     #[test]
