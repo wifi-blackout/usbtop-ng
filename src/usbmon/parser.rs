@@ -112,14 +112,29 @@ pub fn format_mbps(mbps: f64) -> String {
 
 /// `480M`, `5G`, `10G`; `?` for an unknown rate. The compact form the
 /// findings and choke-point messages use.
+///
+/// A link rate is a round number, but a choke point's demand is a sum of
+/// efficiency-scaled rates and is not (the dock's Realtek USB 2 half asks
+/// 1172.25 Mb/s). So the value is rounded: gigabits to two decimals,
+/// megabits to one, with trailing zeros and a bare trailing point trimmed
+/// off, which leaves every round rate spelled the way it always was.
 pub fn short_mbps(mbps: f64) -> String {
     if mbps <= 0.0 {
-        "?".to_string()
-    } else if mbps >= 1000.0 {
-        format!("{}G", mbps / 1000.0)
-    } else {
-        format!("{mbps}M")
+        return "?".to_string();
     }
+    let (value, decimals, unit) = if mbps >= 1000.0 {
+        (mbps / 1000.0, 2, "G")
+    } else {
+        (mbps, 1, "M")
+    };
+    let mut text = format!("{value:.decimals$}");
+    if text.contains('.') {
+        // `trim_end_matches` stops at the point itself, so "10.00" trims to
+        // "10." and then to "10", never to "1".
+        let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+        text = trimmed.to_string();
+    }
+    format!("{text}{unit}")
 }
 
 impl SpeedClass {
@@ -682,7 +697,18 @@ mod tests {
         assert_eq!(short_mbps(5000.0), "5G");
         assert_eq!(short_mbps(8500.0), "8.5G");
         assert_eq!(short_mbps(10000.0), "10G");
+        assert_eq!(short_mbps(20000.0), "20G");
         assert_eq!(short_mbps(0.0), "?");
+        assert_eq!(short_mbps(-1.0), "?");
+        // The sums a choke point carries are not round numbers.
+        assert_eq!(short_mbps(1172.25), "1.17G", "gigabits keep two decimals");
+        assert_eq!(short_mbps(1181.85), "1.18G");
+        assert_eq!(short_mbps(4250.0), "4.25G");
+        assert_eq!(short_mbps(12750.0), "12.75G");
+        assert_eq!(short_mbps(384.0), "384M", "a whole megabit rate stays bare");
+        assert_eq!(short_mbps(9.6), "9.6M", "megabits keep one decimal");
+        assert_eq!(short_mbps(1.05), "1.1M", "and round, they do not truncate");
+        assert_eq!(short_mbps(403.2), "403.2M");
     }
 
     #[test]

@@ -18,7 +18,7 @@ use serde::Deserialize;
 use crate::capacity::Basis;
 use crate::device::manager::DeviceManager;
 use crate::filter::FilterSet;
-use crate::headless::{build_report_at, Baseline, Report};
+use crate::headless::{build_report_at, Baseline, Report, WindowFacts};
 use crate::snapshot::Snapshot;
 use crate::usbmon::binary::BinaryReader;
 use crate::usbmon::reader::UsbmonReader;
@@ -254,9 +254,11 @@ pub fn replay_fixture_with_elapsed(
         &manager,
         &baseline,
         elapsed,
-        source.map_or("none", FixtureSource::label),
-        0,
-        source == Some(FixtureSource::Text),
+        WindowFacts {
+            source: source.map_or("none", FixtureSource::label),
+            dropped: 0,
+            text_active: source == Some(FixtureSource::Text),
+        },
         &FilterSet::default(),
     ))
 }

@@ -79,7 +79,7 @@ step; see Deferred.
   carry), `capacity_mbps`, `demand_mbps`, `ratio`, `devices`, `top` (up to
   three `{path, demand_mbps}`), `message`. Text, after the findings
   section: `chokepoints: N` and one line per entry, `  hub 3-1 (3:2,
-  0bda:5411) 384M carries 9 devices asking 1172M: 3.05x`, or
+  0bda:5411) 384M carries 9 devices asking 1.17G: 3.05x`, or
   `chokepoints: none`.
 
 ## Expected on the dock bundle (`tgl-tb4-2026-09-12/stage2`)
@@ -125,7 +125,7 @@ needed; a hub is any device with children. Root hubs are walked for their
 children but are never a stage. The walk is depth-first from each root
 hub, memoizing each hub's demand, so a nested hub's subtree is summed once.
 Output sorted by ratio descending, then path; only entries at or above
-`CHOKE_FLOOR`. `message()` renders `"384M carries 9 devices asking 1172M:
+`CHOKE_FLOOR`. `message()` renders `"384M carries 9 devices asking 1.17G:
 3.05x"` with `findings::short_speed`, which moves to a small shared place
 (`usbmon::parser::short_mbps`) so neither module depends on the other.
 

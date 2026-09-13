@@ -77,10 +77,7 @@ pub struct Chokepoint {
 }
 
 impl Chokepoint {
-    /// `384M carries 9 devices asking 1.17225G: 3.05x` -- the dock's
-    /// Realtek USB 2 half. Both rates go through
-    /// [`short_mbps`](crate::usbmon::parser::short_mbps), which switches to
-    /// `G` at 1000, so a summed demand keeps every digit the sum has.
+    /// `384M carries 9 devices asking 1.17G: 3.05x`.
     pub fn message(&self) -> String {
         format!(
             "{} carries {} devices asking {}: {:.2}x",

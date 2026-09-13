@@ -260,6 +260,17 @@ fn windowed_rate(baseline_total: Option<u64>, now_total: u64, window_secs: f64) 
     delta as f64 / window_secs
 }
 
+/// The facts of one sample window that a report carries beside the
+/// manager's state: which usbmon interface fed it, how many packets the
+/// channel dropped, and whether the text interface was active (its
+/// isochronous figures are estimates).
+#[derive(Clone, Copy)]
+pub struct WindowFacts {
+    pub source: &'static str,
+    pub dropped: u64,
+    pub text_active: bool,
+}
+
 /// Build one report from the manager's current state and a `baseline` taken
 /// at the start of the window. Pure over the manager's state except for one
 /// read-only scan of the manager's own device directories for their port
@@ -282,13 +293,11 @@ pub fn build_report_at(
     manager: &DeviceManager,
     baseline: &Baseline,
     elapsed: Duration,
-    source: &'static str,
-    dropped: u64,
-    text_active: bool,
+    facts: WindowFacts,
     filter: &FilterSet,
 ) -> Report {
     // Read, not threaded as a parameter: `manager` is already an argument,
-    // and adding an 8th argument alongside it would just duplicate state the
+    // and another argument alongside it would just duplicate state the
     // manager already carries (see `set_internal_snapshot`).
     let snapshot_loaded = manager.has_internal_snapshot();
     let window_secs = elapsed.as_secs_f64().max(0.001);
@@ -375,7 +384,7 @@ pub fn build_report_at(
                         tx_bps,
                         total_rx_bytes: device.bandwidth_stats.total_rx_bytes,
                         total_tx_bytes: device.bandwidth_stats.total_tx_bytes,
-                        estimated: text_active && device.has_iso_traffic(),
+                        estimated: facts.text_active && device.has_iso_traffic(),
                         internal: snapshot_loaded.then_some(device.is_internal),
                         capability_mbps: device.capability.as_ref().map(|c| c.speed.to_mbps()),
                         capability_source: device.capability.as_ref().map(|c| c.source.as_str()),
@@ -433,8 +442,8 @@ pub fn build_report_at(
         version: 1,
         timestamp,
         window_seconds: window_secs,
-        source,
-        dropped_packets: dropped,
+        source: facts.source,
+        dropped_packets: facts.dropped,
         // Filled in by `run` after this call, from the live kernel-drop
         // counter -- see the field's own doc comment.
         kernel_dropped_packets: 0,
@@ -467,9 +476,11 @@ pub fn build_report(
         manager,
         baseline,
         elapsed,
-        source,
-        dropped,
-        text_active,
+        WindowFacts {
+            source,
+            dropped,
+            text_active,
+        },
         filter,
     )
 }
@@ -709,9 +720,11 @@ pub fn run(
             &manager,
             &baseline,
             elapsed,
-            source,
-            dropped.load(Ordering::Relaxed),
-            flags.text_active.load(Ordering::Relaxed),
+            WindowFacts {
+                source,
+                dropped: dropped.load(Ordering::Relaxed),
+                text_active: flags.text_active.load(Ordering::Relaxed),
+            },
             &filter,
         );
         // Not a `build_report` parameter (see the field's doc comment): the
@@ -1395,9 +1408,11 @@ mod tests {
             &mgr,
             &baseline,
             Duration::from_secs(1),
-            "binary",
-            0,
-            false,
+            WindowFacts {
+                source: "binary",
+                dropped: 0,
+                text_active: false,
+            },
             &FilterSet::default(),
         );
         let v = serde_json::to_value(&report).unwrap();
