@@ -11,7 +11,7 @@
 //! - `USB_DT_DEVICE_CAPABILITY` 0x10, `struct usb_dev_cap_header`: bLength,
 //!   bDescriptorType, bDevCapabilityType.
 //! - `USB_SS_CAP_TYPE` 3, `struct usb_ss_cap_descriptor` (bLength 10):
-//!   wSpeedsSupported at offset 4; `USB_5GBPS_OPERATION` is bit 3.
+//!   wSpeedSupported at offset 4; `USB_5GBPS_OPERATION` is bit 3.
 //! - `USB_SSP_CAP_TYPE` 0xA, `struct usb_ssp_cap_descriptor`: bmAttributes
 //!   u32 at offset 4, its low five bits (`USB_SSP_SUBLINK_SPEED_ATTRIBS`)
 //!   the sublink attribute count minus one; the u32 sublink speed
@@ -229,6 +229,33 @@ mod tests {
         bos[34] = 0x10;
         bos[38] = 0x10;
         assert_eq!(capability_from_bos(&bos), Some(UsbSpeed::from_mbps(5000.0)));
+    }
+
+    /// The other two exponents: a sublink stated in b/s or in Mb/s. The
+    /// SuperSpeed capability is dropped from the copy so the sublink
+    /// value is the whole answer.
+    #[test]
+    fn bit_and_megabit_exponents_decode() {
+        // Strip the SuperSpeed capability: header + USB 2 extension + SSP.
+        let mut without_ss = ADAPTER[..12].to_vec();
+        without_ss.extend_from_slice(&ADAPTER[22..]);
+        without_ss[2] = 0x20; // wTotalLength 32
+        without_ss[4] = 0x02; // two capabilities
+                              // Sublink 0 in b/s (exponent 0): mantissa 10 is 0.00001 Mb/s;
+                              // sublink 1 in Mb/s (exponent 2): 0x000a4020 is 10 Mb/s.
+        without_ss[24] = 0x00;
+        without_ss[28] = 0x20;
+        assert_eq!(
+            capability_from_bos(&without_ss),
+            Some(UsbSpeed::from_mbps(10.0))
+        );
+        // Only the b/s sublink left: the capability is that tiny rate, which
+        // can never exceed a link and so never fires a finding.
+        without_ss[28] = 0x00;
+        assert_eq!(
+            capability_from_bos(&without_ss),
+            Some(UsbSpeed::from_mbps(0.00001))
+        );
     }
 
     #[test]
