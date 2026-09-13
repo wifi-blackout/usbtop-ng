@@ -434,6 +434,23 @@ mod tests {
         assert_eq!(read_capability(dir), None, "no version file");
     }
 
+    /// A BOS file that is there but cannot be read (a directory stands in
+    /// for a failing read: EISDIR, not ENOENT) is a BOS the tool cannot
+    /// see, so bcdUSB 3.x does not stand in for it.
+    #[test]
+    fn read_capability_falls_back_only_when_the_file_is_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        std::fs::write(dir.join("version"), " 3.20\n").unwrap();
+        std::fs::create_dir(dir.join("bos_descriptors")).unwrap();
+        assert_eq!(read_capability(dir), None);
+        std::fs::remove_dir(dir.join("bos_descriptors")).unwrap();
+        assert_eq!(
+            read_capability(dir).map(|c| c.source),
+            Some(CapabilitySource::BcdUsb)
+        );
+    }
+
     #[test]
     fn capability_source_names_are_the_json_values() {
         assert_eq!(CapabilitySource::Bos.as_str(), "bos");

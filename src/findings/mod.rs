@@ -311,30 +311,27 @@ impl<'a> Topology<'a> {
             Half::Missing => return Half::Missing,
             Half::Ambiguous => return Half::Ambiguous,
         };
-        // Set B before the claimed ones are struck out. Empty here means
-        // there is nothing on the SuperSpeed side at all, so this hub's half
-        // never enumerated; emptied only by the strike-out below it means
-        // some other hub took the one candidate, which is ambiguity rather
-        // than proof, and falls through to `Ambiguous`.
-        let b_pre: Vec<&Row> = self
-            .hubs_on(&parent_ss)
-            .into_iter()
-            .filter(|h| h.link.to_mbps() > HIGH_SPEED_MBPS)
-            .collect();
-        if b_pre.is_empty() {
-            return Half::Missing;
-        }
+        // A SuperSpeed hub whose own port's kernel peer holds a present hub
+        // is that hub's half: kernel-paired ports are one receptacle, and
+        // only a hub can claim a hub (a plain device on that port claims
+        // nothing). With every such half struck out, an empty set means no
+        // SuperSpeed hub is left for this hub's half to be: it never
+        // enumerated, which is knowledge, not ignorance. More than one
+        // candidate on either side is ambiguity.
         let unclaimed_usb2: Vec<&Row> = self
             .hubs_on(&parent)
             .into_iter()
             .filter(|h| h.link.to_mbps() <= HIGH_SPEED_MBPS && h.capable_above_high())
             .filter(|h| !self.peer_holds_a_hub(h.name))
             .collect();
-        let unclaimed_ss: Vec<&Row> = b_pre
+        let unclaimed_ss: Vec<&Row> = self
+            .hubs_on(&parent_ss)
             .into_iter()
+            .filter(|h| h.link.to_mbps() > HIGH_SPEED_MBPS)
             .filter(|h| !self.peer_holds_a_hub(h.name))
             .collect();
         match (unclaimed_usb2.as_slice(), unclaimed_ss.as_slice()) {
+            (_, []) => Half::Missing,
             ([one], [half]) if one.name == hub && one.vendor_agrees_with(half) => Half::Known {
                 name: half.name.to_string(),
                 by_elimination: true,
@@ -787,6 +784,42 @@ mod tests {
         assert_eq!(
             findings[2].message(),
             "linked at 480M, supports 5G: port 7 of the hub above it (5-1.1) is USB 2 only; move it to a USB 3 port"
+        );
+    }
+
+    /// Every SuperSpeed hub under the parent is spoken for by a hub on its
+    /// kernel peer port, so the one SuperSpeed-capable USB 2 hub left over
+    /// has a half that provably never enumerated: a call-out, naming its
+    /// own empty twin port, not silence.
+    #[test]
+    fn a_hub_whose_only_candidates_are_claimed_by_other_hubs_is_named() {
+        let t = Tree::new();
+        let usb5 = t.root_hub(5, "480");
+        let usb6 = t.root_hub(6, "10000");
+        t.pair(&t.port(&usb5, "usb5", 1), &t.port(&usb6, "usb6", 1));
+        let outer2 = t.device("5-1", "480", Some("2.10"), Some(SS));
+        let outer3 = t.device("6-1", "10000", Some("3.20"), Some(SSP));
+        for n in 1..=2 {
+            t.pair(&t.port(&outer2, "5-1", n), &t.port(&outer3, "6-1", n));
+        }
+        // A healthy hub on port 2, both halves kernel-paired.
+        let healthy2 = t.device("5-1.2", "480", Some("2.10"), Some(SS));
+        let healthy3 = t.device("6-1.2", "5000", Some("3.00"), Some(SS));
+        t.pair(
+            &t.port(&healthy2, "5-1.2", 1),
+            &t.port(&healthy3, "6-1.2", 1),
+        );
+        // A SuperSpeed-capable hub on port 1 whose SuperSpeed side is empty.
+        let dead = t.device("5-1.1", "480", Some("2.10"), Some(SS));
+        t.port(&dead, "5-1.1", 1);
+        assert_eq!(
+            causes(&t.analyze()),
+            vec![(
+                "5-1.1",
+                Some(&Cause::SuperSpeedSideEmpty {
+                    peer_port: "6-1-port1".into()
+                })
+            )]
         );
     }
 

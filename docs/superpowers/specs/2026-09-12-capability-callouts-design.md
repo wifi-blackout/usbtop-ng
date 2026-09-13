@@ -178,16 +178,17 @@ device whose capability exceeds a known link speed can produce a finding.
 2. Another hub at 480 Mb/s or below: the device on the kernel peer of its
    own port, if present.
 3. Otherwise, only when the hub's capability is known to exceed 480 Mb/s:
-   with P2 the hub owning its port and P3 = `ss_half(P2)`, let B0 be the
-   present hubs on P3 at 5 Gb/s or more. B0 empty means there is nothing on
-   the SuperSpeed side at all and the half is *missing*. Otherwise let A be
-   the present hubs on P2 at or below 480 Mb/s with a known capability
-   above it whose kernel peer port holds no present **hub**, and B the
-   members of B0 whose kernel peer port holds no present **hub** — only a
-   hub can be the other half of a hub, so a plain device on that peer port
-   leaves the half unclaimed. When both sets have exactly one member and
-   the two agree on `idVendor` where both are known, they are halves of one
-   hub. Otherwise the half is *ambiguous*.
+   with P2 the hub owning its port and P3 = `ss_half(P2)`, let A be the
+   present hubs on P2 at or below 480 Mb/s with a known capability above
+   it whose kernel peer port holds no present **hub**, and B the present
+   hubs on P3 at 5 Gb/s or more whose kernel peer port holds no present
+   **hub** — only a hub can be the other half of a hub (kernel-paired
+   ports are one receptacle), so a plain device on that peer port claims
+   nothing. B empty means every SuperSpeed hub under P3 is spoken for, or
+   there is none: this hub's half never enumerated and is *missing*. When
+   both sets have exactly one member and the two agree on `idVendor` where
+   both are known, they are halves of one hub. Otherwise the half is
+   *ambiguous*.
 
 The verdict is three-valued — `Known` (and whether it was found by the
 kernel's `peer` or by elimination), `Missing`, `Ambiguous` — because

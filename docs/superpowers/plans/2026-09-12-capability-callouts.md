@@ -2013,7 +2013,7 @@ caveat says a device without a BOS and with bcdUSB below 3 is never
 marked, so a missing 🔺 proves nothing; a short paragraph shows the text
 report's `findings:` section with the two dock lines. SCRIPTING: the two
 new device fields, the top-level `findings` array with its own field table
-(every `FindingReport` field, the five cause tags and `null`), the example
+(every `FindingReport` field, the six cause tags and `null`), the example
 document regenerated from the dock bundle's `golden.binary.json`
 (trimmed), and "additive fields do not bump `version`". ARCHITECTURE:
 `device/bos.rs` in the device section, the doctrine paragraph rewritten
