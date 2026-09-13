@@ -58,7 +58,9 @@ impl Cause {
                     "the hub above it ({hub}) is linked at {}",
                     short_speed(hub_link)
                 );
-                if hub_link.to_mbps() <= HIGH_SPEED_MBPS {
+                // Advice only on a known USB 2 link: a hub the manager
+                // still lists as disconnected has no rate to argue from.
+                if hub_link.to_mbps() > 0.0 && hub_link.to_mbps() <= HIGH_SPEED_MBPS {
                     text.push_str("; move it to a USB 3 port");
                 }
                 text
@@ -649,7 +651,8 @@ mod tests {
         // A 10 Gb/s SSD stuck at High Speed on the inner hub's port 2: its
         // SuperSpeed port is the matched half's port 2.
         t.device("5-1.1.2", "480", Some("2.10"), Some(SSP));
-        // A device on the inner hub's port 8, which has no SuperSpeed twin.
+        // A device on the inner hub's port 7, which has no SuperSpeed twin
+        // (the USB 3 half owns four ports).
         t.device("5-1.1.7", "480", Some("2.10"), Some(SS));
         let findings = t.analyze();
         assert_eq!(
@@ -855,8 +858,53 @@ mod tests {
             .starts_with("linked at 480M, supports 5G (from bcdUSB): "));
     }
 
+    /// A hub the manager still lists as disconnected is not a row, so a
+    /// child still present under it is held by a hub of unknown rate: the
+    /// statement stays true and the USB 3 advice is withheld.
     #[test]
-    fn a_disconnected_device_is_ignored_and_a_present_twin_counts() {
+    fn a_child_of_a_disconnected_hub_gets_no_advice_it_cannot_earn() {
+        let t = Tree::new();
+        paired_roots(&t, 1);
+        let hub = t.device("3-1", "480", Some("2.10"), Some(SS));
+        t.port(&hub, "3-1", 1);
+        t.device("3-1.1", "480", Some("2.10"), Some(SS));
+        let mut manager = DeviceManager::with_sysfs_base(t.base());
+        manager.enumerate_present_devices();
+        manager.update_bus_speeds();
+        let index = PortIndex::scan_devices(
+            manager
+                .buses
+                .values()
+                .flat_map(|bus| bus.devices.values())
+                .filter_map(|device| device.sysfs_path.as_deref()),
+        );
+        manager
+            .buses
+            .get_mut(&3)
+            .unwrap()
+            .devices
+            .get_mut(&2)
+            .unwrap()
+            .is_disconnected = true;
+        let findings = analyze(&manager, &index);
+        assert_eq!(
+            causes(&findings),
+            vec![(
+                "3-1.1",
+                Some(&Cause::UpstreamHubLink {
+                    hub: "3-1".into(),
+                    hub_link: UsbSpeed::UNKNOWN
+                })
+            )]
+        );
+        assert_eq!(
+            findings[0].message(),
+            "linked at 480M, supports 5G: the hub above it (3-1) is linked at ?"
+        );
+    }
+
+    #[test]
+    fn a_device_that_went_disconnected_is_ignored() {
         let t = Tree::new();
         paired_roots(&t, 1);
         t.device("3-1", "480", Some("2.10"), Some(SS));
