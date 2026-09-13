@@ -14,11 +14,8 @@ use crate::capture::FixtureRoot;
 /// The attribute files usbtop-ng reads (see `device::read_metadata_from` and
 /// `enumerate_present_devices`), except `serial`: a bundle is published, a
 /// device serial identifies its owner's hardware, and no replay reads it, so
-/// it is never copied. Nothing else is copied either. `bos_descriptors` is
-/// the one binary attribute: the device's own capability statement (see
-/// `device::bos`), copied as bytes, absent on kernels before 6.9 and on
-/// devices without a BOS.
-const ATTRS: [&str; 9] = [
+/// it is never copied. Nothing else is copied either, except the BOS below.
+const ATTRS: [&str; 8] = [
     "busnum",
     "devnum",
     "speed",
@@ -27,8 +24,15 @@ const ATTRS: [&str; 9] = [
     "manufacturer",
     "product",
     "version",
-    "bos_descriptors",
 ];
+
+/// The one binary attribute, the device's own capability statement (see
+/// `device::bos`), absent on kernels before 6.9 and on devices without a
+/// BOS. Never copied verbatim: a BOS can carry a Container ID, a 128-bit
+/// UUID that names the unit the way a serial does, so the bundle gets it
+/// reduced to its rate capabilities (`bos::rate_capabilities_only`), which
+/// the replay reads exactly as it would the original.
+const BOS_ATTR: &str = "bos_descriptors";
 
 /// The port attribute files copied per hub port (see `copy_ports`): the
 /// firmware's connectability claim and its ACPI position value, neither of
@@ -199,7 +203,15 @@ fn resolve_controller(src_dir: &Path) -> Option<String> {
 /// Copy a device's known attribute files (those that exist) into the fresh
 /// bundle dir `dst`.
 fn copy_attrs(src: &Path, out: &FixtureRoot, dst: &str) -> anyhow::Result<()> {
-    copy_named(src, out, dst, &ATTRS)
+    copy_named(src, out, dst, &ATTRS)?;
+    // The BOS, reduced (see `BOS_ATTR`). Whatever the file held, the
+    // bundle gets a block the replay reads to the same verdict.
+    if let Ok(bytes) = std::fs::read(src.join(BOS_ATTR)) {
+        let reduced = crate::device::bos::rate_capabilities_only(&bytes);
+        out.write(&format!("{dst}/{BOS_ATTR}"), &reduced)
+            .with_context(|| format!("write {dst}/{BOS_ATTR}"))?;
+    }
+    Ok(())
 }
 
 /// Copy the named attribute files (those that exist) from `src` into the
@@ -299,24 +311,36 @@ mod tests {
         assert_eq!(mgr.buses[&1].controller.as_deref(), Some("0000:00:14.0"));
     }
 
-    /// The camera's BOS: a USB 2.0 extension and a SuperSpeed capability,
-    /// 22 bytes with NUL bytes inside, as sysfs serves it.
-    const CAMERA_BOS: &[u8] = &[
-        0x05, 0x0f, 0x16, 0x00, 0x02, 0x07, 0x10, 0x02, 0x06, 0x00, 0x00, 0x00, 0x0a, 0x10, 0x03,
-        0x00, 0x0c, 0x00, 0x03, 0x0a, 0xff, 0x07,
+    /// A hub's BOS as sysfs serves it: USB 2.0 extension, SuperSpeed,
+    /// SuperSpeedPlus (10 Gb/s), then a Container ID whose UUID names the
+    /// unit. NUL bytes inside, as any BOS has.
+    const HUB_BOS: &[u8] = &[
+        0x05, 0x0f, 0x3d, 0x00, 0x04, 0x07, 0x10, 0x02, 0x06, 0x00, 0x00, 0x00, 0x0a, 0x10, 0x03,
+        0x00, 0x0e, 0x00, 0x01, 0x08, 0xbe, 0x00, 0x1c, 0x10, 0x0a, 0x00, 0x23, 0x00, 0x00, 0x00,
+        0x00, 0x11, 0x00, 0x00, 0x30, 0x00, 0x05, 0x00, 0xb0, 0x00, 0x05, 0x00, 0x31, 0x40, 0x0a,
+        0x00, 0xb1, 0x40, 0x0a, 0x00, 0x14, 0x10, 0x04, 0x00, 0xc0, 0x7b, 0x0c, 0x8d, 0xd4, 0x1c,
+        0x45, 0x73, 0xa5, 0x4f, 0x7d, 0xfa, 0xb6, 0x0a, 0xef, 0x18,
     ];
 
     #[test]
-    fn bos_descriptors_are_copied_as_bytes_and_only_when_present() {
+    fn bos_descriptors_are_reduced_to_the_rate_capabilities_and_only_when_present() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("devices")).unwrap();
         build_src(temp.path());
-        std::fs::write(temp.path().join("devices/1-1/bos_descriptors"), CAMERA_BOS).unwrap();
+        std::fs::write(temp.path().join("devices/1-1/bos_descriptors"), HUB_BOS).unwrap();
         dev(
             &temp.path().join("devices"),
             "1-2",
             &[("busnum", "1\n"), ("devnum", "4\n"), ("speed", "480\n")],
         );
+        // Not a BOS at all (a corrupt read): reduces to a bare header, which
+        // the replay reads as no capability, as the live tool did.
+        dev(
+            &temp.path().join("devices"),
+            "1-3",
+            &[("busnum", "1\n"), ("devnum", "5\n"), ("speed", "480\n")],
+        );
+        std::fs::write(temp.path().join("devices/1-3/bos_descriptors"), b"garbage").unwrap();
         let dst = temp.path().join("bundle").join("sysfs");
         materialize_sysfs(
             &temp.path().join("devices"),
@@ -325,24 +349,35 @@ mod tests {
         )
         .unwrap();
 
+        let copied = std::fs::read(dst.join("1-1/bos_descriptors")).unwrap();
         assert_eq!(
-            std::fs::read(dst.join("1-1/bos_descriptors")).unwrap(),
-            CAMERA_BOS,
-            "the blob round-trips byte for byte"
+            copied,
+            crate::device::bos::rate_capabilities_only(HUB_BOS),
+            "the bundle holds the reduced block, not the raw attribute"
+        );
+        assert!(
+            !copied.windows(16).any(|w| w == &HUB_BOS[54..70]),
+            "the Container ID's UUID never reaches the bundle"
         );
         assert!(
             !dst.join("1-2/bos_descriptors").exists(),
             "a device without a BOS gets no file"
         );
-        // The replay reads it back the way the live tool does.
+        assert_eq!(
+            std::fs::read(dst.join("1-3/bos_descriptors")).unwrap(),
+            [0x05, 0x0f, 0x05, 0x00, 0x00],
+            "a file that is not a BOS becomes a bare header"
+        );
+        // The replay reads the reduced block the way the live tool reads the original.
         let mut mgr = crate::device::manager::DeviceManager::with_sysfs_base(dst.clone());
         mgr.enumerate_present_devices();
         let device = &mgr.buses[&1].devices[&3];
         assert_eq!(
             device.capability.as_ref().map(|c| c.speed.to_mbps()),
-            Some(5000.0)
+            Some(10000.0)
         );
         assert!(mgr.buses[&1].devices[&4].capability.is_none());
+        assert!(mgr.buses[&1].devices[&5].capability.is_none());
     }
 
     /// `resolve_controller` returns `None` only when canonicalizing `usbN`

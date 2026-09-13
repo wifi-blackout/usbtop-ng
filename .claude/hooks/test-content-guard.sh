@@ -30,6 +30,12 @@ mkdir -p "$tmp/tests/fixtures/hosts/x/stage1/sysfs/3-1"
 printf '\005\017\005\000\000' > "$tmp/tests/fixtures/hosts/x/stage1/sysfs/3-1/bos_descriptors"
 printf '{"tool_input":{"file_path":"%s/tests/fixtures/hosts/x/stage1/sysfs/3-1/bos_descriptors"}}' "$tmp" | sh "$guard"
 [ $? -eq 0 ] || { echo "FAIL: fixture bos_descriptors was blocked"; fail=1; }
+# The corpus nests root hubs under their controller directory: the same name
+# two levels deeper is exempt too.
+mkdir -p "$tmp/tests/fixtures/hosts/x/stage1/sysfs/0000:00:0d.0/usb2"
+printf '\005\017\005\000\000' > "$tmp/tests/fixtures/hosts/x/stage1/sysfs/0000:00:0d.0/usb2/bos_descriptors"
+printf '{"tool_input":{"file_path":"%s/tests/fixtures/hosts/x/stage1/sysfs/0000:00:0d.0/usb2/bos_descriptors"}}' "$tmp" | sh "$guard"
+[ $? -eq 0 ] || { echo "FAIL: nested fixture bos_descriptors was blocked"; fail=1; }
 printf '\005\017\005\000\000' > "$tmp/tests/fixtures/hosts/x/stage1/sysfs/3-1/descriptors"
 printf '{"tool_input":{"file_path":"%s/tests/fixtures/hosts/x/stage1/sysfs/3-1/descriptors"}}' "$tmp" | sh "$guard"
 [ $? -eq 2 ] || { echo "FAIL: another binary attribute under a fixture was not blocked"; fail=1; }

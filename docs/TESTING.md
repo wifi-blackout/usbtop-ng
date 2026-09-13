@@ -264,10 +264,13 @@ throwaway `stageN.json`.
    `peer` links, rewritten as relative in-bundle symlinks, so a bundle
    carries the connector pairings the TUI groups by. It also copies each
    device's `bos_descriptors` where the kernel exposes it (Linux 6.9 and
-   later), the one binary file in a bundle besides the traces, so a replay
-   decides capability the way the live tool does; a bundle captured on an
-   older kernel, or before 2026-09-12, carries none and its replay falls
-   back to bcdUSB. Only `tgl-tb4-2026-09-12/stage2` carries BOS blobs in
+   later), the one binary file in a bundle besides the traces, reduced to
+   the SuperSpeed and SuperSpeedPlus capability descriptors under a
+   rebuilt header: the Container ID (a per-unit UUID, a serial by another
+   name), the billboard and the rest are dropped, and the replay reads the
+   reduced block exactly as the live tool reads the original. A bundle
+   captured on an older kernel, or before 2026-09-12, carries none and its
+   replay falls back to bcdUSB. Only `tgl-tb4-2026-09-12/stage2` carries BOS blobs in
    today's corpus -- it is the bundle that pins the two expected findings,
    and every other bundle exercises the fallback and must replay to none.
 4. `bm1684x` contributes no fixtures. Its 5.4 vendor kernel carries no usbmon
