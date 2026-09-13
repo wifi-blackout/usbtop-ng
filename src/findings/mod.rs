@@ -157,16 +157,18 @@ impl Row<'_> {
 
     /// Whether `idVendor` allows these two rows to be halves of one hub:
     /// the two halves of a hub are two functions of one silicon and share a
-    /// vendor (the dock's inner hub is 2188:0031 and 2188:0032). An unknown
-    /// id on either side allows the pairing rather than blocking it. Two
-    /// *different* hubs of the same vendor, each failing on the opposite
-    /// half, would still pair; that residue is accepted, since the test is
-    /// only ever applied to a match already unique by elimination.
+    /// vendor (the dock's inner hub is 2188:0031 and 2188:0032). Both ids
+    /// must be known and equal; sysfs states `idVendor` for every device it
+    /// enumerates, so an unknown one is a failed read, and a failed read is
+    /// not evidence. Two *different* hubs of the same vendor, each failing
+    /// on the opposite half, would still pair; that residue is accepted,
+    /// since the test is only ever applied to a match already unique by
+    /// elimination.
     fn vendor_agrees_with(&self, other: &Row) -> bool {
-        match (self.vendor_id, other.vendor_id) {
-            (Some(mine), Some(theirs)) => mine == theirs,
-            _ => true,
-        }
+        matches!(
+            (self.vendor_id, other.vendor_id),
+            (Some(mine), Some(theirs)) if mine == theirs
+        )
     }
 }
 
@@ -759,8 +761,8 @@ mod tests {
         for n in 1..=4 {
             t.pair(&t.port(&outer2, "5-1", n), &t.port(&outer3, "6-1", n));
         }
-        let inner2 = t.device("5-1.1", "480", Some("2.10"), Some(SS));
-        let inner3 = t.device("6-1.4", "10000", Some("3.20"), Some(SSP));
+        let inner2 = t.device_of_vendor("5-1.1", "480", Some("2.10"), Some(SS), 0x2188);
+        let inner3 = t.device_of_vendor("6-1.4", "10000", Some("3.20"), Some(SSP), 0x2188);
         for n in 1..=8 {
             t.port(&inner2, "5-1.1", n);
         }
@@ -1302,8 +1304,8 @@ mod tests {
         for n in 1..=4 {
             t.pair(&t.port(&outer2, "5-1", n), &t.port(&outer3, "6-1", n));
         }
-        let inner2 = t.device("5-1.1", "480", Some("2.10"), Some(SSP));
-        let inner3 = t.device("6-1.4", "10000", Some("3.20"), Some(SSP));
+        let inner2 = t.device_of_vendor("5-1.1", "480", Some("2.10"), Some(SSP), 0x2188);
+        let inner3 = t.device_of_vendor("6-1.4", "10000", Some("3.20"), Some(SSP), 0x2188);
         for n in 1..=8 {
             t.port(&inner2, "5-1.1", n);
         }
@@ -1328,6 +1330,33 @@ mod tests {
 
     /// Two unrelated hubs, each dead on the opposite half, are a unique
     /// match by elimination alone; `idVendor` is what tells them apart.
+    /// An unknown `idVendor` (a failed read: sysfs states one for every
+    /// device) is not agreement. Two unrelated half-failed hubs, one of them
+    /// vendor-less, stay ambiguous instead of fusing into one.
+    #[test]
+    fn an_unknown_vendor_never_completes_an_elimination_match() {
+        let t = Tree::new();
+        let usb5 = t.root_hub(5, "480");
+        let usb6 = t.root_hub(6, "10000");
+        t.pair(&t.port(&usb5, "usb5", 1), &t.port(&usb6, "usb6", 1));
+        let outer2 = t.device_of_vendor("5-1", "480", Some("2.10"), None, 0x2188);
+        let outer3 = t.device_of_vendor("6-1", "10000", Some("3.20"), Some(SSP), 0x8087);
+        for n in 1..=2 {
+            t.pair(&t.port(&outer2, "5-1", n), &t.port(&outer3, "6-1", n));
+        }
+        // X: SuperSpeed side dead, vendor unknown. Y: USB 2 side dead.
+        let x2 = t.device("5-1.1", "480", Some("2.10"), Some(SS));
+        t.port(&x2, "5-1.1", 1);
+        let y3 = t.device_of_vendor("6-1.2", "5000", Some("3.00"), Some(SS), 0x2222);
+        t.port(&y3, "6-1.2", 1);
+        t.device("5-1.1.1", "480", Some("2.10"), Some(SS));
+        assert_eq!(
+            causes(&t.analyze()),
+            vec![("5-1.1.1", None)],
+            "neither hub is named; the device under X gets no cause"
+        );
+    }
+
     #[test]
     fn the_elimination_match_needs_the_two_halves_to_share_a_vendor() {
         let build = |vendor_y: u16| {
@@ -1384,8 +1413,8 @@ mod tests {
         for n in 1..=4 {
             t.pair(&t.port(&outer2, "5-1", n), &t.port(&outer3, "6-1", n));
         }
-        let inner2 = t.device("5-1.1", "480", Some("2.10"), Some(SSP));
-        let inner3 = t.device("6-1.4", "10000", Some("3.20"), Some(SSP));
+        let inner2 = t.device_of_vendor("5-1.1", "480", Some("2.10"), Some(SSP), 0x2188);
+        let inner3 = t.device_of_vendor("6-1.4", "10000", Some("3.20"), Some(SSP), 0x2188);
         for n in 1..=8 {
             t.port(&inner2, "5-1.1", n);
         }
@@ -1394,8 +1423,8 @@ mod tests {
         }
         // The second level, mis-paired again: port 1 of the USB 2 half,
         // port 3 of the SuperSpeed half.
-        let deep2 = t.device("5-1.1.1", "480", Some("2.10"), Some(SS));
-        let deep3 = t.device("6-1.4.3", "5000", Some("3.00"), Some(SS));
+        let deep2 = t.device_of_vendor("5-1.1.1", "480", Some("2.10"), Some(SS), 0x0bda);
+        let deep3 = t.device_of_vendor("6-1.4.3", "5000", Some("3.00"), Some(SS), 0x0bda);
         for n in 1..=4 {
             t.port(&deep2, "5-1.1.1", n);
             t.port(&deep3, "6-1.4.3", n);

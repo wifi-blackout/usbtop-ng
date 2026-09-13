@@ -193,8 +193,9 @@ device whose capability exceeds a known link speed can produce a finding.
    same way). A plain device on the peer port claims nothing. Let A be the members of the
    USB 2 side (present hubs on P2 at or below 480 Mb/s with a known
    capability above it) that claim nothing, and B the members of B0 that
-   nothing claims. When both have exactly one member and the two agree on
-   `idVendor` where both are known, they are halves of one hub. Otherwise,
+   nothing claims. When both have exactly one member and the two carry the same
+   known `idVendor` (an unknown id is a failed read, not agreement), they
+   are halves of one hub. Otherwise,
    including B emptied only by claims, the half is *ambiguous*: a claim
    made by port number is not proof, and ambiguity is silence rather than
    a conviction. Step 2 uses the same notion of a trusted claim.
