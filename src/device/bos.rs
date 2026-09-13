@@ -434,6 +434,27 @@ mod tests {
         assert_eq!(read_capability(dir), None, "no version file");
     }
 
+    /// A hostile block of 300 three-byte "capabilities" of the SuperSpeed
+    /// type: the rebuilt header's count saturates at 255 while its length
+    /// and the appended bytes stay exact.
+    #[test]
+    fn rate_capabilities_only_saturates_the_capability_count() {
+        let mut hostile = vec![0x05, 0x0f, 0x89, 0x03, 0xff]; // wTotalLength 905
+        for _ in 0..300 {
+            hostile.extend_from_slice(&[0x03, 0x10, 0x03]);
+        }
+        let reduced = rate_capabilities_only(&hostile);
+        assert_eq!(reduced.len(), 905);
+        assert_eq!(u16::from_le_bytes([reduced[2], reduced[3]]), 905);
+        assert_eq!(reduced[4], 255, "the count saturates");
+        assert_eq!(&reduced[5..], &hostile[5..]);
+        assert_eq!(
+            capability_from_bos(&reduced),
+            None,
+            "three-byte SuperSpeed capabilities carry no speed word"
+        );
+    }
+
     /// A BOS file that is there but cannot be read (a directory stands in
     /// for a failing read: EISDIR, not ENOENT) is a BOS the tool cannot
     /// see, so bcdUSB 3.x does not stand in for it.
