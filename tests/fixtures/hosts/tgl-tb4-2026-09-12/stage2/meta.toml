@@ -5,7 +5,7 @@ kernel = "7.0.0-31-generic"
 os = "Linux Mint 22.3"
 usbtop_ng_version = "1.7.0"
 stage_id = 2
-captured_unix = 1789239545
+captured_unix = 1789262969
 binary_kernel_dropped = 0
 controllers = ["0000:00:0d.0", "0000:00:14.0", "0000:2e:00.0"]
 speed_classes = ["1.5", "10000", "12", "480", "5000"]
@@ -14,4 +14,4 @@ sources = ["binary", "text"]
 
 [generator]
 kind = "ambient"
-note = "Ambient capture of the Tiger Lake laptop (Thunderbolt 4, kernel 7.0.0-31-generic) with a CalDigit Element Hub attached over Thunderbolt (device 0-3, generation 4). The dock tunnels its own xHCI, 0000:2e:00.0, whose root ports usb5-port1/usb6-port1 pair, and whose internal hubs pair non-adjacently: the USB2 hub 5-1.1 with 6-1-port1 and the USB3 hub 6-1.4 with 5-1-port4. An RTL9210 NVMe adapter sits on the dock's USB2 side only (5-1.2, its USB3 peer port empty: the link fell back), and a third IDS USB3 camera sits on a USB2-only Terminus hub chain (3-1.4.5). Traffic is a 400 MiB direct read of the USB2 flash drive on that chain at about 11 MB/s, started 3 s into a 20 s window. Baseline: the same host's 2026-08-31 stage1 internal-devices.toml, so the dock and everything on it count as external."
+note = "Ambient capture of the Tiger Lake laptop (Thunderbolt 4, kernel 7.0.0-31-generic) with a CalDigit Element Hub attached over Thunderbolt (device 0-3, generation 4). The dock tunnels its own xHCI, 0000:2e:00.0, whose root ports usb5-port1/usb6-port1 pair, and whose internal hubs pair non-adjacently: the USB2 hub 5-1.1 with 6-1-port1 and the USB3 hub 6-1.4 with 5-1-port4. An RTL9210 NVMe adapter sits on the dock's USB2 side only (5-1.2, its USB3 peer port empty: the link fell back), and a third IDS USB3 camera sits on a USB2-only Terminus hub chain (3-1.4.5). Traffic is a 400 MiB direct read of the USB2 flash drive on that chain at about 11 MB/s, started 3 s into a 20 s window. Baseline: the same host's 2026-08-31 stage1 internal-devices.toml, so the dock and everything on it count as external. Recaptured the same day once the sysfs snapshot copied each device's bos_descriptors: the replay reads the adapter's 10 Gb/s and the camera's 5 Gb/s capability from the BOS, the inner dock hub's halves 5-1.1/6-1.4 are matched by elimination despite the kernel's by-number pairing, and the report carries exactly those two findings."

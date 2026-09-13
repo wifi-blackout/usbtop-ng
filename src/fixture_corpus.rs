@@ -327,6 +327,96 @@ fn the_tgl_x360_bundle_pins_differing_port_numbers() {
     assert_eq!(peer_of(&index, "usb3-port1").as_deref(), Some("usb4-port2"));
 }
 
+/// The Thunderbolt 4 laptop with the dock: the two deliberate mis-placements
+/// are the corpus's two findings, read from each device's BOS. The dock's
+/// inner hub halves (`5-1.1` at 480 and `6-1.4` at 10 Gb/s, which the kernel
+/// pairs by port number onto empty ports) are matched by elimination and are
+/// not findings, nor is the outer hub's USB 2 half, the billboard, or the
+/// Realtek hub's USB 2 half whose twin is up.
+#[test]
+fn the_dock_bundle_pins_the_two_findings_and_nothing_else() {
+    let dir = fixtures_root().join("tgl-tb4-2026-09-12").join("stage2");
+    for source in [FixtureSource::Binary, FixtureSource::Text] {
+        let report = replay_fixture(&dir, source).unwrap();
+        let summary: Vec<(&str, Option<&str>, f64, &str)> = report
+            .findings
+            .iter()
+            .map(|f| {
+                (
+                    f.path.as_str(),
+                    f.cause,
+                    f.capability_mbps,
+                    f.capability_source,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("3-1.4.5", Some("upstream_hub_link"), 5000.0, "bos"),
+                ("5-1.2", Some("superspeed_side_empty"), 10000.0, "bos"),
+            ],
+            "{source:?}"
+        );
+        assert_eq!(report.findings[0].upstream.as_deref(), Some("3-1.4"));
+        assert_eq!(report.findings[0].limit_mbps, Some(480.0));
+        assert_eq!(report.findings[1].peer_port.as_deref(), Some("6-1-port2"));
+        assert_eq!(report.findings[1].port.as_deref(), Some("5-1-port2"));
+        // The BOS decides for every device that has one: the inner hub's USB 2
+        // half advertises 10 Gb/s, the Realtek hub's USB 2 half 5 Gb/s.
+        let capability = |bus: u8, port: &str| {
+            report
+                .buses
+                .iter()
+                .flat_map(|bus| bus.devices.iter())
+                .find(|d| d.bus == bus && d.port.as_deref() == Some(port))
+                .map(|d| (d.capability_mbps, d.capability_source))
+                .unwrap_or_else(|| panic!("no device {bus}-{port}"))
+        };
+        assert_eq!(capability(5, "1.1"), (Some(10000.0), Some("bos")));
+        assert_eq!(capability(3, "1"), (Some(5000.0), Some("bos")));
+        assert_eq!(
+            capability(5, "1"),
+            (None, None),
+            "the outer dock hub's USB 2 half advertises no SuperSpeed"
+        );
+        assert_eq!(
+            capability(3, "1.4"),
+            (None, None),
+            "the Terminus hub has no BOS"
+        );
+    }
+}
+
+/// Every other bundle predates the BOS in the snapshot and holds no bcdUSB
+/// 3.x device at a lower link: zero findings, and no capability from a BOS.
+#[test]
+fn every_other_bundle_has_no_findings() {
+    for bundle in discover_bundles() {
+        if bundle.dir.ends_with("tgl-tb4-2026-09-12/stage2") {
+            continue;
+        }
+        for source in sources_of(&bundle) {
+            let report = replay_fixture(&bundle.dir, source).unwrap();
+            assert!(
+                report.findings.is_empty(),
+                "{}: {:?}",
+                bundle.dir.display(),
+                report.findings.iter().map(|f| &f.path).collect::<Vec<_>>()
+            );
+            for device in report.buses.iter().flat_map(|b| &b.devices) {
+                assert_ne!(
+                    device.capability_source,
+                    Some("bos"),
+                    "{}: {}",
+                    bundle.dir.display(),
+                    device.address
+                );
+            }
+        }
+    }
+}
+
 /// Strict-corpus invariant: every directory exactly two levels below `root`
 /// (`hosts/<host>/<stage>/` — the same candidate set `discover_bundles_in`
 /// walks) must be a well-formed bundle: `meta.toml` exists and parses as
