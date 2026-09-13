@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::capacity::{analyze as analyze_capacity, Basis, Chokepoint};
 use crate::connector::PortIndex;
 
 mod connectors;
@@ -26,7 +27,7 @@ use crate::filter::FilterSet;
 use crate::findings::{analyze, Finding};
 use crate::snapshot::{Snapshot, SnapshotDevice};
 use crate::usbmon::monitor::CaptureStream;
-use crate::usbmon::parser::{format_mbps, TransferType, UsbPacket, UsbSpeed};
+use crate::usbmon::parser::{format_mbps, short_mbps, TransferType, UsbPacket, UsbSpeed};
 use connectors::{chain_text, connector_placement, sysfs_name};
 
 pub mod colors;
@@ -101,6 +102,9 @@ pub struct ConnectorView {
     pub buses: Vec<u8>,
     /// Whether a device on this connector owns ports of its own.
     pub is_hub: bool,
+    /// The choke point of a hub sitting on this connector (that connector
+    /// is the hub's link); the worse one when both halves of a hub choke.
+    pub choke: Option<Chokepoint>,
     pub devices: Vec<DeviceRow>,
     /// Sum over `devices`; recomputed by `UsbTopApp::recompute_rates`.
     pub rx_bps: f64,
@@ -207,6 +211,12 @@ pub struct UsbTopApp {
     /// (see `config::Preferences::connector_names` and
     /// [`Self::with_connector_names`]); consulted by `connector_placement`.
     connector_names: BTreeMap<String, String>,
+    /// Which rate the choke-point model assumes every device pushes; the
+    /// `c` key toggles it.
+    pub demand_basis: Basis,
+    /// The hubs whose links are asked more than they can carry, worst first,
+    /// recomputed from the manager every tick (see `capacity::analyze`).
+    pub chokepoints: Vec<Chokepoint>,
 }
 
 /// State of the `/` search box (see `UsbTopApp::search`). `/` opens
@@ -276,6 +286,8 @@ impl UsbTopApp {
             snapshot_dest: None,
             search: SearchState::Off,
             connector_names: BTreeMap::new(),
+            demand_basis: Basis::default(),
+            chokepoints: Vec::new(),
         }
     }
 
@@ -406,6 +418,14 @@ impl UsbTopApp {
             .into_iter()
             .map(|finding| ((finding.bus, finding.address), finding))
             .collect();
+        self.chokepoints = analyze_capacity(manager, self.demand_basis);
+        // By the port name of the hub's link, the same names the placement
+        // key joins with `+`.
+        let chokes_by_port: HashMap<&str, &Chokepoint> = self
+            .chokepoints
+            .iter()
+            .filter_map(|c| c.port.as_deref().map(|p| (p, c)))
+            .collect();
         let bus_speed = |bus_id: u8| manager.buses.get(&bus_id).map(|bus| bus.speed.clone());
 
         let mut buses: Vec<&UsbBus> = manager.buses.values().collect();
@@ -441,12 +461,23 @@ impl UsbTopApp {
                 let connector = match view.connectors.iter().position(|c| c.key == placement.key) {
                     Some(at) => &mut view.connectors[at],
                     None => {
+                        let choke = placement
+                            .key
+                            .split('+')
+                            .filter_map(|port| chokes_by_port.get(port))
+                            .max_by(|a, b| {
+                                a.ratio
+                                    .partial_cmp(&b.ratio)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .map(|c| (*c).clone());
                         view.connectors.push(ConnectorView {
                             key: placement.key,
                             label: placement.label,
                             name: placement.name,
                             buses: placement.buses,
                             is_hub: false,
+                            choke,
                             devices: Vec::new(),
                             rx_bps: 0.0,
                             tx_bps: 0.0,
@@ -526,6 +557,12 @@ impl UsbTopApp {
             .flat_map(ControllerView::rows)
             .filter(|row| row.finding.is_some())
             .count()
+    }
+
+    /// The worst choke ratio on screen, when any hub is at or above the
+    /// breathing room; the list is worst first.
+    pub fn worst_choke(&self) -> Option<f64> {
+        self.chokepoints.first().map(|c| c.ratio)
     }
 
     /// Device keys ("bus:dev") flattened in render order.
@@ -918,6 +955,10 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
             app.toggle_hide_idle();
             KeyOutcome::Redraw
         }
+        KeyCode::Char('c') => {
+            app.demand_basis = app.demand_basis.toggled();
+            KeyOutcome::Resync
+        }
         // Crossterm reports Shift-s as `Char('S')`, not `Char('s')` plus a
         // SHIFT modifier check, so this arm never collides with a lowercase
         // binding. The real sysfs read stays out of this function's own
@@ -1211,6 +1252,21 @@ fn header_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
                 .fg(WARNING_COLOR)
                 .add_modifier(Modifier::BOLD),
         ));
+    }
+
+    // The worst hub link: asked this many times its capacity by the devices
+    // below it (theoretical, see `capacity`); `(cap)` at the capability basis.
+    if let Some(ratio) = app.worst_choke() {
+        stats_line.push(Span::raw(" | choke: "));
+        stats_line.push(Span::styled(
+            format!("{ratio:.2}x"),
+            Style::default()
+                .fg(WARNING_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if app.demand_basis == Basis::Capability {
+            stats_line.push(Span::raw(" (cap)"));
+        }
     }
 
     vec![
@@ -1710,8 +1766,17 @@ fn connector_line(connector: &ConnectorView) -> Line<'static> {
         Some(name) => format!("{name} ({})", connector.label),
         None => connector.label.clone(),
     };
+    let choke = match &connector.choke {
+        Some(c) => format!(
+            " · choke {:.2}x ({} asked of {})",
+            c.ratio,
+            short_mbps(c.demand_mbps),
+            short_mbps(c.capacity_mbps)
+        ),
+        None => String::new(),
+    };
     Line::from(vec![
-        Span::raw(format!("▶ {heading} · bus {span}{hub}  ")),
+        Span::raw(format!("▶ {heading} · bus {span}{hub}{choke}  ")),
         Span::raw(format!(
             "rx {} tx {}",
             format_rate(connector.rx_bps),
@@ -1849,6 +1914,8 @@ fn color_reference_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
             Span::raw(" Help  "),
             Span::styled("i", accent_bold),
             Span::raw(" Idle devices  "),
+            Span::styled("c", accent_bold),
+            Span::raw(" Capacity basis  "),
             Span::styled("/", accent_bold),
             Span::raw(" Search  "),
             Span::styled("q/Esc", accent_bold),
@@ -1898,6 +1965,10 @@ fn draw_help_overlay(f: &mut Frame) {
             Span::raw("        Show or hide idle devices"),
         ]),
         Line::from(vec![
+            Span::styled("  c", Style::default().fg(ACCENT_COLOR)),
+            Span::raw("        Toggle the choke basis: link rates (default) or capabilities"),
+        ]),
+        Line::from(vec![
             Span::styled("  /", Style::default().fg(ACCENT_COLOR)),
             Span::raw(
                 "        Search devices by name, vid:pid, port, or bus:address; Enter keeps it, Esc clears it",
@@ -1924,6 +1995,8 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from("  • Per-device and per-bus %busy"),
         Line::from("  • ⚡ high-utilization indicator (>80% of practical bandwidth)"),
         Line::from("  • 🔺 linked below the speed it supports; the line beneath says why"),
+        Line::from("  • Header shows 'choke: N.NNx' when a hub's link is asked at least 1.25x its capacity"),
+        Line::from("    (the breathing room) by the devices below it; '(cap)' marks the capability basis"),
         Line::from("  • Header shows 'dropped: N' if packets were lost to a full queue"),
         Line::from("  • Header shows 'kdropped: N' if the kernel's usbmon ring dropped packets"),
         Line::from("  • Header shows 'shed: N' if frames were dropped to keep up with a slow"),
@@ -2265,6 +2338,103 @@ mod tests {
         mgr.enumerate_present_devices();
         mgr.update_bus_speeds();
         (temp, mgr)
+    }
+
+    /// `topology_fixture`'s topology plus a 480 hub on root port 2 of usb3
+    /// carrying two 480 devices: one choke point at 2.00x on that hub.
+    fn choked_fixture() -> (tempfile::TempDir, DeviceManager) {
+        let (temp, _) = topology_fixture();
+        let base = temp.path().join("devices");
+        let ctrl = temp.path().join("0000:00:14.0");
+        std::fs::create_dir_all(ctrl.join("usb3").join("usb3:1.0").join("usb3-port2")).unwrap();
+        let write = |dir: &std::path::Path, attrs: &[(&str, &str)]| {
+            std::fs::create_dir_all(dir).unwrap();
+            for (k, v) in attrs {
+                std::fs::write(dir.join(k), format!("{v}\n")).unwrap();
+            }
+        };
+        // topology_fixture already holds 3-2 (dev 3, 480) as a plain device
+        // on root port 2; turn it into a hub with two devices below.
+        for n in 1..=2 {
+            std::fs::create_dir_all(
+                base.join("3-2")
+                    .join("3-2:1.0")
+                    .join(format!("3-2-port{n}")),
+            )
+            .unwrap();
+            write(
+                &base.join(format!("3-2.{n}")),
+                &[
+                    ("busnum", "3"),
+                    ("devnum", &(20 + n).to_string()),
+                    ("speed", "480"),
+                ],
+            );
+        }
+        let mut mgr = DeviceManager::with_sysfs_base(base);
+        mgr.enumerate_present_devices();
+        mgr.update_bus_speeds();
+        (temp, mgr)
+    }
+
+    #[test]
+    fn the_header_shows_the_worst_choke_ratio_only_above_the_floor() {
+        let (_temp, mgr) = choked_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        assert_eq!(app.chokepoints.len(), 1);
+        let stats_line = &header_lines(&app)[1];
+        assert!(stats_line.spans.iter().any(|s| s.content == " | choke: "));
+        let value = stats_line
+            .spans
+            .iter()
+            .find(|s| s.content == "2.00x")
+            .expect("the ratio");
+        assert_eq!(value.style.fg, Some(WARNING_COLOR));
+
+        let (_temp, plain) = topology_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&plain);
+        assert!(!header_lines(&app)[1].to_string().contains("choke"));
+    }
+
+    #[test]
+    fn the_c_key_toggles_the_basis_and_the_header_says_so() {
+        let (_temp, mgr) = choked_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        assert_eq!(app.demand_basis, Basis::Link);
+        let outcome = apply_key(&mut app, KeyEvent::from(KeyCode::Char('c')));
+        assert_eq!(
+            outcome,
+            KeyOutcome::Resync,
+            "the model is rebuilt at the new basis before the repaint"
+        );
+        assert_eq!(app.demand_basis, Basis::Capability);
+        app.sync_from(&mgr);
+        assert!(header_lines(&app)[1].to_string().contains("2.00x (cap)"));
+        apply_key(&mut app, KeyEvent::from(KeyCode::Char('c')));
+        assert_eq!(app.demand_basis, Basis::Link);
+    }
+
+    #[test]
+    fn the_choked_hubs_connector_heading_carries_the_ratio() {
+        let (_temp, mgr) = choked_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        let (lines, _) = device_list_lines_with_selection(&app);
+        let headings: Vec<String> = lines
+            .iter()
+            .map(|l| l.to_string())
+            .filter(|l| l.starts_with("▶ Port"))
+            .collect();
+        let choked: Vec<&String> = headings.iter().filter(|h| h.contains("choke")).collect();
+        assert_eq!(choked.len(), 1, "{headings:?}");
+        assert!(
+            choked[0].contains("· hub · choke 2.00x (768M asked of 384M)  rx"),
+            "{}",
+            choked[0]
+        );
     }
 
     #[test]
@@ -3468,6 +3638,7 @@ mod tests {
         assert!(screen.contains("dropped: N"), "{screen}");
         assert!(screen.contains("shed: N"), "{screen}");
         assert!(screen.contains("the line beneath says why"), "{screen}");
+        assert!(screen.contains("Toggle the choke basis"), "{screen}");
         // The one platform claim the overlay makes, and the only one it may:
         // the binary does not build anywhere else.
         assert!(screen.contains("Linux only"), "{screen}");
@@ -5485,6 +5656,7 @@ mod tests {
         let second_line: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(second_line.contains("Controls:"));
         assert!(second_line.contains("Search"), "{second_line}");
+        assert!(second_line.contains("Capacity basis"), "{second_line}");
         assert!(!second_line.contains("search:"), "{second_line}");
     }
 

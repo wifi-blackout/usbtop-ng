@@ -38,10 +38,7 @@ impl Basis {
         }
     }
 
-    /// The other basis. Only the tests call it today: the headless
-    /// surface picks one basis per run from `--demand`, and the TUI key
-    /// that flips it lands with the TUI surface.
-    #[cfg(test)]
+    /// The other basis.
     pub fn toggled(self) -> Basis {
         match self {
             Basis::Link => Basis::Capability,
