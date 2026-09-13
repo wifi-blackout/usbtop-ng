@@ -353,13 +353,16 @@ says, and the snapshot is the one list you control.
 
 - A device linked below the speed it supports is called out in all three
   surfaces, with the cause when the topology proves it: an empty SuperSpeed
-  side of its connector, a USB 2 only host port, a slower hub above it, a
-  host port that tops out lower, or an upstream that permits the speed
-  while the link still came up slower. Where the topology cannot attribute
-  the shortfall — two hubs that could each be the missing SuperSpeed half of
-  the other side — the call-out is withheld rather than guessed, and a
-  device whose port the connector index does not know is reported with its
-  symptom and no cause.
+  side of its connector, a USB 2 only host port, a USB 2 only port on an
+  otherwise healthy hub, a slower hub above it, a host port that tops out
+  lower, or an upstream that permits the speed while the link still came up
+  slower. Which receptacle is the SuperSpeed side comes from the kernel's
+  own `peer` link and never from the port number alone, because the two
+  halves of a controller number their root ports independently. Where the
+  topology cannot attribute the shortfall — two hubs that could each be the
+  missing SuperSpeed half of the other side, an upstream of unknown rate, a
+  port the connector index does not know — the call-out reports the symptom
+  with no cause rather than guessing.
 - The capability is the device's own statement, decoded from its BOS
   (sysfs `bos_descriptors`, Linux 6.9 and later). Without that file, bcdUSB
   3.x stands in as a 5 Gbps floor, never more, and the finding says

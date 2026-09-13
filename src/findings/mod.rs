@@ -9,6 +9,13 @@
 //! numbers gets its own ports left unpaired and its halves paired with
 //! empty ports. `Topology::ss_half` therefore matches such halves by
 //! elimination and says nothing when the match is ambiguous.
+//!
+//! A port number is never carried from one half of a connector to the
+//! other on its own: each side of a controller numbers its root ports
+//! independently (the corpus's `tgl-x360` bundle pairs `usb3-port1` with
+//! `usb4-port2`). The SuperSpeed receptacle of a port is the kernel's own
+//! reciprocal `peer`, and only under a pair matched by elimination — where
+//! no `peer` exists by construction — is the number the best available.
 
 use std::collections::HashMap;
 
@@ -25,6 +32,9 @@ pub enum Cause {
     SuperSpeedSideEmpty { peer_port: String },
     /// The root port has no SuperSpeed twin.
     Usb2OnlyHostPort,
+    /// The hub above has a working SuperSpeed half, but this port of it has
+    /// no twin there: the receptacle itself is USB 2 only.
+    Usb2OnlyPort { hub: String, number: u32 },
     /// The hub above the device is itself linked below the capability.
     UpstreamHubLink { hub: String, hub_link: UsbSpeed },
     /// The root hub's own rate is below the capability.
@@ -39,6 +49,7 @@ impl Cause {
         match self {
             Cause::SuperSpeedSideEmpty { .. } => "superspeed_side_empty",
             Cause::Usb2OnlyHostPort => "usb2_only_host_port",
+            Cause::Usb2OnlyPort { .. } => "usb2_only_port",
             Cause::UpstreamHubLink { .. } => "upstream_hub_link",
             Cause::HostPortMax { .. } => "host_port_max",
             Cause::UpstreamPermits => "upstream_permits",
@@ -53,6 +64,9 @@ impl Cause {
             Cause::Usb2OnlyHostPort => {
                 "this host port is USB 2 only; move it to a USB 3 port".to_string()
             }
+            Cause::Usb2OnlyPort { hub, number } => format!(
+                "port {number} of the hub above it ({hub}) is USB 2 only; move it to a USB 3 port"
+            ),
             Cause::UpstreamHubLink { hub, hub_link } => {
                 let mut text = format!(
                     "the hub above it ({hub}) is linked at {}",
@@ -102,7 +116,7 @@ impl Finding {
         };
         let reason = match &self.cause {
             Some(cause) => cause.reason(&self.capability.speed),
-            None => "its port is unknown to the connector index".to_string(),
+            None => "why is not attributable from the connector topology".to_string(),
         };
         format!(
             "linked at {}, supports {}{source}: {reason}",
@@ -132,12 +146,27 @@ struct Row<'a> {
     address: u8,
     link: &'a UsbSpeed,
     capability: Option<&'a Capability>,
+    vendor_id: Option<u16>,
 }
 
 impl Row<'_> {
     fn capable_above_high(&self) -> bool {
         self.capability
             .is_some_and(|c| c.speed.to_mbps() > HIGH_SPEED_MBPS)
+    }
+
+    /// Whether `idVendor` allows these two rows to be halves of one hub:
+    /// the two halves of a hub are two functions of one silicon and share a
+    /// vendor (the dock's inner hub is 2188:0031 and 2188:0032). An unknown
+    /// id on either side allows the pairing rather than blocking it. Two
+    /// *different* hubs of the same vendor, each failing on the opposite
+    /// half, would still pair; that residue is accepted, since the test is
+    /// only ever applied to a match already unique by elimination.
+    fn vendor_agrees_with(&self, other: &Row) -> bool {
+        match (self.vendor_id, other.vendor_id) {
+            (Some(mine), Some(theirs)) => mine == theirs,
+            _ => true,
+        }
     }
 }
 
@@ -147,8 +176,12 @@ impl Row<'_> {
 /// hub whose half the topology cannot pin down says nothing at all.
 #[derive(Debug, Clone)]
 enum Half {
-    /// That hub is this hub's SuperSpeed half.
-    Known(String),
+    /// That hub is this hub's SuperSpeed half. `by_elimination` records how
+    /// it was found: the kernel's own `peer` link (`false`) proves the two
+    /// hubs sit on one receptacle, while an elimination match (`true`) only
+    /// proves *which two hubs* are halves. Only the former lets a port
+    /// number be carried across to the other side (see `finding_for`).
+    Known { name: String, by_elimination: bool },
     /// This hub has no SuperSpeed half: it is a SuperSpeed hub itself, it
     /// claims no SuperSpeed capability, there is no SuperSpeed side above
     /// it, or no unclaimed SuperSpeed hub exists there for it to be.
@@ -182,15 +215,26 @@ impl<'a> Topology<'a> {
         self.present(&name)
     }
 
-    /// Whether `hub`'s own port has a reciprocal peer holding a present device.
-    fn peer_holds_a_device(&self, hub: &str) -> bool {
-        self.peer_port_of(hub)
-            .is_some_and(|peer| self.device_on_port(&peer).is_some())
+    /// Whether `hub`'s own port has a reciprocal peer holding a present
+    /// *hub*. Only a hub can be the other half of a hub, so a plain device
+    /// on that peer port — a USB 2 mouse in the receptacle the kernel
+    /// happens to pair with a hub half — leaves the half still unclaimed.
+    fn peer_holds_a_hub(&self, hub: &str) -> bool {
+        self.peer_port_of(hub).is_some_and(|peer| {
+            self.device_on_port(&peer)
+                .is_some_and(|dev| self.ports.is_hub(dev.name))
+        })
     }
 
     /// The present hubs attached to `parent`'s ports, in row order.
     /// Collected rather than returned lazily so the caller may hold the
     /// list across the recursive `ss_half` call.
+    ///
+    /// "Hub" here is `PortIndex::is_hub`: a device that owns at least one
+    /// port object. A hub whose driver has not created its ports yet, and
+    /// one the manager lists as disconnected, are both invisible to this
+    /// for that tick — the engine is re-run and the whole view rebuilt
+    /// every tick, so such a hub simply appears once its ports do.
     fn hubs_on(&self, parent: &str) -> Vec<&'a Row<'a>> {
         self.rows
             .iter()
@@ -239,13 +283,19 @@ impl<'a> Topology<'a> {
             return peer_hubs
                 .into_iter()
                 .find(|h| self.present(h).is_some())
-                .map_or(Half::Missing, Half::Known);
+                .map_or(Half::Missing, |name| Half::Known {
+                    name,
+                    by_elimination: false,
+                });
         };
         // Step 2: the kernel's own pairing.
         if let Some(peer) = self.peer_port_of(hub) {
             if let Some(dev) = self.device_on_port(&peer) {
                 if self.ports.is_hub(dev.name) {
-                    return Half::Known(dev.name.to_string());
+                    return Half::Known {
+                        name: dev.name.to_string(),
+                        by_elimination: false,
+                    };
                 }
             }
         }
@@ -255,31 +305,40 @@ impl<'a> Topology<'a> {
             return Half::Missing;
         }
         let parent_ss = match self.ss_half(&parent) {
-            Half::Known(parent_ss) => parent_ss,
+            Half::Known { name, .. } => name,
             // No SuperSpeed side above at all, so no half of this hub can be
             // enumerated anywhere: that is knowledge, not ignorance.
             Half::Missing => return Half::Missing,
             Half::Ambiguous => return Half::Ambiguous,
         };
-        let unclaimed_usb2: Vec<&str> = self
-            .hubs_on(&parent)
-            .into_iter()
-            .filter(|h| h.link.to_mbps() <= HIGH_SPEED_MBPS && h.capable_above_high())
-            .filter(|h| !self.peer_holds_a_device(h.name))
-            .map(|h| h.name)
-            .collect();
-        let unclaimed_ss: Vec<&str> = self
+        // Set B before the claimed ones are struck out. Empty here means
+        // there is nothing on the SuperSpeed side at all, so this hub's half
+        // never enumerated; emptied only by the strike-out below it means
+        // some other hub took the one candidate, which is ambiguity rather
+        // than proof, and falls through to `Ambiguous`.
+        let b_pre: Vec<&Row> = self
             .hubs_on(&parent_ss)
             .into_iter()
             .filter(|h| h.link.to_mbps() > HIGH_SPEED_MBPS)
-            .filter(|h| !self.peer_holds_a_device(h.name))
-            .map(|h| h.name)
+            .collect();
+        if b_pre.is_empty() {
+            return Half::Missing;
+        }
+        let unclaimed_usb2: Vec<&Row> = self
+            .hubs_on(&parent)
+            .into_iter()
+            .filter(|h| h.link.to_mbps() <= HIGH_SPEED_MBPS && h.capable_above_high())
+            .filter(|h| !self.peer_holds_a_hub(h.name))
+            .collect();
+        let unclaimed_ss: Vec<&Row> = b_pre
+            .into_iter()
+            .filter(|h| !self.peer_holds_a_hub(h.name))
             .collect();
         match (unclaimed_usb2.as_slice(), unclaimed_ss.as_slice()) {
-            ([one], [half]) if *one == hub => Half::Known((*half).to_string()),
-            // Nothing unclaimed on the SuperSpeed side for this hub's half
-            // to be: it never enumerated.
-            (_, []) => Half::Missing,
+            ([one], [half]) if one.name == hub && one.vendor_agrees_with(half) => Half::Known {
+                name: half.name.to_string(),
+                by_elimination: true,
+            },
             _ => Half::Ambiguous,
         }
     }
@@ -301,6 +360,7 @@ pub fn analyze(manager: &DeviceManager, ports: &PortIndex) -> Vec<Finding> {
                 address: device.device_id,
                 link: &device.speed,
                 capability: device.capability.as_ref(),
+                vendor_id: device.vendor_id,
             })
         })
         .collect();
@@ -349,7 +409,7 @@ fn finding_for(
             match topology.ss_half(row.name) {
                 // Its SuperSpeed half is up: a USB 2 half sitting at 480 is
                 // how a USB 3 hub enumerates, not a fault.
-                Half::Known(_) => return None,
+                Half::Known { .. } => return None,
                 // Rule H cannot pin the half down, so an empty SuperSpeed
                 // port opposite proves nothing -- that half may be
                 // enumerated on another port number. Say nothing about the
@@ -360,23 +420,47 @@ fn finding_for(
                 Half::Missing => {}
             }
         }
-        // Only a half rule H actually found places a SuperSpeed port; both
-        // `Missing` and `Ambiguous` take the "P3 unknown" branch, whose
-        // verdict is true either way.
-        let ss_port = match topology.ss_half(&parent) {
-            Half::Known(half) => Some(port_name(&half, number)),
-            Half::Missing | Half::Ambiguous => None,
-        }
-        .filter(|name| topology.ports.get(name).is_some());
+        let parent_half = topology.ss_half(&parent);
+        // The kernel's own twin of *this* port first. The two sides of one
+        // controller number their root ports independently -- the corpus's
+        // `tgl-x360` bundle pairs `usb3-port1` with `usb4-port2` -- so the
+        // same number on the other half names a different receptacle, and
+        // taking it would exonerate a dead connector whenever that other
+        // receptacle happens to be occupied. The number is carried across
+        // only under a pair rule H matched by elimination, where the kernel
+        // left the ports unpaired precisely because the halves sit on
+        // different port numbers and nothing better exists.
+        let ss_port = topology.peer_port_of(row.name).or_else(|| {
+            match &parent_half {
+                Half::Known {
+                    name,
+                    by_elimination: true,
+                } => Some(port_name(name, number)),
+                _ => None,
+            }
+            .filter(|name| topology.ports.get(name).is_some())
+        });
         let cause = match ss_port {
             Some(ss_port) if topology.device_on_port(&ss_port).is_some() => return None,
             Some(ss_port) => Cause::SuperSpeedSideEmpty { peer_port: ss_port },
             None if root_parent => Cause::Usb2OnlyHostPort,
-            None => Cause::UpstreamHubLink {
-                hub_link: topology
-                    .present(&parent)
-                    .map_or(UsbSpeed::UNKNOWN, |p| p.link.clone()),
-                hub: parent,
+            None => match parent_half {
+                // The hub above has a SuperSpeed half and this port of it
+                // has no twin there: the receptacle is USB 2 only. The hub
+                // named is the one the device hangs off, not its half.
+                Half::Known { .. } => Cause::Usb2OnlyPort {
+                    hub: parent,
+                    number,
+                },
+                Half::Missing => Cause::UpstreamHubLink {
+                    hub_link: topology
+                        .present(&parent)
+                        .map_or(UsbSpeed::UNKNOWN, |p| p.link.clone()),
+                    hub: parent,
+                },
+                // Which hub is the parent's half is unknowable, so neither
+                // an empty twin nor a USB 2 only port can be claimed.
+                Half::Ambiguous => return Some(finding(Some(port), None)),
             },
         };
         return Some(finding(Some(port), Some(cause)));
@@ -386,18 +470,23 @@ fn finding_for(
     } else {
         topology.present(&parent).map(|p| p.link.clone())
     };
-    let cause = match limit {
-        Some(max) if max.to_mbps() > 0.0 && max.to_mbps() < capability.speed.to_mbps() => {
-            if root_parent {
-                Cause::HostPortMax { max }
-            } else {
-                Cause::UpstreamHubLink {
-                    hub: parent,
-                    hub_link: max,
-                }
+    // An absent, disconnected, or unknown-rate upstream is ignorance, not
+    // permission: `UpstreamPermits` blames the cable or the device, which
+    // needs an upstream rate that actually allows the capability.
+    let Some(max) = limit.filter(|max| max.to_mbps() > 0.0) else {
+        return Some(finding(Some(port), None));
+    };
+    let cause = if max.to_mbps() < capability.speed.to_mbps() {
+        if root_parent {
+            Cause::HostPortMax { max }
+        } else {
+            Cause::UpstreamHubLink {
+                hub: parent,
+                hub_link: max,
             }
         }
-        _ => Cause::UpstreamPermits,
+    } else {
+        Cause::UpstreamPermits
     };
     Some(finding(Some(port), Some(cause)))
 }
@@ -487,6 +576,21 @@ mod tests {
             self.next_devnum.set(devnum + 1);
             let dir = self.base().join(name);
             Self::write(&dir, bus, devnum, speed, version, bos);
+            dir
+        }
+
+        /// A device that also states an `idVendor`, for the vendor
+        /// agreement rule inside rule H's elimination match.
+        fn device_of_vendor(
+            &self,
+            name: &str,
+            speed: &str,
+            version: Option<&str>,
+            bos: Option<&[u8]>,
+            vendor: u16,
+        ) -> PathBuf {
+            let dir = self.device(name, speed, version, bos);
+            std::fs::write(dir.join("idVendor"), format!("{vendor:04x}\n")).unwrap();
             dir
         }
 
@@ -652,7 +756,8 @@ mod tests {
         // SuperSpeed port is the matched half's port 2.
         t.device("5-1.1.2", "480", Some("2.10"), Some(SSP));
         // A device on the inner hub's port 7, which has no SuperSpeed twin
-        // (the USB 3 half owns four ports).
+        // (the USB 3 half owns four ports): that receptacle is USB 2 only,
+        // which the matched half proves.
         t.device("5-1.1.7", "480", Some("2.10"), Some(SS));
         let findings = t.analyze();
         assert_eq!(
@@ -672,12 +777,16 @@ mod tests {
                 ),
                 (
                     "5-1.1.7",
-                    Some(&Cause::UpstreamHubLink {
+                    Some(&Cause::Usb2OnlyPort {
                         hub: "5-1.1".into(),
-                        hub_link: UsbSpeed::from_mbps(480.0)
+                        number: 7
                     })
                 ),
             ]
+        );
+        assert_eq!(
+            findings[2].message(),
+            "linked at 480M, supports 5G: port 7 of the hub above it (5-1.1) is USB 2 only; move it to a USB 3 port"
         );
     }
 
@@ -705,14 +814,8 @@ mod tests {
         t.device("5-1.1.1", "480", Some("2.10"), Some(SS));
         assert_eq!(
             causes(&t.analyze()),
-            vec![(
-                "5-1.1.1",
-                Some(&Cause::UpstreamHubLink {
-                    hub: "5-1.1".into(),
-                    hub_link: UsbSpeed::from_mbps(480.0)
-                })
-            )],
-            "the hubs are ambiguous; the child's hub link is still a true statement"
+            vec![("5-1.1.1", None)],
+            "the hubs are ambiguous, so nothing above the child is attributable either"
         );
     }
 
@@ -941,7 +1044,7 @@ mod tests {
         assert_eq!(findings[0].port, None);
         assert!(findings[0]
             .message()
-            .ends_with(": its port is unknown to the connector index"));
+            .ends_with(": why is not attributable from the connector topology"));
     }
 
     #[test]
@@ -954,6 +1057,255 @@ mod tests {
         t.device("3-2", "480", Some("2.10"), Some(SS));
         let order: Vec<u8> = t.analyze().iter().map(|f| f.address).collect();
         assert_eq!(order, vec![2, 3, 4]);
+    }
+
+    /// Root ports on the two halves of one controller are numbered
+    /// independently: the committed `tgl-x360` bundle pairs `usb3-port1`
+    /// with `usb4-port2`. The kernel's own `peer` is the only thing that
+    /// names the SuperSpeed receptacle, and taking the same number instead
+    /// would here exonerate `3-1` because the unrelated `usb4-port1` is
+    /// occupied.
+    fn cross_numbered_roots(t: &Tree) -> (PathBuf, PathBuf) {
+        let usb3 = t.root_hub(3, "480");
+        let usb4 = t.root_hub(4, "5000");
+        t.pair(&t.port(&usb3, "usb3", 1), &t.port(&usb4, "usb4", 2));
+        t.pair(&t.port(&usb3, "usb3", 3), &t.port(&usb4, "usb4", 1));
+        t.port(&usb3, "usb3", 2);
+        (usb3, usb4)
+    }
+
+    #[test]
+    fn a_cross_numbered_root_pair_names_the_kernels_twin_not_the_same_number() {
+        let occupied = Tree::new();
+        cross_numbered_roots(&occupied);
+        occupied.device("3-1", "480", Some("2.10"), Some(SS));
+        // A healthy SuperSpeed device on the OTHER receptacle, which shares
+        // only the port number: it must not exonerate `3-1`.
+        occupied.device("4-1", "5000", Some("3.00"), Some(SS));
+        assert_eq!(
+            causes(&occupied.analyze()),
+            vec![(
+                "3-1",
+                Some(&Cause::SuperSpeedSideEmpty {
+                    peer_port: "usb4-port2".into()
+                })
+            )]
+        );
+
+        let alone = Tree::new();
+        cross_numbered_roots(&alone);
+        alone.device("3-1", "480", Some("2.10"), Some(SS));
+        assert_eq!(
+            causes(&alone.analyze()),
+            vec![(
+                "3-1",
+                Some(&Cause::SuperSpeedSideEmpty {
+                    peer_port: "usb4-port2".into()
+                })
+            )],
+            "the twin is named from the peer link, not from what occupies it"
+        );
+    }
+
+    #[test]
+    fn a_root_port_without_a_peer_never_falls_back_to_the_same_number() {
+        let t = Tree::new();
+        cross_numbered_roots(&t);
+        // `usb3-port2` has no peer, and `usb4-port2` exists but belongs to
+        // `usb3-port1`: the number must not be carried across under a root.
+        t.device("3-2", "480", Some("2.10"), Some(SS));
+        assert_eq!(
+            causes(&t.analyze()),
+            vec![("3-2", Some(&Cause::Usb2OnlyHostPort))]
+        );
+    }
+
+    /// The dock shape with a USB 2 mouse in the receptacle the kernel pairs
+    /// with the inner hub's SuperSpeed half. Only a hub can be a hub's
+    /// half, so the mouse must not make `6-1.4` look claimed and convict
+    /// the perfectly healthy `5-1.1`.
+    #[test]
+    fn a_plain_device_on_a_paired_port_does_not_claim_a_hub_half() {
+        let t = Tree::new();
+        let usb5 = t.root_hub(5, "480");
+        let usb6 = t.root_hub(6, "10000");
+        t.pair(&t.port(&usb5, "usb5", 1), &t.port(&usb6, "usb6", 1));
+        let outer2 = t.device("5-1", "480", Some("2.10"), Some(SS));
+        let outer3 = t.device("6-1", "10000", Some("3.20"), Some(SSP));
+        for n in 1..=4 {
+            t.pair(&t.port(&outer2, "5-1", n), &t.port(&outer3, "6-1", n));
+        }
+        let inner2 = t.device("5-1.1", "480", Some("2.10"), Some(SSP));
+        let inner3 = t.device("6-1.4", "10000", Some("3.20"), Some(SSP));
+        for n in 1..=8 {
+            t.port(&inner2, "5-1.1", n);
+        }
+        for n in 1..=4 {
+            t.port(&inner3, "6-1.4", n);
+        }
+        // The mouse sits on `5-1-port4`, whose kernel peer `6-1-port4` is
+        // the inner hub's SuperSpeed half's own port.
+        t.device("5-1.4", "12", Some("2.00"), None);
+        t.device("5-1.1.2", "480", Some("2.10"), Some(SSP));
+        assert_eq!(
+            causes(&t.analyze()),
+            vec![(
+                "5-1.1.2",
+                Some(&Cause::SuperSpeedSideEmpty {
+                    peer_port: "6-1.4-port2".into()
+                })
+            )],
+            "the inner hub is still matched and the mouse is not a finding"
+        );
+    }
+
+    /// Two unrelated hubs, each dead on the opposite half, are a unique
+    /// match by elimination alone; `idVendor` is what tells them apart.
+    #[test]
+    fn the_elimination_match_needs_the_two_halves_to_share_a_vendor() {
+        let build = |vendor_y: u16| {
+            let t = Tree::new();
+            let usb5 = t.root_hub(5, "480");
+            let usb6 = t.root_hub(6, "10000");
+            t.pair(&t.port(&usb5, "usb5", 1), &t.port(&usb6, "usb6", 1));
+            let outer2 = t.device("5-1", "480", Some("2.10"), Some(SS));
+            let outer3 = t.device("6-1", "10000", Some("3.20"), Some(SSP));
+            for n in 1..=4 {
+                t.pair(&t.port(&outer2, "5-1", n), &t.port(&outer3, "6-1", n));
+            }
+            // Hub X: its USB 2 half is up, its SuperSpeed half never came.
+            let x2 = t.device_of_vendor("5-1.1", "480", Some("2.10"), Some(SS), 0x1111);
+            t.port(&x2, "5-1.1", 1);
+            // Hub Y: its SuperSpeed half is up, its USB 2 half never came.
+            let y3 = t.device_of_vendor("6-1.2", "5000", Some("3.00"), Some(SS), vendor_y);
+            t.port(&y3, "6-1.2", 1);
+            t.device("5-1.1.1", "480", Some("2.10"), Some(SS));
+            t
+        };
+        assert_eq!(
+            causes(&build(0x2222).analyze()),
+            vec![("5-1.1.1", None)],
+            "different vendors cannot be two halves of one hub, so nothing is attributable"
+        );
+        // Same vendor: the elimination match stands, X is exonerated and the
+        // stuck device is placed against Y's port 1. Two *different* hubs of
+        // one vendor failing on opposite halves would pair here too; that
+        // residue is accepted.
+        assert_eq!(
+            causes(&build(0x1111).analyze()),
+            vec![(
+                "5-1.1.1",
+                Some(&Cause::SuperSpeedSideEmpty {
+                    peer_port: "6-1.2-port1".into()
+                })
+            )]
+        );
+    }
+
+    /// Elimination nests: a second-level hub whose halves again sit on
+    /// different port numbers is matched under the pair its own parents
+    /// were matched into, and a device stuck below it is placed against
+    /// that second-level half's port.
+    #[test]
+    fn an_elimination_match_under_an_elimination_match_places_the_device() {
+        let t = Tree::new();
+        let usb5 = t.root_hub(5, "480");
+        let usb6 = t.root_hub(6, "10000");
+        t.pair(&t.port(&usb5, "usb5", 1), &t.port(&usb6, "usb6", 1));
+        let outer2 = t.device("5-1", "480", Some("2.10"), Some(SS));
+        let outer3 = t.device("6-1", "10000", Some("3.20"), Some(SSP));
+        for n in 1..=4 {
+            t.pair(&t.port(&outer2, "5-1", n), &t.port(&outer3, "6-1", n));
+        }
+        let inner2 = t.device("5-1.1", "480", Some("2.10"), Some(SSP));
+        let inner3 = t.device("6-1.4", "10000", Some("3.20"), Some(SSP));
+        for n in 1..=8 {
+            t.port(&inner2, "5-1.1", n);
+        }
+        for n in 1..=4 {
+            t.port(&inner3, "6-1.4", n);
+        }
+        // The second level, mis-paired again: port 1 of the USB 2 half,
+        // port 3 of the SuperSpeed half.
+        let deep2 = t.device("5-1.1.1", "480", Some("2.10"), Some(SS));
+        let deep3 = t.device("6-1.4.3", "5000", Some("3.00"), Some(SS));
+        for n in 1..=4 {
+            t.port(&deep2, "5-1.1.1", n);
+            t.port(&deep3, "6-1.4.3", n);
+        }
+        t.device("5-1.1.1.2", "480", Some("2.10"), Some(SS));
+        assert_eq!(
+            causes(&t.analyze()),
+            vec![(
+                "5-1.1.1.2",
+                Some(&Cause::SuperSpeedSideEmpty {
+                    peer_port: "6-1.4.3-port2".into()
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn a_device_under_a_disconnected_hub_is_not_told_the_upstream_permits_it() {
+        let t = Tree::new();
+        paired_roots(&t, 1);
+        let hub = t.device("4-1", "5000", Some("3.20"), Some(SSP));
+        t.port(&hub, "4-1", 1);
+        t.device("4-1.1", "5000", Some("3.20"), Some(SSP));
+        let mut manager = DeviceManager::with_sysfs_base(t.base());
+        manager.enumerate_present_devices();
+        manager.update_bus_speeds();
+        let index = PortIndex::scan_devices(
+            manager
+                .buses
+                .values()
+                .flat_map(|bus| bus.devices.values())
+                .filter_map(|device| device.sysfs_path.as_deref()),
+        );
+        manager
+            .buses
+            .get_mut(&4)
+            .unwrap()
+            .devices
+            .get_mut(&2)
+            .unwrap()
+            .is_disconnected = true;
+        let findings = analyze(&manager, &index);
+        assert_eq!(causes(&findings), vec![("4-1.1", None)]);
+        assert_eq!(
+            findings[0].port.as_deref(),
+            Some("4-1-port1"),
+            "the port is known; it is the upstream's rate that is not"
+        );
+    }
+
+    #[test]
+    fn a_usb2_only_port_on_a_healthy_hub_names_the_port_not_the_hubs_link() {
+        let t = Tree::new();
+        paired_roots(&t, 1);
+        let hub3 = t.device("3-1", "480", Some("2.10"), Some(SS));
+        let hub4 = t.device("4-1", "5000", Some("3.00"), Some(SS));
+        for n in 1..=2 {
+            t.pair(&t.port(&hub3, "3-1", n), &t.port(&hub4, "4-1", n));
+        }
+        // Port 3 exists on the USB 2 half alone: a USB 2 only receptacle.
+        t.port(&hub3, "3-1", 3);
+        t.device("3-1.3", "480", Some("2.10"), Some(SS));
+        let findings = t.analyze();
+        assert_eq!(
+            causes(&findings),
+            vec![(
+                "3-1.3",
+                Some(&Cause::Usb2OnlyPort {
+                    hub: "3-1".into(),
+                    number: 3
+                })
+            )]
+        );
+        assert_eq!(
+            findings[0].message(),
+            "linked at 480M, supports 5G: port 3 of the hub above it (3-1) is USB 2 only; move it to a USB 3 port"
+        );
     }
 
     #[test]

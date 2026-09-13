@@ -150,7 +150,13 @@ treats them alike.
   the reason where the topology proves one. Pure over the manager's rows and
   the port index; no sysfs reads of its own. `Finding::message` is the one
   sentence the TUI line, the text report, and the JSON `message` field all
-  show; each surface supplies its own prefix. The rules are in
+  show; each surface supplies its own prefix. Which receptacle is a port's
+  SuperSpeed side comes from the kernel's own reciprocal `peer` link; the
+  port number is carried from one half to the other only under a hub pair
+  matched by elimination, where no `peer` exists by construction, because
+  the two halves of a controller number their root ports independently (the
+  corpus's `tgl-x360` bundle pairs `usb3-port1` with `usb4-port2`). The
+  rules are in
   `docs/superpowers/specs/2026-09-12-capability-callouts-design.md`.
 
 #### 5. TUI chassis (`tui/`)

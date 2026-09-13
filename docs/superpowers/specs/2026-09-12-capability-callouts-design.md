@@ -158,6 +158,7 @@ pub struct Finding {
 pub enum Cause {
     SuperSpeedSideEmpty { peer_port: String },
     Usb2OnlyHostPort,
+    Usb2OnlyPort { hub: String, number: u32 },
     UpstreamHubLink { hub: String, hub_link: UsbSpeed },
     HostPortMax { max: UsbSpeed },
     UpstreamPermits,
@@ -177,31 +178,51 @@ device whose capability exceeds a known link speed can produce a finding.
 2. Another hub at 480 Mb/s or below: the device on the kernel peer of its
    own port, if present.
 3. Otherwise, only when the hub's capability is known to exceed 480 Mb/s:
-   with P2 the hub owning its port and P3 = `ss_half(P2)`, let A be the
-   present hubs on P2 at or below 480 Mb/s with a known capability above it
-   whose kernel peer port holds no present device, and B the present hubs
-   on P3 at 5 Gb/s or more whose kernel peer port holds no present device.
-   When both sets have exactly one member, they are halves of one hub.
-   Otherwise the half is unknown.
+   with P2 the hub owning its port and P3 = `ss_half(P2)`, let B0 be the
+   present hubs on P3 at 5 Gb/s or more. B0 empty means there is nothing on
+   the SuperSpeed side at all and the half is *missing*. Otherwise let A be
+   the present hubs on P2 at or below 480 Mb/s with a known capability
+   above it whose kernel peer port holds no present **hub**, and B the
+   members of B0 whose kernel peer port holds no present **hub** — only a
+   hub can be the other half of a hub, so a plain device on that peer port
+   leaves the half unclaimed. When both sets have exactly one member and
+   the two agree on `idVendor` where both are known, they are halves of one
+   hub. Otherwise the half is *ambiguous*.
+
+The verdict is three-valued — `Known` (and whether it was found by the
+kernel's `peer` or by elimination), `Missing`, `Ambiguous` — because
+`Missing` is proof that a SuperSpeed half never enumerated, while
+`Ambiguous` is ignorance.
 
 **Rule D, a device D at link L with capability C > L**, own port (P, n)
 from `port_of_device`; when the index does not know that port, the finding
 has no cause:
 
 - L at or below 480 Mb/s:
-  - D is a hub with a known `ss_half`: no finding (its USB 3 half is up).
-  - P3 = `ss_half(P)` known: the SuperSpeed port is (P3, n). A present
-    device there means no finding; an empty one means
-    `SuperSpeedSideEmpty { peer_port }`.
-  - P3 unknown: P a root hub gives `Usb2OnlyHostPort`; otherwise
-    `UpstreamHubLink { hub: P, hub_link: P.link }`, which is true both for
-    a USB 2 only hub and for a USB 3 hub whose own link fell to 480; that
-    hub's own finding, if it has one, says the rest.
-- L at 5 Gb/s or more:
-  - P a root hub: the bus's root-hub speed below C gives
-    `HostPortMax { max }`, else `UpstreamPermits`.
-  - P a hub: P's link below C gives `UpstreamHubLink`, else
-    `UpstreamPermits`.
+  - D is a hub whose `ss_half` is `Known` (its USB 3 half is up) or
+    `Ambiguous` (nothing is provable): no finding.
+  - The SuperSpeed port is the reciprocal kernel `peer` of D's own port
+    when there is one; failing that, and only when `ss_half(P)` is `Known`
+    *by elimination* (where the kernel left the ports unpaired by
+    construction), it is (P3, n) if the index knows that port. The two
+    halves of a controller number their root ports independently — the
+    corpus's `tgl-x360` bundle pairs `usb3-port1` with `usb4-port2` — so
+    the number is never carried across on its own.
+  - A present device on that SuperSpeed port means no finding; an empty one
+    means `SuperSpeedSideEmpty { peer_port }`.
+  - No SuperSpeed port: P a root hub gives `Usb2OnlyHostPort`; P a hub
+    whose half is `Known` gives `Usb2OnlyPort { hub: P, number: n }` (the
+    hub is fine, this receptacle of it is USB 2 only); P a hub whose half
+    is `Missing` gives `UpstreamHubLink { hub: P, hub_link: P.link }`,
+    which is true both for a USB 2 only hub and for a USB 3 hub whose own
+    link fell to 480; P a hub whose half is `Ambiguous` gives no cause.
+- L at 5 Gb/s or more, with the limit the bus's root-hub speed when P is a
+  root hub and P's own link otherwise:
+  - No limit, or a limit at or below zero (P absent, disconnected, or of
+    unknown rate): no cause. Ignorance is not permission.
+  - The limit below C: `HostPortMax { max }` under a root hub,
+    `UpstreamHubLink` under a hub.
+  - Otherwise `UpstreamPermits`.
 
 **Messages** (`Finding::message()`, one string shared by the text report,
 the TUI line and the JSON `message` field): `"linked at 480M, supports
@@ -212,11 +233,14 @@ its own row, and the JSON finding carries `path` as a field. The causes:
 SuperSpeedSideEmpty "the SuperSpeed side of this connector
 (<peer_port>) is empty, so the link came up at USB 2 speed; check the cable
 or the port"; Usb2OnlyHostPort "this host port is USB 2 only; move it to a
-USB 3 port"; UpstreamHubLink "the hub above it (<hub>) is linked at
-<hub_link>" plus "; move it to a USB 3 port" when that link is 480 Mb/s or
-below; HostPortMax "this host port tops out at <max>"; UpstreamPermits "the
-port above it allows <C>; check the cable or the device"; no cause "its port
-is unknown to the connector index".
+USB 3 port"; Usb2OnlyPort "port <n> of the hub above it (<hub>) is USB 2
+only; move it to a USB 3 port"; UpstreamHubLink "the hub above it (<hub>)
+is linked at <hub_link>" plus "; move it to a USB 3 port" when that link is
+a known rate at 480 Mb/s or below; HostPortMax "this host port tops out at
+<max>"; UpstreamPermits "the port above it allows <C>; check the cable or
+the device"; no cause "why is not attributable from the connector
+topology" — which covers a port the index does not know, an ambiguous hub
+pairing, and an upstream of unknown rate alike.
 
 Expected on the recaptured dock bundle: exactly two findings, `5-1.2`
 (10 Gb/s via bos, SuperSpeedSideEmpty at `6-1-port2`) and `3-1.4.5` (5 Gb/s

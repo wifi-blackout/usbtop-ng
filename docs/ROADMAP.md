@@ -56,14 +56,19 @@ Type-C one: every device's capability now comes from its own BOS (sysfs
 `bos_descriptors`, Linux 6.9 and later), with bcdUSB 3.x standing in as a
 5 Gbps floor where the file is absent, and a findings engine calls out each
 device linked below it with the cause the topology proves -- an empty
-SuperSpeed side of the connector, a USB 2 only host port, a slower hub
-above, a host port ceiling, or an upstream that permits the speed. The hard
+SuperSpeed side of the connector, a USB 2 only host port, a USB 2 only port
+on a healthy hub, a slower hub above, a host port ceiling, or an upstream
+that permits the speed. The hard
 part was matching a hub's two halves: the kernel pairs a hub's ports by port
 number with the ports of the hub on its upstream port's peer
 (`drivers/usb/core/port.c` `find_and_link_peer`), so a hub whose halves sit
 on different port numbers has its own ports left unpaired and its halves
 paired with empty ports. The engine therefore matches those halves by
-elimination and, where two candidates fit, says nothing at all.
+elimination -- one unclaimed hub a side, agreeing on `idVendor` -- and,
+where two candidates fit, says nothing at all. Everywhere else the kernel's
+own `peer` link names the SuperSpeed receptacle, since each side of a
+controller numbers its root ports independently and the same number on the
+other half is a different socket.
 
 Next, part 3:
 

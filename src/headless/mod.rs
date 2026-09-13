@@ -121,6 +121,7 @@ impl From<&Finding> for FindingReport {
             Some(Cause::UpstreamHubLink { hub, hub_link }) => {
                 (None, Some(hub.clone()), Some(hub_link.to_mbps()))
             }
+            Some(Cause::Usb2OnlyPort { hub, .. }) => (None, Some(hub.clone()), None),
             Some(Cause::HostPortMax { max }) => (None, None, Some(max.to_mbps())),
             Some(Cause::Usb2OnlyHostPort) | Some(Cause::UpstreamPermits) | None => {
                 (None, None, None)
@@ -205,7 +206,10 @@ fn windowed_rate(baseline_total: Option<u64>, now_total: u64, window_secs: f64) 
 /// at the start of the window. Pure over the manager's state except for one
 /// read-only scan of the manager's own device directories for their port
 /// objects (the connector index the findings need), no clock reads other
-/// than the `timestamp` field.
+/// than the `timestamp` field. That scan runs once per report — so once per
+/// window under `--batch` — and reads nothing outside the device
+/// directories the manager already knows, which under `--replay` are the
+/// bundle's own `sysfs/`.
 ///
 /// `elapsed` is the *measured* time since `baseline` was captured, not the
 /// nominal `--window` value: a SIGINT/SIGTERM can end a window early, and

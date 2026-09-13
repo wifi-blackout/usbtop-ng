@@ -147,10 +147,10 @@ report their own window's true average.
 | `link_mbps` | f64 | the rate the link actually came up at, in Mbps |
 | `capability_mbps` | f64 | the rate the device says it supports, in Mbps |
 | `capability_source` | string | `"bos"` or `"bcd_usb"`, as on the device row |
-| `cause` | string? | `"superspeed_side_empty"`, `"usb2_only_host_port"`, `"upstream_hub_link"`, `"host_port_max"`, or `"upstream_permits"`; `null` when the topology proves none |
+| `cause` | string? | `"superspeed_side_empty"`, `"usb2_only_host_port"`, `"usb2_only_port"`, `"upstream_hub_link"`, `"host_port_max"`, or `"upstream_permits"`; `null` when the topology attributes none |
 | `peer_port` | string? | the empty SuperSpeed port, `6-1-port2`; set by `superspeed_side_empty` only, `null` otherwise |
-| `upstream` | string? | the hub above the device, `3-1.4`; set by `upstream_hub_link` only, `null` otherwise |
-| `limit_mbps` | f64? | the rate that limits the link: the upstream hub's own link for `upstream_hub_link`, the host port's ceiling for `host_port_max`; `null` for every other cause |
+| `upstream` | string? | the hub above the device, `3-1.4`; set by `upstream_hub_link` and `usb2_only_port`, `null` otherwise |
+| `limit_mbps` | f64? | the rate that limits the link: the upstream hub's own link for `upstream_hub_link`, the host port's ceiling for `host_port_max`; `null` for every other cause, `usb2_only_port` included — the port is USB 2 only, the hub above it is not slow |
 | `message` | string | the one sentence the text report and the TUI show, `linked at 480M, supports 10G: <reason>` |
 
 A cause never sets a field another cause owns, so a consumer reads `cause`
