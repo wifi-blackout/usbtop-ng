@@ -683,34 +683,58 @@ impl UsbTopApp {
         device_keys.iter().position(|key| key == selected)
     }
 
-    /// Keep `list_scroll` following the selected device's line: scroll up if
-    /// the selection is above the visible window, down if it's below, and
-    /// leave it untouched otherwise (so it doesn't chase when nothing is
-    /// selected). Always clamped to the current content length afterwards,
-    /// so a shrunk list or a stale offset can't scroll past its end.
+    /// Keep `list_scroll` following the selected device's block: its row
+    /// plus the `trailing` lines drawn under it (a finding's reason line, the
+    /// endpoint rows). Scroll up if the row is above the visible window, down
+    /// if the block's last line is below it, and leave it untouched otherwise
+    /// (so it doesn't chase when nothing is selected). A block taller than
+    /// the window keeps its row on the first line. Always clamped to the
+    /// current content length afterwards, so a shrunk list or a stale offset
+    /// can't scroll past its end.
     ///
     /// `total_lines`/`selected_line` come from `device_list_lines_with_selection`
-    /// (headings count toward both); `visible_height` is the render area's
+    /// (headings count toward both) and `trailing` from
+    /// `selected_row_trailing_lines`; `visible_height` is the render area's
     /// height minus its block's borders, computed by the caller since only it
     /// knows the area.
     fn follow_selection_in_list(
         &mut self,
         total_lines: usize,
         selected_line: Option<usize>,
+        trailing: usize,
         visible_height: u16,
     ) {
         if let Some(index) = selected_line {
             let index = index as u16;
+            let last = index.saturating_add(trailing as u16);
             if index < self.list_scroll {
                 self.list_scroll = index;
-            } else if visible_height > 0 && index >= self.list_scroll.saturating_add(visible_height)
+            } else if visible_height > 0 && last >= self.list_scroll.saturating_add(visible_height)
             {
-                self.list_scroll = index.saturating_sub(visible_height.saturating_sub(1));
+                self.list_scroll = last
+                    .saturating_sub(visible_height.saturating_sub(1))
+                    .min(index);
             }
         }
 
         let max_scroll = (total_lines as u16).saturating_sub(visible_height);
         self.list_scroll = self.list_scroll.min(max_scroll);
+    }
+
+    /// How many lines the selected device's row trails: one for its finding's
+    /// reason line, plus one per endpoint row (see `push_device_row`). Zero
+    /// when nothing is selected.
+    fn selected_row_trailing_lines(&self) -> usize {
+        let Some(selected) = &self.selected_device else {
+            return 0;
+        };
+        self.controllers
+            .iter()
+            .flat_map(ControllerView::rows)
+            .find(|row| format!("{}:{}", row.device.bus_id, row.device.device_id) == *selected)
+            .map_or(0, |row| {
+                usize::from(row.finding.is_some()) + row.device.endpoints.len()
+            })
     }
 }
 
@@ -1580,7 +1604,8 @@ fn inner_height(area: Rect) -> u16 {
 
 fn draw_device_list(f: &mut Frame, area: Rect, app: &mut UsbTopApp) {
     let (lines, selected_line) = device_list_lines_with_selection(app);
-    app.follow_selection_in_list(lines.len(), selected_line, inner_height(area));
+    let trailing = app.selected_row_trailing_lines();
+    app.follow_selection_in_list(lines.len(), selected_line, trailing, inner_height(area));
 
     let list = Paragraph::new(lines)
         .block(
@@ -4234,6 +4259,72 @@ mod tests {
     /// through `follow_selection_in_list` as ordinary lines, no special
     /// casing -- fall right below it in the same window rather than
     /// scrolling out.
+    /// The last device carries a finding. Selecting it from a stale scroll
+    /// above must land its row *and* the reason line under it in the window,
+    /// not the row alone on the last visible line.
+    #[test]
+    fn a_selected_flagged_row_keeps_its_reason_line_on_screen_when_scrolled_to() {
+        let (_t, mgr) = manager_with_n_devices_last_has_endpoints(5);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        let key = app.device_keys().last().cloned().unwrap();
+        let last = app
+            .controllers
+            .iter_mut()
+            .flat_map(|c| c.buses.iter_mut().flat_map(|b| b.devices.iter_mut()))
+            .find(|row| format!("{}:{}", row.device.bus_id, row.device.device_id) == key)
+            .unwrap();
+        last.finding = Some(crate::findings::Finding {
+            bus: last.device.bus_id,
+            address: last.device.device_id,
+            path: "1-5".to_string(),
+            port: None,
+            link: UsbSpeed::from_mbps(480.0),
+            capability: crate::device::Capability {
+                speed: UsbSpeed::from_mbps(5000.0),
+                source: crate::device::CapabilitySource::BcdUsb,
+            },
+            cause: None,
+        });
+        app.selected_device = Some(key);
+        app.list_scroll = 0; // the selection is below the window
+
+        // inner height 4 (backend height 6, minus the block's 2 border rows):
+        // row + reason line + two endpoint rows fill it exactly.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 6)).unwrap();
+        terminal
+            .draw(|f| draw_device_list(f, f.area(), &mut app))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("001:005"), "the selected row: {screen}");
+        assert!(
+            screen.contains("🔺 linked at 480M, supports 5G (from bcdUSB)"),
+            "its reason line: {screen}"
+        );
+        assert!(
+            screen.contains("ep2 out"),
+            "its last endpoint row: {screen}"
+        );
+    }
+
+    /// A block taller than the window keeps the selected row on the first
+    /// visible line rather than scrolling it out to show its trailing lines.
+    #[test]
+    fn a_selected_block_taller_than_the_window_keeps_its_row_on_top() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.list_scroll = 0;
+        // Row at line 10 with 6 trailing lines, window of 4 lines.
+        app.follow_selection_in_list(40, Some(10), 6, 4);
+        assert_eq!(app.list_scroll, 10);
+        // Scrolling up to a row above the window lands on the row.
+        app.follow_selection_in_list(40, Some(3), 6, 4);
+        assert_eq!(app.list_scroll, 3);
+        // A block that fits ends on the last visible line.
+        app.list_scroll = 0;
+        app.follow_selection_in_list(40, Some(10), 2, 4);
+        assert_eq!(app.list_scroll, 9);
+    }
+
     #[test]
     fn endpoint_rows_stay_visible_with_the_selected_device_near_the_bottom() {
         let (_t, mgr) = manager_with_n_devices_last_has_endpoints(5);
