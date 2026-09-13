@@ -135,10 +135,12 @@ treats them alike.
   handling (`apply_key`), the packet drain (`drain_packets`), and every widget.
   The render snapshot is rebuilt from the device manager every tick, so the
   findings and the choke points ride on it with no cache of their own: the
-  header carries `choke: N.NNx`, the worst hub ratio on screen, the choked
-  hub's connector heading carries its own ratio, and the `c` key flips
-  `demand_basis` (`capacity::Basis`) so the next tick recomputes both at the
-  other basis.
+  header carries `choke: N.NNx`, the worst ratio among the hubs with a row
+  on screen (the hub's own or one below it, so the search and idle filters
+  clear it), the choked hub's connector heading carries its own ratio (the
+  worse half's when both halves of a hub choke), and the `c` key flips
+  `demand_basis` (`capacity::Basis`, seeded from `--demand`) and resyncs,
+  so the model is rebuilt at the other basis before the repaint.
 - `connectors.rs`: the render model's connector grouping — building
   `ConnectorView`s from the port index, their labels, and their ordering.
 - `colors.rs`: the color scheme.
@@ -182,7 +184,7 @@ treats them alike.
   their sums separate with no pairing logic. Both sides are practical rates,
   the link rate times `UsbSpeed::class().efficiency()`.
 - `CHOKE_FLOOR` (1.25) is the breathing room: only hubs at or above it are
-  returned, worst first with ties broken by path, so the quiet 1.03x cases
+  returned, worst first with ties broken by path, so the quiet 1.00x cases
   never reach a surface. `Basis::{Link, Capability}` picks which rate each
   device is assumed to push, and `Chokepoint::message` is the one sentence
   the text report and the JSON `message` field show; the TUI builds its own

@@ -83,7 +83,7 @@ above: choke points name the uplinks that would choke if every device below
 them pushed what it can. A hub's own link is the stage, everything below it
 is summed against that link at the practical rate both sides already use,
 and the quotient is listed at or above the breathing room of 1.25 -- below
-that a 480M hub with a flash drive and a mouse reads 1.03x and is not worth
+that a 480M hub with a flash drive and a mouse reads 1.00x and is not worth
 a word. Two bases answer two questions: `link`, the default, takes the rates
 the devices have now, and `capability` takes what each says it could link
 at, bounded by the capacity of every hub above it so nothing under a USB 2

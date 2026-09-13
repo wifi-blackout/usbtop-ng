@@ -38,12 +38,14 @@ step; see Deferred.
   the `%busy` denominators already use (`UsbSpeed::class().efficiency()`:
   0.7 low, 0.8 full and high, 0.85 SuperSpeed and SuperSpeedPlus). A hub's
   demand is the sum over its children. A device of unknown rate contributes
-  nothing; a device the manager lists as disconnected is excluded; internal
-  devices count, they are traffic sources.
+  nothing at either basis, whatever its BOS advertises (nothing has been
+  negotiated for it to push), and a hub of unknown rate has no capacity to
+  be a stage and bounds nothing; a device the manager lists as disconnected
+  is excluded; internal devices count, they are traffic sources.
 - **Capacity.** A hub's capacity is its rate times the same factor.
 - **A choke point** is a hub whose demand divided by its capacity is at or
   above the **breathing room** of 1.25. Below that, an uplink is not
-  listed: a 480M hub carrying one flash drive and a mouse reads 1.03x, and
+  listed: a 480M hub carrying one flash drive and a mouse reads 1.00x, and
   the owner does not want to hear about it. The list is ordered worst
   first; each entry names how many devices sit below the hub and its three
   largest contributors.
@@ -55,14 +57,20 @@ step; see Deferred.
   link when it is a USB 2 half (a link at or below 480 never becomes more:
   the SuperSpeed capacity its BOS may advertise belongs to its other half,
   a different sysfs hub), and the larger of its link and its capability
-  when it is a SuperSpeed half (a 10G hub linked at 5G counts as 10G).
+  when it is a SuperSpeed half (a 10G hub linked at 5G counts as 10G),
+  never more than the port above it can give: under a 5G port that hub
+  stays 5G, since its link can never come up higher there, so a hub's
+  capacity is bounded by the hubs above it exactly as a leaf's rate is.
   Bounding the leaf keeps the view honest: the empty NVMe adapter on the
   dock's USB 2 half asks 480 of it, not 10G, because nothing under a USB 2
   half can push more, and its real fix (moving to the USB 3 half) is a
   call-out the findings already make. On the dock bundle the capability
   view therefore equals the link view; it differs where a SuperSpeed device
-  is linked below its capability under a SuperSpeed hub that has the room,
-  the cable cases.
+  or hub is linked below its capability under a port that has the room, the
+  cable cases. It can also read lower than the link view: a 10G hub linked
+  at 5G under a 10G port with two 5G devices is 2.0x at the link basis and
+  1.0x at the capability one, because the capability view answers what the
+  tree carries once that hub's link comes up.
 - **Recomputed every tick.** The TUI rebuilds its render model from the
   device manager every tick and the findings ride on that; the choke model
   is one walk over the same rows and rides on it too, so any device change
@@ -72,11 +80,16 @@ step; see Deferred.
   breathing room; ` | choke: 3.05x (cap)` at the capability basis. The
   choked hub's connector heading, on the connector the hub sits on (that
   connector is its link): `▶ Port 1 · bus 03 + 04 · hub · choke 3.05x
-  (1.17G asked of 384M)`. The `c` key toggles the basis; the controls line
-  gains `c Capacity basis`; the help overlay explains the counter, the
-  breathing room and the key.
+  (1.17G asked of 384M)`. The header counts only the choke points with a
+  row on screen, the hub's own or one below it, so the search query and
+  the idle filter clear it the way they clear `findings: N`; a connector
+  heading survives exactly when one of those rows does, so the two surfaces
+  agree. The `c` key toggles the basis; the controls line gains `c Capacity
+  basis`; the help overlay explains the counter, the breathing room, the
+  key, and that the capability basis can read lower.
 - **Reports.** `--demand link|capability` (default `link`) picks the basis
-  for `--once` and `--batch`. JSON (version stays 1, additive): top-level
+  for `--once` and `--batch`, and the basis the TUI starts at (`c` toggles
+  from there). JSON (version stays 1, additive): top-level
   `demand_basis` (`"link"` or `"capability"`), `choke_floor` (`1.25`, the
   breathing room, so a script sees the floor that was applied) and
   `chokepoints`, worst first: `bus`, `address`, `path` (the hub),
@@ -140,15 +153,18 @@ Output sorted by ratio descending, then path; only entries at or above
 Basis rules, exactly:
 
 - `rate(device, Link)` = its link rate.
-- `rate(device, Capability)` = the larger of its capability (when known)
-  and its link, then bounded: `min(rate, capacity_rate(hub))` for every hub
-  above it, applied as the walk descends. The `max` mirrors the hub rule: a
-  bcdUSB 3.x floor of 5 Gb/s never makes a device linked at 10 Gb/s ask for
-  less than it already asks.
+- `rate(device, Capability)` = zero when its link is unknown; else the
+  larger of its capability (when known) and its link, then bounded:
+  `min(rate, capacity_rate(hub))` for every hub above it, applied as the
+  walk descends. The `max` mirrors the hub rule: a bcdUSB 3.x floor of
+  5 Gb/s never makes a device linked at 10 Gb/s ask for less than it
+  already asks.
 - `capacity_rate(hub, Link)` = its link rate.
 - `capacity_rate(hub, Capability)` = its link rate when the link is at or
   below 480; else `max(link, capability)` when a capability is known, else
-  the link.
+  the link; then bounded by `capacity_rate` of every hub above it, applied
+  as the walk descends, exactly as a leaf's rate is. A hub of unknown rate
+  (zero) bounds nothing: the hubs below it keep the bound from above.
 - demand or capacity in Mb/s = rate times `class().efficiency()` of that
   rate; a rate of zero yields zero and a hub of zero capacity is never a
   choke point (division is guarded).
@@ -156,13 +172,16 @@ Basis rules, exactly:
 ### Surfaces
 
 - **TUI** (`src/ui/mod.rs`): `UsbTopApp` gains `demand_basis: Basis`
-  (default `Link`) and, per tick in `sync_from`, `chokepoints:
-  Vec<Chokepoint>`; `ConnectorView` gains `choke: Option<Chokepoint>`,
-  attached to the connector the hub sits on (matched by the hub's port
-  name, which `connector_placement` already knows); `header_lines`
-  renders the counter from the worst ratio; `connector_line` appends the
-  suffix; the `c` key flips the basis (`KeyOutcome::Redraw`; the next tick
-  recomputes); the help overlay and the controls line gain their text.
+  (from `--demand`, default `Link`) and, per tick in `sync_from`,
+  `chokepoints: Vec<Chokepoint>`, kept after the search and idle filters
+  to the hubs with a row on screen; `ConnectorView` gains `choke:
+  Option<Chokepoint>`, attached to the connector the hub sits on (matched
+  by the hub's port name, which `connector_placement` already knows; the
+  worse half's when both halves of a hub choke); `header_lines` renders
+  the counter from the worst ratio; `connector_line` appends the suffix;
+  the `c` key flips the basis (`KeyOutcome::Resync`, so the model is
+  rebuilt before the repaint); the help overlay and the controls line gain
+  their text.
 - **Headless** (`src/headless/mod.rs`, `src/main.rs`): `HeadlessOptions`
   gains `demand: Basis`; `build_report` gains the basis as a parameter (its
   24 call sites pass `Basis::Link`, the replay included, so goldens are
@@ -176,7 +195,7 @@ Basis rules, exactly:
 - `capacity`: synthetic trees through the findings tests' tempdir helper
   (moved to a shared `#[cfg(test)]` module so both use one): two 480M
   devices under a 480M hub (2.0x, listed, both named as contributors); a
-  480M flash drive and a 1.5M mouse under one (1.03x, not listed); a mouse
+  480M flash drive and a 1.5M mouse under one (1.00x, not listed); a mouse
   and a keyboard alone (0.03x); nested hubs (the parent's demand includes
   the child hub's whole subtree; the child hub is also its own entry when
   choked); the two halves of a USB 3 hub summed separately; an unknown-rate
@@ -185,17 +204,22 @@ Basis rules, exactly:
   10G hub (link 0.5x, capability 1.0x, neither listed), two of them (link
   1.0x, capability 2.0x listed only at capability), the adapter shape (a
   10G device under a 480 half stays bounded, 1.03x at both bases), a 10G
-  hub linked at 5G with two 10G devices (2.0x at both); top three of five
-  contributors; worst-first order with the path tie-break; the floor
-  exactly at 1.25 (listed) and just below (not).
+  hub linked at 5G with two 10G devices (2.0x at both), the same hub under
+  a 5G root port and under a 5G hub (its capacity stays 5G: 2.0x at both
+  bases), an unknown-link leaf with a readable BOS asking nothing and an
+  unknown-link hub bounding nothing; top three of five contributors;
+  worst-first order with the path tie-break; the floor exactly at 1.25
+  (listed) and just below (not).
 - Corpus: the dock bundle pins the table above at both bases; every golden
   is re-blessed once for the three additive keys and the diff verified
   additive with the jq check; bundles that gain entries (any hub with two
   480M devices) are read as model output and listed in the commit message.
 - `ui`: the header counter absent below the floor, present in the warning
-  colour, with `(cap)` after `c`; `c` flips `demand_basis` and redraws; the
-  connector heading suffix on the choked hub's connector and nowhere else;
-  the help overlay and controls texts.
+  colour, with `(cap)` after `c`; `c` flips `demand_basis` and resyncs; the
+  counter gone under a query that matches nothing and kept under one that
+  matches a device below the choked hub; `--demand` as the starting basis;
+  the connector heading suffix on the choked hub's connector and nowhere
+  else; the help overlay and controls texts.
 - `headless`: `--demand` parses both values and rejects others; the JSON
   shape with nulls where due; the text section with entries and with
   `none`; `demand_basis` follows the flag.

@@ -1532,7 +1532,10 @@ mod tests {
             &FilterSet::default(),
         );
         let text = render_text(&report);
-        assert!(text.contains("\nfindings: none\n"), "{text}");
+        assert!(
+            text.contains("\nfindings: none\nchokepoints:"),
+            "the findings section precedes the choke section: {text}"
+        );
     }
 
     #[test]

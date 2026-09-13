@@ -389,10 +389,11 @@ says, and the snapshot is the one list you control.
   can deliver. It is a model of the topology, not a measurement: no traffic
   is read, and the two sides are practical rates, the link rate times the
   same class efficiency factor the `%busy` denominators use, so a 480 Mbps
-  hub counts as 384M.
+  hub counts as 384M. A hub is any device that owns port objects or has
+  children; one with nothing below it asks nothing.
 - A hub is listed only at or above the **breathing room** of 1.25, meaning
   its subtree asks at least 1.25 times its capacity. Below that an uplink
-  stays quiet: a 480M hub carrying a flash drive and a mouse reads 1.03x,
+  stays quiet: a 480M hub carrying a flash drive and a mouse reads 1.00x,
   which is not worth a word.
 - The TUI puts `choke: N.NNx` in the header, the worst ratio on screen, and
   appends `· choke 3.05x (1.17G asked of 384M)` to the connector heading of
@@ -402,11 +403,13 @@ says, and the snapshot is the one list you control.
   sides. `capability` asks what the tree could carry: each device pushes the
   greater of what it says it supports and what it is linked at now, bounded
   by the capacity of every hub above it, and a SuperSpeed hub counts at the
-  larger of its link and its own capability. The bound keeps it honest —
-  nothing below a USB 2 half can push more than 480M whatever its BOS
-  advertises, and that device's real fix is the move the findings already
-  call out. `--demand link|capability` picks the basis for `--once` and
-  `--batch`.
+  larger of its link and its own capability, never more than the port above
+  it can give. The bound keeps it honest — nothing below a USB 2 half can
+  push more than 480M whatever its BOS advertises, and that device's real
+  fix is the move the findings already call out. A hub counted at its
+  capability has more room, so the capability view can read lower than the
+  link one. `--demand link|capability` picks the basis for `--once` and
+  `--batch`, and the one the TUI starts at.
 - `--once`/`--batch` text reports close with a `chokepoints:` section, one
   indented line per hub, `chokepoints: none` when nothing clears the floor:
   ```

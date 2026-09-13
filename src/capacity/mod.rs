@@ -13,7 +13,7 @@ use crate::usbmon::parser::{short_mbps, UsbSpeed};
 
 /// The breathing room: a hub is listed only when its subtree asks at least
 /// this many times its link's practical capacity. Below it, a 480M hub
-/// carrying a flash drive and a mouse (1.03x) stays quiet.
+/// carrying a flash drive and a mouse (1.00x) stays quiet.
 pub const CHOKE_FLOOR: f64 = 1.25;
 
 const HIGH_SPEED_MBPS: f64 = 480.0;
@@ -27,8 +27,8 @@ pub enum Basis {
     /// The rate each device has now, on both sides.
     #[default]
     Link,
-    /// The topology as it could link: a leaf's capability (bounded by the
-    /// hubs above it), a SuperSpeed hub's capability as its capacity.
+    /// The topology as it could link: a leaf's capability and a SuperSpeed
+    /// hub's capability as its capacity, each bounded by the hubs above it.
     Capability,
 }
 
@@ -105,16 +105,23 @@ fn practical(rate_mbps: f64) -> f64 {
     rate_mbps * speed.class().efficiency()
 }
 
-/// The rate a hub's link is taken to carry, in Mb/s, before efficiency.
-fn capacity_rate(node: &Node, basis: Basis) -> f64 {
+/// The rate a hub's link is taken to carry, in Mb/s, before efficiency: at
+/// the capability basis never more than `bound`, the tightest capacity rate
+/// of the hubs above it, because a hub's link cannot come up faster than
+/// the port it is plugged into (a 10G hub under a 5G port links at 5G,
+/// whatever its BOS says). An unknown link is zero at both bases.
+fn capacity_rate(node: &Node, basis: Basis, bound: f64) -> f64 {
     match basis {
         Basis::Link => node.link,
         // A USB 2 half is 480 whatever its BOS says (the SuperSpeed
         // capability it advertises belongs to its other half, a different
         // sysfs hub); a SuperSpeed half linked below its capability counts
         // at that capability.
-        Basis::Capability if node.link <= HIGH_SPEED_MBPS => node.link,
-        Basis::Capability => node.capability.map_or(node.link, |c| c.max(node.link)),
+        Basis::Capability if node.link <= HIGH_SPEED_MBPS => node.link.min(bound),
+        Basis::Capability => node
+            .capability
+            .map_or(node.link, |c| c.max(node.link))
+            .min(bound),
     }
 }
 
@@ -127,6 +134,9 @@ fn capacity_rate(node: &Node, basis: Basis) -> f64 {
 fn leaf_rate(node: &Node, basis: Basis, bound: f64) -> f64 {
     match basis {
         Basis::Link => node.link,
+        // An unknown link asks nothing at either basis: nothing has been
+        // negotiated for the device to push, whatever its BOS advertises.
+        Basis::Capability if node.link <= 0.0 => 0.0,
         Basis::Capability => node
             .capability
             .unwrap_or(node.link)
@@ -163,10 +173,15 @@ fn walk(
         };
         return (demand, 0, contributors);
     }
-    let rate = capacity_rate(node, basis);
+    let rate = capacity_rate(node, basis, bound);
+    // What the hubs and leaves below are bounded by: at the capability
+    // basis this hub's own rate, itself bounded from above. A hub of
+    // unknown rate bounds nothing, so the hubs above it still see the
+    // demand that crosses them.
     let inner_bound = match basis {
         Basis::Link => bound,
-        Basis::Capability => bound.min(rate),
+        Basis::Capability if rate > 0.0 => rate,
+        Basis::Capability => bound,
     };
     let mut demand = 0.0;
     let mut devices = 0;
@@ -553,6 +568,63 @@ mod tests {
             summary(&choke(&t, Basis::Capability)),
             vec![("2-1", 8500.0, 17000.0, 2.0, 2)]
         );
+    }
+
+    #[test]
+    fn a_hub_never_gains_more_capacity_than_the_port_above_it() {
+        // The same 10G hub linked at 5G, now under a 5G root port: its link
+        // can never come up at 10G there, so the capability basis keeps it
+        // at 5G and the two 5G devices below still choke it at 2.0x.
+        let t = Tree::new();
+        root(&t, 2, "5000", 1);
+        hub(&t, "2-1", "5000", Some(SSP), 4);
+        t.device("2-1.1", "5000", Some("3.20"), Some(SSP));
+        t.device("2-1.2", "5000", Some("3.20"), Some(SSP));
+        let expected = vec![("2-1", 4250.0, 8500.0, 2.0, 2)];
+        assert_eq!(summary(&choke(&t, Basis::Link)), expected);
+        assert_eq!(summary(&choke(&t, Basis::Capability)), expected);
+        // The bound passes through a hub in between: a 5G hub on a 10G root
+        // port caps the 10G hub below it the way the root port did above.
+        let t = Tree::new();
+        root(&t, 2, "10000", 1);
+        hub(&t, "2-1", "5000", Some(SS), 4);
+        hub(&t, "2-1.1", "5000", Some(SSP), 4);
+        t.device("2-1.1.1", "5000", Some("3.20"), Some(SSP));
+        t.device("2-1.1.2", "5000", Some("3.20"), Some(SSP));
+        assert_eq!(
+            summary(&choke(&t, Basis::Capability)),
+            vec![
+                ("2-1", 4250.0, 8500.0, 2.0, 3),
+                ("2-1.1", 4250.0, 8500.0, 2.0, 2)
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_link_asks_nothing_and_bounds_nothing_at_the_capability_basis() {
+        // A leaf whose link is unknown but whose BOS is readable is not a
+        // traffic source: nothing has been negotiated for it to push.
+        let t = Tree::new();
+        root(&t, 2, "10000", 1);
+        hub(&t, "2-1", "5000", Some(SS), 4);
+        t.device("2-1.1", "5000", Some("3.00"), Some(SS));
+        t.device("2-1.2", "0", Some("3.00"), Some(SS)); // rate unknown
+        assert!(
+            choke(&t, Basis::Capability).is_empty(),
+            "one 5G device: 1.0x"
+        );
+        // A hub whose link is unknown has no capacity of its own to be a
+        // stage, and it bounds nothing: the hubs above it still weigh the
+        // demand that crosses them.
+        let t = Tree::new();
+        root(&t, 2, "10000", 1);
+        hub(&t, "2-1", "5000", Some(SS), 4);
+        hub(&t, "2-1.1", "0", Some(SS), 4); // rate unknown
+        t.device("2-1.1.1", "5000", Some("3.00"), Some(SS));
+        t.device("2-1.1.2", "5000", Some("3.00"), Some(SS));
+        let expected = vec![("2-1", 4250.0, 8500.0, 2.0, 3)];
+        assert_eq!(summary(&choke(&t, Basis::Link)), expected);
+        assert_eq!(summary(&choke(&t, Basis::Capability)), expected);
     }
 
     #[test]

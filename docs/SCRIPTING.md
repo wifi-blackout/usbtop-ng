@@ -72,9 +72,9 @@ anything, so both are safe inside a script or a cron job.
 choke-point model assumes every device pushes, for `--once` and `--batch`;
 the chosen basis rides in the report as `demand_basis`, and any other value
 is rejected. Unlike `--window`, `--json`, and `--output`, it is accepted
-without `--once` or `--batch` and simply has nothing to act on there: the
-TUI always starts at the link basis, and its `c` key toggles the basis live.
-See [The chokepoints list](#the-chokepoints-list).
+without `--once` or `--batch`: there it is the basis the TUI starts at, and
+the `c` key toggles the basis live from it. See
+[The chokepoints list](#the-chokepoints-list).
 
 ## `--json`
 
@@ -181,7 +181,7 @@ carry, ordered by `ratio` descending and then by `path`:
 | `bus` | u8 | bus number |
 | `address` | u8 | the hub's USB device number |
 | `path` | string | the hub's sysfs name, `3-1` |
-| `port` | string? | the kernel port object the hub's own link is, `usb3-port1` — the same key `findings[].port` carries, so a script can join the two lists; `null` when the connector index does not know it |
+| `port` | string? | the kernel port object the hub's own link is, `usb3-port1` — the same key `findings[].port` carries, so a script can join the two lists; derived from the hub's sysfs name, so it is set on every entry the model emits, and nullable only in the schema |
 | `capacity_mbps` | f64 | what the hub's link can carry, in Mbps, after the class efficiency factor |
 | `demand_mbps` | f64 | what the devices below it would ask of that link, in Mbps, after the same factor |
 | `ratio` | f64 | `demand_mbps` divided by `capacity_mbps`; at or above `choke_floor` on every entry |
@@ -490,7 +490,7 @@ is linked below its sibling half.
 `choke_floor` is the breathing room, `1.25`. A hub is listed only when its
 subtree asks at least 1.25 times its capacity; below that the model is
 noise, since a 480M hub carrying a flash drive and a mouse already reads
-1.03x. The floor rides in every report so a script sees the one that was
+1.00x. The floor rides in every report so a script sees the one that was
 applied rather than assuming it.
 
 `demand_basis` says which rate each device was assumed to push, and
@@ -501,8 +501,10 @@ applied rather than assuming it.
 - `capability` uses the larger of the rate each device says it could link
   at -- the same BOS figure the findings use -- and the rate it is linked at
   now, bounded by the capacity of every hub above it, and takes a SuperSpeed
-  hub's capacity as the larger of its link and its own capability, so a
-  10 Gbps hub linked at 5 Gbps counts as 10 Gbps. The larger of the two is
+  hub's capacity as the larger of its link and its own capability, bounded
+  the same way, so a 10 Gbps hub linked at 5 Gbps counts as 10 Gbps under a
+  port that can give 10 Gbps and stays 5 Gbps under one that cannot. The
+  larger of the two is
   what the bcdUSB fallback needs: a 5 Gbps floor read from bcdUSB 3.x must
   never make a device already linked at 10 Gbps ask for less than it asks
   today.
@@ -512,8 +514,13 @@ applied rather than assuming it.
   call-out the findings already make, not something this model simulates.
   A USB 2 half's own capacity is likewise its link and never its BOS
   figure, because the SuperSpeed capability such a hub advertises belongs
-  to its other half, a different sysfs hub. Where every device is already
-  linked at what it supports, the two bases give the same list.
+  to its other half, a different sysfs hub. The two bases differ only where
+  a device or a SuperSpeed hub is linked below its capability under a port
+  that has the room, and the capability one can read lower: a 10 Gbps hub
+  linked at 5 Gbps under a 10 Gbps port with two 5 Gbps devices is 2.00x at
+  `link` and 1.00x at `capability`, because that view answers what the tree
+  carries once the hub's link comes up. A device or hub of unknown link
+  rate asks nothing and bounds nothing at either basis.
 
 `--filter` narrows `chokepoints` the way it narrows `findings`, at the list
 and not in the model: the walk always covers the whole device tree, so a

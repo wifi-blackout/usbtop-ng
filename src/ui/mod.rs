@@ -346,6 +346,13 @@ impl UsbTopApp {
         self
     }
 
+    /// Start the choke-point model at `basis` (`--demand`); `c` toggles
+    /// from there.
+    pub fn with_demand_basis(mut self, basis: Basis) -> Self {
+        self.demand_basis = basis;
+        self
+    }
+
     /// Attach where `y` inside the snapshot confirmation prompt writes the
     /// capture (see [`Self::snapshot_dest`]). Preserves the builder style of
     /// [`Self::with_dropped_counter`]. The caller skips this call entirely
@@ -541,6 +548,7 @@ impl UsbTopApp {
         // Once, after every retention pass: no bare heading survives, and
         // every total reflects only the rows still shown.
         self.prune_empty_groups();
+        self.retain_visible_chokepoints();
         self.recompute_rates();
 
         if let Some(selected) = &self.selected_device {
@@ -560,9 +568,31 @@ impl UsbTopApp {
     }
 
     /// The worst choke ratio on screen, when any hub is at or above the
-    /// breathing room; the list is worst first.
+    /// breathing room; the list is worst first and, by the time the header
+    /// reads it, holds only the hubs with a row on screen (see
+    /// [`Self::retain_visible_chokepoints`]).
     pub fn worst_choke(&self) -> Option<f64> {
         self.chokepoints.first().map(|c| c.ratio)
+    }
+
+    /// Keep only the choke points with a row on screen: the hub itself or
+    /// any device below it. The search query and the idle filter drop rows
+    /// after the model is built, and a counter with nothing on screen to
+    /// attribute it to would read as a bug; a connector heading survives
+    /// exactly when one of those rows does, so the two surfaces agree.
+    fn retain_visible_chokepoints(&mut self) {
+        let names: Vec<String> = self
+            .controllers
+            .iter()
+            .flat_map(ControllerView::rows)
+            .filter_map(|row| sysfs_name(&row.device).map(str::to_string))
+            .collect();
+        self.chokepoints.retain(|choke| {
+            names.iter().any(|name| {
+                name.strip_prefix(choke.path.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+            })
+        });
     }
 
     /// Device keys ("bus:dev") flattened in render order.
@@ -1996,7 +2026,8 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from("  • ⚡ high-utilization indicator (>80% of practical bandwidth)"),
         Line::from("  • 🔺 linked below the speed it supports; the line beneath says why"),
         Line::from("  • Header shows 'choke: N.NNx' when a hub's link is asked at least 1.25x its capacity"),
-        Line::from("    (the breathing room) by the devices below it; '(cap)' marks the capability basis"),
+        Line::from("    (the breathing room) by the devices below it; '(cap)' marks the capability basis,"),
+        Line::from("    where a SuperSpeed hub with room counts at its capability, so a ratio can drop"),
         Line::from("  • Header shows 'dropped: N' if packets were lost to a full queue"),
         Line::from("  • Header shows 'kdropped: N' if the kernel's usbmon ring dropped packets"),
         Line::from("  • Header shows 'shed: N' if frames were dropped to keep up with a slow"),
@@ -2415,6 +2446,29 @@ mod tests {
         assert!(header_lines(&app)[1].to_string().contains("2.00x (cap)"));
         apply_key(&mut app, KeyEvent::from(KeyCode::Char('c')));
         assert_eq!(app.demand_basis, Basis::Link);
+    }
+
+    #[test]
+    fn the_header_choke_follows_the_rows_on_screen() {
+        // A query that matches nothing empties the table and the counter
+        // goes with it; one that matches only a device below the choked
+        // hub keeps the counter, since that row is what it is about.
+        let (_temp, mgr) = choked_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Committed("no such device".to_string());
+        app.sync_from(&mgr);
+        assert_eq!(app.worst_choke(), None);
+        assert!(!header_lines(&app)[1].to_string().contains("choke"));
+        app.search = SearchState::Committed("003:021".to_string());
+        app.sync_from(&mgr);
+        assert_eq!(rows(&app).len(), 1, "one device below the hub survives");
+        assert_eq!(app.worst_choke(), Some(2.0));
+    }
+
+    #[test]
+    fn the_demand_flag_seeds_the_basis_the_tui_starts_at() {
+        let app = UsbTopApp::new(Duration::from_millis(100)).with_demand_basis(Basis::Capability);
+        assert_eq!(app.demand_basis, Basis::Capability);
     }
 
     #[test]
