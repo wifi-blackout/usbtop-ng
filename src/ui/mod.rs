@@ -1342,7 +1342,9 @@ const DEVICE_COLUMNS: [usize; 9] = [8, 8, 10, 14, 18, 10, 10, 7, 3];
 
 /// Where a finding's reason line starts: the Device column's own offset
 /// (Port's width plus the one-space separator after it), so the reason
-/// text lines up under Device the way an endpoint row's label does.
+/// text lines up under Device the way an endpoint row's label does. A
+/// count of characters, which equals a count of cells here because the
+/// Port cell is ASCII (digits, dots, `-`, `?`).
 const FINDING_INDENT: usize = DEVICE_COLUMNS[0] + 1;
 
 /// One padded cell per column, separated by single-space spans. Columns are

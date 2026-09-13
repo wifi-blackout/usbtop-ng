@@ -124,17 +124,17 @@
           "capability_source": null,
           "endpoints": [
             {
-              "bps": 193451201.0,
+              "bps": 193082548.0,
               "direction": "in",
               "endpoint": 1,
-              "total_bytes": 193451201,
+              "total_bytes": 193082548,
               "transfer_type": "bulk"
             },
             {
-              "bps": 51770.0,
+              "bps": 51739.0,
               "direction": "out",
               "endpoint": 2,
-              "total_bytes": 51770,
+              "total_bytes": 51739,
               "transfer_type": "bulk"
             }
           ],
@@ -143,11 +143,11 @@
           "port": "1.4.1",
           "product": "FlashDisk",
           "product_id": "0201",
-          "rx_bps": 193451201.0,
+          "rx_bps": 193082548.0,
           "speed_mbps": 480.0,
-          "total_rx_bytes": 193451201,
-          "total_tx_bytes": 51770,
-          "tx_bps": 51770.0,
+          "total_rx_bytes": 193082548,
+          "total_tx_bytes": 51739,
+          "tx_bps": 51739.0,
           "vendor": "USB2.0",
           "vendor_id": "1aa6"
         },
@@ -346,9 +346,9 @@
           "vendor_id": "8087"
         }
       ],
-      "rx_bps": 193452051.0,
+      "rx_bps": 193083398.0,
       "speed_mbps": 480.0,
-      "tx_bps": 52080.0
+      "tx_bps": 52049.0
     },
     {
       "bus": 4,
@@ -655,8 +655,8 @@
   ],
   "kernel_dropped_packets": 0,
   "source": "binary",
-  "total_rx_bps": 193453491.0,
-  "total_tx_bps": 52080.0,
+  "total_rx_bps": 193084838.0,
+  "total_tx_bps": 52049.0,
   "version": 1,
   "window_seconds": 1.0
 }
