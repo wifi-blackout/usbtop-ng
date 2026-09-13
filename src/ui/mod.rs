@@ -704,9 +704,11 @@ impl UsbTopApp {
         trailing: usize,
         visible_height: u16,
     ) {
+        // Line counts saturate into the u16 scroll offset rather than wrap.
+        let clamp = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
         if let Some(index) = selected_line {
-            let index = index as u16;
-            let last = index.saturating_add(trailing as u16);
+            let index = clamp(index);
+            let last = index.saturating_add(clamp(trailing));
             if index < self.list_scroll {
                 self.list_scroll = index;
             } else if visible_height > 0 && last >= self.list_scroll.saturating_add(visible_height)
@@ -717,7 +719,7 @@ impl UsbTopApp {
             }
         }
 
-        let max_scroll = (total_lines as u16).saturating_sub(visible_height);
+        let max_scroll = clamp(total_lines).saturating_sub(visible_height);
         self.list_scroll = self.list_scroll.min(max_scroll);
     }
 
@@ -725,13 +727,20 @@ impl UsbTopApp {
     /// reason line, plus one per endpoint row (see `push_device_row`). Zero
     /// when nothing is selected.
     fn selected_row_trailing_lines(&self) -> usize {
-        let Some(selected) = &self.selected_device else {
+        // The key is `bus:dev` (see `device_keys`); parse it once instead of
+        // formatting one string per row on every frame.
+        let Some((bus, device)) = self
+            .selected_device
+            .as_deref()
+            .and_then(|key| key.split_once(':'))
+            .and_then(|(bus, device)| Some((bus.parse::<u8>().ok()?, device.parse::<u8>().ok()?)))
+        else {
             return 0;
         };
         self.controllers
             .iter()
             .flat_map(ControllerView::rows)
-            .find(|row| format!("{}:{}", row.device.bus_id, row.device.device_id) == *selected)
+            .find(|row| row.device.bus_id == bus && row.device.device_id == device)
             .map_or(0, |row| {
                 usize::from(row.finding.is_some()) + row.device.endpoints.len()
             })
@@ -4323,6 +4332,16 @@ mod tests {
         app.list_scroll = 0;
         app.follow_selection_in_list(40, Some(10), 2, 4);
         assert_eq!(app.list_scroll, 9);
+        // The row already visible (window 7..=10) but its two trailing lines
+        // cut off: the window moves just enough to show them.
+        app.list_scroll = 7;
+        app.follow_selection_in_list(40, Some(9), 2, 4);
+        assert_eq!(app.list_scroll, 8);
+        // Nothing selected, or a block already fully visible: untouched.
+        app.follow_selection_in_list(40, None, 0, 4);
+        assert_eq!(app.list_scroll, 8);
+        app.follow_selection_in_list(40, Some(9), 2, 4);
+        assert_eq!(app.list_scroll, 8);
     }
 
     #[test]
