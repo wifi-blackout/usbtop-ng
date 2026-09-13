@@ -167,12 +167,14 @@ treats them alike.
 
 #### 4c. Capacity (`capacity/`)
 
-- `mod.rs`: `analyze(&DeviceManager, Basis) -> Vec<Chokepoint>`, the
-  theoretical load every hub's link would carry if every device below it
-  pushed what it can. Pure over the manager's rows, like the findings
-  engine, and without even a port index: each device's parent hub comes from
-  its sysfs name (`connector::port_of_device`), a hub is any device with
-  children, and one depth-first walk per root hub sums each subtree once.
+- `mod.rs`: `analyze(&DeviceManager, &PortIndex, Basis) -> Vec<Chokepoint>`,
+  the theoretical load every hub's link would carry if every device below it
+  pushed what it can. Pure over the manager's rows and the port index, like
+  the findings engine, and with no reads of its own: each device's parent
+  hub comes from its sysfs name (`connector::port_of_device`), a hub is any
+  device that owns port objects or has children — an empty hub is a hub that
+  asks nothing, not a leaf asking its link rate — and one depth-first walk
+  per root hub sums each subtree once.
 - A hub's own link is the only stage. A root hub bounds its subtree but is
   never an entry of its own, since everything below a hub already crosses
   that hub's link and the root port above it would read the same number; the

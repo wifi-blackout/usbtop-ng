@@ -483,7 +483,9 @@ everything below a hub crosses that hub's link, and the root port above it
 would always carry the identical number. The USB 2 and USB 3 halves of one
 physical hub are two devices in sysfs with two links, so their subtrees are
 summed separately without any pairing: a USB 2 mouse under a USB 3 hub
-loads the 480M half, a 5 Gbps camera the SuperSpeed one.
+loads the 480M half, a 5 Gbps camera the SuperSpeed one. A hub with nothing
+plugged into it asks nothing and is never an entry, whether or not anything
+is linked below its sibling half.
 
 `choke_floor` is the breathing room, `1.25`. A hub is listed only when its
 subtree asks at least 1.25 times its capacity; below that the model is
@@ -496,10 +498,14 @@ applied rather than assuming it.
 
 - `link`, the default, uses the rate every device has now, on both sides.
   It answers "is the tree as it stands oversubscribed".
-- `capability` uses the rate each device says it could link at -- the same
-  BOS figure the findings use -- bounded by the capacity of every hub above
-  it, and takes a SuperSpeed hub's capacity as the larger of its link and
-  its own capability, so a 10 Gbps hub linked at 5 Gbps counts as 10 Gbps.
+- `capability` uses the larger of the rate each device says it could link
+  at -- the same BOS figure the findings use -- and the rate it is linked at
+  now, bounded by the capacity of every hub above it, and takes a SuperSpeed
+  hub's capacity as the larger of its link and its own capability, so a
+  10 Gbps hub linked at 5 Gbps counts as 10 Gbps. The larger of the two is
+  what the bcdUSB fallback needs: a 5 Gbps floor read from bcdUSB 3.x must
+  never make a device already linked at 10 Gbps ask for less than it asks
+  today.
   The bound is what keeps the view honest: nothing below a USB 2 half can
   push more than 480 Mbps whatever its own BOS advertises, so a 10 Gbps
   drive plugged into one asks 480 of it and not 10000 -- moving it is the

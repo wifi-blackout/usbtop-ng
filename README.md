@@ -399,13 +399,14 @@ says, and the snapshot is the one list you control.
   the hub whose link is choked — that connector is the link. `c` toggles the
   basis, and the header reads `choke: N.NNx (cap)` at the capability one.
 - Two bases. `link`, the default, uses the rate every device has now on both
-  sides. `capability` asks what the tree could carry: each device pushes
-  what it says it supports, bounded by the capacity of every hub above it,
-  and a SuperSpeed hub counts at the larger of its link and its own
-  capability. The bound is what keeps it honest — nothing below a USB 2 half
-  can push more than 480M whatever its BOS advertises, and that device's real
-  fix is the move the findings already call out. `--demand link|capability`
-  picks the basis for `--once` and `--batch`.
+  sides. `capability` asks what the tree could carry: each device pushes the
+  greater of what it says it supports and what it is linked at now, bounded
+  by the capacity of every hub above it, and a SuperSpeed hub counts at the
+  larger of its link and its own capability. The bound keeps it honest —
+  nothing below a USB 2 half can push more than 480M whatever its BOS
+  advertises, and that device's real fix is the move the findings already
+  call out. `--demand link|capability` picks the basis for `--once` and
+  `--batch`.
 - `--once`/`--batch` text reports close with a `chokepoints:` section, one
   indented line per hub, `chokepoints: none` when nothing clears the floor:
   ```
