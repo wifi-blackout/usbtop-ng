@@ -183,12 +183,14 @@ device whose capability exceeds a known link speed can produce a finding.
    on the SuperSpeed side at all and the half is *missing*. Otherwise a
    hub *claims* a half when the reciprocal kernel peer of its own port
    holds a present **hub** and the pairing can be trusted to mean one
-   receptacle: always under a root hub (root ports pair by the
-   controller's raw port numbers), and under another hub only when the
-   two hubs share an `idVendor` where both are known, because the kernel
-   pairs a hub's downstream ports by number alone and a hub whose halves
-   number their ports differently pairs unrelated receptacles. A plain
-   device on the peer port claims nothing. Let A be the members of the
+   receptacle: under a root hub (root ports pair by the controller's raw
+   port numbers), or when both ports carry a nonzero `location` (the
+   firmware's ACPI position, which `find_and_link_peer` pairs by). The
+   kernel's default under a hub pairs downstream ports by number alone,
+   which joins unrelated receptacles on a hub whose halves number their
+   ports differently; such a pairing is a guess and claims nothing, and a
+   vendor match is no evidence either (two hubs of one vendor swap the
+   same way). A plain device on the peer port claims nothing. Let A be the members of the
    USB 2 side (present hubs on P2 at or below 480 Mb/s with a known
    capability above it) that claim nothing, and B the members of B0 that
    nothing claims. When both have exactly one member and the two agree on

@@ -224,22 +224,26 @@ impl<'a> Topology<'a> {
     }
 
     /// The present hub on the reciprocal kernel peer of `hub`'s own port,
-    /// when that pairing can be trusted to mean one receptacle: always
-    /// under a root hub (root ports pair by the controller's raw port
-    /// numbers), and under another hub only when the two hubs share a
-    /// vendor, because the kernel pairs a hub's downstream ports by number
-    /// alone and a hub whose halves number their ports differently pairs
-    /// unrelated receptacles (the dock's outer hub does exactly that).
+    /// when that pairing can be trusted to mean one receptacle: under a
+    /// root hub (root ports pair by the controller's raw port numbers), or
+    /// when both ports carry the firmware's ACPI position (a nonzero
+    /// `location`, the case `find_and_link_peer` pairs by `match_location`).
+    /// A pairing made by port number alone, the kernel's default under a
+    /// hub, joins unrelated receptacles on a hub whose halves number their
+    /// ports differently (the dock's outer hub does exactly that), and a
+    /// vendor match is no evidence either: two hubs of one vendor swap the
+    /// same way. Such a peer is a guess, and a guess claims nothing.
     fn claimed_half(&self, hub: &str) -> Option<&'a Row<'a>> {
+        let (parent, number) = port_of_device(hub)?;
         let peer = self.peer_port_of(hub)?;
         let dev = self.device_on_port(&peer)?;
         if !self.ports.is_hub(dev.name) {
             return None;
         }
-        let (parent, _) = port_of_device(hub)?;
         let under_root = port_of_device(&parent).is_none();
-        let row = self.present(hub)?;
-        (under_root || row.vendor_agrees_with(dev)).then_some(dev)
+        let located = |port: &str| self.ports.get(port).is_some_and(|p| p.located);
+        let by_location = located(&port_name(&parent, number)) && located(&peer);
+        (under_root || by_location).then_some(dev)
     }
 
     /// The present hubs attached to `parent`'s ports, in row order.
@@ -621,6 +625,12 @@ mod tests {
             std::os::unix::fs::symlink(a, b.join("peer")).unwrap();
         }
 
+        /// The firmware's ACPI position of a port, as sysfs prints it; a
+        /// nonzero value marks a pairing the kernel made by location.
+        fn locate(&self, port_dir: &Path, location: u32) {
+            std::fs::write(port_dir.join("location"), format!("0x{location:08x}\n")).unwrap();
+        }
+
         fn analyze(&self) -> Vec<Finding> {
             let mut manager = DeviceManager::with_sysfs_base(self.base());
             manager.enumerate_present_devices();
@@ -832,13 +842,80 @@ mod tests {
         assert_eq!(causes(&t.analyze()), vec![]);
     }
 
+    /// The dock shape with an unrelated SuperSpeed hub of the same vendor on
+    /// the outer hub's SuperSpeed port 1, the port the kernel pairs by
+    /// number with the inner hub's USB 2 half, and a healthy nested hub
+    /// below the inner one. A by-number pairing under a hub claims
+    /// nothing, and two candidates a side are ambiguity: neither hub is
+    /// convicted, and the device stuck under the nested hub gets no cause.
+    #[test]
+    fn a_same_vendor_hub_on_the_wrongly_paired_port_leaves_the_pairing_ambiguous() {
+        let t = Tree::new();
+        let usb5 = t.root_hub(5, "480");
+        let usb6 = t.root_hub(6, "10000");
+        t.pair(&t.port(&usb5, "usb5", 1), &t.port(&usb6, "usb6", 1));
+        let outer2 = t.device_of_vendor("5-1", "480", Some("2.10"), None, 0x2188);
+        let outer3 = t.device_of_vendor("6-1", "10000", Some("3.20"), Some(SSP), 0x8087);
+        for n in 1..=4 {
+            t.pair(&t.port(&outer2, "5-1", n), &t.port(&outer3, "6-1", n));
+        }
+        let inner2 = t.device_of_vendor("5-1.1", "480", Some("2.10"), Some(SSP), 0x2188);
+        let inner3 = t.device_of_vendor("6-1.4", "10000", Some("3.20"), Some(SSP), 0x2188);
+        for n in 1..=4 {
+            t.port(&inner2, "5-1.1", n);
+            t.port(&inner3, "6-1.4", n);
+        }
+        // The unrelated same-vendor SuperSpeed hub, USB 2 half not enumerated.
+        let stray = t.device_of_vendor("6-1.1", "5000", Some("3.00"), Some(SS), 0x2188);
+        t.port(&stray, "6-1.1", 1);
+        // A healthy nested hub on the inner hub's port 2, both halves up,
+        // and a SuperSpeed device stuck at High Speed below its USB 2 half.
+        let nested2 = t.device_of_vendor("5-1.1.2", "480", Some("2.10"), Some(SS), 0x0bda);
+        let nested3 = t.device_of_vendor("6-1.4.2", "5000", Some("3.00"), Some(SS), 0x0bda);
+        t.port(&nested2, "5-1.1.2", 1);
+        t.port(&nested3, "6-1.4.2", 1);
+        t.device("5-1.1.2.1", "480", Some("2.10"), Some(SS));
+        assert_eq!(causes(&t.analyze()), vec![("5-1.1.2.1", None)]);
+    }
+
+    /// A pairing the kernel made by ACPI location is physical evidence:
+    /// two hubs of different vendors on located, paired ports under a hub
+    /// are halves of one hub, and a device stuck below them names its own
+    /// kernel peer.
+    #[test]
+    fn a_location_paired_hub_port_is_trusted_under_a_hub() {
+        let t = Tree::new();
+        let (usb3, usb4) = paired_roots(&t, 1);
+        let _ = (usb3, usb4);
+        let hub2 = t.device("3-1", "480", Some("2.10"), Some(SS));
+        let hub3 = t.device("4-1", "5000", Some("3.00"), Some(SS));
+        let p2 = t.port(&hub2, "3-1", 2);
+        let p3 = t.port(&hub3, "4-1", 2);
+        t.pair(&p2, &p3);
+        t.locate(&p2, 0x0000_000a);
+        t.locate(&p3, 0x0000_000a);
+        let child2 = t.device_of_vendor("3-1.2", "480", Some("2.10"), Some(SS), 0x1111);
+        let child3 = t.device_of_vendor("4-1.2", "5000", Some("3.00"), Some(SS), 0x2222);
+        t.pair(&t.port(&child2, "3-1.2", 1), &t.port(&child3, "4-1.2", 1));
+        t.device("3-1.2.1", "480", Some("2.10"), Some(SS));
+        assert_eq!(
+            causes(&t.analyze()),
+            vec![(
+                "3-1.2.1",
+                Some(&Cause::SuperSpeedSideEmpty {
+                    peer_port: "4-1.2-port1".into()
+                })
+            )]
+        );
+    }
+
     /// The dock shape with a USB 2 only hub of another vendor on the outer
     /// hub's port 4, the port the kernel pairs by number with the inner
-    /// hub's SuperSpeed half. A vendor that differs cannot claim that half,
-    /// so the inner hub stays matched and nothing is convicted wrongly; the
-    /// USB 2 only hub's own child is held by it, and says so.
+    /// hub's SuperSpeed half. That pairing carries no location, so it
+    /// claims nothing: the inner hub stays matched and nothing is convicted
+    /// wrongly; the USB 2 only hub's own child is held by it, and says so.
     #[test]
-    fn a_hub_of_another_vendor_on_the_wrongly_paired_port_claims_nothing() {
+    fn a_usb2_only_hub_on_the_wrongly_paired_port_claims_nothing() {
         let t = Tree::new();
         let usb5 = t.root_hub(5, "480");
         let usb6 = t.root_hub(6, "10000");

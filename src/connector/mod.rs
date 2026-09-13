@@ -27,6 +27,12 @@ pub struct PortInfo {
     pub number: u32,
     /// The companion port's name, from the `peer` link, when there is one.
     pub peer: Option<String>,
+    /// Whether the firmware states the port's position: sysfs `location`
+    /// (the ACPI `_PLD` value `port.c` prints as `0x%08x`) is nonzero. The
+    /// kernel pairs such a port with its companion by matching locations
+    /// (`match_location`); a port without one is paired by number alone,
+    /// which under a hub is a guess the findings engine does not trust.
+    pub located: bool,
 }
 
 /// A port as a physical position: its name, the bus it is on, and its
@@ -113,6 +119,13 @@ impl PortIndex {
                     .and_then(|target| {
                         target.file_name().map(|f| f.to_string_lossy().into_owned())
                     });
+                let located = std::fs::read_to_string(entry.path().join("location"))
+                    .ok()
+                    .and_then(|raw| {
+                        let raw = raw.trim();
+                        u32::from_str_radix(raw.strip_prefix("0x").unwrap_or(raw), 16).ok()
+                    })
+                    .is_some_and(|location| location != 0);
                 self.hubs.insert(device.to_string());
                 self.ports.insert(
                     name,
@@ -120,6 +133,7 @@ impl PortIndex {
                         hub: device.to_string(),
                         number,
                         peer,
+                        located,
                     },
                 );
             }
@@ -386,6 +400,28 @@ mod tests {
         assert_eq!(port_name("3-1.4", 2), "3-1.4-port2");
     }
 
+    /// `location` as `port.c` prints it, `0x%08x`: nonzero marks a port the
+    /// firmware places, zero or absent one it does not.
+    #[test]
+    fn a_port_is_located_only_by_a_nonzero_location() {
+        let t = paired_tree();
+        let base = t.base();
+        std::fs::write(
+            base.join("usb3/usb3:1.0/usb3-port1/location"),
+            "0x0000000a\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("usb3/usb3:1.0/usb3-port2/location"),
+            "0x00000000\n",
+        )
+        .unwrap();
+        let index = PortIndex::scan(&base);
+        assert!(index.get("usb3-port1").unwrap().located);
+        assert!(!index.get("usb3-port2").unwrap().located, "zero");
+        assert!(!index.get("3-1-port1").unwrap().located, "absent");
+    }
+
     #[test]
     fn device_name_of_port_inverts_port_of_device() {
         for name in ["3-1", "3-1.4", "3-1.4.2", "12-10.3"] {
@@ -423,6 +459,7 @@ mod tests {
                 hub: "usb3".to_string(),
                 number: 1,
                 peer: Some("usb4-port1".to_string()),
+                located: false,
             })
         );
         assert_eq!(
@@ -431,6 +468,7 @@ mod tests {
                 hub: "usb3".to_string(),
                 number: 2,
                 peer: None,
+                located: false,
             })
         );
         assert_eq!(
