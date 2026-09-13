@@ -154,11 +154,13 @@ pub fn rate_capabilities_only(bytes: &[u8]) -> Vec<u8> {
         .flatten()
         .filter(|cap| states_a_rate(cap))
         .collect();
-    // A BOS is at most 65535 bytes and holds at most 255 capabilities, and
-    // the walk never yields more than the original held.
+    // The walk reads at most `wTotalLength` bytes, so the kept total always
+    // fits the header's u16; a hostile block could still hold more than 255
+    // three-byte "capabilities", and the count then saturates rather than
+    // wrapping to a header that claims none while carrying bytes.
     let total = 5 + kept.iter().map(|cap| cap.len()).sum::<usize>();
-    let total = u16::try_from(total).unwrap_or(5);
-    let count = u8::try_from(kept.len()).unwrap_or(0);
+    let total = u16::try_from(total).unwrap_or(u16::MAX);
+    let count = u8::try_from(kept.len()).unwrap_or(u8::MAX);
     let mut out = Vec::with_capacity(usize::from(total));
     out.extend_from_slice(&[5, DT_BOS]);
     out.extend_from_slice(&total.to_le_bytes());
