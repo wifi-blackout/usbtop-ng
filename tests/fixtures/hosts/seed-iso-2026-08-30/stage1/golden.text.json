@@ -7,6 +7,8 @@
         {
           "address": 1,
           "bus": 2,
+          "capability_mbps": null,
+          "capability_source": null,
           "endpoints": [],
           "estimated": false,
           "internal": false,
@@ -24,6 +26,8 @@
         {
           "address": 4,
           "bus": 2,
+          "capability_mbps": null,
+          "capability_source": null,
           "endpoints": [
             {
               "bps": 27000.0,
@@ -53,6 +57,7 @@
     }
   ],
   "dropped_packets": 0,
+  "findings": [],
   "kernel_dropped_packets": 0,
   "source": "text",
   "total_rx_bps": 27000.0,

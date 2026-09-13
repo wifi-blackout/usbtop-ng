@@ -40,11 +40,6 @@ pub enum CapabilitySource {
 
 impl CapabilitySource {
     /// The JSON value.
-    ///
-    /// `cfg(test)`-only for now: nothing in production code reads this yet
-    /// (a report/findings serializer will, in a later task); verified here
-    /// and ready for that wiring.
-    #[cfg(test)]
     pub fn as_str(self) -> &'static str {
         match self {
             CapabilitySource::Bos => "bos",

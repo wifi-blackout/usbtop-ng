@@ -7,6 +7,8 @@
         {
           "address": 1,
           "bus": 1,
+          "capability_mbps": null,
+          "capability_source": null,
           "endpoints": [],
           "estimated": false,
           "internal": true,
@@ -33,6 +35,8 @@
         {
           "address": 1,
           "bus": 2,
+          "capability_mbps": 5000.0,
+          "capability_source": "bcd_usb",
           "endpoints": [],
           "estimated": false,
           "internal": true,
@@ -59,6 +63,8 @@
         {
           "address": 1,
           "bus": 3,
+          "capability_mbps": null,
+          "capability_source": null,
           "endpoints": [],
           "estimated": false,
           "internal": true,
@@ -76,6 +82,8 @@
         {
           "address": 5,
           "bus": 3,
+          "capability_mbps": null,
+          "capability_source": null,
           "endpoints": [],
           "estimated": false,
           "internal": true,
@@ -93,6 +101,8 @@
         {
           "address": 6,
           "bus": 3,
+          "capability_mbps": null,
+          "capability_source": null,
           "endpoints": [],
           "estimated": false,
           "internal": true,
@@ -110,6 +120,8 @@
         {
           "address": 2,
           "bus": 3,
+          "capability_mbps": null,
+          "capability_source": null,
           "endpoints": [],
           "estimated": false,
           "internal": true,
@@ -127,6 +139,8 @@
         {
           "address": 3,
           "bus": 3,
+          "capability_mbps": null,
+          "capability_source": null,
           "endpoints": [],
           "estimated": false,
           "internal": true,
@@ -153,6 +167,8 @@
         {
           "address": 1,
           "bus": 4,
+          "capability_mbps": 5000.0,
+          "capability_source": "bcd_usb",
           "endpoints": [],
           "estimated": false,
           "internal": true,
@@ -170,6 +186,8 @@
         {
           "address": 7,
           "bus": 4,
+          "capability_mbps": 5000.0,
+          "capability_source": "bcd_usb",
           "endpoints": [],
           "estimated": false,
           "internal": true,
@@ -187,6 +205,8 @@
         {
           "address": 10,
           "bus": 4,
+          "capability_mbps": 5000.0,
+          "capability_source": "bcd_usb",
           "endpoints": [
             {
               "bps": 720.0,
@@ -212,6 +232,8 @@
         {
           "address": 11,
           "bus": 4,
+          "capability_mbps": 5000.0,
+          "capability_source": "bcd_usb",
           "endpoints": [
             {
               "bps": 720.0,
@@ -241,6 +263,7 @@
     }
   ],
   "dropped_packets": 0,
+  "findings": [],
   "kernel_dropped_packets": 0,
   "source": "binary",
   "total_rx_bps": 1440.0,

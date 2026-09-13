@@ -7,12 +7,7 @@ use crate::usbmon::parser::{TransferType, UsbSpeed};
 pub mod bos;
 pub mod manager;
 
-pub use bos::Capability;
-// `CapabilitySource` has no production reader yet (a report/findings
-// serializer will call `as_str` in a later task); reachable from tests only
-// until then, per the crate's binary dead-code discipline.
-#[cfg(test)]
-pub use bos::CapabilitySource;
+pub use bos::{Capability, CapabilitySource};
 
 /// One endpoint's traffic: its transfer type, cumulative bytes, and a
 /// windowed rate. Keyed in [`UsbDevice::endpoints`] by (number, IN?).

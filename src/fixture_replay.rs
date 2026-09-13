@@ -312,6 +312,7 @@ mod tests {
             total_rx_bps: 0.0,
             total_tx_bps: 0.0,
             buses: Vec::new(),
+            findings: Vec::new(),
         };
         let json = report_to_golden_json(&report).unwrap();
         assert!(json.ends_with('\n'), "trailing newline");

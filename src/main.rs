@@ -23,6 +23,7 @@ mod connector;
 mod device;
 mod diag;
 mod filter;
+mod findings;
 #[cfg(test)]
 mod fixture_corpus;
 mod fixture_replay;

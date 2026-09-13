@@ -1,7 +1,7 @@
 //! Non-TUI reports: `--once` samples one window and prints, `--batch`
 //! prints every window until interrupted. Never prompts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
@@ -10,8 +10,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 
+use crate::connector::PortIndex;
 use crate::device::manager::DeviceManager;
 use crate::filter::FilterSet;
+use crate::findings::{Cause, Finding};
 use crate::usbmon::monitor::{CaptureStream, SourceFlags};
 use crate::usbmon::parser::format_mbps;
 
@@ -51,6 +53,10 @@ pub struct Report {
     pub total_rx_bps: f64,
     pub total_tx_bps: f64,
     pub buses: Vec<BusReport>,
+    /// Devices linked below the speed they support, with the cause the
+    /// topology proves (see `findings::analyze`); only devices the report
+    /// lists. Empty when there is nothing to call out.
+    pub findings: Vec<FindingReport>,
 }
 
 #[derive(Serialize)]
@@ -82,7 +88,59 @@ pub struct DeviceReport {
     /// device did/didn't match it; `null` (`None`) when no snapshot exists,
     /// so a script can tell "external" apart from "unknown".
     pub internal: Option<bool>,
+    /// The highest link rate the device says it supports, in Mbps, and
+    /// where that came from (`"bos"` or `"bcd_usb"`); `null` when unknown.
+    pub capability_mbps: Option<f64>,
+    pub capability_source: Option<&'static str>,
     pub endpoints: Vec<EndpointReport>,
+}
+
+/// One finding as the JSON report carries it: the device, the numbers,
+/// the cause as a `snake_case` tag, and the sentence the text report and
+/// the TUI show. Fields a cause does not use are `null`.
+#[derive(Serialize)]
+pub struct FindingReport {
+    pub bus: u8,
+    pub address: u8,
+    pub path: String,
+    pub port: Option<String>,
+    pub link_mbps: f64,
+    pub capability_mbps: f64,
+    pub capability_source: &'static str,
+    pub cause: Option<&'static str>,
+    pub peer_port: Option<String>,
+    pub upstream: Option<String>,
+    pub limit_mbps: Option<f64>,
+    pub message: String,
+}
+
+impl From<&Finding> for FindingReport {
+    fn from(finding: &Finding) -> Self {
+        let (peer_port, upstream, limit_mbps) = match &finding.cause {
+            Some(Cause::SuperSpeedSideEmpty { peer_port }) => (Some(peer_port.clone()), None, None),
+            Some(Cause::UpstreamHubLink { hub, hub_link }) => {
+                (None, Some(hub.clone()), Some(hub_link.to_mbps()))
+            }
+            Some(Cause::HostPortMax { max }) => (None, None, Some(max.to_mbps())),
+            Some(Cause::Usb2OnlyHostPort) | Some(Cause::UpstreamPermits) | None => {
+                (None, None, None)
+            }
+        };
+        FindingReport {
+            bus: finding.bus,
+            address: finding.address,
+            path: finding.path.clone(),
+            port: finding.port.clone(),
+            link_mbps: finding.link.to_mbps(),
+            capability_mbps: finding.capability.speed.to_mbps(),
+            capability_source: finding.capability.source.as_str(),
+            cause: finding.cause.as_ref().map(Cause::kind),
+            peer_port,
+            upstream,
+            limit_mbps,
+            message: finding.message(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -144,8 +202,10 @@ fn windowed_rate(baseline_total: Option<u64>, now_total: u64, window_secs: f64) 
 }
 
 /// Build one report from the manager's current state and a `baseline` taken
-/// at the start of the window. Pure and fully testable: no clock reads other
-/// than the `timestamp` field, no I/O.
+/// at the start of the window. Pure over the manager's state except for one
+/// read-only scan of the manager's own device directories for their port
+/// objects (the connector index the findings need), no clock reads other
+/// than the `timestamp` field.
 ///
 /// `elapsed` is the *measured* time since `baseline` was captured, not the
 /// nominal `--window` value: a SIGINT/SIGTERM can end a window early, and
@@ -252,6 +312,8 @@ pub fn build_report(
                         total_tx_bytes: device.bandwidth_stats.total_tx_bytes,
                         estimated: text_active && device.has_iso_traffic(),
                         internal: snapshot_loaded.then_some(device.is_internal),
+                        capability_mbps: device.capability.as_ref().map(|c| c.speed.to_mbps()),
+                        capability_source: device.capability.as_ref().map(|c| c.source.as_str()),
                         endpoints,
                     }
                 })
@@ -278,6 +340,25 @@ pub fn build_report(
     let total_rx_bps = bus_reports.iter().map(|b| b.rx_bps).sum();
     let total_tx_bps = bus_reports.iter().map(|b| b.tx_bps).sum();
 
+    // The same scan `ui::sync_from` does: bounded to the manager's own
+    // device directories, under the bundle's `sysfs/` in replay.
+    let index = PortIndex::scan_devices(
+        manager
+            .buses
+            .values()
+            .flat_map(|bus| bus.devices.values())
+            .filter_map(|device| device.sysfs_path.as_deref()),
+    );
+    let listed: HashSet<(u8, u8)> = bus_reports
+        .iter()
+        .flat_map(|bus| bus.devices.iter().map(|d| (d.bus, d.address)))
+        .collect();
+    let findings = crate::findings::analyze(manager, &index)
+        .iter()
+        .filter(|f| listed.contains(&(f.bus, f.address)))
+        .map(FindingReport::from)
+        .collect();
+
     Report {
         version: 1,
         timestamp,
@@ -290,6 +371,7 @@ pub fn build_report(
         total_rx_bps,
         total_tx_bps,
         buses: bus_reports,
+        findings,
     }
 }
 
@@ -304,9 +386,11 @@ fn to_mbps(bytes_per_second: f64) -> f64 {
     }
 }
 
-/// Render a report as plain text: a `ts=` line, one header per bus, and one
-/// indented row per device. `~rx`/`~tx` marks a device whose rate is
-/// `estimated` (see [`DeviceReport::estimated`]).
+/// Render a report as plain text: a `ts=` line, one header per bus, one
+/// indented row per device, and a closing `findings:` section — `none`, or a
+/// count and one indented line per call-out (see [`Report::findings`]).
+/// `~rx`/`~tx` marks a device whose rate is `estimated` (see
+/// [`DeviceReport::estimated`]).
 pub fn render_text(report: &Report) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -355,6 +439,29 @@ pub fn render_text(report: &Report) -> String {
                 tx_prefix,
                 to_mbps(device.tx_bps),
                 name,
+            ));
+        }
+    }
+    if report.findings.is_empty() {
+        out.push_str("findings: none\n");
+    } else {
+        out.push_str(&format!("findings: {}\n", report.findings.len()));
+        for finding in &report.findings {
+            let id = report
+                .buses
+                .iter()
+                .flat_map(|bus| bus.devices.iter())
+                .find(|d| d.bus == finding.bus && d.address == finding.address)
+                .map_or_else(
+                    || "----:----".to_string(),
+                    |d| match (&d.vendor_id, &d.product_id) {
+                        (Some(v), Some(p)) => format!("{v}:{p}"),
+                        _ => "----:----".to_string(),
+                    },
+                );
+            out.push_str(&format!(
+                "  {}:{}  {}  {}  {}\n",
+                finding.bus, finding.address, finding.path, id, finding.message
             ));
         }
     }
@@ -993,6 +1100,154 @@ mod tests {
             device_row.contains("1.5 Mbps"),
             "device row must keep the fractional digit: {device_row}"
         );
+    }
+
+    /// A USB 3 device (bcdUSB 3.20, no BOS) at 480 on a paired root port
+    /// whose SuperSpeed twin is empty, and a plain device: the report
+    /// carries one finding and per-device capability fields.
+    fn tree_with_a_finding() -> (tempfile::TempDir, DeviceManager) {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("devices");
+        let ctrl = temp.path().join("0000:00:14.0");
+        std::fs::create_dir_all(&base).unwrap();
+        let write = |dir: &std::path::Path, attrs: &[(&str, &str)]| {
+            std::fs::create_dir_all(dir).unwrap();
+            for (k, v) in attrs {
+                std::fs::write(dir.join(k), format!("{v}\n")).unwrap();
+            }
+        };
+        let usb3 = ctrl.join("usb3");
+        let usb4 = ctrl.join("usb4");
+        write(&usb3, &[("busnum", "3"), ("devnum", "1"), ("speed", "480")]);
+        write(
+            &usb4,
+            &[("busnum", "4"), ("devnum", "1"), ("speed", "5000")],
+        );
+        symlink(&usb3, base.join("usb3")).unwrap();
+        symlink(&usb4, base.join("usb4")).unwrap();
+        let p3 = usb3.join("usb3:1.0").join("usb3-port1");
+        let p4 = usb4.join("usb4:1.0").join("usb4-port1");
+        std::fs::create_dir_all(&p3).unwrap();
+        std::fs::create_dir_all(&p4).unwrap();
+        symlink(&p4, p3.join("peer")).unwrap();
+        symlink(&p3, p4.join("peer")).unwrap();
+        write(
+            &base.join("3-1"),
+            &[
+                ("busnum", "3"),
+                ("devnum", "2"),
+                ("speed", "480"),
+                ("version", "3.20"),
+                ("idVendor", "0bda"),
+                ("idProduct", "9210"),
+            ],
+        );
+        let mut mgr = DeviceManager::with_sysfs_base(base);
+        mgr.enumerate_present_devices();
+        mgr.update_bus_speeds();
+        (temp, mgr)
+    }
+
+    #[test]
+    fn json_report_carries_findings_and_per_device_capability() {
+        let (_temp, mgr) = tree_with_a_finding();
+        let baseline = Baseline::capture(&mgr);
+        let report = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["version"], 1, "additive fields do not bump the schema");
+        let findings = v["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 1);
+        let f = &findings[0];
+        assert_eq!(f["bus"], 3);
+        assert_eq!(f["address"], 2);
+        assert_eq!(f["path"], "3-1");
+        assert_eq!(f["port"], "usb3-port1");
+        assert_eq!(f["link_mbps"], 480.0);
+        assert_eq!(f["capability_mbps"], 5000.0);
+        assert_eq!(f["capability_source"], "bcd_usb");
+        assert_eq!(f["cause"], "superspeed_side_empty");
+        assert_eq!(f["peer_port"], "usb4-port1");
+        assert!(f["upstream"].is_null());
+        assert!(f["limit_mbps"].is_null());
+        assert!(f["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("linked at 480M, supports 5G (from bcdUSB): "));
+        let devices = v["buses"][0]["devices"].as_array().unwrap();
+        let root = devices.iter().find(|d| d["address"] == 1).unwrap();
+        assert!(root["capability_mbps"].is_null());
+        assert!(root["capability_source"].is_null());
+        let dev = devices.iter().find(|d| d["address"] == 2).unwrap();
+        assert_eq!(dev["capability_mbps"], 5000.0);
+        assert_eq!(dev["capability_source"], "bcd_usb");
+    }
+
+    #[test]
+    fn findings_follow_the_filter() {
+        let (_temp, mgr) = tree_with_a_finding();
+        let baseline = Baseline::capture(&mgr);
+        let filter = FilterSet::parse(&["bus=4".to_string()]).unwrap();
+        let report = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &filter,
+        );
+        assert!(
+            report.findings.is_empty(),
+            "the flagged device is on bus 3, which the filter excludes"
+        );
+    }
+
+    #[test]
+    fn render_text_ends_with_the_findings_section() {
+        let (_temp, mgr) = tree_with_a_finding();
+        let baseline = Baseline::capture(&mgr);
+        let report = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        let text = render_text(&report);
+        assert!(text.contains("\nfindings: 1\n  3:2  3-1  0bda:9210  linked at 480M, supports 5G (from bcdUSB): the SuperSpeed side of this connector (usb4-port1) is empty, so the link came up at USB 2 speed; check the cable or the port\n\n"), "{text}");
+        assert!(
+            text.ends_with("\n\n"),
+            "the blank terminator still ends the report"
+        );
+    }
+
+    #[test]
+    fn render_text_says_findings_none_when_there_are_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let baseline = Baseline::capture(&mgr);
+        let report = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        let text = render_text(&report);
+        assert!(text.ends_with("findings: none\n\n"), "{text}");
     }
 
     #[test]

@@ -174,9 +174,17 @@ impl PortIndex {
         })
     }
 
-    #[cfg(test)]
+    /// The port named `name`, when the scan found it.
     pub fn get(&self, name: &str) -> Option<&PortInfo> {
         self.ports.get(name)
+    }
+
+    /// The ports `hub` owns, by name.
+    pub fn ports_of<'a>(&'a self, hub: &'a str) -> impl Iterator<Item = (&'a str, &'a PortInfo)> {
+        self.ports
+            .iter()
+            .filter(move |(_, info)| info.hub == hub)
+            .map(|(name, info)| (name.as_str(), info))
     }
 
     #[cfg(test)]
@@ -225,6 +233,22 @@ pub fn port_of_device(device: &str) -> Option<(String, u32)> {
         )
     };
     Some((hub, last))
+}
+
+/// The sysfs name of the device on port `number` of `hub`, the inverse of
+/// [`port_of_device`]: port 2 of `usb6` is `6-2`, port 2 of `6-1` is
+/// `6-1.2`. `None` when `hub` is not a device name.
+pub fn device_name_of_port(hub: &str, number: u32) -> Option<String> {
+    let (bus, mut chain) = parse_device_name(hub)?;
+    chain.push(number);
+    Some(format!(
+        "{bus}-{}",
+        chain
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
+    ))
 }
 
 /// `<hub>-port<N>`, the kernel's port device name.
@@ -360,6 +384,32 @@ mod tests {
         );
         assert_eq!(port_of_device("garbage"), None);
         assert_eq!(port_name("3-1.4", 2), "3-1.4-port2");
+    }
+
+    #[test]
+    fn device_name_of_port_inverts_port_of_device() {
+        for name in ["3-1", "3-1.4", "3-1.4.2", "12-10.3"] {
+            let (hub, number) = port_of_device(name).unwrap();
+            assert_eq!(device_name_of_port(&hub, number).as_deref(), Some(name));
+        }
+        assert_eq!(device_name_of_port("usb6", 2).as_deref(), Some("6-2"));
+        assert_eq!(device_name_of_port("6-1", 2).as_deref(), Some("6-1.2"));
+        assert_eq!(device_name_of_port("garbage", 1), None);
+    }
+
+    #[test]
+    fn ports_of_lists_a_hubs_ports_and_nothing_else() {
+        let t = paired_tree();
+        let index = PortIndex::scan(&t.base());
+        let mut names: Vec<&str> = index.ports_of("3-1").map(|(name, _)| name).collect();
+        names.sort();
+        assert_eq!(names, ["3-1-port1", "3-1-port2"]);
+        assert_eq!(index.ports_of("3-2").count(), 0, "a device without ports");
+        assert_eq!(
+            index.get("usb3-port1").map(|info| info.number),
+            Some(1),
+            "get is the public lookup the findings engine uses"
+        );
     }
 
     #[test]
