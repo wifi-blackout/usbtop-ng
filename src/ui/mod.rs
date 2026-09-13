@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::Receiver,
@@ -23,6 +23,7 @@ mod connectors;
 use crate::device::manager::{DeviceManager, TrafficDelta, UsbBus};
 use crate::device::UsbDevice;
 use crate::filter::FilterSet;
+use crate::findings::{analyze, Finding};
 use crate::snapshot::{Snapshot, SnapshotDevice};
 use crate::usbmon::monitor::CaptureStream;
 use crate::usbmon::parser::{format_mbps, TransferType, UsbPacket, UsbSpeed};
@@ -58,6 +59,9 @@ pub(crate) const DRAIN_BATCH: usize = 8_192;
 pub struct DeviceRow {
     pub port_chain: Option<Vec<u32>>,
     pub device: UsbDevice,
+    /// The call-out the findings engine attached to this device, when it
+    /// is linked below the speed it supports (see `findings::analyze`).
+    pub finding: Option<Finding>,
 }
 
 /// One bus (root hub) as a summary line, holding only the rows nothing places
@@ -398,6 +402,10 @@ impl UsbTopApp {
                 .flat_map(|bus| bus.devices.values())
                 .filter_map(|device| device.sysfs_path.as_deref()),
         );
+        let mut findings: HashMap<(u8, u8), Finding> = analyze(manager, &index)
+            .into_iter()
+            .map(|finding| ((finding.bus, finding.address), finding))
+            .collect();
         let bus_speed = |bus_id: u8| manager.buses.get(&bus_id).map(|bus| bus.speed.clone());
 
         let mut buses: Vec<&UsbBus> = manager.buses.values().collect();
@@ -421,6 +429,7 @@ impl UsbTopApp {
                 let row = DeviceRow {
                     port_chain: device.port_chain(),
                     device: device.clone(),
+                    finding: findings.remove(&(device.bus_id, device.device_id)),
                 };
                 let Some(placement) =
                     connector_placement(&index, &row, bus_speed, &self.connector_names)
@@ -508,6 +517,15 @@ impl UsbTopApp {
                 self.selected_device = None;
             }
         }
+    }
+
+    /// How many visible rows carry a finding.
+    pub fn findings_count(&self) -> usize {
+        self.controllers
+            .iter()
+            .flat_map(ControllerView::rows)
+            .filter(|row| row.finding.is_some())
+            .count()
     }
 
     /// Device keys ("bus:dev") flattened in render order.
@@ -1150,6 +1168,18 @@ fn header_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
         ));
     }
 
+    // Devices linked below the speed they support; the rows say why.
+    let findings = app.findings_count();
+    if findings > 0 {
+        stats_line.push(Span::raw(" | findings: "));
+        stats_line.push(Span::styled(
+            findings.to_string(),
+            Style::default()
+                .fg(WARNING_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     vec![
         Line::from(vec![
             Span::styled(
@@ -1309,6 +1339,11 @@ fn draw_device_chart(f: &mut Frame, area: Rect, app: &UsbTopApp) {
 /// whole line, which a `Table` cannot do, so the list is laid out as lines of
 /// pre-padded per-cell spans instead.
 const DEVICE_COLUMNS: [usize; 9] = [8, 8, 10, 14, 18, 10, 10, 7, 3];
+
+/// Where a finding's reason line starts: the Device column's own offset
+/// (Port's width plus the one-space separator after it), so the reason
+/// text lines up under Device the way an endpoint row's label does.
+const FINDING_INDENT: usize = DEVICE_COLUMNS[0] + 2;
 
 /// One padded cell per column, separated by single-space spans. Columns are
 /// measured in terminal cells, not chars: a CJK vendor string is twice as wide
@@ -1584,25 +1619,14 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
         for bus in &controller.buses {
             lines.push(bus_line(bus));
             for row in &bus.devices {
-                push_device_row(&mut lines, app, row, &bus.speed, &mut selected_line);
+                push_device_row(&mut lines, app, row, &mut selected_line);
             }
         }
 
         for connector in &controller.connectors {
             lines.push(connector_line(connector));
             for row in &connector.devices {
-                // Present whenever the row is: a bus line survives pruning
-                // while any connector row on its bus does.
-                // So `UsbSpeed::UNKNOWN` below is unreachable -- see
-                // `prune_empty_groups`, whose `buses.retain` keeps a bus line
-                // for as long as any connector row names that bus.
-                let speed = controller
-                    .buses
-                    .iter()
-                    .find(|bus| bus.bus_id == row.device.bus_id)
-                    .map(|bus| bus.speed.clone())
-                    .unwrap_or(UsbSpeed::UNKNOWN);
-                push_device_row(&mut lines, app, row, &speed, &mut selected_line);
+                push_device_row(&mut lines, app, row, &mut selected_line);
             }
         }
     }
@@ -1662,15 +1686,11 @@ fn connector_line(connector: &ConnectorView) -> Line<'static> {
 
 /// One device row (and, when it is the selected one, its endpoint rows),
 /// appended to `lines`; records the row's line index in `selected_line`
-/// when it is the selected device. `_bus_speed` is the speed of the bus the
-/// device is on; unused for now (`get_speed_indicator` is called with `None`
-/// pending the findings engine that wires the real argument in a later
-/// task), kept in the signature so callers need not change twice.
+/// when it is the selected device.
 fn push_device_row(
     lines: &mut Vec<Line<'static>>,
     app: &UsbTopApp,
     row: &DeviceRow,
-    _bus_speed: &UsbSpeed,
     selected_line: &mut Option<usize>,
 ) {
     let device = &row.device;
@@ -1679,7 +1699,7 @@ fn push_device_row(
     if is_selected {
         *selected_line = Some(lines.len());
     }
-    let indicator = device.get_speed_indicator(None);
+    let indicator = device.get_speed_indicator(row.finding.as_ref().map(|f| &f.capability.speed));
 
     let status_style = if device.is_disconnected {
         Style::default().bg(Color::Gray).fg(Color::White)
@@ -1725,6 +1745,20 @@ fn push_device_row(
     }
 
     lines.push(Line::from(spans).style(status_style));
+    // The call-out's reason, directly under the row it concerns, in the
+    // indicator's colour. Always shown, not only when selected: the point
+    // is to be noticed. Indented to the Device column like an endpoint row.
+    if let Some(finding) = &row.finding {
+        let (r, g, b) = indicator.get_color();
+        lines.push(
+            Line::from(format!(
+                "{}🔺 {}",
+                " ".repeat(FINDING_INDENT),
+                finding.message()
+            ))
+            .style(Style::default().fg(Color::Rgb(r, g, b))),
+        );
+    }
     if is_selected {
         lines.extend(endpoint_lines(row, app.text_source_active()));
     }
@@ -1853,7 +1887,7 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from("  • Controller-grouped, port-ordered device list (USB2/USB3 sibling buses)"),
         Line::from("  • Per-device and per-bus %busy"),
         Line::from("  • ⚡ high-utilization indicator (>80% of practical bandwidth)"),
-        Line::from("  • 🔺 device declares USB 3.x support but linked slower — best-effort signal"),
+        Line::from("  • 🔺 linked below the speed it supports; the line beneath says why"),
         Line::from("  • Header shows 'dropped: N' if packets were lost to a full queue"),
         Line::from("  • Header shows 'kdropped: N' if the kernel's usbmon ring dropped packets"),
         Line::from("  • Header shows 'shed: N' if frames were dropped to keep up with a slow"),
@@ -2165,6 +2199,107 @@ mod tests {
         mgr.enumerate_present_devices();
         mgr.update_bus_speeds();
         (temp, mgr)
+    }
+
+    /// `topology_fixture` plus a root port pair whose USB 2 side holds a
+    /// USB 3 device (bcdUSB 3.20, no BOS) linked at 480 with the
+    /// SuperSpeed side empty: one finding, on `3-1` (dev 2).
+    fn flagged_fixture() -> (tempfile::TempDir, DeviceManager) {
+        use std::os::unix::fs::symlink;
+        let (temp, _) = topology_fixture();
+        let base = temp.path().join("devices");
+        let ctrl = temp.path().join("0000:00:14.0");
+        let p3 = ctrl.join("usb3").join("usb3:1.0").join("usb3-port1");
+        let p4 = ctrl.join("usb4").join("usb4:1.0").join("usb4-port1");
+        std::fs::create_dir_all(&p3).unwrap();
+        std::fs::create_dir_all(&p4).unwrap();
+        symlink(&p4, p3.join("peer")).unwrap();
+        symlink(&p3, p4.join("peer")).unwrap();
+        let d = base.join("3-1");
+        std::fs::create_dir_all(&d).unwrap();
+        for (k, v) in [
+            ("busnum", "3"),
+            ("devnum", "2"),
+            ("speed", "480"),
+            ("version", "3.20"),
+        ] {
+            std::fs::write(d.join(k), format!("{v}\n")).unwrap();
+        }
+        let mut mgr = DeviceManager::with_sysfs_base(base);
+        mgr.enumerate_present_devices();
+        mgr.update_bus_speeds();
+        (temp, mgr)
+    }
+
+    #[test]
+    fn a_flagged_row_carries_the_marker_and_its_reason_line() {
+        let (_temp, mgr) = flagged_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        assert_eq!(app.findings_count(), 1);
+
+        let (lines, _) = device_list_lines_with_selection(&app);
+        let at = lines
+            .iter()
+            .position(|l| l.to_string().contains("003:002"))
+            .expect("the flagged device's row");
+        assert_eq!(lines[at].spans[INDICATOR_SPAN_INDEX].content.trim(), "🔺");
+        let reason = lines[at + 1].to_string();
+        assert!(reason.starts_with("          🔺 linked at 480M, supports 5G (from bcdUSB): the SuperSpeed side of this connector (usb4-port1) is empty"), "{reason}");
+        assert_eq!(
+            lines[at + 1].style.fg,
+            Some(Color::Rgb(255, 255, 0)),
+            "the reason line wears the indicator's colour"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.to_string().contains("supports") && !l.to_string().contains("🔺")),
+            "no other row carries a reason line"
+        );
+    }
+
+    #[test]
+    fn a_reason_line_shifts_the_rows_below_it_but_not_the_selection_key() {
+        let (_temp, mgr) = flagged_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        // Select the device rendered after the flagged one (3-2, dev 3).
+        app.selected_device = Some("3:3".to_string());
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        let flagged = lines
+            .iter()
+            .position(|l| l.to_string().contains("003:002"))
+            .unwrap();
+        let selected = selected_line.expect("the selected row's line");
+        assert!(
+            selected > flagged + 1,
+            "the reason line sits between the two rows"
+        );
+        assert!(lines[selected].to_string().contains("003:003"));
+    }
+
+    #[test]
+    fn the_header_counts_findings_only_when_there_are_any() {
+        let (_temp, mgr) = flagged_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        let stats_line = &header_lines(&app)[1];
+        assert!(stats_line
+            .spans
+            .iter()
+            .any(|s| s.content == " | findings: "));
+        let value = stats_line
+            .spans
+            .iter()
+            .find(|s| s.content == "1")
+            .expect("the count");
+        assert_eq!(value.style.fg, Some(WARNING_COLOR));
+
+        let (_temp, plain) = topology_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&plain);
+        assert!(!header_lines(&app)[1].to_string().contains("findings"));
     }
 
     /// Every connector of the first controller as `(label, buses, is_hub,
@@ -3288,6 +3423,7 @@ mod tests {
         // And both counters the header can spring on the user are explained.
         assert!(screen.contains("dropped: N"), "{screen}");
         assert!(screen.contains("shed: N"), "{screen}");
+        assert!(screen.contains("the line beneath says why"), "{screen}");
         // The one platform claim the overlay makes, and the only one it may:
         // the binary does not build anywhere else.
         assert!(screen.contains("Linux only"), "{screen}");
@@ -4928,6 +5064,7 @@ mod tests {
         let row = DeviceRow {
             port_chain: Some(vec![]),
             device: named_device(1, 3, Some("Kingston Technology"), None, None, None),
+            finding: None,
         };
         assert!(device_matches_search(1, &row, "kingston"));
         assert!(!device_matches_search(1, &row, "logitech"));
@@ -4938,6 +5075,7 @@ mod tests {
         let row = DeviceRow {
             port_chain: Some(vec![]),
             device: named_device(1, 3, None, Some("DataTraveler"), None, None),
+            finding: None,
         };
         assert!(device_matches_search(1, &row, "traveler"));
         assert!(!device_matches_search(1, &row, "mouse"));
@@ -4948,6 +5086,7 @@ mod tests {
         let row = DeviceRow {
             port_chain: Some(vec![]),
             device: named_device(1, 3, None, None, Some(0x04f2), Some(0xb71a)),
+            finding: None,
         };
         assert!(device_matches_search(1, &row, "04f2:b71a"));
         assert!(
@@ -4962,6 +5101,7 @@ mod tests {
         let row = DeviceRow {
             port_chain: Some(vec![1, 4, 2]),
             device: named_device(1, 3, None, None, None, None),
+            finding: None,
         };
         assert!(device_matches_search(1, &row, "1.4.2"));
         assert!(device_matches_search(1, &row, "4.2"));
@@ -4973,6 +5113,7 @@ mod tests {
         let row = DeviceRow {
             port_chain: Some(vec![]),
             device: named_device(1, 3, None, None, None, None),
+            finding: None,
         };
         // Same "{:03}:{:03}" form the Device column prints (see
         // device_list_lines_with_selection), so what you see is what you
@@ -4995,6 +5136,7 @@ mod tests {
         let row = DeviceRow {
             port_chain: None,
             device: named_device(9, 7, None, None, None, None),
+            finding: None,
         };
         // No vendor, no product, no vid:pid, no resolved port chain -- only
         // bus:address is always present.
@@ -5008,6 +5150,7 @@ mod tests {
         let row = DeviceRow {
             port_chain: None,
             device: named_device(1, 3, None, None, None, None),
+            finding: None,
         };
         assert!(device_matches_search(1, &row, ""));
     }
