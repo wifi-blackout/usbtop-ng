@@ -95,6 +95,9 @@
       "tx_bps": 0.0
     }
   ],
+  "choke_floor": 1.25,
+  "chokepoints": [],
+  "demand_basis": "link",
   "dropped_packets": 0,
   "findings": [],
   "kernel_dropped_packets": 0,

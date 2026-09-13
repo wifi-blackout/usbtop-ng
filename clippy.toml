@@ -1,0 +1,4 @@
+# `headless::build_report_at` is `build_report`'s seven parameters plus the
+# choke-point basis (see `capacity::Basis`); eight is the ceiling this repo
+# accepts, not an invitation to grow parameter lists.
+too-many-arguments-threshold = 8

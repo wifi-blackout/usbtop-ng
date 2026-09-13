@@ -6,9 +6,10 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::capacity::Basis;
 use crate::fixture_replay::{
-    discover_bundles, replay_fixture, report_to_golden_json, to_masked_value, Bundle,
-    FixtureSource, Meta,
+    discover_bundles, replay_fixture, replay_fixture_at, report_to_golden_json, to_masked_value,
+    Bundle, FixtureSource, Meta,
 };
 
 fn sources_of(bundle: &Bundle) -> Vec<FixtureSource> {
@@ -385,6 +386,55 @@ fn the_dock_bundle_pins_the_two_findings_and_nothing_else() {
             (None, None),
             "the Terminus hub has no BOS"
         );
+        // The theoretical load on every hub link, worst first: the Realtek
+        // USB 2 half and the Terminus below it tie at 3.05x (path breaks the
+        // tie), the Realtek USB 3 half with two 5G cameras is 2.00x; the
+        // second Terminus (1.05x) and the dock's USB 2 half (1.03x) sit
+        // inside the breathing room.
+        // Practical figures rounded to whole Mb/s and the ratio to a
+        // hundredth: the sums of 0.8- and 0.7-scaled rates are not exact in
+        // f64, and this subtree's exact demand is 1172.25, which lands on
+        // the boundary at a tenth and would flip with the summation order.
+        let whole = |x: f64| x.round();
+        let points: Vec<(&str, f64, f64, f64, usize)> = report
+            .chokepoints
+            .iter()
+            .map(|c| {
+                (
+                    c.path.as_str(),
+                    whole(c.capacity_mbps),
+                    whole(c.demand_mbps),
+                    (c.ratio * 100.0).round() / 100.0,
+                    c.devices,
+                )
+            })
+            .collect();
+        assert_eq!(
+            points,
+            vec![
+                ("3-1", 384.0, 1172.0, 3.05, 9),
+                ("3-1.4", 384.0, 1172.0, 3.05, 8),
+                ("4-1", 4250.0, 8500.0, 2.0, 2),
+            ],
+            "{source:?}"
+        );
+        assert_eq!(report.demand_basis, "link");
+        assert_eq!(report.choke_floor, 1.25);
+        assert_eq!(report.chokepoints[0].port.as_deref(), Some("usb3-port1"));
+        // The capability view equals the link view here: every leaf below
+        // a USB 2 half is bounded to 480 by it, and the USB 3 half's
+        // cameras already link at their 5G capability.
+        let at_capability = replay_fixture_at(&dir, source, Basis::Capability).unwrap();
+        let cap_points: Vec<(&str, f64)> = at_capability
+            .chokepoints
+            .iter()
+            .map(|c| (c.path.as_str(), (c.ratio * 100.0).round() / 100.0))
+            .collect();
+        assert_eq!(
+            cap_points,
+            vec![("3-1", 3.05), ("3-1.4", 3.05), ("4-1", 2.0)]
+        );
+        assert_eq!(at_capability.demand_basis, "capability");
     }
 }
 

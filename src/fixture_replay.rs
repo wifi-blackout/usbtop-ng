@@ -15,9 +15,10 @@ use std::time::Duration;
 #[cfg(test)]
 use serde::Deserialize;
 
+use crate::capacity::Basis;
 use crate::device::manager::DeviceManager;
 use crate::filter::FilterSet;
-use crate::headless::{build_report, Baseline, Report};
+use crate::headless::{build_report_at, Baseline, Report};
 use crate::snapshot::Snapshot;
 use crate::usbmon::binary::BinaryReader;
 use crate::usbmon::reader::UsbmonReader;
@@ -184,7 +185,18 @@ pub fn load_internal_devices(bundle_dir: &Path) -> Option<Arc<Snapshot>> {
 /// This is the exact sequence the capturer uses to generate goldens, so a
 /// committed golden equals this output by construction.
 pub fn replay_fixture(bundle_dir: &Path, source: FixtureSource) -> anyhow::Result<Report> {
-    replay_fixture_with_elapsed(bundle_dir, Some(source), FIXED_ELAPSED)
+    replay_fixture_with_elapsed(bundle_dir, Some(source), FIXED_ELAPSED, Basis::Link)
+}
+
+/// `replay_fixture` at a chosen basis, for the corpus tests that pin the
+/// capability view.
+#[cfg(test)]
+pub fn replay_fixture_at(
+    bundle_dir: &Path,
+    source: FixtureSource,
+    basis: Basis,
+) -> anyhow::Result<Report> {
+    replay_fixture_with_elapsed(bundle_dir, Some(source), FIXED_ELAPSED, basis)
 }
 
 /// [`replay_fixture`] with the window length chosen by the caller: goldens
@@ -192,11 +204,14 @@ pub fn replay_fixture(bundle_dir: &Path, source: FixtureSource) -> anyhow::Resul
 /// capture window so its rates are the rates that were seen. A `None`
 /// source replays no trace at all (a static bundle captured without root):
 /// the report still enumerates every device the sysfs snapshot holds, with
-/// zero traffic and `source == "none"`.
+/// zero traffic and `source == "none"`. The choke points are computed at
+/// `basis`; every caller but the corpus's capability pin passes
+/// [`Basis::Link`], so the committed goldens hold the link view.
 pub fn replay_fixture_with_elapsed(
     bundle_dir: &Path,
     source: Option<FixtureSource>,
     elapsed: Duration,
+    basis: Basis,
 ) -> anyhow::Result<Report> {
     let mut manager = DeviceManager::with_sysfs_base(bundle_dir.join("sysfs"));
     if let Some(snapshot) = load_internal_devices(bundle_dir) {
@@ -234,7 +249,8 @@ pub fn replay_fixture_with_elapsed(
     // NOT (see manager.rs:188); without this the controller/speed fields are null.
     manager.update_bus_speeds();
 
-    Ok(build_report(
+    Ok(build_report_at(
+        basis,
         &manager,
         &baseline,
         elapsed,
@@ -313,6 +329,9 @@ mod tests {
             total_tx_bps: 0.0,
             buses: Vec::new(),
             findings: Vec::new(),
+            demand_basis: "link",
+            choke_floor: 1.25,
+            chokepoints: Vec::new(),
         };
         let json = report_to_golden_json(&report).unwrap();
         assert!(json.ends_with('\n'), "trailing newline");
@@ -426,6 +445,7 @@ mod tests {
             temp.path(),
             Some(FixtureSource::Binary),
             std::time::Duration::from_secs(2),
+            Basis::Link,
         )
         .unwrap();
         assert_eq!(report.window_seconds, 2.0);
@@ -444,7 +464,8 @@ mod tests {
         build_min_bundle(temp.path());
         std::fs::remove_file(temp.path().join("trace.bin")).unwrap();
         std::fs::remove_file(temp.path().join("trace.txt")).unwrap();
-        let report = replay_fixture_with_elapsed(temp.path(), None, FIXED_ELAPSED).unwrap();
+        let report =
+            replay_fixture_with_elapsed(temp.path(), None, FIXED_ELAPSED, Basis::Link).unwrap();
         assert_eq!(report.source, "none");
         let bus = &report.buses[0];
         assert_eq!(bus.controller.as_deref(), Some("0000:00:14.0"));

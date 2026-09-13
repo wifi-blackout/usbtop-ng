@@ -22,6 +22,7 @@ use super::collect::{self, BackendInfo, BuildInfo, HostInfo, TerminalInfo, Usbmo
 use super::inventory::{self, AttrDump, UsbInventory};
 use super::redact::Redactor;
 use super::{note, Note};
+use crate::capacity::Basis;
 use crate::capture::{self, BaselineSource, CaptureFixtureOpts, FixtureRoot};
 use crate::config;
 use crate::fixture_replay::{replay_fixture_with_elapsed, FixtureSource};
@@ -636,7 +637,7 @@ pub fn run_support(
                 .or_else(|| sources.first().copied()),
             _ => None,
         };
-        match replay_fixture_with_elapsed(&fixture_base, source, opts.window) {
+        match replay_fixture_with_elapsed(&fixture_base, source, opts.window, Basis::Link) {
             Ok(report) => {
                 let run = RunRecord {
                     record: "run",

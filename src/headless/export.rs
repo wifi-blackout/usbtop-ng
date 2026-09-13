@@ -253,6 +253,9 @@ mod tests {
             total_tx_bps: 0.0,
             buses: Vec::<BusReport>::new(),
             findings: Vec::new(),
+            demand_basis: "link",
+            choke_floor: 1.25,
+            chokepoints: Vec::new(),
         }
     }
 

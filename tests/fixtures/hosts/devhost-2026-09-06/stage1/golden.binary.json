@@ -619,6 +619,85 @@
       "tx_bps": 0.0
     }
   ],
+  "choke_floor": 1.25,
+  "chokepoints": [
+    {
+      "address": 4,
+      "bus": 4,
+      "capacity_mbps": 4250.0,
+      "demand_mbps": 17000.0,
+      "devices": 5,
+      "message": "4.25G carries 5 devices asking 17G: 4.00x",
+      "path": "4-1.4",
+      "port": "4-1-port4",
+      "ratio": 4.0,
+      "top": [
+        {
+          "demand_mbps": 4250.0,
+          "path": "4-1.4.1.1"
+        },
+        {
+          "demand_mbps": 4250.0,
+          "path": "4-1.4.1.2"
+        },
+        {
+          "demand_mbps": 4250.0,
+          "path": "4-1.4.1.3"
+        }
+      ]
+    },
+    {
+      "address": 2,
+      "bus": 4,
+      "capacity_mbps": 8500.0,
+      "demand_mbps": 25500.0,
+      "devices": 7,
+      "message": "8.5G carries 7 devices asking 25.5G: 3.00x",
+      "path": "4-1",
+      "port": "usb4-port1",
+      "ratio": 3.0,
+      "top": [
+        {
+          "demand_mbps": 8500.0,
+          "path": "4-1.1"
+        },
+        {
+          "demand_mbps": 4250.0,
+          "path": "4-1.4.1.1"
+        },
+        {
+          "demand_mbps": 4250.0,
+          "path": "4-1.4.1.2"
+        }
+      ]
+    },
+    {
+      "address": 5,
+      "bus": 4,
+      "capacity_mbps": 4250.0,
+      "demand_mbps": 12750.0,
+      "devices": 3,
+      "message": "4.25G carries 3 devices asking 12.75G: 3.00x",
+      "path": "4-1.4.1",
+      "port": "4-1.4-port1",
+      "ratio": 3.0,
+      "top": [
+        {
+          "demand_mbps": 4250.0,
+          "path": "4-1.4.1.1"
+        },
+        {
+          "demand_mbps": 4250.0,
+          "path": "4-1.4.1.2"
+        },
+        {
+          "demand_mbps": 4250.0,
+          "path": "4-1.4.1.3"
+        }
+      ]
+    }
+  ],
+  "demand_basis": "link",
   "dropped_packets": 0,
   "findings": [],
   "kernel_dropped_packets": 0,

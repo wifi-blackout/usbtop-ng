@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
 
+use crate::capacity::Basis;
 use crate::fixture_replay::replay_fixture_with_elapsed;
 use crate::fixture_replay::FIXED_ELAPSED;
 use crate::fixture_replay::{replay_fixture, report_to_golden_json, FixtureSource};
@@ -141,7 +142,7 @@ fn assemble_into(
     }
     let report = match report_for_meta {
         Some(report) => report,
-        None => replay_fixture_with_elapsed(&base, None, FIXED_ELAPSED)?,
+        None => replay_fixture_with_elapsed(&base, None, FIXED_ELAPSED, Basis::Link)?,
     };
     let binary_kernel_dropped = traces
         .iter()
@@ -734,9 +735,13 @@ mod tests {
             toml::from_str(&std::fs::read_to_string(outdir.join("meta.toml")).unwrap()).unwrap();
         assert!(meta.sources.is_empty());
         assert_eq!(meta.controllers, vec!["0000:00:14.0".to_string()]);
-        let report =
-            crate::fixture_replay::replay_fixture_with_elapsed(&outdir, None, FIXED_ELAPSED)
-                .unwrap();
+        let report = crate::fixture_replay::replay_fixture_with_elapsed(
+            &outdir,
+            None,
+            FIXED_ELAPSED,
+            crate::capacity::Basis::Link,
+        )
+        .unwrap();
         assert_eq!(report.source, "none");
     }
 

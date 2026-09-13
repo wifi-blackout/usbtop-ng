@@ -17,6 +17,7 @@ use std::path::Path;
 use std::process;
 use std::sync::Arc;
 
+mod capacity;
 mod capture;
 mod config;
 mod connector;
@@ -95,6 +96,11 @@ struct Cli {
     /// Print reports as JSON (one document per report)
     #[arg(long)]
     json: bool,
+
+    /// Which rate the choke-point model assumes every device pushes:
+    /// `link` (its current link) or `capability` (what it could link at)
+    #[arg(long, value_enum, default_value = "link", value_name = "BASIS")]
+    demand: DemandBasis,
 
     /// Write the reports to PATH instead of stdout (created or truncated;
     /// the file starts with a run record). Needs --once or --batch.
@@ -186,6 +192,22 @@ struct Cli {
 enum UpdateUsbidsMode {
     Check,
     Pull,
+}
+
+/// `--demand`'s two bases (see `capacity::Basis`).
+#[derive(Clone, clap::ValueEnum)]
+enum DemandBasis {
+    Link,
+    Capability,
+}
+
+impl From<DemandBasis> for capacity::Basis {
+    fn from(basis: DemandBasis) -> Self {
+        match basis {
+            DemandBasis::Link => capacity::Basis::Link,
+            DemandBasis::Capability => capacity::Basis::Capability,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -743,6 +765,7 @@ fn main() -> Result<()> {
                 expect_capture: !usbmon_status.available_buses.is_empty(),
                 output: cli.output.as_deref().map(std::path::PathBuf::from),
                 run_record,
+                demand: cli.demand.clone().into(),
             },
         );
         monitor.stop();
@@ -1107,6 +1130,16 @@ mod tests {
 
         let absent = Cli::try_parse_from(["usbtop-ng"]).unwrap();
         assert!(absent.update_usbids.is_none());
+    }
+
+    #[test]
+    fn demand_flag_parses_its_two_bases_and_nothing_else() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["usbtop-ng", "--once", "--demand", "capability"]).unwrap();
+        assert!(matches!(cli.demand, DemandBasis::Capability));
+        let cli = Cli::try_parse_from(["usbtop-ng", "--once"]).unwrap();
+        assert!(matches!(cli.demand, DemandBasis::Link));
+        assert!(Cli::try_parse_from(["usbtop-ng", "--once", "--demand", "both"]).is_err());
     }
 
     #[test]

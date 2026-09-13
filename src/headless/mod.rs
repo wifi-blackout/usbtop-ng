@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 
+use crate::capacity::{Basis, Chokepoint, CHOKE_FLOOR};
 use crate::connector::PortIndex;
 use crate::device::manager::DeviceManager;
 use crate::filter::FilterSet;
@@ -32,6 +33,9 @@ pub struct HeadlessOptions {
     pub output: Option<std::path::PathBuf>,
     /// Leads a file export; never printed to stdout.
     pub run_record: export::RunRecord,
+    /// `--demand`: which rate the choke-point model assumes every device
+    /// pushes (see `capacity::Basis`).
+    pub demand: Basis,
 }
 
 #[derive(Serialize)]
@@ -57,6 +61,15 @@ pub struct Report {
     /// topology proves (see `findings::analyze`); only devices the report
     /// lists. Empty when there is nothing to call out.
     pub findings: Vec<FindingReport>,
+    /// The basis the choke points were computed at, `"link"` or
+    /// `"capability"` (see `capacity::Basis`).
+    pub demand_basis: &'static str,
+    /// The breathing room applied: a hub is listed only when its subtree
+    /// asks at least this many times its link's capacity.
+    pub choke_floor: f64,
+    /// Hubs whose links are asked more than they can carry, worst first
+    /// (see `capacity::analyze`); only hubs the report lists.
+    pub chokepoints: Vec<ChokepointReport>,
 }
 
 #[derive(Serialize)]
@@ -145,6 +158,51 @@ impl From<&Finding> for FindingReport {
 }
 
 #[derive(Serialize)]
+pub struct ContributorReport {
+    pub path: String,
+    pub demand_mbps: f64,
+}
+
+/// One choke point as the JSON report carries it (see `capacity::Chokepoint`).
+#[derive(Serialize)]
+pub struct ChokepointReport {
+    pub bus: u8,
+    pub address: u8,
+    pub path: String,
+    pub port: Option<String>,
+    pub capacity_mbps: f64,
+    pub demand_mbps: f64,
+    pub ratio: f64,
+    pub devices: usize,
+    pub top: Vec<ContributorReport>,
+    pub message: String,
+}
+
+impl From<&Chokepoint> for ChokepointReport {
+    fn from(c: &Chokepoint) -> Self {
+        ChokepointReport {
+            bus: c.bus,
+            address: c.address,
+            path: c.path.clone(),
+            port: c.port.clone(),
+            capacity_mbps: c.capacity_mbps,
+            demand_mbps: c.demand_mbps,
+            ratio: c.ratio,
+            devices: c.devices,
+            top: c
+                .top
+                .iter()
+                .map(|t| ContributorReport {
+                    path: t.path.clone(),
+                    demand_mbps: t.demand_mbps,
+                })
+                .collect(),
+            message: c.message(),
+        }
+    }
+}
+
+#[derive(Serialize)]
 pub struct EndpointReport {
     pub endpoint: u8,
     pub direction: &'static str,
@@ -217,7 +275,10 @@ fn windowed_rate(baseline_total: Option<u64>, now_total: u64, window_secs: f64) 
 /// understate every rate and put a false `window_seconds` in the report.
 /// Floored at 1ms so a pathological zero-elapsed window (e.g. a signal
 /// landing in the same instant as `Baseline::capture`) cannot divide by zero.
-pub fn build_report(
+///
+/// The choke points are computed at `basis`.
+pub fn build_report_at(
+    basis: Basis,
     manager: &DeviceManager,
     baseline: &Baseline,
     elapsed: Duration,
@@ -362,6 +423,11 @@ pub fn build_report(
         .filter(|f| listed.contains(&(f.bus, f.address)))
         .map(FindingReport::from)
         .collect();
+    let chokepoints = crate::capacity::analyze(manager, basis)
+        .iter()
+        .filter(|c| listed.contains(&(c.bus, c.address)))
+        .map(ChokepointReport::from)
+        .collect();
 
     Report {
         version: 1,
@@ -376,7 +442,36 @@ pub fn build_report(
         total_tx_bps,
         buses: bus_reports,
         findings,
+        demand_basis: basis.as_str(),
+        choke_floor: CHOKE_FLOOR,
+        chokepoints,
     }
+}
+
+/// [`build_report_at`] at the link basis, which is the view the committed
+/// goldens hold. Only the tests call it: the replay path and `run` both
+/// choose a basis explicitly, so the shipped binary reaches
+/// [`build_report_at`] directly.
+#[cfg(test)]
+pub fn build_report(
+    manager: &DeviceManager,
+    baseline: &Baseline,
+    elapsed: Duration,
+    source: &'static str,
+    dropped: u64,
+    text_active: bool,
+    filter: &FilterSet,
+) -> Report {
+    build_report_at(
+        Basis::Link,
+        manager,
+        baseline,
+        elapsed,
+        source,
+        dropped,
+        text_active,
+        filter,
+    )
 }
 
 /// Bytes per second as MB/s, floored at zero (mirrors `ui::to_mbps`, kept
@@ -390,9 +485,27 @@ fn to_mbps(bytes_per_second: f64) -> f64 {
     }
 }
 
+/// `vid:pid` of the listed device, or `----:----`.
+fn device_id_cell(report: &Report, bus: u8, address: u8) -> String {
+    report
+        .buses
+        .iter()
+        .flat_map(|b| b.devices.iter())
+        .find(|d| d.bus == bus && d.address == address)
+        .map_or_else(
+            || "----:----".to_string(),
+            |d| match (&d.vendor_id, &d.product_id) {
+                (Some(v), Some(p)) => format!("{v}:{p}"),
+                _ => "----:----".to_string(),
+            },
+        )
+}
+
 /// Render a report as plain text: a `ts=` line, one header per bus, one
-/// indented row per device, and a closing `findings:` section — `none`, or a
-/// count and one indented line per call-out (see [`Report::findings`]).
+/// indented row per device, a `findings:` section — `none`, or a count and
+/// one indented line per call-out (see [`Report::findings`]) — and a
+/// closing `chokepoints:` section, `none` or a count and one indented line
+/// per choked hub link (see [`Report::chokepoints`]).
 /// `~rx`/`~tx` marks a device whose rate is `estimated` (see
 /// [`DeviceReport::estimated`]).
 pub fn render_text(report: &Report) -> String {
@@ -451,21 +564,22 @@ pub fn render_text(report: &Report) -> String {
     } else {
         out.push_str(&format!("findings: {}\n", report.findings.len()));
         for finding in &report.findings {
-            let id = report
-                .buses
-                .iter()
-                .flat_map(|bus| bus.devices.iter())
-                .find(|d| d.bus == finding.bus && d.address == finding.address)
-                .map_or_else(
-                    || "----:----".to_string(),
-                    |d| match (&d.vendor_id, &d.product_id) {
-                        (Some(v), Some(p)) => format!("{v}:{p}"),
-                        _ => "----:----".to_string(),
-                    },
-                );
+            let id = device_id_cell(report, finding.bus, finding.address);
             out.push_str(&format!(
                 "  {}:{}  {}  {}  {}\n",
                 finding.bus, finding.address, finding.path, id, finding.message
+            ));
+        }
+    }
+    if report.chokepoints.is_empty() {
+        out.push_str("chokepoints: none\n");
+    } else {
+        out.push_str(&format!("chokepoints: {}\n", report.chokepoints.len()));
+        for point in &report.chokepoints {
+            let id = device_id_cell(report, point.bus, point.address);
+            out.push_str(&format!(
+                "  hub {} ({}:{}, {}) {}\n",
+                point.path, point.bus, point.address, id, point.message
             ));
         }
     }
@@ -590,7 +704,8 @@ pub fn run(
             flags.text_active.load(Ordering::Relaxed),
             flags.mmap_active.load(Ordering::Relaxed),
         );
-        let mut report = build_report(
+        let mut report = build_report_at(
+            opts.demand,
             &manager,
             &baseline,
             elapsed,
@@ -702,6 +817,7 @@ mod tests {
                     arch: "x86_64",
                     buses: vec![],
                 },
+                demand: Basis::Link,
             },
         )
         .expect_err("a dead capture channel must fail the run, not report zeros");
@@ -1195,6 +1311,156 @@ mod tests {
         assert_eq!(dev["capability_source"], "bcd_usb");
     }
 
+    /// A 480 hub on a root port with two 480 devices: one choke point.
+    fn tree_with_a_choke() -> (tempfile::TempDir, DeviceManager) {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("devices");
+        let ctrl = temp.path().join("0000:00:14.0");
+        std::fs::create_dir_all(&base).unwrap();
+        let write = |dir: &std::path::Path, attrs: &[(&str, &str)]| {
+            std::fs::create_dir_all(dir).unwrap();
+            for (k, v) in attrs {
+                std::fs::write(dir.join(k), format!("{v}\n")).unwrap();
+            }
+        };
+        let usb1 = ctrl.join("usb1");
+        write(&usb1, &[("busnum", "1"), ("devnum", "1"), ("speed", "480")]);
+        std::os::unix::fs::symlink(&usb1, base.join("usb1")).unwrap();
+        std::fs::create_dir_all(usb1.join("usb1:1.0").join("usb1-port1")).unwrap();
+        let hub = base.join("1-1");
+        write(
+            &hub,
+            &[
+                ("busnum", "1"),
+                ("devnum", "2"),
+                ("speed", "480"),
+                ("idVendor", "1a40"),
+                ("idProduct", "0201"),
+            ],
+        );
+        for n in 1..=2 {
+            std::fs::create_dir_all(hub.join("1-1:1.0").join(format!("1-1-port{n}"))).unwrap();
+            write(
+                &base.join(format!("1-1.{n}")),
+                &[
+                    ("busnum", "1"),
+                    ("devnum", &(n + 2).to_string()),
+                    ("speed", "480"),
+                ],
+            );
+        }
+        let mut mgr = DeviceManager::with_sysfs_base(base);
+        mgr.enumerate_present_devices();
+        mgr.update_bus_speeds();
+        (temp, mgr)
+    }
+
+    #[test]
+    fn json_report_carries_the_choke_points_and_the_basis() {
+        let (_temp, mgr) = tree_with_a_choke();
+        let baseline = Baseline::capture(&mgr);
+        let report = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["demand_basis"], "link");
+        assert_eq!(v["choke_floor"], 1.25);
+        let points = v["chokepoints"].as_array().unwrap();
+        assert_eq!(points.len(), 1);
+        let c = &points[0];
+        assert_eq!(
+            (c["bus"].as_u64(), c["address"].as_u64()),
+            (Some(1), Some(2))
+        );
+        assert_eq!(c["path"], "1-1");
+        assert_eq!(c["port"], "usb1-port1");
+        assert_eq!(c["capacity_mbps"], 384.0);
+        assert_eq!(c["demand_mbps"], 768.0);
+        assert_eq!(c["ratio"], 2.0);
+        assert_eq!(c["devices"], 2);
+        assert_eq!(c["top"].as_array().unwrap().len(), 2);
+        assert_eq!(c["top"][0]["path"], "1-1.1");
+        assert_eq!(c["top"][0]["demand_mbps"], 384.0);
+        assert_eq!(c["message"], "384M carries 2 devices asking 768M: 2.00x");
+
+        let report = build_report_at(
+            crate::capacity::Basis::Capability,
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["demand_basis"], "capability");
+    }
+
+    #[test]
+    fn choke_points_follow_the_filter() {
+        let (_temp, mgr) = tree_with_a_choke();
+        let baseline = Baseline::capture(&mgr);
+        let filter = FilterSet::parse(&["bus=2".to_string()]).unwrap();
+        let report = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &filter,
+        );
+        assert!(
+            report.chokepoints.is_empty(),
+            "the hub is on bus 1, which the filter excludes"
+        );
+    }
+
+    #[test]
+    fn render_text_lists_the_choke_points_after_the_findings() {
+        let (_temp, mgr) = tree_with_a_choke();
+        let baseline = Baseline::capture(&mgr);
+        let report = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        let text = render_text(&report);
+        assert!(
+            text.contains("findings: none\nchokepoints: 1\n  hub 1-1 (1:2, 1a40:0201) 384M carries 2 devices asking 768M: 2.00x\n\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_text_says_chokepoints_none_when_there_are_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let baseline = Baseline::capture(&mgr);
+        let report = build_report(
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            "binary",
+            0,
+            false,
+            &FilterSet::default(),
+        );
+        assert!(render_text(&report).ends_with("findings: none\nchokepoints: none\n\n"));
+    }
+
     #[test]
     fn findings_follow_the_filter() {
         let (_temp, mgr) = tree_with_a_finding();
@@ -1216,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn render_text_ends_with_the_findings_section() {
+    fn render_text_ends_with_the_findings_and_chokepoints_sections() {
         let (_temp, mgr) = tree_with_a_finding();
         let baseline = Baseline::capture(&mgr);
         let report = build_report(
@@ -1229,7 +1495,7 @@ mod tests {
             &FilterSet::default(),
         );
         let text = render_text(&report);
-        assert!(text.contains("\nfindings: 1\n  3:2  3-1  0bda:9210  linked at 480M, supports 5G (from bcdUSB): the SuperSpeed side of this connector (usb4-port1) is empty, so the link came up at USB 2 speed; check the cable or the port\n\n"), "{text}");
+        assert!(text.contains("\nfindings: 1\n  3:2  3-1  0bda:9210  linked at 480M, supports 5G (from bcdUSB): the SuperSpeed side of this connector (usb4-port1) is empty, so the link came up at USB 2 speed; check the cable or the port\nchokepoints: none\n\n"), "{text}");
         assert!(
             text.ends_with("\n\n"),
             "the blank terminator still ends the report"
@@ -1251,7 +1517,7 @@ mod tests {
             &FilterSet::default(),
         );
         let text = render_text(&report);
-        assert!(text.ends_with("findings: none\n\n"), "{text}");
+        assert!(text.contains("\nfindings: none\n"), "{text}");
     }
 
     #[test]
