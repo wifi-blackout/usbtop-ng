@@ -29,7 +29,8 @@ step; see Deferred.
   a root port shares nothing. The USB 2 and USB 3 halves of one hub are two
   sysfs hubs with two links, so their sums are separate without any pairing
   logic; a USB 2 mouse under a USB 3 hub crosses the 480M half, a camera
-  the 5G half.
+  the 5G half. A hub is a device that owns port objects or has children; a
+  hub with nothing below it asks nothing.
 - **Demand.** A leaf's demand is its rate times the class efficiency factor
   the `%busy` denominators already use (`UsbSpeed::class().efficiency()`:
   0.7 low, 0.8 full and high, 0.85 SuperSpeed and SuperSpeedPlus). A hub's
@@ -45,11 +46,12 @@ step; see Deferred.
   largest contributors.
 - **Two bases, `link` and `capability`.** `link` (the default) uses every
   device's current rate on both sides. `capability` is the topology as it
-  could link, given the hubs it has: a leaf's rate is its BOS capability
-  (bcdUSB floor where that is all the tool has), bounded by the capacity
-  of every hub above it; a hub's capacity is its link when it is a USB 2
-  half (a link at or below 480 never becomes more: the SuperSpeed capacity
-  its BOS may advertise belongs to its other half, a different sysfs hub),
+  could link, given the hubs it has: a leaf's rate is the larger of its BOS
+  capability (bcdUSB floor where that is all the tool has) and its link,
+  bounded by the capacity of every hub above it; a hub's capacity is its
+  link when it is a USB 2 half (a link at or below 480 never becomes more:
+  the SuperSpeed capacity its BOS may advertise belongs to its other half,
+  a different sysfs hub),
   and the larger of its link and its capability when it is a SuperSpeed
   half (a 10G hub linked at 5G counts as 10G). Bounding the leaf keeps the
   view honest: the empty NVMe adapter on the dock's USB 2 half asks 480 of
@@ -115,14 +117,17 @@ pub struct Chokepoint {
     pub devices: usize, pub top: Vec<Contributor>,
 }
 impl Chokepoint { pub fn message(&self) -> String }
-pub fn analyze(manager: &DeviceManager, basis: Basis) -> Vec<Chokepoint>
+pub fn analyze(manager: &DeviceManager, ports: &PortIndex, basis: Basis)
+    -> Vec<Chokepoint>
 ```
 
 Pure over the manager's rows: name from the sysfs path, bus, address, rate,
 capability, disconnected flag. The tree comes from the names
-(`connector::port_of_device` gives every device's hub), so no port index is
-needed; a hub is any device with children. Root hubs are walked for their
-children but are never a stage. The walk is depth-first from each root
+(`connector::port_of_device` gives every device's hub). The connector index
+says which devices own port objects, so a hub is any device that owns one or
+has children: an empty hub is a hub, not a leaf asking its link rate. Both
+callers already build that index for the findings. Root hubs are walked for
+their children but are never a stage. The walk is depth-first from each root
 hub, memoizing each hub's demand, so a nested hub's subtree is summed once.
 Output sorted by ratio descending, then path; only entries at or above
 `CHOKE_FLOOR`. `message()` renders `"384M carries 9 devices asking 1.17G:
@@ -132,9 +137,11 @@ Output sorted by ratio descending, then path; only entries at or above
 Basis rules, exactly:
 
 - `rate(device, Link)` = its link rate.
-- `rate(device, Capability)` = its capability when known, else its link,
-  then bounded: `min(rate, capacity_rate(hub))` for every hub above it,
-  applied as the walk descends.
+- `rate(device, Capability)` = the larger of its capability (when known)
+  and its link, then bounded: `min(rate, capacity_rate(hub))` for every hub
+  above it, applied as the walk descends. The `max` mirrors the hub rule: a
+  bcdUSB 3.x floor of 5 Gb/s never makes a device linked at 10 Gb/s ask for
+  less than it already asks.
 - `capacity_rate(hub, Link)` = its link rate.
 - `capacity_rate(hub, Capability)` = its link rate when the link is at or
   below 480; else `max(link, capability)` when a capability is known, else

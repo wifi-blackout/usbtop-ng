@@ -78,6 +78,38 @@ Next, part 3:
   it. It waits on the dock carrying real traffic; the finding model already
   leaves room for it, since the cause enum is open.
 
+Shipped 2026-09-13, part 3 for the USB tree, ahead of the measured overlay
+above: choke points name the uplinks that would choke if every device below
+them pushed what it can. A hub's own link is the stage, everything below it
+is summed against that link at the practical rate both sides already use,
+and the quotient is listed at or above the breathing room of 1.25 -- below
+that a 480M hub with a flash drive and a mouse reads 1.03x and is not worth
+a word. Two bases answer two questions: `link`, the default, takes the rates
+the devices have now, and `capability` takes what each says it could link
+at, bounded by the capacity of every hub above it so nothing under a USB 2
+half asks more than 480M. The worst ratio sits in the TUI header, the choked
+hub's own ratio on its connector heading, `c` toggles the basis, and
+`--demand link|capability` picks it for the `--once`/`--batch` reports,
+which carry `demand_basis`, `choke_floor`, and a `chokepoints` list. It is a
+model of the topology and says so: nothing is measured, and two 480M devices
+under one 480M hub read 2.00x whether or not they ever transfer together.
+
+The second step, once the stages above the root hub can be priced:
+
+- The controller's own PCIe uplink as a stage: sysfs `current_link_speed`
+  times `current_link_width` on the controller's PCI device gives the rate
+  an xHCI card's whole bus tree shares. Integrated controllers expose
+  neither attribute, so the stage exists only where the controller is a
+  discrete PCIe function, and the model must stay silent rather than guess
+  elsewhere.
+- The Thunderbolt link as a stage above that: every tunnel through a router
+  shares it, and a host-to-host network peer shares it too, so a tunneled
+  controller's whole tree is one contributor among several. The kernel
+  gives the link rate and the lane count from `/sys/bus/thunderbolt` and no
+  per-tunnel allocation at all, so the honest output is the shared ceiling
+  and what is known to be under it, never a per-tunnel share invented to
+  fill the gap.
+
 Parked until Linux exposes them, not dropped. No stable kernel interface
 carries these today, and each becomes buildable the moment a mainline ABI
 or capable hardware lands:

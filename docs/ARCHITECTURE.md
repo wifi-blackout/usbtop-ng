@@ -133,6 +133,12 @@ treats them alike.
 
 - `mod.rs`: app state (`UsbTopApp`), the per-interval render snapshot, key
   handling (`apply_key`), the packet drain (`drain_packets`), and every widget.
+  The render snapshot is rebuilt from the device manager every tick, so the
+  findings and the choke points ride on it with no cache of their own: the
+  header carries `choke: N.NNx`, the worst hub ratio on screen, the choked
+  hub's connector heading carries its own ratio, and the `c` key flips
+  `demand_basis` (`capacity::Basis`) so the next tick recomputes both at the
+  other basis.
 - `connectors.rs`: the render model's connector grouping — building
   `ConnectorView`s from the port index, their labels, and their ordering.
 - `colors.rs`: the color scheme.
@@ -158,6 +164,28 @@ treats them alike.
   corpus's `tgl-x360` bundle pairs `usb3-port1` with `usb4-port2`). The
   rules are in
   `docs/superpowers/specs/2026-09-12-capability-callouts-design.md`.
+
+#### 4c. Capacity (`capacity/`)
+
+- `mod.rs`: `analyze(&DeviceManager, Basis) -> Vec<Chokepoint>`, the
+  theoretical load every hub's link would carry if every device below it
+  pushed what it can. Pure over the manager's rows, like the findings
+  engine, and without even a port index: each device's parent hub comes from
+  its sysfs name (`connector::port_of_device`), a hub is any device with
+  children, and one depth-first walk per root hub sums each subtree once.
+- A hub's own link is the only stage. A root hub bounds its subtree but is
+  never an entry of its own, since everything below a hub already crosses
+  that hub's link and the root port above it would read the same number; the
+  two halves of a physical hub are two sysfs devices with two links, so
+  their sums separate with no pairing logic. Both sides are practical rates,
+  the link rate times `UsbSpeed::class().efficiency()`.
+- `CHOKE_FLOOR` (1.25) is the breathing room: only hubs at or above it are
+  returned, worst first with ties broken by path, so the quiet 1.03x cases
+  never reach a surface. `Basis::{Link, Capability}` picks which rate each
+  device is assumed to push, and `Chokepoint::message` is the one sentence
+  the text report and the JSON `message` field show; the TUI builds its own
+  shorter heading suffix from the same numbers. The rules are in
+  `docs/superpowers/specs/2026-09-13-chokepoints-design.md`.
 
 #### 5. TUI chassis (`tui/`)
 

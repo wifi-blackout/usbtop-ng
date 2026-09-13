@@ -19,6 +19,7 @@ anything, so both are safe inside a script or a cron job.
      1:3     05e3:0610  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  GenesysLogic USB2.1 Hub
      1:4  i  04f2:b71a  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  SunplusIT Inc HD Webcam
    findings: none
+   chokepoints: none
    ```
    The first line carries the window's timestamp, length, packet source, the
    channel drop count, and the kernel-side ring drop count (`kdropped`,
@@ -27,12 +28,15 @@ anything, so both are safe inside a script or a cron job.
    1-wide origin cell (`i` when the device matches an internal-device
    snapshot, blank otherwise — see
    [The `internal` field](#the-internal-field)), `vendor_id:product_id`, link
-   speed, rx and tx rate, and the vendor/product string. A `findings:`
-   section closes the report: `none`, or a count and one indented line per
+   speed, rx and tx rate, and the vendor/product string. Two sections close
+   the report: `findings:`, `none` or a count and one indented line per
    device linked below the speed it supports (see
-   [The findings list](#the-findings-list)). This capture ran on an idle bus
-   with nothing to call out, hence the all-zero rates and the empty section;
-   a device moving data reports its rate here instead.
+   [The findings list](#the-findings-list)), then `chokepoints:`, `none` or
+   a count and one indented line per hub whose link is asked for more than
+   it can carry (see [The chokepoints list](#the-chokepoints-list)). This
+   capture ran on an idle bus with nothing to call out, hence the all-zero
+   rates and the empty sections; a device moving data reports its rate here
+   instead.
 
 ## `--batch`: one report per window, repeated
 
@@ -62,6 +66,16 @@ anything, so both are safe inside a script or a cron job.
   window, with its own default and floor -- 5 seconds and 0.1 seconds, the
   capture rule, not the report rule above.
 
+## `--demand BASIS`: the choke-point basis
+
+`--demand link` (the default) or `--demand capability` picks the rate the
+choke-point model assumes every device pushes, for `--once` and `--batch`;
+the chosen basis rides in the report as `demand_basis`, and any other value
+is rejected. Unlike `--window`, `--json`, and `--output`, it is accepted
+without `--once` or `--batch` and simply has nothing to act on there: the
+TUI always starts at the link basis, and its `c` key toggles the basis live.
+See [The chokepoints list](#the-chokepoints-list).
+
 ## `--json`
 
 `--json` prints each report as one JSON document instead of the text table.
@@ -87,6 +101,9 @@ Report, the top-level document:
 | `total_tx_bps` | f64 | sum of every bus's `tx_bps` |
 | `buses` | array | one entry per bus, sorted by bus number |
 | `findings` | array | devices linked below the speed they support, sorted by (bus, address); empty when there is nothing to call out. See [The findings list](#the-findings-list) |
+| `demand_basis` | string | `"link"` or `"capability"`, the rate the choke-point model assumed every device pushes; follows `--demand`. See [The chokepoints list](#the-chokepoints-list) |
+| `choke_floor` | f64 | the breathing room applied, `1.25`: a hub is listed only when the devices below it ask at least this many times its link's capacity |
+| `chokepoints` | array | hubs whose links are asked for more than they can carry, worst first; empty when none reaches `choke_floor`. See [The chokepoints list](#the-chokepoints-list) |
 
 `buses[]`, one entry per bus:
 
@@ -156,14 +173,38 @@ report their own window's true average.
 A cause never sets a field another cause owns, so a consumer reads `cause`
 first and then only the fields that tag defines; everything else is `null`.
 
+`chokepoints[]`, one entry per hub whose link is asked for more than it can
+carry, ordered by `ratio` descending and then by `path`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `bus` | u8 | bus number |
+| `address` | u8 | the hub's USB device number |
+| `path` | string | the hub's sysfs name, `3-1` |
+| `port` | string? | the kernel port object the hub's own link is, `usb3-port1` — the same key `findings[].port` carries, so a script can join the two lists; `null` when the connector index does not know it |
+| `capacity_mbps` | f64 | what the hub's link can carry, in Mbps, after the class efficiency factor |
+| `demand_mbps` | f64 | what the devices below it would ask of that link, in Mbps, after the same factor |
+| `ratio` | f64 | `demand_mbps` divided by `capacity_mbps`; at or above `choke_floor` on every entry |
+| `devices` | u64 | how many devices sit below the hub, nested hubs counted |
+| `top` | array | the largest contributors, at most three, by demand descending and then by path |
+| `message` | string | the one sentence the text report's `chokepoints:` section shows, `384M carries 9 devices asking 1.17G: 3.05x`; the TUI's connector heading builds a shorter suffix from the same numbers |
+
+`chokepoints[].top[]`, one entry per contributing device:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `path` | string | the device's sysfs name, `3-1.4.1` |
+| `demand_mbps` | f64 | what that device alone asks of the hub's link, in Mbps |
+
 ### Example document
 
 A representative document, trimmed to two buses with one device each,
 matching the field names and shapes above; it comes from the corpus's
 Thunderbolt 4 dock bundle, where both of those devices are linked below the
-speed they support, so the report carries two findings. Pretty-printed here
-for readability: `--once --json` prints each report as a single compact
-line:
+speed they support, so the report carries two findings. That bundle also has
+three choke points; the first of them is kept here and the other two
+trimmed. Pretty-printed here for readability: `--once --json` prints each
+report as a single compact line:
 
 ```json
 {
@@ -269,6 +310,35 @@ line:
       "upstream": null,
       "limit_mbps": null,
       "message": "linked at 480M, supports 10G: the SuperSpeed side of this connector (6-1-port2) is empty, so the link came up at USB 2 speed; check the cable or the port"
+    }
+  ],
+  "demand_basis": "link",
+  "choke_floor": 1.25,
+  "chokepoints": [
+    {
+      "bus": 3,
+      "address": 2,
+      "path": "3-1",
+      "port": "usb3-port1",
+      "capacity_mbps": 384.0,
+      "demand_mbps": 1172.25,
+      "ratio": 3.052734375,
+      "devices": 9,
+      "top": [
+        {
+          "path": "3-1.4.1",
+          "demand_mbps": 384.0
+        },
+        {
+          "path": "3-1.4.5",
+          "demand_mbps": 384.0
+        },
+        {
+          "path": "3-1.4.7.3",
+          "demand_mbps": 384.0
+        }
+      ],
+      "message": "384M carries 9 devices asking 1.17G: 3.05x"
     }
   ]
 }
@@ -393,6 +463,60 @@ device filtered out of `buses[].devices` is filtered out of `findings` too.
 
 ```bash
 sudo usbtop-ng --once --json | jq -c '.findings[] | {path, cause, message}'
+```
+
+## The chokepoints list
+
+`chokepoints` is the top-level list of hubs whose links are asked for more
+than they can carry. It is a model of the topology, not a measurement: no
+traffic is read for it. Every end device contributes what it would push at
+its own rate, each hub above it adds that contribution into its own subtree
+sum, and the sum is divided by what the hub's own link can carry. Both
+sides are practical rates -- the link rate times the class efficiency factor
+the `%busy` denominators use, so a 480 Mbps hub reads 384 -- and the
+quotient is `ratio`. A device of unknown rate contributes nothing, a
+disconnected one is left out, and an internal device counts like any other,
+because it is a traffic source too.
+
+A hub's own link is the only stage. A root hub is therefore never an entry:
+everything below a hub crosses that hub's link, and the root port above it
+would always carry the identical number. The USB 2 and USB 3 halves of one
+physical hub are two devices in sysfs with two links, so their subtrees are
+summed separately without any pairing: a USB 2 mouse under a USB 3 hub
+loads the 480M half, a 5 Gbps camera the SuperSpeed one.
+
+`choke_floor` is the breathing room, `1.25`. A hub is listed only when its
+subtree asks at least 1.25 times its capacity; below that the model is
+noise, since a 480M hub carrying a flash drive and a mouse already reads
+1.03x. The floor rides in every report so a script sees the one that was
+applied rather than assuming it.
+
+`demand_basis` says which rate each device was assumed to push, and
+`--demand` picks it:
+
+- `link`, the default, uses the rate every device has now, on both sides.
+  It answers "is the tree as it stands oversubscribed".
+- `capability` uses the rate each device says it could link at -- the same
+  BOS figure the findings use -- bounded by the capacity of every hub above
+  it, and takes a SuperSpeed hub's capacity as the larger of its link and
+  its own capability, so a 10 Gbps hub linked at 5 Gbps counts as 10 Gbps.
+  The bound is what keeps the view honest: nothing below a USB 2 half can
+  push more than 480 Mbps whatever its own BOS advertises, so a 10 Gbps
+  drive plugged into one asks 480 of it and not 10000 -- moving it is the
+  call-out the findings already make, not something this model simulates.
+  A USB 2 half's own capacity is likewise its link and never its BOS
+  figure, because the SuperSpeed capability such a hub advertises belongs
+  to its other half, a different sysfs hub. Where every device is already
+  linked at what it supports, the two bases give the same list.
+
+`--filter` narrows `chokepoints` the way it narrows `findings`, at the list
+and not in the model: the walk always covers the whole device tree, so a
+device filtered out of `buses[].devices` still counts toward the hub above
+it, but an entry whose own hub row was filtered out is dropped from the
+list.
+
+```bash
+sudo usbtop-ng --once --json | jq -c '.chokepoints[] | [.path, .ratio]'
 ```
 
 ## The `estimated` field

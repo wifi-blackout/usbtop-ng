@@ -100,6 +100,7 @@ fallback are root-owned by default.
 | `↑` / `↓` | Select a device. The device table scrolls to keep it visible. |
 | `h` | Open or close the help overlay. |
 | `i` | Show or hide idle devices. Saves the choice to `~/.usbtop-ng/preferences.toml`. |
+| `c` | Toggle the choke basis: the rates devices are linked at now, or the rates they say they could link at. See [Choke points](#choke-points). |
 | `/` | Open search input, prefilled with the active query if one is committed. See [Search](#search). |
 | `S` | Snapshot every attached device as internal, after a confirmation. See [Device origin](#device-origin). |
 | `Ctrl-L` | Wipe the screen and repaint it from scratch. |
@@ -380,6 +381,43 @@ says, and the snapshot is the one list you control.
   `capability_mbps` and `capability_source` on every device row. See
   [docs/SCRIPTING.md](docs/SCRIPTING.md#the-findings-list).
 
+### Choke points
+
+- A hub's link carries everything below it. usbtop-ng adds up what every
+  device under a hub would push at its own rate, compares the sum with what
+  that hub's own link can carry, and names the hubs asked for more than they
+  can deliver. It is a model of the topology, not a measurement: no traffic
+  is read, and the two sides are practical rates, the link rate times the
+  same class efficiency factor the `%busy` denominators use, so a 480 Mbps
+  hub counts as 384M.
+- A hub is listed only at or above the **breathing room** of 1.25, meaning
+  its subtree asks at least 1.25 times its capacity. Below that an uplink
+  stays quiet: a 480M hub carrying a flash drive and a mouse reads 1.03x,
+  which is not worth a word.
+- The TUI puts `choke: N.NNx` in the header, the worst ratio on screen, and
+  appends `· choke 3.05x (1.17G asked of 384M)` to the connector heading of
+  the hub whose link is choked — that connector is the link. `c` toggles the
+  basis, and the header reads `choke: N.NNx (cap)` at the capability one.
+- Two bases. `link`, the default, uses the rate every device has now on both
+  sides. `capability` asks what the tree could carry: each device pushes
+  what it says it supports, bounded by the capacity of every hub above it,
+  and a SuperSpeed hub counts at the larger of its link and its own
+  capability. The bound is what keeps it honest — nothing below a USB 2 half
+  can push more than 480M whatever its BOS advertises, and that device's real
+  fix is the move the findings already call out. `--demand link|capability`
+  picks the basis for `--once` and `--batch`.
+- `--once`/`--batch` text reports close with a `chokepoints:` section, one
+  indented line per hub, `chokepoints: none` when nothing clears the floor:
+  ```
+  chokepoints: 3
+    hub 3-1 (3:2, 0bda:5411) 384M carries 9 devices asking 1.17G: 3.05x
+    hub 3-1.4 (3:42, 1a40:0201) 384M carries 8 devices asking 1.17G: 3.05x
+    hub 4-1 (4:2, 0bda:0411) 4.25G carries 2 devices asking 8.5G: 2.00x
+  ```
+- `--json` carries the same list as a top-level `chokepoints` array, plus
+  `demand_basis` and `choke_floor`, the breathing room that was applied. See
+  [docs/SCRIPTING.md](docs/SCRIPTING.md#the-chokepoints-list).
+
 ### Reporting a problem
 
 - `usbtop-ng --support` gathers a diagnostic bundle for a bug report: the
@@ -632,6 +670,8 @@ Options:
           Print a report every window until interrupted
       --json
           Print reports as JSON (one document per report)
+      --demand <BASIS>
+          Which rate the choke-point model assumes every device pushes: `link` (its current link) or `capability` (what it could link at) [default: link] [possible values: link, capability]
       --output <PATH>
           Write the reports to PATH instead of stdout (created or truncated; the file starts with a run record). Needs --once or --batch
       --window <SECONDS>
@@ -680,6 +720,11 @@ them safe in a script or a cron job. See
   park a wedged terminal there.
 - The Rust runtime writes a panic message and backtrace to stderr, not
   usbtop-ng.
+- Choke points are theoretical, and deliberately so: two 480M devices under
+  one 480M hub read 2.00x whether or not they ever transfer together. The
+  model says which uplink could not carry its subtree at full tilt, not
+  which one is congested right now; the per-device rates and `%busy` are
+  where the measured answer lives.
 - 🔺 is a best-effort signal. A device with no BOS — no `bos_descriptors`
   file, because the kernel predates 6.9 or the device has none — and a
   bcdUSB below 3 is never marked, so a missing 🔺 proves nothing. The BOS
