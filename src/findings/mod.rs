@@ -355,7 +355,7 @@ fn finding_for(
                 // enumerated on another port number. Say nothing about the
                 // hub; its children still get their own true statement.
                 Half::Ambiguous => return None,
-                // Rule H proved the half never enumerated: judge the hub
+                // Rule H proved the half never enumerated: treat the hub
                 // like any other device below.
                 Half::Missing => {}
             }
