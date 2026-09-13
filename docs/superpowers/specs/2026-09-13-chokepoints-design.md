@@ -67,7 +67,7 @@ step; see Deferred.
   breathing room; ` | choke: 3.05x (cap)` at the capability basis. The
   choked hub's connector heading, on the connector the hub sits on (that
   connector is its link): `▶ Port 1 · bus 03 + 04 · hub · choke 3.05x
-  (1172M asked of 384M)`. The `c` key toggles the basis; the controls line
+  (1.17G asked of 384M)`. The `c` key toggles the basis; the controls line
   gains `c Capacity basis`; the help overlay explains the counter, the
   breathing room and the key.
 - **Reports.** `--demand link|capability` (default `link`) picks the basis
