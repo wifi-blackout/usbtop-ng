@@ -426,13 +426,6 @@ impl UsbTopApp {
             .map(|finding| ((finding.bus, finding.address), finding))
             .collect();
         self.chokepoints = analyze_capacity(manager, &index, self.demand_basis);
-        // By the port name of the hub's link, the same names the placement
-        // key joins with `+`.
-        let chokes_by_port: HashMap<&str, &Chokepoint> = self
-            .chokepoints
-            .iter()
-            .filter_map(|c| c.port.as_deref().map(|p| (p, c)))
-            .collect();
         let bus_speed = |bus_id: u8| manager.buses.get(&bus_id).map(|bus| bus.speed.clone());
 
         let mut buses: Vec<&UsbBus> = manager.buses.values().collect();
@@ -468,23 +461,15 @@ impl UsbTopApp {
                 let connector = match view.connectors.iter().position(|c| c.key == placement.key) {
                     Some(at) => &mut view.connectors[at],
                     None => {
-                        let choke = placement
-                            .key
-                            .split('+')
-                            .filter_map(|port| chokes_by_port.get(port))
-                            .max_by(|a, b| {
-                                a.ratio
-                                    .partial_cmp(&b.ratio)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                            .map(|c| (*c).clone());
                         view.connectors.push(ConnectorView {
                             key: placement.key,
                             label: placement.label,
                             name: placement.name,
                             buses: placement.buses,
                             is_hub: false,
-                            choke,
+                            // Attached once the screen filters have run
+                            // (see `keep_chokepoints_on_screen`).
+                            choke: None,
                             devices: Vec::new(),
                             rx_bps: 0.0,
                             tx_bps: 0.0,
@@ -548,7 +533,7 @@ impl UsbTopApp {
         // Once, after every retention pass: no bare heading survives, and
         // every total reflects only the rows still shown.
         self.prune_empty_groups();
-        self.retain_visible_chokepoints();
+        self.keep_chokepoints_on_screen();
         self.recompute_rates();
 
         if let Some(selected) = &self.selected_device {
@@ -570,17 +555,20 @@ impl UsbTopApp {
     /// The worst choke ratio on screen, when any hub is at or above the
     /// breathing room; the list is worst first and, by the time the header
     /// reads it, holds only the hubs with a row on screen (see
-    /// [`Self::retain_visible_chokepoints`]).
+    /// [`Self::keep_chokepoints_on_screen`]).
     pub fn worst_choke(&self) -> Option<f64> {
         self.chokepoints.first().map(|c| c.ratio)
     }
 
-    /// Keep only the choke points with a row on screen: the hub itself or
-    /// any device below it. The search query and the idle filter drop rows
-    /// after the model is built, and a counter with nothing on screen to
-    /// attribute it to would read as a bug; a connector heading survives
-    /// exactly when one of those rows does, so the two surfaces agree.
-    fn retain_visible_chokepoints(&mut self) {
+    /// Keep only the choke points with a row on screen, the hub itself or
+    /// any device below it, and put each on the heading of the connector
+    /// its hub sits on (the worse one when both halves of a hub choke).
+    /// The search query and the idle filter drop rows after the model is
+    /// built, and a counter with nothing on screen to attribute it to
+    /// would read as a bug; a connector heading survives exactly when one
+    /// of those rows does and takes its choke from the same retained list,
+    /// so the two surfaces agree.
+    fn keep_chokepoints_on_screen(&mut self) {
         let names: Vec<String> = self
             .controllers
             .iter()
@@ -593,6 +581,29 @@ impl UsbTopApp {
                     .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
             })
         });
+        // By the port name of the hub's link, the same names the placement
+        // key joins with `+`.
+        let by_port: HashMap<&str, &Chokepoint> = self
+            .chokepoints
+            .iter()
+            .filter_map(|c| c.port.as_deref().map(|p| (p, c)))
+            .collect();
+        for connector in self
+            .controllers
+            .iter_mut()
+            .flat_map(|controller| controller.connectors.iter_mut())
+        {
+            connector.choke = connector
+                .key
+                .split('+')
+                .filter_map(|port| by_port.get(port))
+                .max_by(|a, b| {
+                    a.ratio
+                        .partial_cmp(&b.ratio)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|c| (*c).clone());
+        }
     }
 
     /// Device keys ("bus:dev") flattened in render order.
@@ -2463,6 +2474,53 @@ mod tests {
         app.sync_from(&mgr);
         assert_eq!(rows(&app).len(), 1, "one device below the hub survives");
         assert_eq!(app.worst_choke(), Some(2.0));
+    }
+
+    #[test]
+    fn a_heading_drops_the_choke_of_a_half_whose_rows_are_off_screen() {
+        // Paired halves 3-1 and 4-1 share one connector and only the USB 2
+        // half chokes, under the two 480 devices added here. A query that
+        // keeps only the USB 3 half's hub row drops the choke from the
+        // header and from the heading alike: nothing on screen is what it
+        // is about.
+        let (temp, _) = connector_fixture();
+        let base = temp.path().join("devices");
+        for n in 1..=2u8 {
+            let dir = base.join(format!("3-1.{n}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("busnum"), "3\n").unwrap();
+            std::fs::write(dir.join("devnum"), format!("{}\n", 30 + n)).unwrap();
+            std::fs::write(dir.join("speed"), "480\n").unwrap();
+        }
+        let mut mgr = DeviceManager::with_sysfs_base(base);
+        mgr.enumerate_present_devices();
+        mgr.update_bus_speeds();
+        let headings = |app: &UsbTopApp| -> Vec<String> {
+            let (lines, _) = device_list_lines_with_selection(app);
+            lines
+                .iter()
+                .map(|l| l.to_string())
+                .filter(|l| l.starts_with("▶ Port"))
+                .collect()
+        };
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        assert_eq!(app.chokepoints.len(), 1, "{:?}", app.chokepoints);
+        assert_eq!(app.chokepoints[0].path, "3-1");
+        assert_eq!(
+            headings(&app)
+                .iter()
+                .filter(|h| h.contains("choke"))
+                .count(),
+            1
+        );
+        app.search = SearchState::Committed("004:002".to_string());
+        app.sync_from(&mgr);
+        assert_eq!(rows(&app).len(), 1, "only the USB 3 half's hub row");
+        assert_eq!(app.worst_choke(), None);
+        let headings = headings(&app);
+        assert_eq!(headings.len(), 1, "the connector stays, for that row");
+        assert!(!headings[0].contains("choke"), "{}", headings[0]);
     }
 
     #[test]
