@@ -205,12 +205,18 @@ fn resolve_controller(src_dir: &Path) -> Option<String> {
 fn copy_attrs(src: &Path, out: &FixtureRoot, dst: &str) -> anyhow::Result<()> {
     copy_named(src, out, dst, &ATTRS)?;
     // The BOS, reduced (see `BOS_ATTR`). Whatever the file held, the
-    // bundle gets a block the replay reads to the same verdict.
-    if let Ok(bytes) = std::fs::read(src.join(BOS_ATTR)) {
-        let reduced = crate::device::bos::rate_capabilities_only(&bytes);
-        out.write(&format!("{dst}/{BOS_ATTR}"), &reduced)
-            .with_context(|| format!("write {dst}/{BOS_ATTR}"))?;
-    }
+    // bundle gets a block the replay reads to the same verdict: an absent
+    // file stays absent (the replay falls back to bcdUSB, as the live tool
+    // did), and a file that is there but cannot be read becomes a bare
+    // header (no capability, as the live tool concluded; see
+    // `device::bos::read_capability`).
+    let reduced = match std::fs::read(src.join(BOS_ATTR)) {
+        Ok(bytes) => crate::device::bos::rate_capabilities_only(&bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => crate::device::bos::rate_capabilities_only(&[]),
+    };
+    out.write(&format!("{dst}/{BOS_ATTR}"), &reduced)
+        .with_context(|| format!("write {dst}/{BOS_ATTR}"))?;
     Ok(())
 }
 
@@ -341,6 +347,21 @@ mod tests {
             &[("busnum", "1\n"), ("devnum", "5\n"), ("speed", "480\n")],
         );
         std::fs::write(temp.path().join("devices/1-3/bos_descriptors"), b"garbage").unwrap();
+        // A file that is there but cannot be read (a directory stands in for
+        // a failing read: EISDIR, not ENOENT) while bcdUSB claims 3.x: live,
+        // that is no capability, and the replay must not invent the bcdUSB
+        // floor from an absent file.
+        dev(
+            &temp.path().join("devices"),
+            "1-4",
+            &[
+                ("busnum", "1\n"),
+                ("devnum", "6\n"),
+                ("speed", "480\n"),
+                ("version", "3.20\n"),
+            ],
+        );
+        std::fs::create_dir(temp.path().join("devices/1-4/bos_descriptors")).unwrap();
         let dst = temp.path().join("bundle").join("sysfs");
         materialize_sysfs(
             &temp.path().join("devices"),
@@ -378,6 +399,15 @@ mod tests {
         );
         assert!(mgr.buses[&1].devices[&4].capability.is_none());
         assert!(mgr.buses[&1].devices[&5].capability.is_none());
+        assert_eq!(
+            std::fs::read(dst.join("1-4/bos_descriptors")).unwrap(),
+            [0x05, 0x0f, 0x05, 0x00, 0x00],
+            "an unreadable BOS becomes a bare header"
+        );
+        assert!(
+            mgr.buses[&1].devices[&6].capability.is_none(),
+            "the replay concludes no capability, as the live tool did, not the bcdUSB floor"
+        );
     }
 
     /// `resolve_controller` returns `None` only when canonicalizing `usbN`
