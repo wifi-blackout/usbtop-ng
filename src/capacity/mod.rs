@@ -7,7 +7,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::connector::{port_name, port_of_device};
+use crate::connector::{port_name, port_of_device, PortIndex};
 use crate::device::manager::DeviceManager;
 use crate::usbmon::parser::{short_mbps, UsbSpeed};
 
@@ -17,6 +17,9 @@ use crate::usbmon::parser::{short_mbps, UsbSpeed};
 pub const CHOKE_FLOOR: f64 = 1.25;
 
 const HIGH_SPEED_MBPS: f64 = 480.0;
+
+/// How far below [`CHOKE_FLOOR`] still counts as reaching it (see `walk`).
+const FLOOR_TOLERANCE: f64 = 1e-9;
 
 /// Which rate every device is assumed to push.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -116,12 +119,19 @@ fn capacity_rate(node: &Node, basis: Basis) -> f64 {
 }
 
 /// The rate a leaf is taken to push, before efficiency: at the capability
-/// basis its capability bounded by `bound`, the tightest capacity rate of
-/// the hubs above it.
+/// basis the larger of its capability and its link, bounded by `bound`, the
+/// tightest capacity rate of the hubs above it. The `max` mirrors the hub
+/// rule: a stated capability is a floor, never a ceiling below the rate the
+/// device has actually reached, so a bcdUSB 3.x floor of 5 Gb/s cannot make
+/// a device linked at 10 Gb/s ask for less than it already asks.
 fn leaf_rate(node: &Node, basis: Basis, bound: f64) -> f64 {
     match basis {
         Basis::Link => node.link,
-        Basis::Capability => node.capability.unwrap_or(node.link).min(bound),
+        Basis::Capability => node
+            .capability
+            .unwrap_or(node.link)
+            .max(node.link)
+            .min(bound),
     }
 }
 
@@ -131,12 +141,17 @@ fn leaf_rate(node: &Node, basis: Basis, bound: f64) -> f64 {
 fn walk(
     nodes: &[Node],
     at: usize,
+    ports: &PortIndex,
     basis: Basis,
     bound: f64,
     out: &mut Vec<Chokepoint>,
 ) -> (f64, usize, Vec<Contributor>) {
     let node = &nodes[at];
-    if node.children.is_empty() {
+    // A hub is a device that owns port objects or has children. A hub with
+    // nothing below it is not a traffic source: an empty 4-port hub asks
+    // nothing of its uplink, where treating it as a leaf would have it ask
+    // its whole link rate.
+    if node.children.is_empty() && !ports.is_hub(node.name) {
         let demand = practical(leaf_rate(node, basis, bound));
         let contributors = if demand > 0.0 {
             vec![Contributor {
@@ -157,7 +172,7 @@ fn walk(
     let mut devices = 0;
     let mut contributors = Vec::new();
     for &child in &node.children {
-        let (d, n, c) = walk(nodes, child, basis, inner_bound, out);
+        let (d, n, c) = walk(nodes, child, ports, basis, inner_bound, out);
         demand += d;
         devices += n + 1;
         contributors.extend(c);
@@ -167,7 +182,10 @@ fn walk(
         let capacity = practical(rate);
         if capacity > 0.0 {
             let ratio = demand / capacity;
-            if ratio >= CHOKE_FLOOR {
+            // Tolerant on purpose: the practical figures are products of
+            // 0.7, 0.8 and 0.85, so a subtree meant to sit exactly on the
+            // floor can land an ulp below it and would otherwise vanish.
+            if ratio + FLOOR_TOLERANCE >= CHOKE_FLOOR {
                 let mut top = contributors.clone();
                 top.sort_by(|a, b| {
                     b.demand_mbps
@@ -194,8 +212,11 @@ fn walk(
 }
 
 /// Every hub whose subtree asks at least `CHOKE_FLOOR` times its link's
-/// practical capacity, worst first, ties by path.
-pub fn analyze(manager: &DeviceManager, basis: Basis) -> Vec<Chokepoint> {
+/// practical capacity, worst first, ties by path. `ports` says which
+/// devices own port objects, so a hub with nothing plugged into it is
+/// recognised as a hub rather than counted as a device asking its link
+/// rate.
+pub fn analyze(manager: &DeviceManager, ports: &PortIndex, basis: Basis) -> Vec<Chokepoint> {
     let mut nodes: Vec<Node> = manager
         .buses
         .values()
@@ -227,7 +248,7 @@ pub fn analyze(manager: &DeviceManager, basis: Basis) -> Vec<Chokepoint> {
     let mut out = Vec::new();
     for (i, parent) in parents.iter().enumerate() {
         if parent.is_none() {
-            walk(&nodes, i, basis, f64::INFINITY, &mut out);
+            walk(&nodes, i, ports, basis, f64::INFINITY, &mut out);
         }
     }
     out.sort_by(|a, b| {
@@ -272,6 +293,13 @@ mod tests {
         dir
     }
 
+    /// `analyze` over the tree as the live callers build it: the manager and
+    /// the connector index scanned from the same device directories.
+    fn choke(t: &Tree, basis: Basis) -> Vec<Chokepoint> {
+        let m = t.manager();
+        analyze(&m, &Tree::port_index(&m), basis)
+    }
+
     fn summary(points: &[Chokepoint]) -> Vec<(&str, f64, f64, f64, usize)> {
         points
             .iter()
@@ -294,7 +322,7 @@ mod tests {
         hub(&t, "1-1", "480", None, 2);
         t.device("1-1.1", "480", Some("2.00"), None);
         t.device("1-1.2", "480", Some("2.00"), None);
-        let points = analyze(&t.manager(), Basis::Link);
+        let points = choke(&t, Basis::Link);
         assert_eq!(summary(&points), vec![("1-1", 384.0, 768.0, 2.0, 2)]);
         let c = &points[0];
         assert_eq!(
@@ -325,7 +353,7 @@ mod tests {
         t.device("1-1.1", "480", Some("2.00"), None);
         t.device("1-1.2", "1.5", Some("2.00"), None);
         assert!(
-            analyze(&t.manager(), Basis::Link).is_empty(),
+            choke(&t, Basis::Link).is_empty(),
             "1.003x is not a choke point"
         );
     }
@@ -340,7 +368,7 @@ mod tests {
         for n in 2..=11 {
             t.device(&format!("1-1.{n}"), "12", Some("2.00"), None);
         }
-        let points = analyze(&t.manager(), Basis::Link);
+        let points = choke(&t, Basis::Link);
         assert_eq!(points.len(), 1, "exactly 1.25x is listed");
         assert!((points[0].ratio - 1.25).abs() < 1e-9);
         // Nine of them: 470.4, below the floor.
@@ -351,7 +379,7 @@ mod tests {
         for n in 2..=10 {
             t.device(&format!("1-1.{n}"), "12", Some("2.00"), None);
         }
-        assert!(analyze(&t.manager(), Basis::Link).is_empty());
+        assert!(choke(&t, Basis::Link).is_empty());
     }
 
     #[test]
@@ -363,7 +391,7 @@ mod tests {
         t.device("1-1.1.1", "480", Some("2.00"), None);
         t.device("1-1.1.2", "480", Some("2.00"), None);
         t.device("1-1.2", "480", Some("2.00"), None);
-        let points = analyze(&t.manager(), Basis::Link);
+        let points = choke(&t, Basis::Link);
         assert_eq!(
             summary(&points),
             vec![
@@ -372,6 +400,33 @@ mod tests {
             ],
             "the parent counts the child hub and every device below it"
         );
+    }
+
+    #[test]
+    fn an_empty_hub_asks_nothing() {
+        // A hub owns port objects even with nothing plugged in, so it is a
+        // hub and not a leaf asking its own link rate.
+        let t = Tree::new();
+        root(&t, 1, "480", 1);
+        hub(&t, "1-1", "480", None, 2);
+        t.device("1-1.1", "480", Some("2.00"), None);
+        hub(&t, "1-1.2", "480", None, 2);
+        assert!(
+            choke(&t, Basis::Link).is_empty(),
+            "one flash drive asks 384 of 384; the empty hub asks nothing"
+        );
+        // With a second flash drive the hub is listed, and the empty hub is
+        // a device below it but never a contributor.
+        let t = Tree::new();
+        root(&t, 1, "480", 1);
+        hub(&t, "1-1", "480", None, 3);
+        t.device("1-1.1", "480", Some("2.00"), None);
+        hub(&t, "1-1.2", "480", None, 2);
+        t.device("1-1.3", "480", Some("2.00"), None);
+        let points = choke(&t, Basis::Link);
+        assert_eq!(summary(&points), vec![("1-1", 384.0, 768.0, 2.0, 3)]);
+        let top: Vec<&str> = points[0].top.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(top, ["1-1.1", "1-1.3"]);
     }
 
     #[test]
@@ -389,7 +444,7 @@ mod tests {
         t.device("3-1.2", "480", Some("2.00"), None);
         t.device("4-1.1", "5000", Some("3.00"), Some(SS));
         assert_eq!(
-            summary(&analyze(&t.manager(), Basis::Link)),
+            summary(&choke(&t, Basis::Link)),
             vec![("3-1", 384.0, 768.0, 2.0, 2)],
             "the USB 3 half carries one 5G device, 1.0x, and is not listed"
         );
@@ -404,7 +459,10 @@ mod tests {
         t.device("1-1.2", "480", Some("2.00"), None);
         t.device("1-1.3", "0", Some("2.00"), None); // rate unknown
         let mut manager = t.manager();
-        let points = analyze(&manager, Basis::Link);
+        // Scanned once, before the rows are mutated: the index reads sysfs,
+        // which the mutations below do not touch.
+        let ports = Tree::port_index(&manager);
+        let points = analyze(&manager, &ports, Basis::Link);
         assert_eq!(
             summary(&points),
             vec![("1-1", 384.0, 768.0, 2.0, 3)],
@@ -419,7 +477,7 @@ mod tests {
         for device in manager.buses.get_mut(&1).unwrap().devices.values_mut() {
             device.is_internal = true;
         }
-        assert_eq!(analyze(&manager, Basis::Link).len(), 1);
+        assert_eq!(analyze(&manager, &ports, Basis::Link).len(), 1);
         // A device the manager lists as disconnected is out of the sum.
         manager
             .buses
@@ -430,7 +488,7 @@ mod tests {
             .unwrap()
             .is_disconnected = true;
         assert!(
-            analyze(&manager, Basis::Link).is_empty(),
+            analyze(&manager, &ports, Basis::Link).is_empty(),
             "one 480 device left: 1.0x"
         );
     }
@@ -443,13 +501,13 @@ mod tests {
         root(&t, 2, "10000", 1);
         hub(&t, "2-1", "10000", Some(SSP), 4);
         t.device("2-1.1", "5000", Some("3.20"), Some(SSP));
-        assert!(analyze(&t.manager(), Basis::Link).is_empty());
-        assert!(analyze(&t.manager(), Basis::Capability).is_empty());
+        assert!(choke(&t, Basis::Link).is_empty());
+        assert!(choke(&t, Basis::Capability).is_empty());
         // Two of them: link 1.0x (not listed), capability 2.0x (listed).
         t.device("2-1.2", "5000", Some("3.20"), Some(SSP));
-        assert!(analyze(&t.manager(), Basis::Link).is_empty());
+        assert!(choke(&t, Basis::Link).is_empty());
         assert_eq!(
-            summary(&analyze(&t.manager(), Basis::Capability)),
+            summary(&choke(&t, Basis::Capability)),
             vec![("2-1", 8500.0, 17000.0, 2.0, 2)]
         );
     }
@@ -463,12 +521,9 @@ mod tests {
         hub(&t, "5-1", "480", None, 2);
         t.device("5-1.1", "480", Some("2.10"), Some(SSP));
         t.device("5-1.2", "12", Some("2.01"), None);
+        assert!(choke(&t, Basis::Link).is_empty(), "1.03x at link");
         assert!(
-            analyze(&t.manager(), Basis::Link).is_empty(),
-            "1.03x at link"
-        );
-        assert!(
-            analyze(&t.manager(), Basis::Capability).is_empty(),
+            choke(&t, Basis::Capability).is_empty(),
             "still 1.03x at capability: bounded"
         );
         // A USB 2 half that advertises SuperSpeed (its other half's) keeps 480.
@@ -478,7 +533,7 @@ mod tests {
         t.device("3-1.1", "480", Some("2.10"), Some(SS));
         t.device("3-1.2", "480", Some("2.10"), Some(SS));
         assert_eq!(
-            summary(&analyze(&t.manager(), Basis::Capability)),
+            summary(&choke(&t, Basis::Capability)),
             vec![("3-1", 384.0, 768.0, 2.0, 2)]
         );
     }
@@ -491,12 +546,33 @@ mod tests {
         t.device("2-1.1", "5000", Some("3.20"), Some(SSP));
         t.device("2-1.2", "5000", Some("3.20"), Some(SSP));
         assert_eq!(
-            summary(&analyze(&t.manager(), Basis::Link)),
+            summary(&choke(&t, Basis::Link)),
             vec![("2-1", 4250.0, 8500.0, 2.0, 2)]
         );
         assert_eq!(
-            summary(&analyze(&t.manager(), Basis::Capability)),
+            summary(&choke(&t, Basis::Capability)),
             vec![("2-1", 8500.0, 17000.0, 2.0, 2)]
+        );
+    }
+
+    #[test]
+    fn a_bcd_usb_floor_leaf_linked_above_it_keeps_its_link_at_the_capability_basis() {
+        // No BOS, so the capability is the bcdUSB 3.x floor of 5 Gb/s --
+        // below the 10 Gb/s these two are already linked at. The capability
+        // basis must not read that floor as a ceiling.
+        let t = Tree::new();
+        root(&t, 2, "10000", 1);
+        hub(&t, "2-1", "10000", Some(SSP), 4);
+        t.device("2-1.1", "10000", Some("3.10"), None);
+        t.device("2-1.2", "10000", Some("3.10"), None);
+        assert_eq!(
+            summary(&choke(&t, Basis::Link)),
+            vec![("2-1", 8500.0, 17000.0, 2.0, 2)]
+        );
+        assert_eq!(
+            summary(&choke(&t, Basis::Capability)),
+            vec![("2-1", 8500.0, 17000.0, 2.0, 2)],
+            "the 5G floor never lowers a device already linked at 10G"
         );
     }
 
@@ -510,7 +586,7 @@ mod tests {
         t.device("1-1.3", "1.5", Some("2.00"), None);
         t.device("1-1.4", "12", Some("2.00"), None);
         t.device("1-1.5", "480", Some("2.00"), None);
-        let points = analyze(&t.manager(), Basis::Link);
+        let points = choke(&t, Basis::Link);
         let top: Vec<&str> = points[0].top.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(top, ["1-1.2", "1-1.5", "1-1.1"]);
     }
@@ -525,7 +601,7 @@ mod tests {
                 t.device(&format!("{name}.{n}"), "480", Some("2.00"), None);
             }
         }
-        let points = analyze(&t.manager(), Basis::Link);
+        let points = choke(&t, Basis::Link);
         let order: Vec<&str> = points.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(order, ["1-3", "1-1", "1-2"]);
     }

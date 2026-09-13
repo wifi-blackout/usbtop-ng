@@ -418,7 +418,7 @@ impl UsbTopApp {
             .into_iter()
             .map(|finding| ((finding.bus, finding.address), finding))
             .collect();
-        self.chokepoints = analyze_capacity(manager, self.demand_basis);
+        self.chokepoints = analyze_capacity(manager, &index, self.demand_basis);
         // By the port name of the hub's link, the same names the placement
         // key joins with `+`.
         let chokes_by_port: HashMap<&str, &Chokepoint> = self

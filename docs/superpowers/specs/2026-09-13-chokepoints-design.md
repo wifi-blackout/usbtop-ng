@@ -30,7 +30,10 @@ step; see Deferred.
   sysfs hubs with two links, so their sums are separate without any pairing
   logic; a USB 2 mouse under a USB 3 hub crosses the 480M half, a camera
   the 5G half. A hub is a device that owns port objects or has children; a
-  hub with nothing below it asks nothing.
+  hub with nothing below it asks nothing. A hub captured without its port
+  objects and without children is indistinguishable from a leaf and counts
+  as one; the two older `devhost` snapshots hold the same empty hub that
+  way.
 - **Demand.** A leaf's demand is its rate times the class efficiency factor
   the `%busy` denominators already use (`UsbSpeed::class().efficiency()`:
   0.7 low, 0.8 full and high, 0.85 SuperSpeed and SuperSpeedPlus). A hub's
@@ -51,15 +54,15 @@ step; see Deferred.
   bounded by the capacity of every hub above it; a hub's capacity is its
   link when it is a USB 2 half (a link at or below 480 never becomes more:
   the SuperSpeed capacity its BOS may advertise belongs to its other half,
-  a different sysfs hub),
-  and the larger of its link and its capability when it is a SuperSpeed
-  half (a 10G hub linked at 5G counts as 10G). Bounding the leaf keeps the
-  view honest: the empty NVMe adapter on the dock's USB 2 half asks 480 of
-  it, not 10G, because nothing under a USB 2 half can push more, and its
-  real fix (moving to the USB 3 half) is a call-out the findings already
-  make. On the dock bundle the capability view therefore equals the link
-  view; it differs where a SuperSpeed device is linked below its capability
-  under a SuperSpeed hub that has the room, the cable cases.
+  a different sysfs hub), and the larger of its link and its capability
+  when it is a SuperSpeed half (a 10G hub linked at 5G counts as 10G).
+  Bounding the leaf keeps the view honest: the empty NVMe adapter on the
+  dock's USB 2 half asks 480 of it, not 10G, because nothing under a USB 2
+  half can push more, and its real fix (moving to the USB 3 half) is a
+  call-out the findings already make. On the dock bundle the capability
+  view therefore equals the link view; it differs where a SuperSpeed device
+  is linked below its capability under a SuperSpeed hub that has the room,
+  the cable cases.
 - **Recomputed every tick.** The TUI rebuilds its render model from the
   device manager every tick and the findings ride on that; the choke model
   is one walk over the same rows and rides on it too, so any device change

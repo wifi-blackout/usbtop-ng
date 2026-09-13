@@ -432,7 +432,7 @@ pub fn build_report_at(
         .filter(|f| listed.contains(&(f.bus, f.address)))
         .map(FindingReport::from)
         .collect();
-    let chokepoints = crate::capacity::analyze(manager, basis)
+    let chokepoints = crate::capacity::analyze(manager, &index, basis)
         .iter()
         .filter(|c| listed.contains(&(c.bus, c.address)))
         .map(ChokepointReport::from)
