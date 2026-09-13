@@ -1662,13 +1662,15 @@ fn connector_line(connector: &ConnectorView) -> Line<'static> {
 
 /// One device row (and, when it is the selected one, its endpoint rows),
 /// appended to `lines`; records the row's line index in `selected_line`
-/// when it is the selected device. `bus_speed` is the speed of the bus the
-/// device is on, for the `!` indicator.
+/// when it is the selected device. `_bus_speed` is the speed of the bus the
+/// device is on; unused for now (`get_speed_indicator` is called with `None`
+/// pending the findings engine that wires the real argument in a later
+/// task), kept in the signature so callers need not change twice.
 fn push_device_row(
     lines: &mut Vec<Line<'static>>,
     app: &UsbTopApp,
     row: &DeviceRow,
-    bus_speed: &UsbSpeed,
+    _bus_speed: &UsbSpeed,
     selected_line: &mut Option<usize>,
 ) {
     let device = &row.device;
@@ -1677,7 +1679,7 @@ fn push_device_row(
     if is_selected {
         *selected_line = Some(lines.len());
     }
-    let indicator = device.get_speed_indicator(bus_speed);
+    let indicator = device.get_speed_indicator(None);
 
     let status_style = if device.is_disconnected {
         Style::default().bg(Color::Gray).fg(Color::White)

@@ -37,7 +37,7 @@ impl UsbSpeed {
     }
 
     /// Build a speed from an exact Mbps value (used by tests and by
-    /// `max_capability`'s "5000 Mbps capable" signal). Non-positive and
+    /// `capability`'s "5000 Mbps capable" signal). Non-positive and
     /// non-finite values read as unknown, same as `from_speed_str`.
     pub fn from_mbps(mbps: f64) -> Self {
         Self::from_mbps_checked(mbps)

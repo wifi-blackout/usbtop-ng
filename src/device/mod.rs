@@ -4,7 +4,15 @@ use std::time::{Duration, Instant};
 use crate::stats::{BandwidthStats, WindowCounter};
 use crate::usbmon::parser::{TransferType, UsbSpeed};
 
+pub mod bos;
 pub mod manager;
+
+pub use bos::Capability;
+// `CapabilitySource` has no production reader yet (a report/findings
+// serializer will call `as_str` in a later task); reachable from tests only
+// until then, per the crate's binary dead-code discipline.
+#[cfg(test)]
+pub use bos::CapabilitySource;
 
 /// One endpoint's traffic: its transfer type, cumulative bytes, and a
 /// windowed rate. Keyed in [`UsbDevice::endpoints`] by (number, IN?).
@@ -37,10 +45,11 @@ pub struct UsbDevice {
     /// its last stamp (see `DeviceManager::stamp_internal`). `false` with no
     /// snapshot loaded, same as any non-matching device.
     pub is_internal: bool,
-    /// Highest speed this device is electrically capable of, independent of
-    /// how fast it's actually linked (see `check_speed_mismatch`). Cached at
-    /// sysfs read time so mismatch checks never touch the filesystem.
-    pub max_capability: Option<UsbSpeed>,
+    /// The highest link rate this device says it supports (see
+    /// [`bos::read_capability`]), independent of how fast it is linked.
+    /// Read once from sysfs; the findings engine compares it with the link
+    /// and the topology, never the filesystem.
+    pub capability: Option<Capability>,
     /// Per-endpoint traffic, keyed by (endpoint number, IN?). Populated by
     /// `record_endpoint` as callbacks arrive; a device with no traffic yet
     /// has an empty map rather than pre-declared rows, since the endpoint
@@ -100,7 +109,7 @@ impl UsbDevice {
             last_seen: Instant::now(),
             sysfs_path: None,
             is_internal: false,
-            max_capability: None,
+            capability: None,
             endpoints: BTreeMap::new(),
         }
     }
@@ -176,7 +185,7 @@ impl UsbDevice {
             self.serial = Some(printable(serial.trim()));
         }
 
-        self.max_capability = read_max_capability(sysfs_path);
+        self.capability = bos::read_capability(sysfs_path);
     }
 
     /// Scan `base` for the sysfs entry whose `busnum`/`devnum` files match
@@ -253,25 +262,13 @@ impl UsbDevice {
             .get_utilization_percentage(max_bandwidth)
     }
 
-    /// `Some(capability)` when this device's cached max capability
-    /// (`max_capability`) is faster than both the bus it's plugged into and
-    /// its current link speed — i.e. it could run faster on a better bus.
-    /// Reads only the cached field; no live sysfs access.
-    pub fn check_speed_mismatch(&self, bus_speed: &UsbSpeed) -> Option<UsbSpeed> {
-        let capability = self.max_capability.clone()?;
-        if capability.to_mbps() > bus_speed.to_mbps() && capability.to_mbps() > self.speed.to_mbps()
-        {
-            Some(capability)
-        } else {
-            None
-        }
-    }
-
-    /// Visual indicator for speed-capability issues. `LimitedByBus` takes
-    /// precedence over `HighUtilization` when both apply.
-    pub fn get_speed_indicator(&self, bus_speed: &UsbSpeed) -> SpeedIndicator {
-        if let Some(capable_speed) = self.check_speed_mismatch(bus_speed) {
-            SpeedIndicator::LimitedByBus(capable_speed)
+    /// Visual indicator for the `!` column. `below_capability` is the
+    /// capability the findings engine found this device linked below, when
+    /// it did (see `findings::analyze`); it takes precedence over
+    /// `HighUtilization`.
+    pub fn get_speed_indicator(&self, below_capability: Option<&UsbSpeed>) -> SpeedIndicator {
+        if let Some(capable_speed) = below_capability {
+            SpeedIndicator::BelowCapability(capable_speed.clone())
         } else if self.speed.to_mbps() > 0.0 && self.get_busy_percentage() > 80.0 {
             SpeedIndicator::HighUtilization
         } else {
@@ -336,23 +333,13 @@ impl UsbDevice {
     }
 }
 
-/// Best-effort capability signal: a device that declares bcdUSB >= 3.00 in
-/// its descriptor (sysfs `version`) is SuperSpeed-capable. Devices linked
-/// below their capability usually report bcdUSB 2.10 on the USB2 bus, so the
-/// absence of this signal proves nothing — 🔺 is best-effort by design.
-fn read_max_capability(dir: &std::path::Path) -> Option<UsbSpeed> {
-    let raw = std::fs::read_to_string(dir.join("version")).ok()?;
-    let major: u32 = raw.trim().split('.').next()?.parse().ok()?;
-    (major >= 3).then_some(UsbSpeed::from_mbps(5000.0))
-}
-
 /// Visual indicator for a device's speed-capability status, surfaced as the
 /// `!` column in the device list.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpeedIndicator {
     Normal,
     HighUtilization,
-    LimitedByBus(UsbSpeed), // Contains the speed the device is capable of
+    BelowCapability(UsbSpeed), // Contains the speed the device is capable of
 }
 
 impl SpeedIndicator {
@@ -361,7 +348,7 @@ impl SpeedIndicator {
         match self {
             SpeedIndicator::Normal => "",
             SpeedIndicator::HighUtilization => "⚡",
-            SpeedIndicator::LimitedByBus(_) => "🔺",
+            SpeedIndicator::BelowCapability(_) => "🔺",
         }
     }
 
@@ -370,7 +357,7 @@ impl SpeedIndicator {
         match self {
             SpeedIndicator::Normal => (128, 128, 128),        // Gray
             SpeedIndicator::HighUtilization => (255, 165, 0), // Orange
-            SpeedIndicator::LimitedByBus(_) => (255, 255, 0), // Yellow
+            SpeedIndicator::BelowCapability(_) => (255, 255, 0), // Yellow
         }
     }
 
@@ -385,9 +372,9 @@ impl SpeedIndicator {
         match self {
             SpeedIndicator::Normal => "Normal operation".to_string(),
             SpeedIndicator::HighUtilization => "High bandwidth utilization".to_string(),
-            SpeedIndicator::LimitedByBus(capable_speed) => {
+            SpeedIndicator::BelowCapability(capable_speed) => {
                 format!(
-                    "Device capable of {} but limited by bus speed",
+                    "Device capable of {} but linked slower",
                     format_speed(capable_speed)
                 )
             }
@@ -611,9 +598,8 @@ mod tests {
     }
 
     #[test]
-    fn max_capability_reads_declared_bcd_usb_version() {
+    fn capability_falls_back_to_declared_bcd_usb_version() {
         let temp = tempfile::tempdir().unwrap();
-        // device declaring bcdUSB 3.20 -> SuperSpeed-capable
         write_device(
             &temp.path().join("1-2"),
             1,
@@ -622,15 +608,37 @@ mod tests {
         );
         let mut d = UsbDevice::new(1, 5);
         d.populate_from_sysfs(Some(temp.path()));
-        assert_eq!(d.max_capability, Some(UsbSpeed::from_mbps(5000.0)));
-        // 🔺: capable of SuperSpeed, linked High on a High bus
         assert_eq!(
-            d.check_speed_mismatch(&UsbSpeed::from_mbps(480.0)),
-            Some(UsbSpeed::from_mbps(5000.0))
+            d.capability,
+            Some(Capability {
+                speed: UsbSpeed::from_mbps(5000.0),
+                source: CapabilitySource::BcdUsb
+            })
         );
+    }
+
+    #[test]
+    fn capability_prefers_the_bos_over_bcd_usb() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("1-2");
+        write_device(&dir, 1, 5, &[("speed", "480"), ("version", "2.10")]);
+        // SuperSpeed capability only (the camera's shape).
+        std::fs::write(
+            dir.join("bos_descriptors"),
+            [
+                0x05u8, 0x0f, 0x16, 0x00, 0x02, 0x07, 0x10, 0x02, 0x06, 0x00, 0x00, 0x00, 0x0a,
+                0x10, 0x03, 0x00, 0x0c, 0x00, 0x03, 0x0a, 0xff, 0x07,
+            ],
+        )
+        .unwrap();
+        let mut d = UsbDevice::new(1, 5);
+        d.populate_from_sysfs(Some(temp.path()));
         assert_eq!(
-            d.get_speed_indicator(&UsbSpeed::from_mbps(480.0)),
-            SpeedIndicator::LimitedByBus(UsbSpeed::from_mbps(5000.0))
+            d.capability,
+            Some(Capability {
+                speed: UsbSpeed::from_mbps(5000.0),
+                source: CapabilitySource::Bos
+            })
         );
     }
 
@@ -640,14 +648,11 @@ mod tests {
         d.speed = UsbSpeed::from_mbps(12.0); // practical 1.2 MB/s
         d.bandwidth_stats.current_bps = 1_100_000.0;
         assert!(d.get_busy_percentage() > 80.0);
-        assert_eq!(
-            d.get_speed_indicator(&UsbSpeed::from_mbps(12.0)),
-            SpeedIndicator::HighUtilization
-        );
+        assert_eq!(d.get_speed_indicator(None), SpeedIndicator::HighUtilization);
     }
 
     #[test]
-    fn limited_by_bus_takes_precedence_over_high_utilization() {
+    fn below_capability_takes_precedence_over_high_utilization() {
         let temp = tempfile::tempdir().unwrap();
         write_device(
             &temp.path().join("1-2"),
@@ -658,12 +663,12 @@ mod tests {
         let mut d = UsbDevice::new(1, 7);
         d.populate_from_sysfs(Some(temp.path()));
         // Also pin utilization above the 80% threshold, so both conditions
-        // are true at once; LimitedByBus must still win.
+        // are true at once; BelowCapability must still win.
         d.bandwidth_stats.current_bps = 1_000_000_000.0;
         assert!(d.get_busy_percentage() > 80.0);
         assert_eq!(
-            d.get_speed_indicator(&UsbSpeed::from_mbps(480.0)),
-            SpeedIndicator::LimitedByBus(UsbSpeed::from_mbps(5000.0))
+            d.get_speed_indicator(Some(&UsbSpeed::from_mbps(5000.0))),
+            SpeedIndicator::BelowCapability(UsbSpeed::from_mbps(5000.0))
         );
     }
 
@@ -671,36 +676,7 @@ mod tests {
     fn normal_indicator_when_no_mismatch_and_low_utilization() {
         let mut d = UsbDevice::new(1, 9);
         d.speed = UsbSpeed::from_mbps(480.0);
-        assert_eq!(
-            d.get_speed_indicator(&UsbSpeed::from_mbps(480.0)),
-            SpeedIndicator::Normal
-        );
-    }
-
-    #[test]
-    fn read_max_capability_signals_only_on_declared_usb_3() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("version"), "3.20\n").unwrap();
-        assert_eq!(
-            read_max_capability(temp.path()),
-            Some(UsbSpeed::from_mbps(5000.0))
-        );
-
-        // Real sysfs pads the field; 2.x says nothing about SuperSpeed support.
-        std::fs::write(temp.path().join("version"), " 2.10\n").unwrap();
-        assert_eq!(read_max_capability(temp.path()), None);
-
-        std::fs::write(temp.path().join("version"), " 1.10\n").unwrap();
-        assert_eq!(read_max_capability(temp.path()), None);
-    }
-
-    #[test]
-    fn read_max_capability_none_when_version_is_missing_or_unparsable() {
-        let temp = tempfile::tempdir().unwrap();
-        assert_eq!(read_max_capability(temp.path()), None, "no version file");
-
-        std::fs::write(temp.path().join("version"), "not-a-version\n").unwrap();
-        assert_eq!(read_max_capability(temp.path()), None);
+        assert_eq!(d.get_speed_indicator(None), SpeedIndicator::Normal);
     }
 
     /// Without the bcdUSB signal there is no 🔺 to show, so the indicator
@@ -717,19 +693,12 @@ mod tests {
         );
         let mut d = UsbDevice::new(1, 4);
         d.populate_from_sysfs(Some(temp.path()));
-        assert_eq!(d.max_capability, None);
-        assert_eq!(d.check_speed_mismatch(&UsbSpeed::from_mbps(480.0)), None);
-        assert_eq!(
-            d.get_speed_indicator(&UsbSpeed::from_mbps(480.0)),
-            SpeedIndicator::Normal
-        );
+        assert_eq!(d.capability, None);
+        assert_eq!(d.get_speed_indicator(None), SpeedIndicator::Normal);
 
         // Full speed practical max is 1.2 MB/s, so this crosses 80% busy.
         d.bandwidth_stats.current_bps = 1_100_000.0;
-        assert_eq!(
-            d.get_speed_indicator(&UsbSpeed::from_mbps(480.0)),
-            SpeedIndicator::HighUtilization
-        );
+        assert_eq!(d.get_speed_indicator(None), SpeedIndicator::HighUtilization);
     }
 
     #[test]
@@ -737,20 +706,20 @@ mod tests {
         assert_eq!(SpeedIndicator::Normal.get_symbol(), "");
         assert_eq!(SpeedIndicator::HighUtilization.get_symbol(), "⚡");
         assert_eq!(
-            SpeedIndicator::LimitedByBus(UsbSpeed::from_mbps(5000.0)).get_symbol(),
+            SpeedIndicator::BelowCapability(UsbSpeed::from_mbps(5000.0)).get_symbol(),
             "🔺"
         );
         assert_eq!(SpeedIndicator::Normal.get_color(), (128, 128, 128));
         assert_eq!(SpeedIndicator::HighUtilization.get_color(), (255, 165, 0));
         assert_eq!(
-            SpeedIndicator::LimitedByBus(UsbSpeed::from_mbps(5000.0)).get_color(),
+            SpeedIndicator::BelowCapability(UsbSpeed::from_mbps(5000.0)).get_color(),
             (255, 255, 0)
         );
     }
 
     #[test]
     fn speed_indicator_description_mentions_capability() {
-        let indicator = SpeedIndicator::LimitedByBus(UsbSpeed::from_mbps(5000.0));
+        let indicator = SpeedIndicator::BelowCapability(UsbSpeed::from_mbps(5000.0));
         assert!(indicator.get_description().contains("5 Gbps"));
         assert_eq!(SpeedIndicator::Normal.get_description(), "Normal operation");
     }
