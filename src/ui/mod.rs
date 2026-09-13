@@ -1343,7 +1343,7 @@ const DEVICE_COLUMNS: [usize; 9] = [8, 8, 10, 14, 18, 10, 10, 7, 3];
 /// Where a finding's reason line starts: the Device column's own offset
 /// (Port's width plus the one-space separator after it), so the reason
 /// text lines up under Device the way an endpoint row's label does.
-const FINDING_INDENT: usize = DEVICE_COLUMNS[0] + 2;
+const FINDING_INDENT: usize = DEVICE_COLUMNS[0] + 1;
 
 /// One padded cell per column, separated by single-space spans. Columns are
 /// measured in terminal cells, not chars: a CJK vendor string is twice as wide
@@ -2245,7 +2245,15 @@ mod tests {
             .expect("the flagged device's row");
         assert_eq!(lines[at].spans[INDICATOR_SPAN_INDEX].content.trim(), "🔺");
         let reason = lines[at + 1].to_string();
-        assert!(reason.starts_with("          🔺 linked at 480M, supports 5G (from bcdUSB): the SuperSpeed side of this connector (usb4-port1) is empty"), "{reason}");
+        assert!(reason.starts_with("         🔺 linked at 480M, supports 5G (from bcdUSB): the SuperSpeed side of this connector (usb4-port1) is empty"), "{reason}");
+        // Under the Device column: the same offset an endpoint row's label has.
+        let device_row = lines[at].to_string();
+        let device_cell_at = device_row.find("003:002").expect("the Device cell");
+        assert_eq!(
+            reason.find('🔺'),
+            Some(device_cell_at),
+            "{device_row}\n{reason}"
+        );
         assert_eq!(
             lines[at + 1].style.fg,
             Some(Color::Rgb(255, 255, 0)),
