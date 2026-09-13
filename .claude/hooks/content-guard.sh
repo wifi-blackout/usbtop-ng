@@ -22,6 +22,7 @@ fi
 case "$file" in
   */target/*|*/.git/*|*/scratchpad/*) exit 0 ;;
   *.bin) exit 0 ;;   # sanitized usbmon trace fixtures are legitimately binary
+  *tests/fixtures/*/sysfs/*/bos_descriptors) exit 0 ;;   # each device's BOS, copied as bytes by the capturer
   */.claude/hooks/denylist.local) exit 0 ;;   # the denylist names its own terms
 esac
 

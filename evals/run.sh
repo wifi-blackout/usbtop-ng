@@ -23,8 +23,11 @@ scan_fail=0
 # file that should be text (source, docs, config), so an extension allowlist is
 # right — git's own binary detection would wrongly skip a corrupted .rs too,
 # since a stray NUL makes git classify it as binary.
+# The corpus's one binary attribute: each device's BOS, copied byte for byte
+# by the fixture capturer (see src/capture/sysfs.rs ATTRS), so it carries NUL
+# bytes by design too.
 nul_hits=$(git ls-files | while IFS= read -r f; do
-  case "$f" in *.bin) continue ;; esac
+  case "$f" in *.bin|tests/fixtures/*/sysfs/*/bos_descriptors) continue ;; esac
   [ -f "$f" ] && LC_ALL=C grep -qaP '\x00' "$f" 2>/dev/null && echo "$f"
 done)
 [ -z "$nul_hits" ] || { echo "  NUL byte in:"; printf '%s\n' "$nul_hits" | sed 's/^/    /'; scan_fail=1; }

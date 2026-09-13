@@ -24,6 +24,16 @@ printf '0123456789\n' > "$tmp/tests/fixtures/hosts/x/dev/serial"
 printf '{"tool_input":{"file_path":"%s/tests/fixtures/hosts/x/dev/serial"}}' "$tmp" | sh "$guard"
 [ $? -eq 2 ] || { echo "FAIL: fixture serial file was not blocked"; fail=1; }
 
+# A device's BOS blob under a fixture's sysfs snapshot is binary by design:
+# NUL bytes inside it are skipped, but only under that exact name.
+mkdir -p "$tmp/tests/fixtures/hosts/x/stage1/sysfs/3-1"
+printf '\005\017\005\000\000' > "$tmp/tests/fixtures/hosts/x/stage1/sysfs/3-1/bos_descriptors"
+printf '{"tool_input":{"file_path":"%s/tests/fixtures/hosts/x/stage1/sysfs/3-1/bos_descriptors"}}' "$tmp" | sh "$guard"
+[ $? -eq 0 ] || { echo "FAIL: fixture bos_descriptors was blocked"; fail=1; }
+printf '\005\017\005\000\000' > "$tmp/tests/fixtures/hosts/x/stage1/sysfs/3-1/descriptors"
+printf '{"tool_input":{"file_path":"%s/tests/fixtures/hosts/x/stage1/sysfs/3-1/descriptors"}}' "$tmp" | sh "$guard"
+[ $? -eq 2 ] || { echo "FAIL: another binary attribute under a fixture was not blocked"; fail=1; }
+
 # Scratch/target paths are always skipped even with a NUL.
 mkdir -p "$tmp/target"
 printf 'a\000b' > "$tmp/target/x.rs"

@@ -262,7 +262,12 @@ throwaway `stageN.json`.
    bundle is published, and no replay reads it), plus each hub's port
    objects (`<hub>-port<N>` with `connect_type` and `location`) and their
    `peer` links, rewritten as relative in-bundle symlinks, so a bundle
-   carries the connector pairings the TUI groups by.
+   carries the connector pairings the TUI groups by. It also copies each
+   device's `bos_descriptors` where the kernel exposes it (Linux 6.9 and
+   later), the one binary file in a bundle besides the traces, so a replay
+   decides capability the way the live tool does; a bundle captured on an
+   older kernel, or before 2026-09-12, carries none and its replay falls
+   back to bcdUSB.
 4. `bm1684x` contributes no fixtures. Its 5.4 vendor kernel carries no usbmon
    module, so the stage-0 gate fails before any capture is possible (see
    [Test hosts](#test-hosts)). That usbmon-absent state is a documented

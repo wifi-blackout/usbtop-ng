@@ -14,8 +14,11 @@ use crate::capture::FixtureRoot;
 /// The attribute files usbtop-ng reads (see `device::read_metadata_from` and
 /// `enumerate_present_devices`), except `serial`: a bundle is published, a
 /// device serial identifies its owner's hardware, and no replay reads it, so
-/// it is never copied. Nothing else is copied either.
-const ATTRS: [&str; 8] = [
+/// it is never copied. Nothing else is copied either. `bos_descriptors` is
+/// the one binary attribute: the device's own capability statement (see
+/// `device::bos`), copied as bytes, absent on kernels before 6.9 and on
+/// devices without a BOS.
+const ATTRS: [&str; 9] = [
     "busnum",
     "devnum",
     "speed",
@@ -24,6 +27,7 @@ const ATTRS: [&str; 8] = [
     "manufacturer",
     "product",
     "version",
+    "bos_descriptors",
 ];
 
 /// The port attribute files copied per hub port (see `copy_ports`): the
@@ -293,6 +297,52 @@ mod tests {
         mgr.enumerate_present_devices();
         mgr.update_bus_speeds();
         assert_eq!(mgr.buses[&1].controller.as_deref(), Some("0000:00:14.0"));
+    }
+
+    /// The camera's BOS: a USB 2.0 extension and a SuperSpeed capability,
+    /// 22 bytes with NUL bytes inside, as sysfs serves it.
+    const CAMERA_BOS: &[u8] = &[
+        0x05, 0x0f, 0x16, 0x00, 0x02, 0x07, 0x10, 0x02, 0x06, 0x00, 0x00, 0x00, 0x0a, 0x10, 0x03,
+        0x00, 0x0c, 0x00, 0x03, 0x0a, 0xff, 0x07,
+    ];
+
+    #[test]
+    fn bos_descriptors_are_copied_as_bytes_and_only_when_present() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("devices")).unwrap();
+        build_src(temp.path());
+        std::fs::write(temp.path().join("devices/1-1/bos_descriptors"), CAMERA_BOS).unwrap();
+        dev(
+            &temp.path().join("devices"),
+            "1-2",
+            &[("busnum", "1\n"), ("devnum", "4\n"), ("speed", "480\n")],
+        );
+        let dst = temp.path().join("bundle").join("sysfs");
+        materialize_sysfs(
+            &temp.path().join("devices"),
+            &FixtureRoot::create(&temp.path().join("bundle")).unwrap(),
+            "sysfs",
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(dst.join("1-1/bos_descriptors")).unwrap(),
+            CAMERA_BOS,
+            "the blob round-trips byte for byte"
+        );
+        assert!(
+            !dst.join("1-2/bos_descriptors").exists(),
+            "a device without a BOS gets no file"
+        );
+        // The replay reads it back the way the live tool does.
+        let mut mgr = crate::device::manager::DeviceManager::with_sysfs_base(dst.clone());
+        mgr.enumerate_present_devices();
+        let device = &mgr.buses[&1].devices[&3];
+        assert_eq!(
+            device.capability.as_ref().map(|c| c.speed.to_mbps()),
+            Some(5000.0)
+        );
+        assert!(mgr.buses[&1].devices[&4].capability.is_none());
     }
 
     /// `resolve_controller` returns `None` only when canonicalizing `usbN`
