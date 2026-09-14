@@ -433,7 +433,9 @@ self-description with its raw descriptors (`inventory/`), your preferences
 and internal-device snapshot with home paths rewritten and connector
 labels masked (`config/`), the
 terminal setup (`terminal.toml`), the embedded fixture (`fixture/`, the same
-layout as `tests/fixtures/hosts/`), a replayed report (`report.json`), the
+layout as `tests/fixtures/hosts/`), the fixture replayed once and reported
+at each choke basis (`report.json` at `link`, `report.capability.json` at
+`capability`; only `demand_basis` and `chokepoints` differ), the
 printed summary saved as `SUMMARY.txt`, the run's debug log
 (`usbtop-ng.log`), and a `manifest.toml` listing each file with its size,
 the redaction counts, and everything that was unavailable.

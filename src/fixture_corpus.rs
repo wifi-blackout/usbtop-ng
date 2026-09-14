@@ -438,6 +438,52 @@ fn the_dock_bundle_pins_the_two_findings_and_nothing_else() {
     }
 }
 
+/// Bundles whose choke points differ between the two bases, as `host/stage`.
+/// None yet: no capture holds a SuperSpeed device or hub linked below its
+/// capability under a port that has the room, so the capability basis has
+/// no real-capture coverage beyond the synthetic trees in `capacity`. The
+/// first bundle that differs must be listed here and pinned by a test of
+/// its own, so a cable case cannot land in the corpus unnoticed.
+const BASES_DIFFER: &[&str] = &[];
+
+fn bundle_name(bundle: &Bundle) -> String {
+    let stage = bundle.dir.file_name().unwrap_or_default().to_string_lossy();
+    let host = bundle
+        .dir
+        .parent()
+        .and_then(Path::file_name)
+        .unwrap_or_default()
+        .to_string_lossy();
+    format!("{host}/{stage}")
+}
+
+/// The choke points as (path, capacity, demand): what the basis can move.
+fn choke_view(report: &crate::headless::Report) -> Vec<(String, f64, f64)> {
+    report
+        .chokepoints
+        .iter()
+        .map(|c| (c.path.clone(), c.capacity_mbps, c.demand_mbps))
+        .collect()
+}
+
+#[test]
+fn the_two_bases_agree_on_every_bundle_not_listed_as_differing() {
+    for bundle in &discover_bundles() {
+        let name = bundle_name(bundle);
+        for source in sources_of(bundle) {
+            let link = replay_fixture_at(&bundle.dir, source, Basis::Link).unwrap();
+            let capability = replay_fixture_at(&bundle.dir, source, Basis::Capability).unwrap();
+            let (link, capability) = (choke_view(&link), choke_view(&capability));
+            assert_eq!(
+                link != capability,
+                BASES_DIFFER.contains(&name.as_str()),
+                "{name} {source:?}: link {link:?}, capability {capability:?}; a bundle where \
+                 the bases differ is listed in BASES_DIFFER and pinned by its own test"
+            );
+        }
+    }
+}
+
 /// Every other bundle predates the BOS in the snapshot and holds no bcdUSB
 /// 3.x device at a lower link: zero findings, and no capability from a BOS.
 #[test]

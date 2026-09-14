@@ -93,6 +93,15 @@ hub's own ratio on its connector heading, `c` toggles the basis, and
 which carry `demand_basis`, `choke_floor`, and a `chokepoints` list. It is a
 model of the topology and says so: nothing is measured, and two 480M devices
 under one 480M hub read 2.00x whether or not they ever transfer together.
+The support bundle carries both views (`report.json`, `report.capability.json`).
+
+A known hole: the capability basis has no real-capture coverage. Every
+corpus bundle reads the same at both bases, because no fleet host holds a
+SuperSpeed device or hub linked below its capability under a port with
+room; the corpus pins that agreement (`BASES_DIFFER` in `fixture_corpus`)
+so the first cable case captured cannot land unpinned. The capture itself
+waits on hardware: a 10G device on a 10G port through a cable that links it
+lower.
 
 The second step, once the stages above the root hub can be priced:
 

@@ -25,8 +25,9 @@ use super::{note, Note};
 use crate::capacity::Basis;
 use crate::capture::{self, BaselineSource, CaptureFixtureOpts, FixtureRoot};
 use crate::config;
-use crate::fixture_replay::{replay_fixture_with_elapsed, FixtureSource};
+use crate::fixture_replay::{replay_fixture_prepared, FixtureSource};
 use crate::headless::export::{enabled_features, ReportSink, RunRecord};
+use crate::headless::Report;
 use crate::tui::sync::{probe_decision, probe_sync_mode, ProbeDecision, SyncMode};
 use crate::usbids::{self, UsbIds};
 use crate::usbmon::{self, UsbmonStatus};
@@ -332,8 +333,24 @@ pub struct Summary {
     pub backend: String,
     pub capture: String,
     pub devices: String,
+    /// The choke points at each basis (see `choke_line`), or why there are
+    /// none to count.
+    pub choke: String,
     pub notes: Vec<Note>,
     pub redacted: String,
+}
+
+/// The `choke:` summary line: how many hubs sit at or above the breathing
+/// room at each basis and the worst ratio, `link 3 (worst 3.05x);
+/// capability 3 (worst 3.05x)`, or `none` on a side with nothing listed.
+fn choke_line(link: &Report, capability: &Report) -> String {
+    fn side(report: &Report) -> String {
+        match report.chokepoints.first() {
+            Some(worst) => format!("{} (worst {:.2}x)", report.chokepoints.len(), worst.ratio),
+            None => "none".to_string(),
+        }
+    }
+    format!("link {}; capability {}", side(link), side(capability))
 }
 
 #[derive(Serialize)]
@@ -616,6 +633,7 @@ pub fn run_support(
     if let CaptureState::Skipped(r) | CaptureState::Failed(r) = &mut capture_state {
         *r = scrub_fixture(r);
     }
+    let mut choke_summary = String::from("not replayed");
     if !fixture_base.join("meta.toml").exists() {
         // No fixture at all (the capture and the static assembly both
         // failed, or the pin check skipped them): leave no empty `fixture/`
@@ -637,8 +655,8 @@ pub fn run_support(
                 .or_else(|| sources.first().copied()),
             _ => None,
         };
-        match replay_fixture_with_elapsed(&fixture_base, source, opts.window, Basis::Link) {
-            Ok(report) => {
+        match replay_fixture_prepared(&fixture_base, source, opts.window) {
+            Ok(replayed) => {
                 let run = RunRecord {
                     record: "run",
                     usbtop_ng: build.version.clone(),
@@ -654,15 +672,26 @@ pub fn run_support(
                     arch: std::env::consts::ARCH,
                     buses: usbmon_info.available_buses.clone(),
                 };
-                // Create report.json beneath the anchor (never by path), then
-                // hand the open file to the sink. The subsequent redact_file
-                // rewrites it in place, again through the anchor.
-                let file = writer.open_new_file("report.json")?;
-                let mut sink =
-                    ReportSink::from_open_file(file, dir.join("report.json"), &run, true)?;
-                sink.write(&report, true)?;
-                sink.finish();
-                writer.redact_file("report.json")?;
+                // One replay, both choke bases: report.json is the link view
+                // the reports default to, report.capability.json the same
+                // document at the capability basis, so a bug report carries
+                // the choke points a maintainer would otherwise have to ask
+                // for. Each is created beneath the anchor (never by path),
+                // then the open file is handed to the sink; the subsequent
+                // redact_file rewrites it in place, again through the anchor.
+                let link = replayed.report(Basis::Link);
+                let capability = replayed.report(Basis::Capability);
+                choke_summary = choke_line(&link, &capability);
+                for (name, report) in [
+                    ("report.json", &link),
+                    ("report.capability.json", &capability),
+                ] {
+                    let file = writer.open_new_file(name)?;
+                    let mut sink = ReportSink::from_open_file(file, dir.join(name), &run, true)?;
+                    sink.write(report, true)?;
+                    sink.finish();
+                    writer.redact_file(name)?;
+                }
             }
             Err(e) => notes.push(note("report.json", format!("replay failed: {e:#}"))),
         }
@@ -699,6 +728,7 @@ pub fn run_support(
         backend: backend_line(&backend),
         capture: capture_line(&capture_state),
         devices: devices_line(&inv),
+        choke: choke_summary,
         notes: notes.clone(),
         redacted: redacted_line(&writer.redactor().summary()),
     };
@@ -948,6 +978,7 @@ pub fn render_summary(s: &Summary) -> String {
     out.push_str(&format!("  backend:  {}\n", s.backend));
     out.push_str(&format!("  capture:  {}\n", s.capture));
     out.push_str(&format!("  devices:  {}\n", s.devices));
+    out.push_str(&format!("  choke:    {}\n", s.choke));
     if s.notes.is_empty() {
         out.push_str("  notes:    none\n");
     } else {
@@ -1322,7 +1353,52 @@ mod tests {
     }
 
     #[test]
-    fn render_summary_has_the_ten_line_layout() {
+    fn choke_line_counts_each_basis_and_names_the_worst_ratio() {
+        use crate::headless::{build_report_at, Baseline, WindowFacts};
+        use crate::test_tree::Tree;
+        // A 480 hub with two 480 devices below it: one choke point at 2.00x
+        // at either basis (nothing here advertises more than it links at).
+        let t = Tree::new();
+        let root = t.root_hub(1, "480");
+        t.port(&root, "usb1", 1);
+        let hub = t.device("1-1", "480", Some("2.00"), None);
+        t.port(&hub, "1-1", 1);
+        t.port(&hub, "1-1", 2);
+        t.device("1-1.1", "480", Some("2.00"), None);
+        t.device("1-1.2", "480", Some("2.00"), None);
+        let manager = t.manager();
+        let baseline = Baseline::capture(&manager);
+        let report = |basis: Basis| {
+            build_report_at(
+                basis,
+                &manager,
+                &baseline,
+                Duration::from_secs(1),
+                WindowFacts {
+                    source: "none",
+                    dropped: 0,
+                    text_active: false,
+                },
+                &crate::filter::FilterSet::default(),
+            )
+        };
+        let link = report(Basis::Link);
+        let capability = report(Basis::Capability);
+        assert_eq!(
+            choke_line(&link, &capability),
+            "link 1 (worst 2.00x); capability 1 (worst 2.00x)"
+        );
+        // A side with nothing listed says so.
+        let mut empty = report(Basis::Link);
+        empty.chokepoints.clear();
+        assert_eq!(
+            choke_line(&empty, &capability),
+            "link none; capability 1 (worst 2.00x)"
+        );
+    }
+
+    #[test]
+    fn render_summary_has_the_eleven_line_layout() {
         let summary = Summary {
             dir_name: "usbtop-ng-support-20260903T091500Z".into(),
             archive: ArchiveState::Written(
@@ -1336,14 +1412,16 @@ mod tests {
             backend: "mmap ring (64 MiB) would be selected; eBPF: BTF present, not built in".into(),
             capture: "5.0 s aggregate, 1,234 events, kernel drops 0, sources binary+text".into(),
             devices: "21 across 4 buses (1.5/12/480/5000/10000 Mbps)".into(),
+            choke: "link 3 (worst 3.05x); capability 3 (worst 3.05x)".into(),
             notes: vec![note("dmesg", "permission denied")],
             redacted: "3 home paths; host identity never collected; device serials included".into(),
         };
         let text = render_summary(&summary);
         // Built as plain lines (never `\x20` continuations, which the write
         // tooling in this environment would decode) but byte-identical to
-        // the spec's ten-line block: two leading spaces before each label,
-        // and each label padded so every value starts in the same column.
+        // the spec's block, eleven lines since the choke line joined it:
+        // two leading spaces before each label, and each label padded so
+        // every value starts in the same column.
         let lines = [
             "usbtop-ng support bundle",
             "  bundle:   ./usbtop-ng-support-20260903T091500Z.tar.gz (412 KB, 14 files)",
@@ -1353,6 +1431,7 @@ mod tests {
             "  backend:  mmap ring (64 MiB) would be selected; eBPF: BTF present, not built in",
             "  capture:  5.0 s aggregate, 1,234 events, kernel drops 0, sources binary+text",
             "  devices:  21 across 4 buses (1.5/12/480/5000/10000 Mbps)",
+            "  choke:    link 3 (worst 3.05x); capability 3 (worst 3.05x)",
             "  notes:    dmesg: permission denied",
             "  redacted: 3 home paths; host identity never collected; device serials included",
         ];
@@ -1589,6 +1668,7 @@ mod tests {
             "fixture/internal-devices.toml",
             "fixture/sysfs/usb1",
             "report.json",
+            "report.capability.json",
             "SUMMARY.txt",
             "usbtop-ng.log",
         ] {
@@ -1620,6 +1700,18 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(doc["source"], "none");
         assert_eq!(doc["window_seconds"], 1.0);
+        assert_eq!(doc["demand_basis"], "link");
+        // The same replay at the capability basis, beside it: the same run
+        // record, the same rows, only the basis and its choke list differ.
+        let capability = std::fs::read_to_string(dir.join("report.capability.json")).unwrap();
+        let cap_lines: Vec<&str> = capability.lines().collect();
+        assert_eq!(cap_lines.len(), 2);
+        assert_eq!(cap_lines[0], lines[0], "one run record for both");
+        let cap_doc: serde_json::Value = serde_json::from_str(cap_lines[1]).unwrap();
+        assert_eq!(cap_doc["demand_basis"], "capability");
+        assert_eq!(cap_doc["buses"], doc["buses"]);
+        assert_eq!(cap_doc["findings"], doc["findings"]);
+        assert_eq!(summary.choke, "link none; capability none");
 
         // Device identity in, host identity out.
         let usb = std::fs::read_to_string(dir.join("inventory/usb.toml")).unwrap();
@@ -1689,6 +1781,10 @@ mod tests {
         assert!(summary_text.starts_with("usbtop-ng support bundle\n"));
         assert!(
             summary_text.contains("  bundle:   usbtop-ng-support-20260829T104000Z/ ("),
+            "{summary_text}"
+        );
+        assert!(
+            summary_text.contains("  choke:    link none; capability none\n"),
             "{summary_text}"
         );
         match &summary.archive {

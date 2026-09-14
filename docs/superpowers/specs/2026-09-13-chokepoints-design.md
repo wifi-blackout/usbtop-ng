@@ -98,7 +98,11 @@ step; see Deferred.
   three `{path, demand_mbps}`), `message`. Text, after the findings
   section: `chokepoints: N` and one line per entry, `  hub 3-1 (3:2,
   0bda:5411) 384M carries 9 devices asking 1.17G: 3.05x`, or
-  `chokepoints: none`.
+  `chokepoints: none`. The support bundle replays its fixture once and
+  writes the report at each basis, `report.json` at `link` and
+  `report.capability.json` at `capability`, and its `SUMMARY.txt` gains a
+  `choke:` line counting each basis with its worst ratio, so a bug report
+  carries both views without a second run.
 
 ## Expected on the dock bundle (`tgl-tb4-2026-09-12/stage2`)
 
@@ -214,6 +218,15 @@ Basis rules, exactly:
   is re-blessed once for the three additive keys and the diff verified
   additive with the jq check; bundles that gain entries (any hub with two
   480M devices) are read as model output and listed in the commit message.
+  Every bundle is also replayed at both bases and the two choke lists
+  compared: they must agree unless the bundle is named in `BASES_DIFFER`,
+  which is empty until a capture holds a SuperSpeed device or hub linked
+  below its capability under a port with room (the cable case no fleet host
+  has yet), so the first such capture cannot land unpinned.
+- Support: the bundle test finds `report.capability.json` beside
+  `report.json` with the same run record and rows and `demand_basis`
+  `capability`, and the `choke:` summary line; `choke_line` is pinned on a
+  choked synthetic tree and on an empty side.
 - `ui`: the header counter absent below the floor, present in the warning
   colour, with `(cap)` after `c`; `c` flips `demand_basis` and resyncs; the
   counter gone under a query that matches nothing and kept under one that

@@ -334,7 +334,11 @@ Fleet build notes, learned capturing the Pi bundles (2026-08-31):
 capture when run as root, without traces otherwise), so a bug reporter's
 bundle can be promoted to a corpus fixture by copying its `fixture/`
 directory into `tests/fixtures/hosts/<board>-<date>/stage<N>/` and
-re-running `cargo test fixture_corpus`.
+re-running `cargo test fixture_corpus`. The bundle's `report.capability.json`
+beside `report.json` says at a glance whether the two choke bases differ
+there; a bundle where they do is the capture the corpus is still missing
+(see `BASES_DIFFER` in `src/fixture_corpus.rs`) and must be named there when
+promoted.
 
 ## Per-platform notes
 

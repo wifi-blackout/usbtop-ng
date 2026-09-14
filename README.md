@@ -93,12 +93,17 @@ Run `sudo usbtop` when your account cannot read the usbmon interfaces. Both
 the binary `/dev/usbmon*` nodes usbtop-ng prefers and the debugfs text
 fallback are root-owned by default.
 
+The screen needs a terminal of at least 80 columns by 24 rows. Below that
+usbtop-ng shows the current size and the minimum instead of a clipped
+layout, keeps measuring, and draws the screen as soon as the window is
+large enough; `q` still quits.
+
 ## Keys
 
 | Key | Action |
 | --- | --- |
 | `↑` / `↓` | Select a device. The device table scrolls to keep it visible. |
-| `h` | Open or close the help overlay. |
+| `h` | Open or close the help overlay. `↑` / `↓` scroll it when it does not fit; the title says so. |
 | `i` | Show or hide idle devices. Saves the choice to `~/.usbtop-ng/preferences.toml`. |
 | `c` | Toggle the choke basis: the rates devices are linked at now, or the rates they say they could link at. See [Choke points](#choke-points). |
 | `/` | Open search input, prefilled with the active query if one is committed. See [Search](#search). |
@@ -430,8 +435,10 @@ says, and the snapshot is the one list you control.
   (serial numbers included, as device identity), your configuration with
   home paths rewritten to `~`, the terminal setup, and, when run with
   `sudo`, a short capture of the aggregate bus packaged as a replayable
-  fixture. It writes `usbtop-ng-support-<UTC time>/` plus a `.tar.gz` beside
-  it, prints a summary, and says how to file the issue.
+  fixture, replayed into a report at each choke basis (`report.json` at
+  `link`, `report.capability.json` at `capability`) with a `choke:` line in
+  the summary counting both. It writes `usbtop-ng-support-<UTC time>/` plus
+  a `.tar.gz` beside it, prints a summary, and says how to file the issue.
 - Under `sudo`, a bundle written inside your home directory is handed back
   to you; one written elsewhere (`/tmp`, say) stays root-owned.
 - Nothing that identifies the machine or its owner is collected: no

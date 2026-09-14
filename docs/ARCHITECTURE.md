@@ -140,7 +140,13 @@ treats them alike.
   clear it), the choked hub's connector heading carries its own ratio (the
   worse half's when both halves of a hub choke), and the `c` key flips
   `demand_basis` (`capacity::Basis`, seeded from `--demand`) and resyncs,
-  so the model is rebuilt at the other basis before the repaint.
+  so the model is rebuilt at the other basis before the repaint. `draw_ui`
+  starts with the terminal floor (`MIN_COLS` x `MIN_ROWS`, 80x24): below it
+  a notice with the current size replaces every layout and overlay, and
+  the keys still work. The help overlay is sized to its text up to the
+  screen, scrolls with `↑`/`↓` when it does not fit, and never wraps: every
+  help line is kept under the width the floor guarantees, and a test pins
+  it.
 - `connectors.rs`: the render model's connector grouping — building
   `ConnectorView`s from the port index, their labels, and their ordering.
 - `colors.rs`: the color scheme.
@@ -252,9 +258,11 @@ See [TUI chassis](#tui-chassis) for how these fit together.
   archive.
 - `diag/support.rs`: the `--support` orchestrator. It embeds a fixture from
   `capture/` (a live capture as root, a static sysfs bundle otherwise),
-  re-asserts SEC-1 and SEC-2 over it, replays it into `report.json` through
-  the export sink, writes the summary to `SUMMARY.txt` in the bundle, and
-  prints it with filing guidance. The logger is built with a tee so the
+  re-asserts SEC-1 and SEC-2 over it, replays it once
+  (`fixture_replay::Replayed`) and writes the report at each choke basis
+  through the export sink (`report.json` at `link`, `report.capability.json`
+  at `capability`), writes the summary to `SUMMARY.txt` in the bundle with
+  a `choke:` line counting both, and prints it with filing guidance. The logger is built with a tee so the
   run's own log lands in the bundle as `usbtop-ng.log`.
 - `capture/` and `fixture_replay.rs` are part of the default build: the
   capturer's assembly and guards are what `--support` embeds, and the replay

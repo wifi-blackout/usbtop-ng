@@ -213,6 +213,46 @@ pub fn replay_fixture_with_elapsed(
     elapsed: Duration,
     basis: Basis,
 ) -> anyhow::Result<Report> {
+    Ok(replay_fixture_prepared(bundle_dir, source, elapsed)?.report(basis))
+}
+
+/// A bundle replayed once: the manager after the trace, its baseline and
+/// the window facts, so one replay can be reported at both choke bases (the
+/// support bundle writes `report.json` and `report.capability.json` from
+/// the same replay).
+pub struct Replayed {
+    manager: DeviceManager,
+    baseline: Baseline,
+    elapsed: Duration,
+    source: Option<FixtureSource>,
+}
+
+impl Replayed {
+    /// The report at `basis`; everything but the choke points is the same
+    /// at either.
+    pub fn report(&self, basis: Basis) -> Report {
+        build_report_at(
+            basis,
+            &self.manager,
+            &self.baseline,
+            self.elapsed,
+            WindowFacts {
+                source: self.source.map_or("none", FixtureSource::label),
+                dropped: 0,
+                text_active: self.source == Some(FixtureSource::Text),
+            },
+            &FilterSet::default(),
+        )
+    }
+}
+
+/// Replay `bundle_dir` as [`replay_fixture_with_elapsed`] does and keep the
+/// state instead of reporting it.
+pub fn replay_fixture_prepared(
+    bundle_dir: &Path,
+    source: Option<FixtureSource>,
+    elapsed: Duration,
+) -> anyhow::Result<Replayed> {
     let mut manager = DeviceManager::with_sysfs_base(bundle_dir.join("sysfs"));
     if let Some(snapshot) = load_internal_devices(bundle_dir) {
         manager.set_internal_snapshot(Some(snapshot));
@@ -249,18 +289,12 @@ pub fn replay_fixture_with_elapsed(
     // NOT (see manager.rs:188); without this the controller/speed fields are null.
     manager.update_bus_speeds();
 
-    Ok(build_report_at(
-        basis,
-        &manager,
-        &baseline,
+    Ok(Replayed {
+        manager,
+        baseline,
         elapsed,
-        WindowFacts {
-            source: source.map_or("none", FixtureSource::label),
-            dropped: 0,
-            text_active: source == Some(FixtureSource::Text),
-        },
-        &FilterSet::default(),
-    ))
+        source,
+    })
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
@@ -137,6 +137,9 @@ pub struct UsbTopApp {
     pub bandwidth_history: Vec<(f64, f64)>, // (timestamp, total_bandwidth)
     pub selected_device: Option<String>,
     pub show_help: bool,
+    /// How far the help overlay is scrolled, in lines; back to the top
+    /// whenever it opens, clamped to the fit whenever it draws.
+    pub help_scroll: u16,
     pub start_time: Instant,
     /// How often the loop takes a fresh snapshot of the devices; the schedule
     /// itself lives in the loop (see `tui::run_app`), not here.
@@ -269,6 +272,7 @@ impl UsbTopApp {
             bandwidth_history: Vec::new(),
             selected_device: None,
             show_help: false,
+            help_scroll: 0,
             start_time: Instant::now(),
             refresh_rate,
             total_bandwidth: 0.0,
@@ -952,6 +956,17 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
             app.show_help = false;
             KeyOutcome::Redraw
         }
+        // Help owns the arrows too: they scroll it when it does not fit
+        // (the draw clamps the value to the fit), and never move the
+        // selection behind it.
+        KeyCode::Up if app.show_help => {
+            app.help_scroll = app.help_scroll.saturating_sub(1);
+            KeyOutcome::Redraw
+        }
+        KeyCode::Down if app.show_help => {
+            app.help_scroll = app.help_scroll.saturating_add(1);
+            KeyOutcome::Redraw
+        }
         // Opens search input, prefilled with the last committed query
         // (empty from `Off`). Also closes help when it was open -- one less
         // stuck state, rather than making the user close help first. Never
@@ -982,6 +997,7 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
         KeyCode::Char('q') | KeyCode::Esc => KeyOutcome::Quit,
         KeyCode::Char('h') => {
             app.show_help = !app.show_help;
+            app.help_scroll = 0;
             KeyOutcome::Redraw
         }
         KeyCode::Up => {
@@ -1163,17 +1179,29 @@ fn drain_deltas(
     applied
 }
 
+/// The smallest terminal the screen is laid out for: the header, the
+/// charts, the table and the controls bar need the rows, the columns need
+/// the width, and the help overlay's lines are kept under it (see
+/// `help_lines`). Below it `draw_ui` shows the size instead of a layout
+/// that clips.
+pub const MIN_COLS: u16 = 80;
+pub const MIN_ROWS: u16 = 24;
+
 pub(crate) fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
+    let size = f.area();
+    // Ahead of the overlays: they would not fit either.
+    if size.width < MIN_COLS || size.height < MIN_ROWS {
+        draw_size_notice(f, size);
+        return;
+    }
     if app.snapshot_prompt.is_some() {
         draw_snapshot_prompt(f, app);
         return;
     }
     if app.show_help {
-        draw_help_overlay(f);
+        draw_help_overlay(f, app);
         return;
     }
-
-    let size = f.area();
 
     // Create main layout
     let chunks = Layout::default()
@@ -1197,6 +1225,32 @@ pub(crate) fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
     draw_device_chart(f, chart_chunks[1], app);
     draw_device_list(f, chunks[2], app);
     draw_color_reference(f, chunks[3], app);
+}
+
+/// What a terminal below the floor shows: the minimum, the current size and
+/// the way out. The keys still work (`q` quits), and a resize repaints
+/// through the normal path.
+fn draw_size_notice(f: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("usbtop-ng needs a terminal of at least {MIN_COLS}x{MIN_ROWS}"),
+            Style::default()
+                .fg(WARNING_COLOR)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!("This one is {}x{}", area.width, area.height)),
+        Line::from("Resize the window, or press q to quit"),
+    ];
+    let top = area.height.saturating_sub(3) / 2;
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(top),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), rows[1]);
 }
 
 /// Bytes per second as MB/s, floored at zero. Bandwidth is never negative, so
@@ -1974,10 +2028,46 @@ fn draw_color_reference(f: &mut Frame, area: Rect, app: &UsbTopApp) {
     f.render_widget(reference, area);
 }
 
-fn draw_help_overlay(f: &mut Frame) {
-    let area = centered_rect(60, 70, f.area());
+/// The widest the help overlay gets; wider reads worse.
+const HELP_WIDTH: u16 = 100;
 
-    let help_text = vec![
+/// The help overlay, sized to its text up to the screen minus a margin.
+/// What does not fit scrolls (`↑`/`↓`, see `apply_key`) and the title says
+/// so; the lines never wrap, since `help_lines` keeps every one inside the
+/// overlay at the 80-column floor.
+fn draw_help_overlay(f: &mut Frame, app: &mut UsbTopApp) {
+    let screen = f.area();
+    let lines = help_lines();
+    let total = lines.len();
+    let width = screen.width.saturating_sub(2).min(HELP_WIDTH);
+    let visible = usize::from(screen.height.saturating_sub(4)).min(total);
+    let max_scroll = u16::try_from(total - visible).unwrap_or(u16::MAX);
+    app.help_scroll = app.help_scroll.min(max_scroll);
+    let height = u16::try_from(visible).unwrap_or(u16::MAX).saturating_add(2);
+    let area = Rect {
+        x: screen.width.saturating_sub(width) / 2,
+        y: screen.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let title = if max_scroll > 0 {
+        " Help (↑/↓ scroll) "
+    } else {
+        " Help "
+    };
+    let help = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .scroll((app.help_scroll, 0));
+
+    f.render_widget(Clear, area); // Clear background
+    f.render_widget(help, area);
+}
+
+/// The help text. Every line stays at or under 76 columns so the overlay
+/// never wraps at the floor (78 columns inside its border at `MIN_COLS`);
+/// a test pins that.
+fn help_lines() -> Vec<Line<'static>> {
+    vec![
         Line::from(vec![Span::styled(
             "usbtop-ng Help",
             Style::default()
@@ -1990,9 +2080,7 @@ fn draw_help_overlay(f: &mut Frame) {
             Span::styled("  ↑/↓", Style::default().fg(ACCENT_COLOR)),
             Span::raw("      Select a device (list scrolls to keep it visible)"),
         ]),
-        Line::from(
-            "  Selecting a device expands its endpoints below it, dimmed and not selectable",
-        ),
+        Line::from("  Selecting a device expands its endpoints below it, dimmed, not selectable"),
         Line::from(vec![
             Span::styled("  h", Style::default().fg(ACCENT_COLOR)),
             Span::raw("        Toggle this help"),
@@ -2011,10 +2099,9 @@ fn draw_help_overlay(f: &mut Frame) {
         ]),
         Line::from(vec![
             Span::styled("  /", Style::default().fg(ACCENT_COLOR)),
-            Span::raw(
-                "        Search devices by name, vid:pid, port, or bus:address; Enter keeps it, Esc clears it",
-            ),
+            Span::raw("        Search devices by name, vid:pid, port, or bus:address;"),
         ]),
+        Line::from("           Enter keeps the query, Esc clears it"),
         Line::from(vec![
             Span::styled("  S", Style::default().fg(ACCENT_COLOR)),
             Span::raw("        Snapshot attached devices as internal"),
@@ -2027,18 +2114,18 @@ fn draw_help_overlay(f: &mut Frame) {
             Span::styled("  Ctrl-C", Style::default().fg(ACCENT_COLOR)),
             Span::raw("   Quit application"),
         ]),
-        Line::from(
-            "  ~ marks estimated rates: isochronous bytes on the text interface are a sampled estimate, not an exact count.",
-        ),
+        Line::from("  ~ marks estimated rates: isochronous bytes on the text interface are"),
+        Line::from("    a sampled estimate, not an exact count"),
         Line::from(""),
         Line::from("Features:"),
         Line::from("  • Controller-grouped, port-ordered device list (USB2/USB3 sibling buses)"),
         Line::from("  • Per-device and per-bus %busy"),
         Line::from("  • ⚡ high-utilization indicator (>80% of practical bandwidth)"),
         Line::from("  • 🔺 linked below the speed it supports; the line beneath says why"),
-        Line::from("  • Header shows 'choke: N.NNx' when a hub's link is asked at least 1.25x its capacity"),
-        Line::from("    (the breathing room) by the devices below it; '(cap)' marks the capability basis,"),
-        Line::from("    where a SuperSpeed hub with room counts at its capability, so a ratio can drop"),
+        Line::from("  • Header shows 'choke: N.NNx' when a hub's link is asked at least"),
+        Line::from("    1.25x its capacity (the breathing room) by the devices below it;"),
+        Line::from("    '(cap)' marks the capability basis, where a SuperSpeed hub with room"),
+        Line::from("    counts at its capability, so a ratio can drop"),
         Line::from("  • Header shows 'dropped: N' if packets were lost to a full queue"),
         Line::from("  • Header shows 'kdropped: N' if the kernel's usbmon ring dropped packets"),
         Line::from("  • Header shows 'shed: N' if frames were dropped to keep up with a slow"),
@@ -2049,14 +2136,7 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from("  • Linux only"),
         Line::from(""),
         Line::from("Press 'h' to close this help"),
-    ];
-
-    let help = Paragraph::new(help_text)
-        .block(Block::default().borders(Borders::ALL).title(" Help "))
-        .wrap(Wrap { trim: true });
-
-    f.render_widget(Clear, area); // Clear background
-    f.render_widget(help, area);
+    ]
 }
 
 /// The `S` overlay: `Confirm` asks before capturing, `Done` reports what
@@ -4092,6 +4172,99 @@ mod tests {
 
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(20, 5)).unwrap();
         terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn a_terminal_below_the_floor_shows_its_size_and_the_minimum() {
+        let (_temp, mgr) = topology_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        for (w, h) in [(79u16, 24u16), (80, 23), (60, 20)] {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+            let screen = terminal.backend().to_string();
+            assert!(screen.contains("at least 80x24"), "{w}x{h}: {screen}");
+            assert!(screen.contains(&format!("This one is {w}x{h}")), "{screen}");
+            assert!(!screen.contains("Total:"), "{screen}");
+        }
+        // The floor itself draws the screen.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("Total:"), "{screen}");
+        assert!(!screen.contains("at least 80x24"), "{screen}");
+        // The notice wins over the overlays, which would not fit either.
+        app.show_help = true;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("at least 80x24"), "{screen}");
+        assert!(!screen.contains("usbtop-ng Help"), "{screen}");
+    }
+
+    /// Every help line fits the overlay at the 80-column floor (78 columns
+    /// inside the border, one to spare), so nothing wraps and the scroll
+    /// range is the line count.
+    #[test]
+    fn every_help_line_fits_the_overlay_at_the_floor() {
+        for line in help_lines() {
+            assert!(line.width() <= 76, "{} columns: {line}", line.width());
+        }
+    }
+
+    #[test]
+    fn the_help_overlay_scrolls_when_it_does_not_fit() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.show_help = true;
+        let lines = help_lines().len();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("Help (↑/↓ scroll)"), "{screen}");
+        assert!(screen.contains("usbtop-ng Help"), "{screen}");
+        assert!(
+            !screen.contains("Press 'h' to close"),
+            "the tail is below the fold: {screen}"
+        );
+        // Down scrolls a line at a time: the top line leaves the window.
+        assert_eq!(
+            apply_key(&mut app, KeyEvent::from(KeyCode::Down)),
+            KeyOutcome::Redraw
+        );
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        assert!(!terminal.backend().to_string().contains("usbtop-ng Help"));
+        // The scroll stops at the end, with the last line on the bottom row:
+        // 20 lines show inside a 24-row screen (a margin and a border each
+        // side). Drawn on a fresh terminal: the test backend keeps a stale
+        // cell behind a wide glyph (the ⚡ bullet) that scrolled through
+        // this row in the frame before, which a real terminal erases.
+        for _ in 0..200 {
+            apply_key(&mut app, KeyEvent::from(KeyCode::Down));
+        }
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("Press 'h' to close"), "{screen}");
+        assert_eq!(usize::from(app.help_scroll), lines - 20, "{lines} lines");
+        // Up goes back; closing and reopening starts at the top.
+        apply_key(&mut app, KeyEvent::from(KeyCode::Up));
+        assert_eq!(usize::from(app.help_scroll), lines - 21);
+        apply_key(&mut app, KeyEvent::from(KeyCode::Char('h')));
+        assert!(!app.show_help);
+        apply_key(&mut app, KeyEvent::from(KeyCode::Char('h')));
+        assert!(app.show_help);
+        assert_eq!(app.help_scroll, 0);
+        // A tall terminal fits the whole text: no hint, and Down is clamped
+        // back to the top.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 60)).unwrap();
+        apply_key(&mut app, KeyEvent::from(KeyCode::Down));
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains(" Help "), "{screen}");
+        assert!(!screen.contains("scroll)"), "{screen}");
+        assert!(screen.contains("usbtop-ng Help"), "{screen}");
+        assert!(screen.contains("Press 'h' to close"), "{screen}");
+        assert_eq!(app.help_scroll, 0, "clamped to the fit");
     }
 
     #[test]
