@@ -576,26 +576,41 @@ fn read_capped(path: &Path, cap: usize) -> std::io::Result<Vec<u8>> {
 }
 
 /// One PCI device the bundle lists: a device the kernel marks removable
-/// (hot-pluggable, or behind an externally facing port, which is where a
-/// Thunderbolt or USB4 tunnel puts its devices), a bridge above one, or a
-/// Thunderbolt host interface. `chain` names the bridges above it,
-/// root-first, so the tunnel's host side reads off the file.
+/// (behind a port the firmware flags as externally facing, which is what a
+/// Thunderbolt or USB4 port is, so a tunnel's devices are the removable
+/// ones: `pci_set_removable` in drivers/pci/probe.c, verified against
+/// v5.16 and v7.0, marks a device only below an external-facing or
+/// removable parent, and leaves every other device without the attribute),
+/// a bridge above one, or a Thunderbolt host interface. `chain` names the
+/// bridges above it, root-first, so the tunnel's host side reads off the
+/// file.
 #[derive(Debug, Serialize)]
 pub struct PciEntry {
     pub address: String,
-    /// `removable`, `bridge` (above a removable device) or
-    /// `thunderbolt_host` (the PCI function a Thunderbolt domain hangs off).
-    pub role: &'static str,
+    pub role: PciRole,
     pub chain: Vec<String>,
     pub attrs: BTreeMap<String, String>,
 }
 
-/// The attributes read per PCI device: identity, whether it is enabled and
-/// awake, the link it negotiated against the link it could, the ASPM
-/// states the kernel lets it enter, and the AER counters. An allowlist,
-/// not a walk: a PCI device directory also holds `config`, `rom` and the
-/// BAR files, which are binary, mmap-only, or have side effects to read.
-const PCI_ATTRS: [&str; 25] = [
+/// Why a device is listed. One value per device: a removable device
+/// outranks a bridge above another, which outranks a Thunderbolt host, so
+/// the role says the most (a function that is both a bridge above a
+/// removable device and a domain's host reads `bridge`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PciRole {
+    Removable,
+    Bridge,
+    ThunderboltHost,
+}
+
+/// The attributes read per PCI device without touching the hardware:
+/// identity, whether it is enabled and awake, the link speed it could
+/// negotiate, the ASPM states the kernel lets it enter, and the AER
+/// counters. An allowlist, not a walk: a PCI device directory also holds
+/// `config`, `rom` and the BAR files, which are binary, mmap-only, or have
+/// side effects to read.
+const PCI_ATTRS: [&str; 22] = [
     "vendor",
     "device",
     "subsystem_vendor",
@@ -607,10 +622,7 @@ const PCI_ATTRS: [&str; 25] = [
     "power_state",
     "power/runtime_status",
     "d3cold_allowed",
-    "current_link_speed",
-    "current_link_width",
     "max_link_speed",
-    "max_link_width",
     "link/clkpm",
     "link/l0s_aspm",
     "link/l1_aspm",
@@ -623,16 +635,36 @@ const PCI_ATTRS: [&str; 25] = [
     "aer_dev_nonfatal",
 ];
 
-/// `0000:2e:00.0`: a domain, a bus, a slot and a function, all hex.
+/// The attributes whose sysfs readers take a runtime-PM reference on the
+/// device and its parent (`pci_config_pm_runtime_get` in drivers/pci/pci.c
+/// resumes a device in D3cold; `current_link_speed_show`,
+/// `current_link_width_show` and `max_link_width_show` in pci-sysfs.c call
+/// it, verified against v7.0). Read only while the device is awake
+/// (`power/runtime_status` of `active`), so the bundle never wakes what it
+/// is describing; the window between the check and the read is accepted.
+const PCI_LINK_ATTRS: [&str; 3] = ["current_link_speed", "current_link_width", "max_link_width"];
+
+/// What an entry carries instead of the link attributes when it was not
+/// awake.
+const LINK_NOT_READ: &str =
+    "runtime status is not active: reading the link would resume the device";
+
+/// `0000:2e:00.0`: a domain of four hex digits or more (VMD and other
+/// synthetic domains go past `ffff`), then a bus, a slot and a function.
 fn is_pci_address(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    bytes.len() == 12
-        && bytes[4] == b':'
-        && bytes[7] == b':'
-        && bytes[10] == b'.'
-        && name
-            .char_indices()
-            .all(|(i, c)| matches!(i, 4 | 7 | 10) || c.is_ascii_hexdigit())
+    let hex = |s: &str, min: usize, max: usize| {
+        (min..=max).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit())
+    };
+    let mut parts = name.split(':');
+    let (Some(domain), Some(bus), Some(rest), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let Some((slot, func)) = rest.split_once('.') else {
+        return false;
+    };
+    hex(domain, 4, 8) && hex(bus, 2, 2) && hex(slot, 2, 2) && hex(func, 1, 1)
 }
 
 /// The PCI addresses above `real` in the device tree, root-first.
@@ -648,28 +680,45 @@ fn pci_chain(real: &Path) -> Vec<String> {
     chain
 }
 
+/// One attribute into `attrs`, sparse by design as in `walk_attrs`: an
+/// absent file is silent (a bridge has no AER counters, an older kernel no
+/// `link/` directory), a present but unreadable one is noted.
+fn read_pci_attr(
+    real: &Path,
+    name: &str,
+    attrs: &mut BTreeMap<String, String>,
+    notes: &mut Vec<Note>,
+) {
+    let path = real.join(name);
+    match read_capped(&path, ATTR_VALUE_CAP) {
+        Ok(bytes) => {
+            attrs.insert(
+                name.to_string(),
+                String::from_utf8_lossy(&bytes).trim().to_string(),
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => notes.push(note(
+            &path.display().to_string(),
+            format!("could not read: {e}"),
+        )),
+    }
+}
+
 fn read_pci_attrs(real: &Path, notes: &mut Vec<Note>) -> BTreeMap<String, String> {
     let mut attrs = BTreeMap::new();
     for name in PCI_ATTRS {
-        let path = real.join(name);
-        match read_capped(&path, ATTR_VALUE_CAP) {
-            Ok(bytes) => {
-                attrs.insert(
-                    name.to_string(),
-                    String::from_utf8_lossy(&bytes).trim().to_string(),
-                );
-            }
-            // Sparse by design, as in `walk_attrs`: a bridge has no AER
-            // counters, an older kernel no `link/` directory.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => notes.push(note(
-                &path.display().to_string(),
-                format!("could not read: {e}"),
-            )),
-        }
+        read_pci_attr(real, name, &mut attrs, notes);
     }
     if let Some(driver) = link_name(&real.join("driver")) {
         attrs.insert("driver".to_string(), driver);
+    }
+    if attrs.get("power/runtime_status").map(String::as_str) == Some("active") {
+        for name in PCI_LINK_ATTRS {
+            read_pci_attr(real, name, &mut attrs, notes);
+        }
+    } else {
+        attrs.insert("link_not_read".to_string(), LINK_NOT_READ.to_string());
     }
     attrs
 }
@@ -678,8 +727,11 @@ fn read_pci_attrs(real: &Path, notes: &mut Vec<Note>) -> BTreeMap<String, String
 /// `pci_root` (`/sys/bus/pci/devices`) whose `removable` attribute reads
 /// `removable`, the bridges above each, and the PCI function every
 /// Thunderbolt domain under `thunderbolt_root` hangs off. Sorted by
-/// address. A kernel before 5.16 exposes no `removable` attribute at all;
-/// that is noted once rather than reported as "nothing removable".
+/// address. The kernel gives the attribute only to the devices it marks, so
+/// when no examined device carries it the note says both things that can
+/// mean: nothing sits behind an externally facing port, or the kernel
+/// predates the attribute (Linux 5.16). An entry that cannot be resolved or
+/// read is noted, never silently dropped.
 pub fn read_pci(pci_root: &Path, thunderbolt_root: &Path) -> (Vec<PciEntry>, Vec<Note>) {
     let mut notes = Vec::new();
     if let Err(e) = std::fs::read_dir(pci_root) {
@@ -689,58 +741,94 @@ pub fn read_pci(pci_root: &Path, thunderbolt_root: &Path) -> (Vec<PciEntry>, Vec
         ));
         return (Vec::new(), notes);
     }
-    // Address -> (real path, role); a removable device outranks a bridge,
-    // a bridge outranks a Thunderbolt host, so the role says the most.
-    let mut listed: BTreeMap<String, (PathBuf, &'static str)> = BTreeMap::new();
+    let real_of = |address: &str, notes: &mut Vec<Note>| -> Option<PathBuf> {
+        let entry = pci_root.join(address);
+        match std::fs::canonicalize(&entry) {
+            Ok(real) => Some(real),
+            Err(e) => {
+                notes.push(note(
+                    &entry.display().to_string(),
+                    format!("could not resolve: {e}"),
+                ));
+                None
+            }
+        }
+    };
+    let mut listed: BTreeMap<String, (PathBuf, PciRole)> = BTreeMap::new();
+    let mut examined = 0usize;
     let mut attribute_seen = false;
-    let real_of =
-        |address: &str| -> Option<PathBuf> { std::fs::canonicalize(pci_root.join(address)).ok() };
     for address in entry_names(pci_root)
         .into_iter()
         .filter(|n| is_pci_address(n))
     {
-        let Some(real) = real_of(&address) else {
+        examined += 1;
+        let Some(real) = real_of(&address, &mut notes) else {
             continue;
         };
-        let removable = match std::fs::read_to_string(real.join("removable")) {
+        let attribute = real.join("removable");
+        let removable = match std::fs::read_to_string(&attribute) {
             Ok(value) => {
                 attribute_seen = true;
                 value.trim() == "removable"
             }
-            Err(_) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                notes.push(note(
+                    &attribute.display().to_string(),
+                    format!("could not read: {e}"),
+                ));
+                false
+            }
         };
         if !removable {
             continue;
         }
         for bridge in pci_chain(&real) {
-            if let Some(bridge_real) = real_of(&bridge) {
-                listed.entry(bridge).or_insert((bridge_real, "bridge"));
+            if let Some(bridge_real) = real_of(&bridge, &mut notes) {
+                listed
+                    .entry(bridge)
+                    .or_insert((bridge_real, PciRole::Bridge));
             }
         }
-        listed.insert(address, (real, "removable"));
+        listed.insert(address, (real, PciRole::Removable));
     }
     for domain in entry_names(thunderbolt_root)
         .into_iter()
         .filter(|n| n.starts_with("domain"))
     {
-        let Some(real) = std::fs::canonicalize(thunderbolt_root.join(&domain)).ok() else {
-            continue;
+        let entry = thunderbolt_root.join(&domain);
+        let real = match std::fs::canonicalize(&entry) {
+            Ok(real) => real,
+            Err(e) => {
+                notes.push(note(
+                    &entry.display().to_string(),
+                    format!("could not resolve: {e}"),
+                ));
+                continue;
+            }
         };
-        let Some(parent) = real.parent() else {
-            continue;
-        };
-        let host = parent.file_name().map(|n| n.to_string_lossy().into_owned());
-        if let Some(host) = host.filter(|n| is_pci_address(n)) {
-            listed
-                .entry(host)
-                .or_insert((parent.to_path_buf(), "thunderbolt_host"));
+        let host = real
+            .parent()
+            .and_then(Path::file_name)
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| is_pci_address(n));
+        match (host, real.parent()) {
+            (Some(host), Some(parent)) => {
+                listed
+                    .entry(host)
+                    .or_insert((parent.to_path_buf(), PciRole::ThunderboltHost));
+            }
+            _ => notes.push(note(
+                &entry.display().to_string(),
+                "the domain does not hang off a PCI function".to_string(),
+            )),
         }
     }
-    if !attribute_seen && !listed.is_empty() {
+    if examined > 0 && !attribute_seen {
         notes.push(note(
             &pci_root.display().to_string(),
-            "no device carries the `removable` attribute (Linux 5.16 and later expose it), so \
-             hot-pluggable devices cannot be told apart here"
+            "no PCI device is marked removable: nothing sits behind a port the firmware flags as \
+             externally facing, or the kernel predates the attribute (Linux 5.16)"
                 .to_string(),
         ));
     }
@@ -804,58 +892,100 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
-    /// `sys/bus/pci/devices` with a tunneled chain (root port, bridge,
-    /// endpoint) beside a fixed device, and a Thunderbolt domain hanging off
-    /// its host interface; returns (pci root, thunderbolt root).
-    fn fake_pci(base: &Path, with_removable: bool) -> (PathBuf, PathBuf) {
+    /// `sys/bus/pci/devices` laid out as `/sys` is, with relative symlinks
+    /// into `sys/devices`: a tunneled chain (root port, bridge, endpoint)
+    /// beside a fixed device that carries no `removable` attribute, and a
+    /// Thunderbolt domain hanging off its host interface, which is asleep.
+    /// Returns (pci root, thunderbolt root).
+    fn fake_pci(base: &Path, with_removable: bool, with_domain: bool) -> (PathBuf, PathBuf) {
         let bus = base.join("sys/bus/pci/devices");
         let tb = base.join("sys/bus/thunderbolt/devices");
         std::fs::create_dir_all(&bus).unwrap();
         std::fs::create_dir_all(&tb).unwrap();
-        let root_port = base.join("sys/devices/pci0000:00/0000:00:07.1");
-        let bridge = root_port.join("0000:2c:00.0");
-        let endpoint = bridge.join("0000:2e:00.0");
-        let fixed = base.join("sys/devices/pci0000:00/0000:00:14.0");
-        let nhi = base.join("sys/devices/pci0000:00/0000:00:0d.2");
-        write(&root_port, "class", "0x060400\n");
-        write(&endpoint, "vendor", "0x8086\n");
-        write(&endpoint, "current_link_speed", "2.5 GT/s PCIe\n");
-        write(&endpoint, "power/runtime_status", "active\n");
-        write(&endpoint, "link/l1_aspm", "0\n");
-        write(&endpoint, "aer_dev_correctable", "RxErr 0\nBadTLP 1\n");
-        write(&endpoint, "config", "binary\n");
-        write(&fixed, "vendor", "0x8086\n");
-        write(&nhi, "vendor", "0x8086\n");
-        write(&nhi, "power_state", "D3cold\n");
-        std::fs::create_dir_all(nhi.join("domain0")).unwrap();
-        std::os::unix::fs::symlink(nhi.join("domain0"), tb.join("domain0")).unwrap();
+        std::fs::create_dir_all(base.join("sys/bus/pci/drivers/xhci_hcd")).unwrap();
+        let root_port = "pci0000:00/0000:00:07.1";
+        let bridge = "pci0000:00/0000:00:07.1/0000:2c:00.0";
+        let endpoint = "pci0000:00/0000:00:07.1/0000:2c:00.0/0000:2e:00.0";
+        let fixed = "pci0000:00/0000:00:14.0";
+        let nhi = "pci0000:00/0000:00:0d.2";
+        let dev = |rel: &str| base.join("sys/devices").join(rel);
+        write(&dev(root_port), "class", "0x060400\n");
+        write(&dev(root_port), "power/runtime_status", "active\n");
+        write(&dev(root_port), "current_link_speed", "2.5 GT/s PCIe\n");
+        write(&dev(endpoint), "vendor", "0x8086\n");
+        write(&dev(endpoint), "current_link_speed", "2.5 GT/s PCIe\n");
+        write(&dev(endpoint), "max_link_speed", "2.5 GT/s PCIe\n");
+        write(&dev(endpoint), "power/runtime_status", "active\n");
+        write(&dev(endpoint), "link/l1_aspm", "0\n");
+        write(&dev(endpoint), "aer_dev_correctable", "RxErr 0\nBadTLP 1\n");
+        write(&dev(endpoint), "config", "binary\n");
+        write(&dev(fixed), "vendor", "0x8086\n");
+        write(&dev(nhi), "vendor", "0x8086\n");
+        write(&dev(nhi), "power_state", "D3cold\n");
+        write(&dev(nhi), "power/runtime_status", "suspended\n");
+        write(&dev(nhi), "current_link_speed", "would resume the device\n");
         if with_removable {
-            write(&bridge, "removable", "removable\n");
-            write(&endpoint, "removable", "removable\n");
-            write(&fixed, "removable", "fixed\n");
+            write(&dev(bridge), "removable", "removable\n");
+            write(&dev(endpoint), "removable", "removable\n");
         }
-        std::fs::create_dir_all(endpoint.join("drivers/xhci_hcd")).unwrap();
-        std::os::unix::fs::symlink("drivers/xhci_hcd", endpoint.join("driver")).unwrap();
-        for (name, real) in [
-            ("0000:00:07.1", &root_port),
-            ("0000:2c:00.0", &bridge),
-            ("0000:2e:00.0", &endpoint),
-            ("0000:00:14.0", &fixed),
-            ("0000:00:0d.2", &nhi),
+        // Five levels down from `sys/devices/<endpoint>` back to `sys/`.
+        std::os::unix::fs::symlink(
+            "../../../../../bus/pci/drivers/xhci_hcd",
+            dev(endpoint).join("driver"),
+        )
+        .unwrap();
+        for (name, rel) in [
+            ("0000:00:07.1", root_port),
+            ("0000:2c:00.0", bridge),
+            ("0000:2e:00.0", endpoint),
+            ("0000:00:14.0", fixed),
+            ("0000:00:0d.2", nhi),
         ] {
-            std::os::unix::fs::symlink(real, bus.join(name)).unwrap();
+            std::os::unix::fs::symlink(format!("../../../devices/{rel}"), bus.join(name)).unwrap();
         }
         std::fs::write(bus.join("not-an-address"), "").unwrap();
+        if with_domain {
+            std::fs::create_dir_all(dev(nhi).join("domain0")).unwrap();
+            std::os::unix::fs::symlink(
+                format!("../../../devices/{nhi}/domain0"),
+                tb.join("domain0"),
+            )
+            .unwrap();
+        }
         (bus, tb)
+    }
+
+    #[test]
+    fn pci_addresses_allow_wide_domains_and_nothing_else() {
+        for ok in [
+            "0000:00:07.1",
+            "0001:2e:00.0",
+            "10000:e0:1d.0",
+            "ffffffff:00:00.7",
+        ] {
+            assert!(is_pci_address(ok), "{ok}");
+        }
+        for bad in [
+            "pci0000:00",
+            "0000:00:07.1:pcie004",
+            "usb3",
+            "0000:00:07",
+            "000:00:07.1",
+            "0000:0:07.1",
+            "0000:00:07.10",
+            "domain0",
+        ] {
+            assert!(!is_pci_address(bad), "{bad}");
+        }
     }
 
     #[test]
     fn read_pci_lists_removable_devices_their_bridges_and_the_thunderbolt_host() {
         let temp = tempfile::tempdir().unwrap();
-        let (bus, tb) = fake_pci(temp.path(), true);
+        let (bus, tb) = fake_pci(temp.path(), true, true);
         let (entries, notes) = read_pci(&bus, &tb);
         assert!(notes.is_empty(), "{notes:?}");
-        let listed: Vec<(&str, &str, Vec<&str>)> = entries
+        let listed: Vec<(&str, PciRole, Vec<&str>)> = entries
             .iter()
             .map(|e| {
                 (
@@ -868,12 +998,12 @@ mod tests {
         assert_eq!(
             listed,
             vec![
-                ("0000:00:07.1", "bridge", vec![]),
-                ("0000:00:0d.2", "thunderbolt_host", vec![]),
-                ("0000:2c:00.0", "removable", vec!["0000:00:07.1"]),
+                ("0000:00:07.1", PciRole::Bridge, vec![]),
+                ("0000:00:0d.2", PciRole::ThunderboltHost, vec![]),
+                ("0000:2c:00.0", PciRole::Removable, vec!["0000:00:07.1"]),
                 (
                     "0000:2e:00.0",
-                    "removable",
+                    PciRole::Removable,
                     vec!["0000:00:07.1", "0000:2c:00.0"]
                 ),
             ],
@@ -896,38 +1026,73 @@ mod tests {
             endpoint.attrs.get("link/l1_aspm").map(String::as_str),
             Some("0")
         );
-        assert_eq!(
-            endpoint
-                .attrs
-                .get("power/runtime_status")
-                .map(String::as_str),
-            Some("active")
-        );
         assert!(
             !endpoint.attrs.contains_key("config"),
             "an allowlist, not a walk"
         );
+        // Awake: the link is read. Asleep: it is not, and the entry says why,
+        // since reading it would have woken the device.
         assert_eq!(
-            entries[1].attrs.get("power_state").map(String::as_str),
+            endpoint.attrs.get("current_link_speed").map(String::as_str),
+            Some("2.5 GT/s PCIe")
+        );
+        assert!(!endpoint.attrs.contains_key("link_not_read"));
+        let nhi = &entries[1];
+        assert_eq!(
+            nhi.attrs.get("power_state").map(String::as_str),
             Some("D3cold")
         );
+        assert!(!nhi.attrs.contains_key("current_link_speed"), "{nhi:?}");
+        assert_eq!(
+            nhi.attrs.get("link_not_read").map(String::as_str),
+            Some(LINK_NOT_READ)
+        );
+        // Serialized, the role is the snake_case word the docs name.
+        let json = serde_json::to_string(&entries[1].role).unwrap();
+        assert_eq!(json, "\"thunderbolt_host\"");
     }
 
     #[test]
-    fn read_pci_notes_a_kernel_without_the_removable_attribute() {
-        // Nothing carries `removable`, so nothing can be told apart, but the
-        // Thunderbolt host is still listed and the gap is said once.
+    fn read_pci_notes_when_no_device_is_marked_removable() {
+        // With a Thunderbolt host: it is listed, and the note says nothing
+        // is marked removable, which is what an old kernel and an empty
+        // Thunderbolt port both look like.
         let temp = tempfile::tempdir().unwrap();
-        let (bus, tb) = fake_pci(temp.path(), false);
+        let (bus, tb) = fake_pci(temp.path(), false, true);
         let (entries, notes) = read_pci(&bus, &tb);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].role, "thunderbolt_host");
+        assert_eq!(entries[0].role, PciRole::ThunderboltHost);
         assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(notes[0].reason.contains("removable"), "{notes:?}");
+        assert!(notes[0].reason.contains("marked removable"), "{notes:?}");
+        // Without any Thunderbolt: nothing listed, and the same note, since
+        // an empty file would otherwise read as "nothing to say".
+        let temp = tempfile::tempdir().unwrap();
+        let (bus, tb) = fake_pci(temp.path(), false, false);
+        let (entries, notes) = read_pci(&bus, &tb);
+        assert!(entries.is_empty());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].reason.contains("Linux 5.16"), "{notes:?}");
         // No PCI tree at all is a note of its own and nothing listed.
         let (entries, notes) = read_pci(&temp.path().join("missing"), &tb);
         assert!(entries.is_empty());
         assert_eq!(notes.len(), 1);
+    }
+
+    #[test]
+    fn read_pci_notes_an_entry_it_cannot_resolve_instead_of_dropping_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let (bus, tb) = fake_pci(temp.path(), true, true);
+        // A bus entry whose target vanished mid-run (a surprise removal).
+        std::os::unix::fs::symlink("../../../devices/pci0000:00/gone", bus.join("0000:3f:00.0"))
+            .unwrap();
+        let (entries, notes) = read_pci(&bus, &tb);
+        assert_eq!(entries.len(), 4, "the rest is still listed");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].item.ends_with("0000:3f:00.0"), "{notes:?}");
+        assert!(
+            notes[0].reason.starts_with("could not resolve"),
+            "{notes:?}"
+        );
     }
 
     /// Raw bytes (descriptor blobs); never spelled as string escapes, which

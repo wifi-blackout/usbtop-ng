@@ -5,7 +5,7 @@
 //! instead of errors: a missing file is a fact about the host, not a failure
 //! of the bundle. The device inventory (collector C) lives in `inventory.rs`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
@@ -477,8 +477,8 @@ pub fn probe_backend(
 /// driver, the hot-plug service and the error-reporting prefix: a device
 /// tunneled over Thunderbolt or USB4 is a PCI device, and its link going
 /// down, its slot event and its errors are logged under those names rather
-/// than under `thunderbolt`. `aer:` keeps the colon so an unrelated word
-/// does not match.
+/// than under `thunderbolt`. `aer:` keeps the space and the colon the
+/// kernel prints around it so an unrelated word does not match.
 const DMESG_KEYWORDS: [&str; 11] = [
     "usb",
     "xhci",
@@ -490,22 +490,60 @@ const DMESG_KEYWORDS: [&str; 11] = [
     "usbmon",
     "pcieport",
     "pciehp",
-    "aer:",
+    " aer:",
 ];
+
+/// Words that stand in front of a PCI address without naming a driver: the
+/// core's enumeration lines (`pci 0000:2e:00.0: BAR 0 ...`) name every
+/// device, and the port driver is a keyword already.
+const DMESG_GENERIC_PREFIXES: [&str; 2] = ["pci", "pcieport"];
 
 /// Keep the lines that mention USB, a host controller, Thunderbolt, a hub,
 /// usbmon, a PCIe port, its hot-plug service or an AER report
-/// (case-insensitive), or any of `addresses` (the removable PCI devices
-/// the inventory found, so their own drivers' lines come along whatever
-/// the driver is called), whole. Host identity never appears on those
-/// lines except a USB network adapter's MAC, which the caller masks with
-/// `Redactor::mac_addresses`.
-pub fn filter_dmesg(text: &str, addresses: &[String]) -> String {
+/// (case-insensitive), whole; plus every line naming one of `addresses`
+/// (the PCI devices the inventory listed), and every line a driver of one
+/// of them wrote: the kernel prints `<driver> <address>: ...` when a driver
+/// has a device to name and `<driver>: ...` when it does not, so the word
+/// in front of a listed address is the driver's name and its bare lines
+/// follow (`atlantic: Boot code hanged` after `atlantic 0000:08:00.0:
+/// enabling device`); `drivers`, the bound drivers the inventory found,
+/// covers a driver that never logged an address. Host identity never
+/// appears on those lines except a USB network adapter's MAC, which the
+/// caller masks with `Redactor::mac_addresses`.
+pub fn filter_dmesg(text: &str, addresses: &[String], drivers: &[String]) -> String {
+    let addresses: Vec<String> = addresses.iter().map(|a| a.to_lowercase()).collect();
+    let mut names: BTreeSet<String> = drivers.iter().map(|d| d.to_lowercase()).collect();
+    for line in text.lines() {
+        let lower = line.to_lowercase();
+        let words: Vec<&str> = lower.split_whitespace().collect();
+        for (i, word) in words.iter().enumerate().skip(1) {
+            let word = word.trim_end_matches(':');
+            if !addresses.iter().any(|a| a == word) {
+                continue;
+            }
+            let name = words[i - 1];
+            let looks_like_a_name = !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            if looks_like_a_name && !DMESG_GENERIC_PREFIXES.contains(&name) {
+                names.insert(name.to_string());
+            }
+        }
+    }
     let mut out = String::new();
     for line in text.lines() {
         let lower = line.to_lowercase();
+        // After the `[  123.456] ` stamp, when there is one.
+        let message = lower.split_once("] ").map_or(lower.as_str(), |(_, m)| m);
+        let by_driver = names.iter().any(|name| {
+            message
+                .strip_prefix(name.as_str())
+                .is_some_and(|rest| rest.starts_with(':') || rest.starts_with(' '))
+        });
         if DMESG_KEYWORDS.iter().any(|k| lower.contains(k))
             || addresses.iter().any(|a| lower.contains(a.as_str()))
+            || by_driver
         {
             out.push_str(line);
             out.push('\n');
@@ -1039,8 +1077,11 @@ mod tests {
                     [    8.0] pcieport 0000:00:07.1: AER: Corrected error message received from 0000:2e:00.0\n\
                     [    9.0] pciehp 0000:2c:00.0:pcie004: Slot(0-1): Link Down\n\
                     [   10.0] atlantic 0000:08:00.0: enabling device (0000 -> 0002)\n\
-                    [   11.0] atlantic: Boot code hanged\n";
-        let kept = filter_dmesg(text, &["0000:08:00.0".to_string()]);
+                    [   11.0] atlantic: Boot code hanged\n\
+                    [   12.0] atlantic: rr 0x3040 = 0xffffffff\n\
+                    [   13.0] atlantis: a different module entirely\n\
+                    [   14.0] r8169 0000:03:00.0: eth0: RTL8168h\n";
+        let kept = filter_dmesg(text, &["0000:08:00.0".to_string()], &[]);
         assert!(
             kept.contains("SerialNumber: 0123ABCD"),
             "device lines stay whole"
@@ -1059,22 +1100,35 @@ mod tests {
         assert!(kept.contains("Slot(0-1): Link Down"));
         assert!(kept.contains("atlantic 0000:08:00.0: enabling device"));
         assert!(!kept.contains("type 00 class 0x060100"));
-        assert!(!kept.contains("Boot code hanged"));
-        assert_eq!(kept.lines().count(), 9, "six USB lines and three PCI ones");
-        // Without addresses the driver line has nothing to be kept by.
-        assert!(!filter_dmesg(text, &[]).contains("atlantic"));
+        // The driver named in front of the listed address is followed into
+        // its bare lines, the ones that name no device; a module whose name
+        // merely starts the same is not, and neither is a driver of an
+        // unlisted device.
+        assert!(kept.contains("Boot code hanged"));
+        assert!(kept.contains("rr 0x3040 = 0xffffffff"));
+        assert!(!kept.contains("atlantis"));
+        assert!(!kept.contains("RTL8168h"));
+        assert_eq!(
+            kept.lines().count(),
+            11,
+            "six USB lines, the port's two, and the driver's three"
+        );
+        // Without the address, nothing names the driver and its lines are
+        // out; naming the driver from the inventory brings them back.
+        assert!(!filter_dmesg(text, &[], &[]).contains("atlantic"));
+        let by_driver = filter_dmesg(text, &[], &["atlantic".to_string()]);
+        assert!(by_driver.contains("Boot code hanged"));
+        assert!(by_driver.contains("enabling device"));
+        assert!(!by_driver.contains("atlantis"));
     }
 
     #[test]
     fn run_dmesg_returns_the_whole_log_or_a_reason_and_never_panics() {
         match run_dmesg() {
             // Unfiltered: the orchestrator cuts it down once it knows which
-            // PCI addresses to keep, so every line the filter keeps is one
-            // the raw text held.
-            Ok(text) => {
-                let kept = filter_dmesg(&text, &[]);
-                assert!(kept.lines().all(|line| text.contains(line)));
-            }
+            // PCI addresses to keep. A kernel log that reached us is
+            // line-terminated text; `filter_dmesg`'s own test pins the cut.
+            Ok(text) => assert!(text.is_empty() || text.ends_with('\n')),
             Err(reason) => assert!(!reason.is_empty()),
         }
     }

@@ -253,16 +253,22 @@ See [TUI chassis](#tui-chassis) for how these fit together.
   device's sysfs self-description, its interfaces, endpoints, and hub ports,
   the raw `descriptors`/`bos_descriptors` blobs to their real length, the
   Thunderbolt and Type-C attribute trees, and the PCI devices the kernel
-  marks `removable` (Linux 5.16 and later: hot-pluggable, or behind an
-  externally facing port, which is where a Thunderbolt or USB4 tunnel puts
-  its devices) with the bridges above them and each Thunderbolt domain's
-  host interface, read through an allowlist of attributes (identity, link
-  speed and width against the maximum, power state, ASPM, AER counters)
-  rather than a walk, since a PCI device directory also holds `config`,
-  `rom` and the BAR files; the kernel-log filter keeps the USB, Thunderbolt,
-  PCIe-port, hot-plug and AER lines and any line naming a removable
-  device's address, so a tunneled device's own driver is heard whatever it
-  is called. The backend probe answers which usbmon source
+  marks `removable` (Linux 5.16 and later, and only below a port the
+  firmware flags as externally facing, which is what a Thunderbolt or USB4
+  port is: `pci_set_removable` in `drivers/pci/probe.c` leaves every other
+  device without the attribute, a hot-plug slot included) with the bridges
+  above them and each Thunderbolt domain's host interface, read through an
+  allowlist of attributes (identity, link speed and width against the
+  maximum, power state, ASPM, AER counters) rather than a walk, since a PCI
+  device directory also holds `config`, `rom` and the BAR files. The three
+  link attributes whose sysfs readers take a runtime-PM reference
+  (`pci_config_pm_runtime_get` resumes a device in D3cold) are read only
+  while the device is awake, so the bundle never wakes what it describes.
+  The kernel-log filter keeps the USB, Thunderbolt, PCIe-port, hot-plug and
+  AER lines, any line naming a listed device's address, and the lines of
+  the drivers seen in front of one, so a tunneled device's own driver is
+  heard whatever it is called and even where it names no device
+  (`atlantic: Boot code hanged`). The backend probe answers which usbmon source
   `start_monitoring` would select with the same probes it uses.
 - `diag/bundle.rs`: the bundle directory, the manifest (format version, UTC
   time, file list with sizes, redaction counts, notes), and the `tar`

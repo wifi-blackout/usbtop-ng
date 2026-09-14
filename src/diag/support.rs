@@ -544,21 +544,21 @@ pub fn run_support(
             backend: &backend,
         },
     )?;
-    // Before the kernel log: the removable devices' addresses pick their
-    // drivers' lines out of it, whatever the drivers are called.
+    // Before the kernel log: the listed devices' addresses and drivers pick
+    // their lines out of it, whatever the drivers are called.
     let (pci, pci_notes) = inventory::read_pci(&roots.pci, &roots.thunderbolt);
     notes.extend(pci_notes);
-    let removable: Vec<String> = pci
+    let addresses: Vec<String> = pci.iter().map(|entry| entry.address.clone()).collect();
+    let drivers: Vec<String> = pci
         .iter()
-        .filter(|entry| entry.role == "removable")
-        .map(|entry| entry.address.clone())
+        .filter_map(|entry| entry.attrs.get("driver").cloned())
         .collect();
     writer.write_toml("inventory/pci-removable.toml", &PciFile { devices: pci })?;
     match &env.dmesg {
         Ok(text) => {
             let masked = writer
                 .redactor()
-                .mac_addresses(&collect::filter_dmesg(text, &removable));
+                .mac_addresses(&collect::filter_dmesg(text, &addresses, &drivers));
             writer.write_text("dmesg-usb.txt", &masked)?;
         }
         Err(reason) => notes.push(note("dmesg", reason)),
@@ -1541,42 +1541,46 @@ mod tests {
 
     /// A sysfs tree the capturer can materialize: a controller with a
     /// symlinked root hub and one device carrying a descriptor blob.
-    /// A PCI tree with one tunneled chain: root port `0000:00:07.1` (fixed)
-    /// above bridge `0000:2c:00.0` and endpoint `0000:2e:00.0` (both
-    /// removable), plus the fixed controller `0000:00:14.0`. Bus entries are
-    /// symlinks into it, as under `/sys/bus/pci/devices`.
+    /// A PCI tree laid out as `/sys` is, with relative symlinks into
+    /// `sys/devices`: root port `0000:00:07.1` (no `removable` attribute,
+    /// as the kernel leaves a fixed device) above bridge `0000:2c:00.0` and
+    /// endpoint `0000:2e:00.0` (both removable), plus the fixed controller
+    /// `0000:00:14.0` the USB fixture already made.
     fn fake_pci_tree(base: &Path) {
         let bus = base.join("sys/bus/pci/devices");
         std::fs::create_dir_all(&bus).unwrap();
-        let root_port = base.join("sys/devices/pci0000:00/0000:00:07.1");
-        let bridge = root_port.join("0000:2c:00.0");
-        let endpoint = bridge.join("0000:2e:00.0");
-        write(&root_port, "class", "0x060400\n");
-        write(&root_port, "current_link_speed", "2.5 GT/s PCIe\n");
-        write(&bridge, "removable", "removable\n");
-        write(&bridge, "class", "0x060400\n");
-        write(&endpoint, "removable", "removable\n");
-        write(&endpoint, "vendor", "0x8086\n");
-        write(&endpoint, "device", "0x0b27\n");
-        write(&endpoint, "class", "0x0c0330\n");
-        write(&endpoint, "current_link_speed", "2.5 GT/s PCIe\n");
-        write(&endpoint, "current_link_width", "4\n");
-        write(&endpoint, "power/runtime_status", "active\n");
-        write(&endpoint, "link/l1_aspm", "0\n");
-        write(&endpoint, "aer_dev_correctable", "RxErr 0\nBadTLP 0\n");
-        write(&endpoint, "config", "binary-never-read\n");
-        std::fs::create_dir_all(endpoint.join("driver-target/xhci_hcd")).unwrap();
-        std::os::unix::fs::symlink("driver-target/xhci_hcd", endpoint.join("driver")).unwrap();
-        for (name, real) in [
-            ("0000:00:07.1", &root_port),
-            ("0000:2c:00.0", &bridge),
-            ("0000:2e:00.0", &endpoint),
-            (
-                "0000:00:14.0",
-                &base.join("sys/devices/pci0000:00/0000:00:14.0"),
-            ),
+        std::fs::create_dir_all(base.join("sys/bus/pci/drivers/xhci_hcd")).unwrap();
+        let root_port = "pci0000:00/0000:00:07.1";
+        let bridge = "pci0000:00/0000:00:07.1/0000:2c:00.0";
+        let endpoint = "pci0000:00/0000:00:07.1/0000:2c:00.0/0000:2e:00.0";
+        let dev = |rel: &str| base.join("sys/devices").join(rel);
+        write(&dev(root_port), "class", "0x060400\n");
+        write(&dev(root_port), "power/runtime_status", "active\n");
+        write(&dev(root_port), "current_link_speed", "2.5 GT/s PCIe\n");
+        write(&dev(bridge), "removable", "removable\n");
+        write(&dev(bridge), "class", "0x060400\n");
+        write(&dev(endpoint), "removable", "removable\n");
+        write(&dev(endpoint), "vendor", "0x8086\n");
+        write(&dev(endpoint), "device", "0x0b27\n");
+        write(&dev(endpoint), "class", "0x0c0330\n");
+        write(&dev(endpoint), "current_link_speed", "2.5 GT/s PCIe\n");
+        write(&dev(endpoint), "current_link_width", "4\n");
+        write(&dev(endpoint), "power/runtime_status", "active\n");
+        write(&dev(endpoint), "link/l1_aspm", "0\n");
+        write(&dev(endpoint), "aer_dev_correctable", "RxErr 0\nBadTLP 0\n");
+        write(&dev(endpoint), "config", "binary-never-read\n");
+        std::os::unix::fs::symlink(
+            "../../../../../bus/pci/drivers/xhci_hcd",
+            dev(endpoint).join("driver"),
+        )
+        .unwrap();
+        for (name, rel) in [
+            ("0000:00:07.1", root_port),
+            ("0000:2c:00.0", bridge),
+            ("0000:2e:00.0", endpoint),
+            ("0000:00:14.0", "pci0000:00/0000:00:14.0"),
         ] {
-            std::os::unix::fs::symlink(real, bus.join(name)).unwrap();
+            std::os::unix::fs::symlink(format!("../../../devices/{rel}"), bus.join(name)).unwrap();
         }
     }
 
