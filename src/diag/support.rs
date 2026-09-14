@@ -19,7 +19,7 @@ use serde::Serialize;
 
 use super::bundle::{self, utc_stamp, BundleWriter};
 use super::collect::{self, BackendInfo, BuildInfo, HostInfo, TerminalInfo, UsbmonInfo};
-use super::inventory::{self, AttrDump, UsbInventory};
+use super::inventory::{self, AttrDump, PciEntry, UsbInventory};
 use super::redact::Redactor;
 use super::{note, Note};
 use crate::capacity::Basis;
@@ -144,6 +144,7 @@ pub struct Roots {
     pub device_tree: PathBuf,
     pub btf: PathBuf,
     pub thunderbolt: PathBuf,
+    pub pci: PathBuf,
     pub typec: PathBuf,
     pub power_delivery: PathBuf,
     pub home: Option<PathBuf>,
@@ -186,6 +187,7 @@ impl Roots {
             device_tree: PathBuf::from("/proc/device-tree"),
             btf: PathBuf::from("/sys/kernel/btf/vmlinux"),
             thunderbolt: PathBuf::from("/sys/bus/thunderbolt/devices"),
+            pci: PathBuf::from("/sys/bus/pci/devices"),
             typec: PathBuf::from("/sys/class/typec"),
             power_delivery: PathBuf::from("/sys/class/usb_power_delivery"),
             home,
@@ -365,6 +367,15 @@ struct ThunderboltFile {
     devices: Vec<AttrDump>,
 }
 
+/// `inventory/pci-removable.toml`: the PCI devices the kernel marks
+/// removable (a Thunderbolt or USB4 tunnel's devices among them), the
+/// bridges above them and the Thunderbolt host interfaces, each with its
+/// link, power and error state (see `inventory::read_pci`).
+#[derive(Serialize)]
+struct PciFile {
+    devices: Vec<PciEntry>,
+}
+
 #[derive(Serialize)]
 struct TypecFile {
     typec: Vec<AttrDump>,
@@ -533,9 +544,21 @@ pub fn run_support(
             backend: &backend,
         },
     )?;
+    // Before the kernel log: the removable devices' addresses pick their
+    // drivers' lines out of it, whatever the drivers are called.
+    let (pci, pci_notes) = inventory::read_pci(&roots.pci, &roots.thunderbolt);
+    notes.extend(pci_notes);
+    let removable: Vec<String> = pci
+        .iter()
+        .filter(|entry| entry.role == "removable")
+        .map(|entry| entry.address.clone())
+        .collect();
+    writer.write_toml("inventory/pci-removable.toml", &PciFile { devices: pci })?;
     match &env.dmesg {
         Ok(text) => {
-            let masked = writer.redactor().mac_addresses(text);
+            let masked = writer
+                .redactor()
+                .mac_addresses(&collect::filter_dmesg(text, &removable));
             writer.write_text("dmesg-usb.txt", &masked)?;
         }
         Err(reason) => notes.push(note("dmesg", reason)),
@@ -1518,9 +1541,49 @@ mod tests {
 
     /// A sysfs tree the capturer can materialize: a controller with a
     /// symlinked root hub and one device carrying a descriptor blob.
+    /// A PCI tree with one tunneled chain: root port `0000:00:07.1` (fixed)
+    /// above bridge `0000:2c:00.0` and endpoint `0000:2e:00.0` (both
+    /// removable), plus the fixed controller `0000:00:14.0`. Bus entries are
+    /// symlinks into it, as under `/sys/bus/pci/devices`.
+    fn fake_pci_tree(base: &Path) {
+        let bus = base.join("sys/bus/pci/devices");
+        std::fs::create_dir_all(&bus).unwrap();
+        let root_port = base.join("sys/devices/pci0000:00/0000:00:07.1");
+        let bridge = root_port.join("0000:2c:00.0");
+        let endpoint = bridge.join("0000:2e:00.0");
+        write(&root_port, "class", "0x060400\n");
+        write(&root_port, "current_link_speed", "2.5 GT/s PCIe\n");
+        write(&bridge, "removable", "removable\n");
+        write(&bridge, "class", "0x060400\n");
+        write(&endpoint, "removable", "removable\n");
+        write(&endpoint, "vendor", "0x8086\n");
+        write(&endpoint, "device", "0x0b27\n");
+        write(&endpoint, "class", "0x0c0330\n");
+        write(&endpoint, "current_link_speed", "2.5 GT/s PCIe\n");
+        write(&endpoint, "current_link_width", "4\n");
+        write(&endpoint, "power/runtime_status", "active\n");
+        write(&endpoint, "link/l1_aspm", "0\n");
+        write(&endpoint, "aer_dev_correctable", "RxErr 0\nBadTLP 0\n");
+        write(&endpoint, "config", "binary-never-read\n");
+        std::fs::create_dir_all(endpoint.join("driver-target/xhci_hcd")).unwrap();
+        std::os::unix::fs::symlink("driver-target/xhci_hcd", endpoint.join("driver")).unwrap();
+        for (name, real) in [
+            ("0000:00:07.1", &root_port),
+            ("0000:2c:00.0", &bridge),
+            ("0000:2e:00.0", &endpoint),
+            (
+                "0000:00:14.0",
+                &base.join("sys/devices/pci0000:00/0000:00:14.0"),
+            ),
+        ] {
+            std::os::unix::fs::symlink(real, bus.join(name)).unwrap();
+        }
+    }
+
     fn fake_roots(base: &Path) -> Roots {
         let devices = base.join("sys/bus/usb/devices");
         let ctrl = base.join("sys/devices/pci0000:00/0000:00:14.0");
+        fake_pci_tree(base);
         let usb1 = ctrl.join("usb1");
         write(&usb1, "busnum", "1\n");
         write(&usb1, "devnum", "1\n");
@@ -1587,6 +1650,7 @@ mod tests {
             device_tree: base.join("proc/device-tree"),
             btf: base.join("sys/kernel/btf/vmlinux"),
             thunderbolt: home.join("not-a-dir"),
+            pci: base.join("sys/bus/pci/devices"),
             typec: base.join("sys/class/typec"),
             power_delivery: base.join("sys/class/usb_power_delivery"),
             home: Some(home.clone()),
@@ -1664,6 +1728,7 @@ mod tests {
             "inventory/usb.toml",
             "inventory/descriptors/1-1.bin",
             "inventory/thunderbolt.toml",
+            "inventory/pci-removable.toml",
             "inventory/typec.toml",
             "config/config.toml",
             "config/preferences.toml",
@@ -1716,6 +1781,35 @@ mod tests {
         assert_eq!(cap_doc["buses"], doc["buses"]);
         assert_eq!(cap_doc["findings"], doc["findings"]);
         assert_eq!(summary.choke, "link none; capability none");
+
+        // The tunneled chain: the two removable devices, the fixed root port
+        // above them as a bridge, and nothing for the fixed controller.
+        let pci: toml::Value = toml::from_str(
+            &std::fs::read_to_string(dir.join("inventory/pci-removable.toml")).unwrap(),
+        )
+        .unwrap();
+        let entries = pci["devices"].as_array().unwrap();
+        let listed: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|e| (e["address"].as_str().unwrap(), e["role"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("0000:00:07.1", "bridge"),
+                ("0000:2c:00.0", "removable"),
+                ("0000:2e:00.0", "removable"),
+            ]
+        );
+        let endpoint = &entries[2];
+        assert_eq!(
+            endpoint["chain"].as_array().unwrap().len(),
+            2,
+            "root port then bridge: {endpoint}"
+        );
+        assert_eq!(endpoint["attrs"]["driver"].as_str(), Some("xhci_hcd"));
+        assert_eq!(endpoint["attrs"]["link/l1_aspm"].as_str(), Some("0"));
+        assert!(endpoint["attrs"].get("config").is_none(), "never read");
 
         // Device identity in, host identity out.
         let usb = std::fs::read_to_string(dir.join("inventory/usb.toml")).unwrap();

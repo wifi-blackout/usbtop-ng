@@ -432,8 +432,11 @@ says, and the snapshot is the one list you control.
 
 - `usbtop-ng --support` gathers a diagnostic bundle for a bug report: the
   build and host details, the usbmon probe and the backend it would pick,
-  the USB lines of the kernel log, every USB device's full self-description
-  (serial numbers included, as device identity), your configuration with
+  the USB, Thunderbolt and PCIe-port lines of the kernel log, every USB
+  device's full self-description (serial numbers included, as device
+  identity), the PCI devices the kernel marks removable, which is where a
+  Thunderbolt or USB4 tunnel puts its devices, with their link, power and
+  error state and their own kernel-log lines, your configuration with
   home paths rewritten to `~`, the terminal setup, and, when run with
   `sudo`, a short capture of the aggregate bus packaged as a replayable
   fixture, replayed into a report at each choke basis (`report.json` at

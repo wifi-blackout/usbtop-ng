@@ -473,7 +473,13 @@ pub fn probe_backend(
 
 // --- B. dmesg -------------------------------------------------------------
 
-const DMESG_KEYWORDS: [&str; 8] = [
+/// Substrings of a lower-cased line. The three PCI ones are the port
+/// driver, the hot-plug service and the error-reporting prefix: a device
+/// tunneled over Thunderbolt or USB4 is a PCI device, and its link going
+/// down, its slot event and its errors are logged under those names rather
+/// than under `thunderbolt`. `aer:` keeps the colon so an unrelated word
+/// does not match.
+const DMESG_KEYWORDS: [&str; 11] = [
     "usb",
     "xhci",
     "ehci",
@@ -482,17 +488,25 @@ const DMESG_KEYWORDS: [&str; 8] = [
     "thunderbolt",
     "hub",
     "usbmon",
+    "pcieport",
+    "pciehp",
+    "aer:",
 ];
 
 /// Keep the lines that mention USB, a host controller, Thunderbolt, a hub,
-/// or usbmon (case-insensitive), whole. Host identity never appears on
-/// those lines except a USB network adapter's MAC, which the caller masks
-/// with `Redactor::mac_addresses`.
-pub fn filter_dmesg(text: &str) -> String {
+/// usbmon, a PCIe port, its hot-plug service or an AER report
+/// (case-insensitive), or any of `addresses` (the removable PCI devices
+/// the inventory found, so their own drivers' lines come along whatever
+/// the driver is called), whole. Host identity never appears on those
+/// lines except a USB network adapter's MAC, which the caller masks with
+/// `Redactor::mac_addresses`.
+pub fn filter_dmesg(text: &str, addresses: &[String]) -> String {
     let mut out = String::new();
     for line in text.lines() {
         let lower = line.to_lowercase();
-        if DMESG_KEYWORDS.iter().any(|k| lower.contains(k)) {
+        if DMESG_KEYWORDS.iter().any(|k| lower.contains(k))
+            || addresses.iter().any(|a| lower.contains(a.as_str()))
+        {
             out.push_str(line);
             out.push('\n');
         }
@@ -500,8 +514,10 @@ pub fn filter_dmesg(text: &str) -> String {
     out
 }
 
-/// Live: run `dmesg` and filter it. `Err` carries the reason (the tool is
-/// missing, or the kernel restricts the log to root) for a note.
+/// Live: run `dmesg` and hand back the whole log for `filter_dmesg` to cut
+/// down once the inventory knows which PCI addresses to keep. `Err`
+/// carries the reason (the tool is missing, or the kernel restricts the
+/// log to root) for a note.
 pub fn run_dmesg() -> Result<String, String> {
     let output = Command::new("dmesg")
         .output()
@@ -514,7 +530,7 @@ pub fn run_dmesg() -> Result<String, String> {
             stderr.trim()
         ));
     }
-    Ok(filter_dmesg(&String::from_utf8_lossy(&output.stdout)))
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 // --- D. configuration -----------------------------------------------------
@@ -1018,8 +1034,13 @@ mod tests {
                     [    3.0] thunderbolt 0-1: new device found\n\
                     [    4.0] hub 3-1:1.0: USB hub found\n\
                     [    5.0] DWC2 controller ready\n\
-                    [    6.0] usbmon: debugfs is not available\n";
-        let kept = filter_dmesg(text);
+                    [    6.0] usbmon: debugfs is not available\n\
+                    [    7.0] pci 0000:00:1f.0: [8086:a082] type 00 class 0x060100\n\
+                    [    8.0] pcieport 0000:00:07.1: AER: Corrected error message received from 0000:2e:00.0\n\
+                    [    9.0] pciehp 0000:2c:00.0:pcie004: Slot(0-1): Link Down\n\
+                    [   10.0] atlantic 0000:08:00.0: enabling device (0000 -> 0002)\n\
+                    [   11.0] atlantic: Boot code hanged\n";
+        let kept = filter_dmesg(text, &["0000:08:00.0".to_string()]);
         assert!(
             kept.contains("SerialNumber: 0123ABCD"),
             "device lines stay whole"
@@ -1030,16 +1051,30 @@ mod tests {
         assert!(kept.contains("usbmon: debugfs"));
         assert!(!kept.contains("Linux version"));
         assert!(!kept.contains("hostname"));
-        assert_eq!(kept.lines().count(), 6);
+        // The PCI side of a tunnel: the port's error report, the slot event,
+        // and the removable device's own driver line by its address. Plain
+        // PCI enumeration stays out, and so does a driver line that names
+        // neither the device nor a keyword.
+        assert!(kept.contains("AER: Corrected error"));
+        assert!(kept.contains("Slot(0-1): Link Down"));
+        assert!(kept.contains("atlantic 0000:08:00.0: enabling device"));
+        assert!(!kept.contains("type 00 class 0x060100"));
+        assert!(!kept.contains("Boot code hanged"));
+        assert_eq!(kept.lines().count(), 9, "six USB lines and three PCI ones");
+        // Without addresses the driver line has nothing to be kept by.
+        assert!(!filter_dmesg(text, &[]).contains("atlantic"));
     }
 
     #[test]
-    fn run_dmesg_returns_text_or_a_reason_and_never_panics() {
+    fn run_dmesg_returns_the_whole_log_or_a_reason_and_never_panics() {
         match run_dmesg() {
-            Ok(text) => assert!(text.lines().all(|line| {
-                let lower = line.to_lowercase();
-                DMESG_KEYWORDS.iter().any(|k| lower.contains(k))
-            })),
+            // Unfiltered: the orchestrator cuts it down once it knows which
+            // PCI addresses to keep, so every line the filter keeps is one
+            // the raw text held.
+            Ok(text) => {
+                let kept = filter_dmesg(&text, &[]);
+                assert!(kept.lines().all(|line| text.contains(line)));
+            }
             Err(reason) => assert!(!reason.is_empty()),
         }
     }

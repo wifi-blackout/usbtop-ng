@@ -251,10 +251,19 @@ See [TUI chassis](#tui-chassis) for how these fit together.
   testable against a fake tree, and each returns typed data plus
   "unavailable" notes rather than errors. The inventory reads every USB
   device's sysfs self-description, its interfaces, endpoints, and hub ports,
-  the raw `descriptors`/`bos_descriptors` blobs to their real length, and
-  the Thunderbolt and Type-C attribute trees; the backend probe answers
-  which usbmon source `start_monitoring` would select with the same probes
-  it uses.
+  the raw `descriptors`/`bos_descriptors` blobs to their real length, the
+  Thunderbolt and Type-C attribute trees, and the PCI devices the kernel
+  marks `removable` (Linux 5.16 and later: hot-pluggable, or behind an
+  externally facing port, which is where a Thunderbolt or USB4 tunnel puts
+  its devices) with the bridges above them and each Thunderbolt domain's
+  host interface, read through an allowlist of attributes (identity, link
+  speed and width against the maximum, power state, ASPM, AER counters)
+  rather than a walk, since a PCI device directory also holds `config`,
+  `rom` and the BAR files; the kernel-log filter keeps the USB, Thunderbolt,
+  PCIe-port, hot-plug and AER lines and any line naming a removable
+  device's address, so a tunneled device's own driver is heard whatever it
+  is called. The backend probe answers which usbmon source
+  `start_monitoring` would select with the same probes it uses.
 - `diag/bundle.rs`: the bundle directory, the manifest (format version, UTC
   time, file list with sizes, redaction counts, notes), and the `tar`
   archive.

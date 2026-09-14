@@ -428,8 +428,13 @@ floor 0.1).
 
 What the bundle holds: build and host details (`build.toml`, `host.toml`),
 the usbmon probe and the backend the monitor would select (`usbmon.toml`),
-the USB lines of the kernel log (`dmesg-usb.txt`), every device's full
-self-description with its raw descriptors (`inventory/`), your preferences
+the USB, Thunderbolt and PCIe-port lines of the kernel log plus every line
+naming a removable PCI device (`dmesg-usb.txt`), every USB device's full
+self-description with its raw descriptors and the PCI devices the kernel
+marks removable, the bridges above them and the Thunderbolt host
+interfaces, each with its link, power and AER state
+(`inventory/pci-removable.toml`; a Thunderbolt or USB4 tunnel's devices
+are the removable ones), your preferences
 and internal-device snapshot with home paths rewritten and connector
 labels masked (`config/`), the
 terminal setup (`terminal.toml`), the embedded fixture (`fixture/`, the same

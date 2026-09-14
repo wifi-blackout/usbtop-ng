@@ -118,6 +118,14 @@ The second step, once the stages above the root hub can be priced:
   per-tunnel allocation at all, so the honest output is the shared ceiling
   and what is known to be under it, never a per-tunnel share invented to
   fill the gap.
+- A tunneled PCIe device that is not a USB controller, a 10G NIC behind a
+  USB4 adapter say, as a sibling consumer of that Thunderbolt link in the
+  controller grouping. usbmon never sees such a device, so today the TUI
+  has no place for it; the kernel marks it `removable` and puts it under
+  the same root port as the tunneled xHCI, which is the join the grouping
+  would use. The support bundle's `inventory/pci-removable.toml` already
+  collects exactly those devices with their link and power state, as the
+  groundwork for this row.
 
 Parked until Linux exposes them, not dropped. No stable kernel interface
 carries these today, and each becomes buildable the moment a mainline ABI
