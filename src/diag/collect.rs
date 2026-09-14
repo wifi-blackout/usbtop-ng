@@ -517,8 +517,13 @@ pub fn filter_dmesg(text: &str, addresses: &[String], drivers: &[String]) -> Str
         let lower = line.to_lowercase();
         let words: Vec<&str> = lower.split_whitespace().collect();
         for (i, word) in words.iter().enumerate().skip(1) {
-            let word = word.trim_end_matches(':');
-            if !addresses.iter().any(|a| a == word) {
+            // `0000:2c:00.0:`, or `0000:2c:00.0:pcie004:` from a port
+            // service: the address, then nothing or a colon.
+            let names_address = addresses.iter().any(|a| {
+                word.strip_prefix(a.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+            });
+            if !names_address {
                 continue;
             }
             let name = words[i - 1];
@@ -534,16 +539,23 @@ pub fn filter_dmesg(text: &str, addresses: &[String], drivers: &[String]) -> Str
     let mut out = String::new();
     for line in text.lines() {
         let lower = line.to_lowercase();
-        // After the `[  123.456] ` stamp, when there is one.
-        let message = lower.split_once("] ").map_or(lower.as_str(), |(_, m)| m);
-        let by_driver = names.iter().any(|name| {
-            message
-                .strip_prefix(name.as_str())
-                .is_some_and(|rest| rest.starts_with(':') || rest.starts_with(' '))
-        });
+        // After the `[  123.456] ` stamp, when the line carries one; a
+        // line without one keeps a `] ` inside its message.
+        let message = if lower.starts_with('[') {
+            lower.split_once("] ").map_or(lower.as_str(), |(_, m)| m)
+        } else {
+            lower.as_str()
+        };
+        let by_driver = || {
+            names.iter().any(|name| {
+                message
+                    .strip_prefix(name.as_str())
+                    .is_some_and(|rest| rest.starts_with(':') || rest.starts_with(' '))
+            })
+        };
         if DMESG_KEYWORDS.iter().any(|k| lower.contains(k))
             || addresses.iter().any(|a| lower.contains(a.as_str()))
-            || by_driver
+            || by_driver()
         {
             out.push_str(line);
             out.push('\n');
@@ -1080,7 +1092,10 @@ mod tests {
                     [   11.0] atlantic: Boot code hanged\n\
                     [   12.0] atlantic: rr 0x3040 = 0xffffffff\n\
                     [   13.0] atlantis: a different module entirely\n\
-                    [   14.0] r8169 0000:03:00.0: eth0: RTL8168h\n";
+                    [   14.0] r8169 0000:03:00.0: eth0: RTL8168h\n\
+                    [   15.0] mydrv 0000:08:00.0:pcie001: service bound\n\
+                    [   16.0] mydrv: a bare line of the service\n\
+                    atlantic: status [OK] then a bracket in the message\n";
         let kept = filter_dmesg(text, &["0000:08:00.0".to_string()], &[]);
         assert!(
             kept.contains("SerialNumber: 0123ABCD"),
@@ -1108,10 +1123,15 @@ mod tests {
         assert!(kept.contains("rr 0x3040 = 0xffffffff"));
         assert!(!kept.contains("atlantis"));
         assert!(!kept.contains("RTL8168h"));
+        // A port service glues a suffix onto the address; the driver in
+        // front of it is still followed. A line without a timestamp keeps
+        // its whole text as the message, bracket and all.
+        assert!(kept.contains("a bare line of the service"));
+        assert!(kept.contains("then a bracket in the message"));
         assert_eq!(
             kept.lines().count(),
-            11,
-            "six USB lines, the port's two, and the driver's three"
+            14,
+            "six USB lines, the port's two, and the drivers' six"
         );
         // Without the address, nothing names the driver and its lines are
         // out; naming the driver from the inventory brings them back.
