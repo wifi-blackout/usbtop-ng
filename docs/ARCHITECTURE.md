@@ -142,11 +142,13 @@ treats them alike.
   `demand_basis` (`capacity::Basis`, seeded from `--demand`) and resyncs,
   so the model is rebuilt at the other basis before the repaint. `draw_ui`
   starts with the terminal floor (`MIN_COLS` x `MIN_ROWS`, 80x24): below it
-  a notice with the current size replaces every layout and overlay, and
-  the keys still work. The help overlay is sized to its text up to the
-  screen, scrolls with `↑`/`↓` when it does not fit, and never wraps: every
-  help line is kept under the width the floor guarantees, and a test pins
-  it.
+  a wrapped notice with the current size replaces every layout and
+  overlay, and the draw sets `too_small` so `apply_key` lets only `q` and
+  Ctrl-C through, holding a hidden prompt or query unchanged rather than
+  letting a key act on what nobody can see. The help overlay is sized to
+  its text up to the screen (its widest line across, its line count down),
+  scrolls with `↑`/`↓` when it does not fit, and never wraps: every help
+  line is kept inside the width the floor guarantees, and a test pins it.
 - `connectors.rs`: the render model's connector grouping — building
   `ConnectorView`s from the port index, their labels, and their ordering.
 - `colors.rs`: the color scheme.

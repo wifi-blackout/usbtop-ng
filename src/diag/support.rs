@@ -340,8 +340,9 @@ pub struct Summary {
     pub redacted: String,
 }
 
-/// The `choke:` summary line: how many hubs sit at or above the breathing
-/// room at each basis and the worst ratio, `link 3 (worst 3.05x);
+/// The `choke:` summary line: how many hub links sit at or above the
+/// breathing room at each basis (a hub with both halves choked counts
+/// twice, as in the reports) and the worst ratio, `link 3 (worst 3.05x);
 /// capability 3 (worst 3.05x)`, or `none` on a side with nothing listed.
 fn choke_line(link: &Report, capability: &Report) -> String {
     fn side(report: &Report) -> String {
@@ -693,7 +694,10 @@ pub fn run_support(
                     writer.redact_file(name)?;
                 }
             }
-            Err(e) => notes.push(note("report.json", format!("replay failed: {e:#}"))),
+            Err(e) => notes.push(note(
+                "report.json, report.capability.json",
+                format!("replay failed: {e:#}"),
+            )),
         }
     }
 

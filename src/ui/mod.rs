@@ -140,6 +140,10 @@ pub struct UsbTopApp {
     /// How far the help overlay is scrolled, in lines; back to the top
     /// whenever it opens, clamped to the fit whenever it draws.
     pub help_scroll: u16,
+    /// Set by the last draw: the terminal was below the floor and the size
+    /// notice was all it showed, so `apply_key` lets only the quit keys act
+    /// and every hidden state waits for a screen that can show it.
+    pub too_small: bool,
     pub start_time: Instant,
     /// How often the loop takes a fresh snapshot of the devices; the schedule
     /// itself lives in the loop (see `tui::run_app`), not here.
@@ -273,6 +277,7 @@ impl UsbTopApp {
             selected_device: None,
             show_help: false,
             help_scroll: 0,
+            too_small: false,
             start_time: Instant::now(),
             refresh_rate,
             total_bandwidth: 0.0,
@@ -857,6 +862,21 @@ pub(crate) fn apply_key(app: &mut UsbTopApp, key: KeyEvent) -> KeyOutcome {
         return KeyOutcome::None;
     }
 
+    // Below the terminal floor the screen shows only the size notice (see
+    // `draw_ui`), so nothing the other keys would act on is visible: a
+    // prompt's `y` or a query's letters must not act unseen. Only the way
+    // out the notice names gets through, and every state waits, unchanged,
+    // for a screen that can show it.
+    if app.too_small {
+        let quits = key.code == KeyCode::Char('q')
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+        return if quits {
+            KeyOutcome::Quit
+        } else {
+            KeyOutcome::None
+        };
+    }
+
     // The snapshot prompt takes every key while it's open, ahead of the
     // ordinary bindings below -- e.g. 'q' during Confirm cancels the prompt
     // rather than quitting. This is the same "owns the screen while it's up"
@@ -1189,8 +1209,10 @@ pub const MIN_ROWS: u16 = 24;
 
 pub(crate) fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
     let size = f.area();
-    // Ahead of the overlays: they would not fit either.
-    if size.width < MIN_COLS || size.height < MIN_ROWS {
+    // Ahead of the overlays: they would not fit either. The flag tells
+    // `apply_key` what is on screen.
+    app.too_small = size.width < MIN_COLS || size.height < MIN_ROWS;
+    if app.too_small {
         draw_size_notice(f, size);
         return;
     }
@@ -1228,8 +1250,10 @@ pub(crate) fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {
 }
 
 /// What a terminal below the floor shows: the minimum, the current size and
-/// the way out. The keys still work (`q` quits), and a resize repaints
-/// through the normal path.
+/// the way out. `q` and Ctrl-C quit (`apply_key` holds every other key), and
+/// a resize repaints through the normal path. Wrapped, since the one screen
+/// that only ever shows on a small terminal must fit a narrow one too; the
+/// text is centred on its wrapped height.
 fn draw_size_notice(f: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from(Span::styled(
@@ -1241,16 +1265,30 @@ fn draw_size_notice(f: &mut Frame, area: Rect) {
         Line::from(format!("This one is {}x{}", area.width, area.height)),
         Line::from("Resize the window, or press q to quit"),
     ];
-    let top = area.height.saturating_sub(3) / 2;
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(top),
-            Constraint::Length(3),
-            Constraint::Min(0),
-        ])
-        .split(area);
-    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), rows[1]);
+    // Rows after wrapping, counted the plain way (a line of n columns takes
+    // n / width rows, rounded up); word wrapping can take one more, which
+    // the room below the block absorbs.
+    let width = usize::from(area.width.max(1));
+    let rows: usize = lines
+        .iter()
+        .map(|line| line.width().div_ceil(width).max(1))
+        .sum();
+    let top = area
+        .height
+        .saturating_sub(u16::try_from(rows).unwrap_or(u16::MAX))
+        / 2;
+    let block = Rect {
+        x: area.x,
+        y: area.y + top,
+        width: area.width,
+        height: area.height - top,
+    };
+    f.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        block,
+    );
 }
 
 /// Bytes per second as MB/s, floored at zero. Bandwidth is never negative, so
@@ -2028,18 +2066,19 @@ fn draw_color_reference(f: &mut Frame, area: Rect, app: &UsbTopApp) {
     f.render_widget(reference, area);
 }
 
-/// The widest the help overlay gets; wider reads worse.
-const HELP_WIDTH: u16 = 100;
-
-/// The help overlay, sized to its text up to the screen minus a margin.
-/// What does not fit scrolls (`↑`/`↓`, see `apply_key`) and the title says
-/// so; the lines never wrap, since `help_lines` keeps every one inside the
+/// The help overlay, sized to its text up to the screen minus a margin:
+/// its widest line plus the border across, its line count down. What does
+/// not fit down scrolls (`↑`/`↓`, see `apply_key`) and the title says so;
+/// the lines never wrap, since `help_lines` keeps every one inside the
 /// overlay at the 80-column floor.
 fn draw_help_overlay(f: &mut Frame, app: &mut UsbTopApp) {
     let screen = f.area();
     let lines = help_lines();
     let total = lines.len();
-    let width = screen.width.saturating_sub(2).min(HELP_WIDTH);
+    let widest = lines.iter().map(Line::width).max().unwrap_or(0);
+    let width = u16::try_from(widest + 2)
+        .unwrap_or(u16::MAX)
+        .min(screen.width.saturating_sub(2));
     let visible = usize::from(screen.height.saturating_sub(4)).min(total);
     let max_scroll = u16::try_from(total - visible).unwrap_or(u16::MAX);
     app.help_scroll = app.help_scroll.min(max_scroll);
@@ -2063,9 +2102,9 @@ fn draw_help_overlay(f: &mut Frame, app: &mut UsbTopApp) {
     f.render_widget(help, area);
 }
 
-/// The help text. Every line stays at or under 76 columns so the overlay
-/// never wraps at the floor (78 columns inside its border at `MIN_COLS`);
-/// a test pins that.
+/// The help text. Every line stays at or under 76 columns, the width inside
+/// the overlay's border at `MIN_COLS` (78 across with the screen's margin),
+/// so nothing wraps at the floor; a test pins that.
 fn help_lines() -> Vec<Line<'static>> {
     vec![
         Line::from(vec![Span::styled(
@@ -4162,16 +4201,21 @@ mod tests {
 
     /// `centered_rect_for_lines`'s clamp has to hold even when the terminal
     /// itself is smaller than the popup would like: a hub farm's device
-    /// count must not turn a tiny terminal into a panic.
+    /// count must not turn a small terminal into a panic. Drawn at the
+    /// floor, the smallest screen that reaches the prompt at all (below it
+    /// the size notice takes the whole screen), with more devices than the
+    /// popup can list there.
     #[test]
-    fn the_confirmation_overlay_does_not_panic_on_a_tiny_terminal_with_many_devices() {
-        let port_paths: Vec<String> = (0..20).map(|i| format!("1-{i}")).collect();
+    fn the_confirmation_overlay_does_not_panic_on_a_small_terminal_with_many_devices() {
+        let port_paths: Vec<String> = (0..40).map(|i| format!("1-{i}")).collect();
         let port_paths: Vec<&str> = port_paths.iter().map(String::as_str).collect();
         let mut app = UsbTopApp::new(Duration::from_millis(100));
         open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&port_paths)));
 
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(20, 5)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("Snapshot internal devices"), "{screen}");
     }
 
     #[test]
@@ -4185,14 +4229,38 @@ mod tests {
             let screen = terminal.backend().to_string();
             assert!(screen.contains("at least 80x24"), "{w}x{h}: {screen}");
             assert!(screen.contains(&format!("This one is {w}x{h}")), "{screen}");
+            assert!(screen.contains("press q to quit"), "{w}x{h}: {screen}");
             assert!(!screen.contains("Total:"), "{screen}");
+            assert!(app.too_small);
         }
+        // Narrower than the notice's own first line: it wraps rather than
+        // cuts, so the minimum, the size and the way out are all still said
+        // in full, the minimum on a row of its own.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(
+            screen
+                .lines()
+                .any(|row| row.contains("80x24") && !row.contains("at least")),
+            "the minimum wrapped onto its own row: {screen}"
+        );
+        assert!(screen.contains("This one is 40x10"), "{screen}");
+        assert!(screen.contains("press q to quit"), "{screen}");
+        // And on a screen too small for the whole notice, the minimum and the
+        // size still land.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(20, 5)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("80x24"), "{screen}");
+        assert!(screen.contains("20x5"), "{screen}");
         // The floor itself draws the screen.
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
         let screen = terminal.backend().to_string();
         assert!(screen.contains("Total:"), "{screen}");
         assert!(!screen.contains("at least 80x24"), "{screen}");
+        assert!(!app.too_small);
         // The notice wins over the overlays, which would not fit either.
         app.show_help = true;
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
@@ -4202,9 +4270,63 @@ mod tests {
         assert!(!screen.contains("usbtop-ng Help"), "{screen}");
     }
 
-    /// Every help line fits the overlay at the 80-column floor (78 columns
-    /// inside the border, one to spare), so nothing wraps and the scroll
-    /// range is the line count.
+    #[test]
+    fn below_the_floor_only_quitting_gets_through_and_hidden_state_waits() {
+        // A confirmation prompt under the notice: `y` would confirm it
+        // unseen, so it is held; the prompt is still there for a screen
+        // that can show it.
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        open_snapshot_prompt(&mut app, Ok(fixture_snapshot(&["1-1"])));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        assert!(app.too_small);
+        assert_eq!(
+            apply_key(&mut app, KeyEvent::from(KeyCode::Char('y'))),
+            KeyOutcome::None
+        );
+        assert!(
+            matches!(app.snapshot_prompt, Some(SnapshotPrompt::Confirm(_))),
+            "the prompt waits, unchanged"
+        );
+        // The way out the notice names, and only that: Esc and h do nothing.
+        assert_eq!(
+            apply_key(&mut app, KeyEvent::from(KeyCode::Esc)),
+            KeyOutcome::None
+        );
+        assert_eq!(
+            apply_key(&mut app, KeyEvent::from(KeyCode::Char('h'))),
+            KeyOutcome::None
+        );
+        assert!(!app.show_help);
+        assert_eq!(
+            apply_key(&mut app, KeyEvent::from(KeyCode::Char('q'))),
+            KeyOutcome::Quit
+        );
+        assert_eq!(
+            apply_key(&mut app, ctrl(KeyCode::Char('c'))),
+            KeyOutcome::Quit
+        );
+        // A query being typed is hidden too: `q` quits instead of typing.
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.search = SearchState::Editing("ab".to_string());
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        assert_eq!(
+            apply_key(&mut app, KeyEvent::from(KeyCode::Char('q'))),
+            KeyOutcome::Quit
+        );
+        assert!(matches!(&app.search, SearchState::Editing(q) if q == "ab"));
+        // Grown back, the query is where it was and its keys are its own
+        // again.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        assert!(!app.too_small);
+        apply_key(&mut app, KeyEvent::from(KeyCode::Char('q')));
+        assert!(matches!(&app.search, SearchState::Editing(q) if q == "abq"));
+    }
+
+    /// Every help line fits the overlay at the 80-column floor: 76 columns
+    /// inside the border, exactly, so nothing wraps and the scroll range is
+    /// the line count.
     #[test]
     fn every_help_line_fits_the_overlay_at_the_floor() {
         for line in help_lines() {

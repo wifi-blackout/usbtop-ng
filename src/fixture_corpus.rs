@@ -457,13 +457,10 @@ fn bundle_name(bundle: &Bundle) -> String {
     format!("{host}/{stage}")
 }
 
-/// The choke points as (path, capacity, demand): what the basis can move.
-fn choke_view(report: &crate::headless::Report) -> Vec<(String, f64, f64)> {
-    report
-        .chokepoints
-        .iter()
-        .map(|c| (c.path.clone(), c.capacity_mbps, c.demand_mbps))
-        .collect()
+/// The choke list as it is reported, every field, so a basis that moved
+/// anything in it (a ratio, a contributor, the sentence) is caught.
+fn choke_view(report: &crate::headless::Report) -> serde_json::Value {
+    serde_json::to_value(&report.chokepoints).unwrap()
 }
 
 #[test]

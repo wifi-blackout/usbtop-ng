@@ -96,7 +96,8 @@ fallback are root-owned by default.
 The screen needs a terminal of at least 80 columns by 24 rows. Below that
 usbtop-ng shows the current size and the minimum instead of a clipped
 layout, keeps measuring, and draws the screen as soon as the window is
-large enough; `q` still quits.
+large enough. Only `q` and `Ctrl-C` act while the notice is up; a prompt or
+a search left open waits, unchanged, for a screen that can show it.
 
 ## Keys
 

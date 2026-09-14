@@ -435,7 +435,8 @@ labels masked (`config/`), the
 terminal setup (`terminal.toml`), the embedded fixture (`fixture/`, the same
 layout as `tests/fixtures/hosts/`), the fixture replayed once and reported
 at each choke basis (`report.json` at `link`, `report.capability.json` at
-`capability`; only `demand_basis` and `chokepoints` differ), the
+`capability`: the same rows, each with its own `demand_basis`,
+`chokepoints` and timestamp), the
 printed summary saved as `SUMMARY.txt`, the run's debug log
 (`usbtop-ng.log`), and a `manifest.toml` listing each file with its size,
 the redaction counts, and everything that was unavailable.
