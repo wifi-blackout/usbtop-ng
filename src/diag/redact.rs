@@ -171,8 +171,31 @@ impl Redactor {
     /// line, and the identifying path component after `/dev/disk/by-uuid/`,
     /// `by-partuuid/`, `by-id/` (which carries the drive's serial),
     /// `by-label/`, and `by-partlabel/` (user-chosen names); every other
-    /// token is kept whole. All counted under `fs_uuid`.
+    /// token is kept whole, and so is the text's own whitespace, newlines
+    /// included, so the rule runs over the kernel log's echo of the
+    /// command line as well as over `/proc/cmdline`. All counted under
+    /// `fs_uuid`.
     pub fn cmdline(&mut self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut token_start = None;
+        for (i, c) in text.char_indices() {
+            if c.is_whitespace() {
+                if let Some(start) = token_start.take() {
+                    out.push_str(&self.cmdline_token(&text[start..i]));
+                }
+                out.push(c);
+            } else if token_start.is_none() {
+                token_start = Some(i);
+            }
+        }
+        if let Some(start) = token_start {
+            out.push_str(&self.cmdline_token(&text[start..]));
+        }
+        out
+    }
+
+    /// One whitespace-free token of `cmdline`, masked or kept whole.
+    fn cmdline_token(&mut self, token: &str) -> String {
         const BY_PREFIXES: [&str; 5] = [
             "/dev/disk/by-uuid/",
             "/dev/disk/by-partuuid/",
@@ -180,25 +203,19 @@ impl Redactor {
             "/dev/disk/by-label/",
             "/dev/disk/by-partlabel/",
         ];
-        let tokens: Vec<String> = text
-            .split_whitespace()
-            .map(|token| {
-                if let Some(at) = token.find("UUID=") {
-                    self.bump("fs_uuid");
-                    return format!("{}UUID=<redacted>", &token[..at]);
-                }
-                for prefix in BY_PREFIXES {
-                    if let Some(at) = token.find(prefix) {
-                        self.bump("fs_uuid");
-                        let start = at + prefix.len();
-                        let end = token[start..].find('/').map_or(token.len(), |i| start + i);
-                        return format!("{}<redacted>{}", &token[..start], &token[end..]);
-                    }
-                }
-                token.to_string()
-            })
-            .collect();
-        tokens.join(" ")
+        if let Some(at) = token.find("UUID=") {
+            self.bump("fs_uuid");
+            return format!("{}UUID=<redacted>", &token[..at]);
+        }
+        for prefix in BY_PREFIXES {
+            if let Some(at) = token.find(prefix) {
+                self.bump("fs_uuid");
+                let start = at + prefix.len();
+                let end = token[start..].find('/').map_or(token.len(), |i| start + i);
+                return format!("{}<redacted>{}", &token[..start], &token[end..]);
+            }
+        }
+        token.to_string()
     }
 
     /// Masks every value of a `[connector_names]` table in a preferences
@@ -509,6 +526,22 @@ mod tests {
             r.cmdline("x=/dev/disk/by-id/ata-Model_123/extra"),
             "x=/dev/disk/by-id/<redacted>/extra"
         );
+    }
+
+    /// The kernel log echoes the boot command line, so the rule also runs
+    /// over a multi-line text whose lines must keep their own spacing:
+    /// the `[    0.000000]` stamp is padded, and the newlines are the lines.
+    #[test]
+    fn cmdline_keeps_the_texts_own_whitespace_and_newlines() {
+        let mut r = Redactor::new(None);
+        let text = "[    0.000000] Command line: BOOT_IMAGE=/boot/vmlinuz root=UUID=307c1732-bacd-4ef4-9050-b4c9e99e5648 ro\n\
+                    [    0.100000] usb 1-4: new device\n";
+        assert_eq!(
+            r.cmdline(text),
+            "[    0.000000] Command line: BOOT_IMAGE=/boot/vmlinuz root=UUID=<redacted> ro\n\
+             [    0.100000] usb 1-4: new device\n"
+        );
+        assert_eq!(r.summary(), vec![("fs_uuid".to_string(), 1)]);
     }
 
     #[test]

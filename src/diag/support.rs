@@ -556,9 +556,14 @@ pub fn run_support(
     writer.write_toml("inventory/pci-removable.toml", &PciFile { devices: pci })?;
     match &env.dmesg {
         Ok(text) => {
-            let masked = writer
-                .redactor()
-                .mac_addresses(&collect::filter_dmesg(text, &addresses, &drivers));
+            // What a kept line can carry that names the host: the MAC a
+            // network driver prints on probe, and the disk identifiers in
+            // the kernel's echo of the boot command line, kept whenever
+            // that line mentions USB.
+            let filtered = collect::filter_dmesg(text, &addresses, &drivers);
+            let redactor = writer.redactor();
+            let no_mac = redactor.mac_addresses(&filtered);
+            let masked = redactor.cmdline(&no_mac);
             writer.write_text("dmesg-usb.txt", &masked)?;
         }
         Err(reason) => notes.push(note("dmesg", reason)),
@@ -1662,6 +1667,54 @@ mod tests {
             preferences_file: Some(home.join(".usbtop-ng/preferences.toml")),
             usbids_chain: vec![home.join(".usbtop-ng/usb.ids")],
         }
+    }
+
+    /// The kernel echoes the boot command line into its log, and that line
+    /// is kept whenever it mentions USB (a `usbcore` quirk, say). It names
+    /// the root filesystem by UUID, which `/proc/cmdline` already has masked
+    /// in `host.toml`; the log copy gets the same rule, and every other
+    /// line keeps its padded timestamp untouched.
+    #[test]
+    fn the_kernel_log_masks_the_command_line_it_echoes() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = fake_roots(temp.path());
+        let target = temp.path().join("out");
+        private_target(&target);
+        let prepared = prepare_dir(&target, 1_788_000_000).unwrap();
+        std::fs::write(prepared.dir.join("usbtop-ng.log"), "[INFO] starting\n").unwrap();
+        let uuid = "307c1732-bacd-4ef4-9050-b4c9e99e5648";
+        let env = Environment {
+            dmesg: Ok(format!(
+                "[    0.000000] Command line: BOOT_IMAGE=/boot/vmlinuz root=UUID={uuid} ro usbcore.autosuspend=-1\n\
+                 [    0.000001] Linux version 7.0\n\
+                 [    1.200000] usb 1-4: new high-speed USB device number 3 using xhci_hcd\n"
+            )),
+            ..environment(1000, Ok(status(false)))
+        };
+        let opts = SupportOpts {
+            window: Duration::from_secs(1),
+            no_capture: true,
+            command: vec![
+                "usbtop-ng".into(),
+                "--support".into(),
+                "--no-capture".into(),
+            ],
+        };
+        run_support(&opts, &roots, &env, &prepared, 1_788_000_000).unwrap();
+        let log = std::fs::read_to_string(prepared.dir.join("dmesg-usb.txt")).unwrap();
+        assert!(!log.contains(uuid), "{log}");
+        assert!(
+            log.contains("root=UUID=<redacted> ro usbcore.autosuspend=-1"),
+            "{log}"
+        );
+        assert!(
+            !log.contains("Linux version"),
+            "a keyword-free line is cut: {log}"
+        );
+        assert!(
+            log.contains("[    1.200000] usb 1-4: new high-speed"),
+            "the other lines keep their spacing: {log}"
+        );
     }
 
     /// The hermetic end-to-end: a non-root `--support --no-capture` against

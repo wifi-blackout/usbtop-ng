@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The support bundle's kernel log (`dmesg-usb.txt`) now names a device's driver only from the front of its line, the shape the kernel prints, so a word that merely stands before an address elsewhere (the `from` of an AER report) no longer pulls unrelated lines in; and the kernel's echo of the boot command line, kept whenever it mentions USB, has its filesystem identifiers masked the way `host.toml` already had them.
 - The device list keeps the whole selected block on screen: when a selection below the window scrolls into view, its row lands so that the finding's reason line and its endpoint rows under it are visible too, instead of the row alone on the last line with the rest cut off. A block taller than the window keeps its row on the first line.
 
 ### Security

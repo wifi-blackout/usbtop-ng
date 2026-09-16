@@ -498,8 +498,9 @@ const DMESG_KEYWORDS: [&str; 11] = [
 /// device, and the port driver is a keyword already.
 const DMESG_GENERIC_PREFIXES: [&str; 2] = ["pci", "pcieport"];
 
-/// The message after the `[  123.456] ` stamp, when the line carries one;
-/// a line without one keeps a `] ` inside its message.
+/// The message after a leading `[...] `: the `[  123.456] ` stamp on a
+/// normal line, or a bracketed tag on a line printed without one. A line
+/// that starts with neither is taken whole, a `] ` later in it included.
 fn dmesg_message(lower: &str) -> &str {
     if lower.starts_with('[') {
         lower.split_once("] ").map_or(lower, |(_, m)| m)
@@ -518,19 +519,22 @@ fn dmesg_message(lower: &str) -> &str {
 /// follow (`atlantic: Boot code hanged` after `atlantic 0000:08:00.0:
 /// enabling device`); `drivers`, the bound drivers the inventory found,
 /// covers a driver that never logged an address. The filter redacts
-/// nothing: the lines it keeps are device and driver messages, kept whole
-/// (a device serial is in scope), and the host identifier a network driver
-/// prints on probe, its adapter's MAC, is masked by the caller with
-/// `Redactor::mac_addresses`.
+/// nothing and keeps each line whole; the caller masks what a kept line
+/// can carry that names the host: the MAC a network driver prints on
+/// probe (`Redactor::mac_addresses`) and the disk identifiers in the
+/// kernel's echo of the boot command line, kept whenever that line
+/// mentions USB (`Redactor::cmdline`). A device serial is in scope and
+/// stays.
 pub fn filter_dmesg(text: &str, addresses: &[String], drivers: &[String]) -> String {
     let addresses: Vec<String> = addresses.iter().map(|a| a.to_lowercase()).collect();
     let mut names: BTreeSet<String> = drivers.iter().map(|d| d.to_lowercase()).collect();
     for line in text.lines() {
         let lower = line.to_lowercase();
         // `dev_printk` prints the driver, then its device: `<driver>
-        // <address>: ...`, or `<address>:pcie004: ...` from a port service.
-        // Only that position names a driver; an address anywhere else on
-        // the line (`... received from 0000:2e:00.0`) has none in front.
+        // <address>: ...`, or `<driver> <address>:pcie004: ...` from a port
+        // service. Only that position names a driver; an address anywhere
+        // else on the line (`... received from 0000:2e:00.0`) has none in
+        // front.
         let mut words = dmesg_message(&lower).split_whitespace();
         let (Some(name), Some(device)) = (words.next(), words.next()) else {
             continue;
@@ -574,13 +578,13 @@ pub fn filter_dmesg(text: &str, addresses: &[String], drivers: &[String]) -> Str
 /// carries the reason (the tool is missing, or the kernel restricts the
 /// log to root) for a note.
 pub fn run_dmesg() -> Result<String, String> {
-    run_dmesg_from(Path::new("dmesg"))
+    run_dmesg_with(&mut Command::new("dmesg"))
 }
 
-/// `run_dmesg` over a named program: `dmesg` from `PATH` live, a script
-/// standing in for it under test.
-fn run_dmesg_from(program: &Path) -> Result<String, String> {
-    let output = Command::new(program)
+/// `run_dmesg` over a prepared command: `dmesg` from `PATH` live, a
+/// script standing in for it under test.
+fn run_dmesg_with(command: &mut Command) -> Result<String, String> {
+    let output = command
         .output()
         .map_err(|e| format!("could not run dmesg: {e}"))?;
     if !output.status.success() {
@@ -1183,13 +1187,13 @@ mod tests {
     }
 
     #[test]
-    fn run_dmesg_from_hands_back_the_whole_log_or_the_reason() {
-        use std::os::unix::fs::PermissionsExt;
+    fn run_dmesg_with_hands_back_the_whole_log_or_the_reason() {
+        // The stand-ins are scripts run through `sh`, so the test needs no
+        // execute bit and works under a `noexec` temp directory.
         let temp = tempfile::tempdir().unwrap();
         let script = |name: &str, body: &str| {
             let path = temp.path().join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(&path, body).unwrap();
             path
         };
         // Unfiltered: a line no keyword would keep is still there, because
@@ -1197,18 +1201,19 @@ mod tests {
         // which PCI addresses to keep.
         let log = "[    0.1] Linux version 7.0\n[    1.2] usb 1-4: new device\n";
         let ok = script("dmesg-ok", &format!("printf '%s' '{log}'\n"));
-        assert_eq!(run_dmesg_from(&ok).unwrap(), log);
+        assert_eq!(run_dmesg_with(Command::new("sh").arg(&ok)).unwrap(), log);
         // A restricted log: the reason carries the exit status and what the
         // tool said, for the bundle's note.
         let denied = script(
             "dmesg-denied",
             "echo 'dmesg: read kernel buffer failed: Operation not permitted' >&2\nexit 1\n",
         );
-        let reason = run_dmesg_from(&denied).unwrap_err();
+        let reason = run_dmesg_with(Command::new("sh").arg(&denied)).unwrap_err();
         assert!(reason.contains("exit status: 1"), "{reason}");
         assert!(reason.contains("Operation not permitted"), "{reason}");
         // No tool at all.
-        let missing = run_dmesg_from(&temp.path().join("no-such-dmesg")).unwrap_err();
+        let missing =
+            run_dmesg_with(&mut Command::new(temp.path().join("no-such-dmesg"))).unwrap_err();
         assert!(missing.starts_with("could not run dmesg: "), "{missing}");
     }
 
