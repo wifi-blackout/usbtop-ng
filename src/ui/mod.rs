@@ -1205,6 +1205,7 @@ fn drain_deltas(
 /// `help_lines`). Below it `draw_ui` shows the size instead of a layout
 /// that clips.
 pub const MIN_COLS: u16 = 80;
+/// The rows of that smallest terminal; `MIN_COLS` says what both hold.
 pub const MIN_ROWS: u16 = 24;
 
 pub(crate) fn draw_ui(f: &mut Frame, app: &mut UsbTopApp) {

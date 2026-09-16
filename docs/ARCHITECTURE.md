@@ -279,8 +279,9 @@ See [TUI chassis](#tui-chassis) for how these fit together.
   (`fixture_replay::Replayed`) and writes the report at each choke basis
   through the export sink (`report.json` at `link`, `report.capability.json`
   at `capability`), writes the summary to `SUMMARY.txt` in the bundle with
-  a `choke:` line counting both, and prints it with filing guidance. The logger is built with a tee so the
-  run's own log lands in the bundle as `usbtop-ng.log`.
+  a `choke:` line counting both, and prints it with filing guidance. The
+  logger is built with a tee so the run's own log lands in the bundle as
+  `usbtop-ng.log`.
 - `capture/` and `fixture_replay.rs` are part of the default build: the
   capturer's assembly and guards are what `--support` embeds, and the replay
   path is shared with the corpus tests so a golden equals a replay by

@@ -157,6 +157,8 @@ impl From<&Finding> for FindingReport {
     }
 }
 
+/// One device below a choke point and what it asks, as the JSON report
+/// carries it (see `capacity::Contributor`).
 #[derive(Serialize)]
 pub struct ContributorReport {
     pub path: String,
