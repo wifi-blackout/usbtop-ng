@@ -179,6 +179,7 @@ Each fills a hole no on-hand device covers.
 | Powered USB2 OTG hub + micro-B adapter | the Pi Zero's single port |
 | E-marked USB-C cables, 3 A and 5 A rated | the future cable diagnostics |
 | SD card for the reader | makes the card reader a bulk source |
+| A USB-C display, or a USB-C to DP cable and a display | a DisplayPort alt mode partner on a Type-C port |
 
 ## Traffic generators
 

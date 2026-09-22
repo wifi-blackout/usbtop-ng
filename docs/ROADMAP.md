@@ -70,6 +70,15 @@ own `peer` link names the SuperSpeed receptacle, since each side of a
 controller numbers its root ports independently and the same number on the
 other half is a different socket.
 
+### The bottleneck finder
+
+The feature in one line: name the link that limits the devices below it,
+today from the topology and later from measurement, and price every
+consumer that shares that link, USB or not. Its pieces: part 3 below, the
+choke points (shipped) and the measured overlay (next); then the second
+step, the stages above the root hub and the consumers those stages must
+count, a tunneled PCIe device and a DisplayPort stream among them.
+
 Next, part 3:
 
 - Shared uplink / bottleneck ranking under load. Several devices sharing one
@@ -125,7 +134,50 @@ The second step, once the stages above the root hub can be priced:
   the same root port as the tunneled xHCI, which is the join the grouping
   would use. The support bundle's `inventory/pci-removable.toml` already
   collects exactly those devices with their link and power state, as the
-  groundwork for this row.
+  groundwork for this row. Designed 2026-09-15; the spec lands with its
+  build: a tunnel group headed by its root port and the router's link, one
+  row per tunneled function no bus represents, a `tunnels` list in the
+  reports.
+- A DisplayPort stream as a consumer, priced from what the display asks.
+  Two places see it. On a Type-C connector the alt mode's pin assignment
+  decides what USB keeps: C and E give all four lanes to DisplayPort and
+  leave USB 2 only, D keeps one SuperSpeed channel, a lane pair, beside
+  two lanes of DisplayPort
+  (`Documentation/ABI/testing/sysfs-driver-typec-displayport`:
+  `displayport/pin_assignment` and `configuration` on the partner's alt
+  mode, whose `svid` reads `ff01` and whose `active` says whether it is
+  entered; `sysfs-bus-typec`). A display's own hub, USB 2 only because
+  assignment C took the lanes, then gets that as its cause instead of
+  `superspeed_side_empty`'s "check the cable or the port"; the rate of the
+  pixels plays no part there, the pins do. Through a USB4 or Thunderbolt
+  router the DisplayPort tunnel reserves the negotiated DP link rate times
+  its lane count, less the line coding, whatever the pixels then need
+  (`tb_dp_bandwidth` in drivers/thunderbolt/tunnel.c, v6.12: eight
+  tenths, or 128/132 at UHBR rates); with USB4 bandwidth allocation mode
+  the reservation follows what the DP IN adapter requests instead
+  (`tb_dp_bandwidth_alloc_mode_enable`, same file). Neither the negotiated
+  rate and lane count nor the allocation reach sysfs: they surface as raw
+  register words in the Thunderbolt debugfs and in the driver's debug
+  log. So the stage prices the tunnel from the display, as the floor of
+  an uncompressed stream and said to be one: the active mode's pixel
+  clock, from
+  `DRM_IOCTL_MODE_GETCRTC`, whose `drm_mode_modeinfo` carries `clock`,
+  `hdisplay`, `vdisplay` and `vrefresh` (include/uapi/drm/drm_mode.h),
+  times 24 bits per pixel, since no KMS query reports the link's colour
+  depth or whether the stream is compressed. The KMS query ioctls take no
+  DRM master (drivers/gpu/drm/drm_ioctl.c, flags 0), only the card node,
+  which root, the `video` group or logind's seat ACL opens; sysfs alone
+  does not do: a connector's `modes` lists mode names without refresh
+  rates and `edid` the display's timings, not the one in use
+  (drm_sysfs.c). That floor, against the link's rate and the USB tunnel's
+  remainder, says whether a 4K display at 60 or 144 Hz is what leaves the
+  dock's SuperSpeed bus short. This is not display diagnostics, which stay
+  out by charter: the mode is read only to price the pixels. No fleet host
+  shows an alt mode today; both of `tgl-tb4`'s partners are USB4
+  connections with no alt mode objects at all, so building this needs a
+  DisplayPort alt mode partner on a Type-C port, a USB-C display or a
+  USB-C to DisplayPort cable with a display behind it (see
+  [To acquire](TESTING.md#to-acquire)), on `tgl-tb4` or `cezanne`.
 
 Parked until Linux exposes them, not dropped. No stable kernel interface
 carries these today, and each becomes buildable the moment a mainline ABI
@@ -141,7 +193,8 @@ or capable hardware lands:
   implemented in PD controller silicon, with no kernel attribute yet.
 
 Revisit this list on kernel upgrades. Display diagnostics stay out by
-charter, not by gap.
+charter, not by gap; pricing a display's stream as a consumer of a link is
+bandwidth, not display diagnostics (see the bottleneck finder above).
 
 Prerequisite, now met by the test fleet: the buildable tier needs a host
 that exposes the typec, power-delivery, and thunderbolt classes, and the
