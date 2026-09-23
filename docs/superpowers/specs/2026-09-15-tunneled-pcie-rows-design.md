@@ -1,8 +1,9 @@
 # Tunneled PCIe devices in the device table — design
 
 **Date:** 2026-09-15
-**Status:** approved in the design session (sections 1-5); spec under review;
-adversarial three-engine review before merge per REVIEW.md
+**Status:** approved in the design session (sections 1-5); the 2026-09-16
+two-axis review's five points folded in on 2026-09-23; adversarial
+three-engine review before merge per REVIEW.md
 
 ## Goal
 
@@ -31,19 +32,31 @@ depends on it:
   external-facing or removable parent gets the attribute). Buses `usb5` and
   `usb6` name `0000:2e:00.0` as their controller.
 - The router `0-3` reports `generation` 4, `rx_speed` and `tx_speed`
-  `20.0 Gb/s`, `rx_lanes` and `tx_lanes` 2, `device_name` `Element Hub`.
-  Routers are named `%u-%llx` (domain, route; drivers/thunderbolt/switch.c
-  v6.12) and a route's depth is `tb_route_length` (tb.h v6.12: bits above
-  each 8-bit hop), so a depth-one router's route is 1..=255 and `D-0` is
-  the host router.
+  `20.0 Gb/s`, `rx_lanes` and `tx_lanes` 2, `device_name` `Element Hub`,
+  `vendor_name` the dock's maker. The formats, from
+  drivers/thunderbolt/switch.c v6.12: `speed_show` prints `%u.0 Gb/s` for
+  both speeds, `rx_lanes_show` and `tx_lanes_show` print 1, 2 or 3 (3 is
+  the wider side of an asymmetric link), `generation_show` prints `%u`,
+  and `device_name_show` and `vendor_name_show` print the DROM string or
+  an empty line when the DROM has none. All seven are in
+  Documentation/ABI/testing/sysfs-bus-thunderbolt. Routers are named
+  `%u-%llx` (domain, route; `dev_set_name` in switch.c) and a route's depth
+  is `tb_route_length` (tb.h v6.12: bits above each 8-bit hop), so a
+  depth-one router's route is 1..=255 and `D-0` is the host router.
 - Nothing in that sysfs maps a root port to a router: `/sys/class/devlink`
   has no entry for the host interface or the root ports, and the host router
-  has no `usb4_port*` objects. The kernel's ABI file documents no such
-  mapping either.
-- `current_link_speed`, `current_link_width` and `max_link_width` are read
-  through `pci_config_pm_runtime_get` (drivers/pci/pci-sysfs.c v7.0), which
-  resumes a device in D3cold; `max_link_speed` is not. The bundle already
-  reads the three only while `power/runtime_status` is `active`.
+  has no `usb4_port*` objects. sysfs-bus-thunderbolt documents no such
+  mapping either: its `usb4_portX` entries describe a router's USB4 ports
+  (`connector`, `link`), not the PCI root port a tunnel lands on.
+- `current_link_speed` and `current_link_width` are read through
+  `pci_config_pm_runtime_get` (drivers/pci/pci-sysfs.c v7.0), which resumes
+  a device in D3cold; `max_link_speed` is not. The bundle already reads them
+  (and `max_link_width`, which a row has no use for) only while
+  `power/runtime_status` is `active`. Both speed attributes print
+  `pci_speed_string` (drivers/pci/probe.c v7.0): `2.5 GT/s PCIe`,
+  `5.0 GT/s PCIe`, `8.0 GT/s PCIe`, `16.0 GT/s PCIe`, `32.0 GT/s PCIe`,
+  `64.0 GT/s PCIe`, or `Unknown` for a speed outside its table;
+  `current_link_width_show` prints `%u`.
 - No host on the fleet has a tunneled PCIe device that is not a USB
   controller. The dock's own bridges are the only other removable devices,
   and bridges are not rows.
@@ -53,11 +66,13 @@ depends on it:
 - **The join is the root port.** Every removable, non-bridge PCI function
   is grouped by the first PCI address above it (root-first chain), and a
   bus whose controller is such a function belongs to that group instead of
-  to its controller's own group. Nothing pairs a root port with a router
-  except the one case that cannot be wrong: exactly one depth-one router
-  in `/sys/bus/thunderbolt/devices` and exactly one root port with
-  removable devices below it. Otherwise every group shows its root port
-  alone. No guessed pairing, ever; the doctrine is the findings engine's.
+  to its controller's own group. A tunnel is a root port with at least one
+  removable non-bridge function below it; a root port with only removable
+  bridges below it is no tunnel and counts for nothing. Nothing pairs a
+  root port with a router except the one case that cannot be wrong: exactly
+  one depth-one router in `/sys/bus/thunderbolt/devices` and exactly one
+  tunnel. Otherwise every group shows its root port alone. No guessed
+  pairing, ever; the doctrine is the findings engine's.
 - **Rows are topology, not traffic.** A PCIe row carries what sysfs says
   about the function and its link, never a bandwidth figure: usbmon does not
   see it, and nothing else measures it here. The traffic columns show `--`.
@@ -81,17 +96,19 @@ depends on it:
 - **Additive JSON.** `tunnels` is a new top-level list, empty when there is
   none; `version` stays 1, as it did for `findings` and `chokepoints`.
 
-## 1. The reader (`src/tunnel/mod.rs`, new) and the shared helpers (`src/pci/mod.rs`, new)
+## 1. The reader and the shared helpers
 
-`src/pci/mod.rs` takes over from `diag/inventory.rs`, unchanged in
-behaviour: `is_address` (the former `is_pci_address`: a domain of four to
-eight hex digits, a two-digit bus, a two-digit slot, a one-digit function),
-`chain` (the former `pci_chain`: the PCI addresses above a resolved
-directory, root-first), `LINK_ATTRS` and the citation that explains them,
-plus `is_awake(real: &Path) -> bool` (`power/runtime_status` reads
-`active`). The inventory's test
-`pci_addresses_allow_wide_domains_and_nothing_else` moves with them. The
-inventory keeps `read_pci`, `read_pci_attrs` and its notes.
+The reader is `src/tunnel/mod.rs` (new); the helpers are `src/pci/mod.rs`
+(new), which takes over from `diag/inventory.rs`, unchanged in behaviour:
+`is_address` (the former `is_pci_address`: a domain of four to eight hex
+digits, a two-digit bus, a two-digit slot, a one-digit function), `chain`
+(the former `pci_chain`: the PCI addresses above a resolved directory,
+root-first), and `is_awake(real: &Path) -> bool` (`power/runtime_status`
+reads `active`) with the citation that explains the wake gate. The
+inventory's test `pci_addresses_allow_wide_domains_and_nothing_else` moves
+with them. The inventory keeps `read_pci`, `read_pci_attrs`, its
+`PCI_LINK_ATTRS` list (the row has no use for `max_link_width`) and its
+notes.
 
 ```rust
 pub struct TunnelRoots { pub pci: PathBuf, pub thunderbolt: PathBuf }
@@ -116,7 +133,7 @@ pub struct PciLink { pub gts: f64, pub width: u32 }
 pub struct PciFunction {
     pub address: String,
     pub class: u32,                   // 0x020000
-    pub class_name: &'static str,     // "Ethernet controller"
+    pub class_name: String,           // table name, or "class 0x......"
     pub vendor_id: u16,
     pub device_id: u16,
     pub driver: Option<String>,       // basename of the `driver` link
@@ -136,8 +153,12 @@ pub struct Tunnel {
 }
 
 impl PciFunction {
-    pub fn is_usb_controller(&self) -> bool  // class >> 8 == 0x0c03
+    /// `class >> 8 == 0x0c03`, the USB4 host interface `0x0c0340` excepted.
+    pub fn is_usb_controller(&self) -> bool
 }
+
+/// The class table below; `None` for a code it does not name.
+fn class_name(class: u32) -> Option<&'static str>
 
 pub fn read_tunnels(roots: &TunnelRoots) -> Vec<Tunnel>
 ```
@@ -151,9 +172,11 @@ Reading rules:
   port is `chain[0]`.
 - Parsing: `vendor`, `device` and `class` are `0x`-prefixed hex; a value
   that does not parse skips the function (identity is the row).
-  `max_link_speed` and `current_link_speed` are `"8.0 GT/s PCIe"`: the
-  leading float. `current_link_width` is a decimal. A value that does not
-  parse leaves the field `None`.
+  `class_name` is the table's name for `class`, or `class 0x{class:06x}`
+  when the table has none. `max_link_speed` and `current_link_speed` are
+  `pci_speed_string` text (`"8.0 GT/s PCIe"`, see above): the leading
+  float, so `Unknown` does not parse. `current_link_width` is a decimal. A
+  value that does not parse leaves the field `None`.
 - `driver` is the basename of the `driver` symlink when it resolves.
   `interface` is the single directory entry of `net/` when there is exactly
   one; two or more leave it `None`.
@@ -162,32 +185,45 @@ Reading rules:
   awake and either attribute is absent or unparsable it is `None`. Neither
   attribute is opened otherwise.
 - Routers: entries of `roots.thunderbolt` of the form `<decimal>-<hex>`
-  whose route parses and lies in 1..=255. Attributes are read as
-  documented above; each is `None` when absent or unparsable. The join
-  applies when exactly one router and exactly one tunnel were found.
+  whose route parses and lies in 1..=255. Attributes are read in the
+  formats documented above; each is `None` when absent or unparsable, and
+  an empty `device_name` or `vendor_name` (a DROM without one) is `None`
+  too. The join applies when exactly one such router and exactly one tunnel
+  were found, a tunnel being what the Decisions define: at least one
+  removable non-bridge function under the root port.
 - Tunnels sort by root port, functions by address, and the function list is
   never empty (a root port with only bridges below it is not a tunnel).
 - An unreadable `roots.pci` yields an empty list; an unreadable
   `roots.thunderbolt` yields tunnels without routers. The reader has no
   notes channel; the bundle's walker keeps its own.
 
-Class table (`class_name`), by the top byte and, where named, the top two
-bytes; anything else prints `class 0x......`:
+Class table (`class_name`). The lookup tries the whole 24-bit code, then
+the top two bytes, then the top byte; anything else prints
+`class 0x......`. Names follow the class section of pci.ids (its `C`
+records: base class, subclass, programming interface; the copy at
+`/usr/share/misc/pci.ids`, read 2026-09-23) and the codes match
+include/linux/pci_ids.h v7.0 (`PCI_CLASS_STORAGE_EXPRESS 0x010802`,
+`PCI_CLASS_NETWORK_ETHERNET 0x0200`, `PCI_CLASS_MULTIMEDIA_HD_AUDIO 0x0403`,
+`PCI_CLASS_SERIAL_USB 0x0c03`, the `PCI_BASE_CLASS_*` bytes). The USB4
+host interface is pci.ids' programming interface `40` under `0c03`, read
+live as `0x0c0340` on the laptop's host interface; pci_ids.h v7.0 has no
+name for it. `0x0280` is pci.ids' "Network controller", the same as its
+base class, so it takes the `0x02` row.
 
 | code | name |
 |---|---|
-| `0x0108` | NVMe controller |
+| `0x010802` | NVMe controller |
+| `0x0108` | non-volatile memory controller |
 | `0x01` | mass storage controller |
 | `0x0200` | Ethernet controller |
-| `0x0280` | wireless controller |
 | `0x02` | network controller |
 | `0x03` | display controller |
 | `0x0403` | audio device |
 | `0x04` | multimedia controller |
-| `0x0c03` | USB controller |
-| `0x0c0a` | USB4 host interface |
-| `0x0c` | serial bus controller |
 | `0x08` | system peripheral |
+| `0x0c0340` | USB4 host interface |
+| `0x0c03` | USB controller |
+| `0x0c` | serial bus controller |
 | `0x0d` | wireless controller |
 | `0x12` | processing accelerator |
 
@@ -205,7 +241,8 @@ bytes; anything else prints `class 0x......`:
   String }` is `Thunderbolt 0-3 Element Hub · 2×20 Gb/s` when the router
   is joined (name, then `device_name` when present, then
   `{rx_lanes}×{rx_gbps} Gb/s` when both are known, `{rx_gbps} Gb/s` when
-  only the rate is), and `external PCIe port` otherwise.
+  only the rate is; the lane count is the kernel's, 3 included), and
+  `external PCIe port` otherwise.
 - The heading prints `═ {id} · {label} ═` for a tunnel group and `═ {id} ═`
   for a controller group as today. Root ports sort among controller ids
   alphabetically, as ids do today.
@@ -216,12 +253,13 @@ bytes; anything else prints `class 0x......`:
 
   ```
   PCIe 0000:2d:00.1 · Ethernet controller · atlantic · 1d6a:14c0 · enp45s0 · 8 GT/s ×1
-  PCIe 0000:2d:00.1 · Ethernet controller · atlantic · 1d6a:14c0 · asleep, ≤ 16 GT/s per lane
+  PCIe 0000:2d:00.1 · Ethernet controller · atlantic · 1d6a:14c0 · enp45s0 · asleep, ≤ 16 GT/s per lane
   PCIe 0000:2e:00.0 · USB controller · no driver · 8086:15ec · asleep
   ```
 
   The pieces in order: `PCIe {address}`, the class name, the driver or `no
-  driver`, `{vendor:04x}:{device:04x}`, the interface when present, then
+  driver`, `{vendor:04x}:{device:04x}`, the interface when present (it is
+  read whatever the power state, so an asleep NIC keeps its name), then
   the link: `{gts} GT/s ×{width}` when read; `asleep` when
   `runtime_status` is `suspended`; `link not read` otherwise (awake but
   unparsable, or any other status, `unsupported` included); the two
@@ -236,7 +274,10 @@ bytes; anything else prints `class 0x......`:
 - `help_lines` gains one line, under 76 columns: `PCIe rows are tunneled
   devices usbmon never sees: their link, not their traffic`.
 
-## 3. The reports (`src/headless/mod.rs`, `src/fixture_replay.rs`, `src/diag/support.rs`)
+## 3. The reports
+
+The files: `src/headless/mod.rs`, `src/headless/export.rs`,
+`src/fixture_replay.rs`, `src/diag/support.rs`.
 
 - `build_report_at` gains `tunnels: &[Tunnel]` as its last parameter.
   `headless::run` reads `tunnel::read_tunnels(&TunnelRoots::live())` once
@@ -276,9 +317,10 @@ bytes; anything else prints `class 0x......`:
   then `chokepoints:` at the end holds.
 - The two literal `Report { .. }` constructions (`fixture_replay.rs`,
   `headless/export.rs`) gain `tunnels: Vec::new()`.
-- The 18 goldens are re-blessed once; the review evidence is a jq diff
-  showing the only change is the added empty `tunnels` key. A corpus test
-  asserts every bundle replays to an empty list.
+- The 18 golden bundles (36 files: `golden.binary.json` and
+  `golden.text.json` each) are re-blessed once; the review evidence is a
+  jq diff showing the only change is the added empty `tunnels` key. A
+  corpus test asserts every bundle replays to an empty list.
 - `docs/SCRIPTING.md`: `tunnels` in the field list, the example document,
   and a "The tunnels list" section after the chokepoints one; the additive
   version sentence covers it.
@@ -300,7 +342,9 @@ text).
   `is_awake`.
 - `tunnel`: a fake tree builder (root port, two bridges, an xHCI, a NIC
   with `net/enp45s0`, a router dir) and tests for grouping by root port,
-  the bridge and USB-controller classification, the wake gate (a NIC with
+  the bridge and USB-controller classification (`0x0c0330` is a
+  controller, `0x0c0340` is not), the class name at each tier and the
+  `class 0x......` fallback, the wake gate (a NIC with
   `power/runtime_status` `suspended` and a present `current_link_speed`
   yields `link: None`, `max_gts: Some` and `awake: false`; a status of
   `unsupported` yields the same with the row saying `link not read`), the
