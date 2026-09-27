@@ -576,14 +576,14 @@ fn read_capped(path: &Path, cap: usize) -> std::io::Result<Vec<u8>> {
 }
 
 /// One PCI device the bundle lists: a device the kernel marks removable
-/// (behind a port the firmware flags as externally facing, which is what a
-/// Thunderbolt or USB4 port is, so a tunnel's devices are the removable
-/// ones: `pci_set_removable` in drivers/pci/probe.c, verified against
-/// v5.16 and v7.0, marks a device only below an external-facing or
-/// removable parent, and leaves every other device without the attribute),
-/// a bridge above one, or a Thunderbolt host interface. `chain` names the
-/// bridges above it, root-first, so the tunnel's host side reads off the
-/// file.
+/// (`pci_set_removable` in drivers/pci/probe.c: from v5.16 to v6.12
+/// everything below a port the firmware flags as externally facing, which
+/// a Thunderbolt or USB4 port is; from v6.13, on x86 with ACPI, only what
+/// sits behind a tunnel, a discrete controller's own switch excluded
+/// (`arch_pci_dev_is_removable`); the bundle lists what the running kernel
+/// marks and says nothing more), a bridge above one, or a Thunderbolt host
+/// interface. `chain` names the bridges above it, root-first, so the
+/// tunnel's host side reads off the file.
 #[derive(Debug, Serialize)]
 pub struct PciEntry {
     pub address: String,
@@ -636,12 +636,10 @@ const PCI_ATTRS: [&str; 22] = [
 ];
 
 /// The attributes whose sysfs readers take a runtime-PM reference on the
-/// device and its parent (`pci_config_pm_runtime_get` in drivers/pci/pci.c
-/// resumes a device in D3cold; `current_link_speed_show`,
-/// `current_link_width_show` and `max_link_width_show` in pci-sysfs.c call
-/// it, verified against v7.0). Read only while the device is awake
-/// (`power/runtime_status` of `active`), so the bundle never wakes what it
-/// is describing; the window between the check and the read is accepted.
+/// device and its parent and resume a device in D3cold; read only while
+/// the device is awake, the rule and its citation being
+/// `crate::pci::is_awake`. The window between the check and the read is
+/// accepted.
 const PCI_LINK_ATTRS: [&str; 3] = ["current_link_speed", "current_link_width", "max_link_width"];
 
 /// What an entry carries instead of the link attributes when it was not
@@ -651,35 +649,6 @@ const LINK_NOT_READ: &str =
 
 /// `0000:2e:00.0`: a domain of four hex digits or more (VMD and other
 /// synthetic domains go past `ffff`), then a bus, a slot and a function.
-fn is_pci_address(name: &str) -> bool {
-    let hex = |s: &str, min: usize, max: usize| {
-        (min..=max).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit())
-    };
-    let mut parts = name.split(':');
-    let (Some(domain), Some(bus), Some(rest), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    let Some((slot, func)) = rest.split_once('.') else {
-        return false;
-    };
-    hex(domain, 4, 8) && hex(bus, 2, 2) && hex(slot, 2, 2) && hex(func, 1, 1)
-}
-
-/// The PCI addresses above `real` in the device tree, root-first.
-fn pci_chain(real: &Path) -> Vec<String> {
-    let mut chain: Vec<String> = real
-        .ancestors()
-        .skip(1)
-        .filter_map(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .filter(|n| is_pci_address(n))
-        .collect();
-    chain.reverse();
-    chain
-}
-
 /// One attribute into `attrs`, sparse by design as in `walk_attrs`: an
 /// absent file is silent (a bridge has no AER counters, an older kernel no
 /// `link/` directory), a present but unreadable one is noted.
@@ -713,7 +682,7 @@ fn read_pci_attrs(real: &Path, notes: &mut Vec<Note>) -> BTreeMap<String, String
     if let Some(driver) = link_name(&real.join("driver")) {
         attrs.insert("driver".to_string(), driver);
     }
-    if attrs.get("power/runtime_status").map(String::as_str) == Some("active") {
+    if crate::pci::is_awake(attrs.get("power/runtime_status").map(String::as_str)) {
         for name in PCI_LINK_ATTRS {
             read_pci_attr(real, name, &mut attrs, notes);
         }
@@ -759,7 +728,7 @@ pub fn read_pci(pci_root: &Path, thunderbolt_root: &Path) -> (Vec<PciEntry>, Vec
     let mut attribute_seen = false;
     for address in entry_names(pci_root)
         .into_iter()
-        .filter(|n| is_pci_address(n))
+        .filter(|n| crate::pci::is_address(n))
     {
         examined += 1;
         let Some(real) = real_of(&address, &mut notes) else {
@@ -783,7 +752,7 @@ pub fn read_pci(pci_root: &Path, thunderbolt_root: &Path) -> (Vec<PciEntry>, Vec
         if !removable {
             continue;
         }
-        for bridge in pci_chain(&real) {
+        for bridge in crate::pci::chain(&real) {
             if let Some(bridge_real) = real_of(&bridge, &mut notes) {
                 listed
                     .entry(bridge)
@@ -811,7 +780,7 @@ pub fn read_pci(pci_root: &Path, thunderbolt_root: &Path) -> (Vec<PciEntry>, Vec
             .parent()
             .and_then(Path::file_name)
             .map(|n| n.to_string_lossy().into_owned())
-            .filter(|n| is_pci_address(n));
+            .filter(|n| crate::pci::is_address(n));
         match (host, real.parent()) {
             (Some(host), Some(parent)) => {
                 listed
@@ -837,7 +806,7 @@ pub fn read_pci(pci_root: &Path, thunderbolt_root: &Path) -> (Vec<PciEntry>, Vec
         .map(|(address, (real, role))| PciEntry {
             address,
             role,
-            chain: pci_chain(&real),
+            chain: crate::pci::chain(&real),
             attrs: read_pci_attrs(&real, &mut notes),
         })
         .collect();
@@ -953,30 +922,6 @@ mod tests {
             .unwrap();
         }
         (bus, tb)
-    }
-
-    #[test]
-    fn pci_addresses_allow_wide_domains_and_nothing_else() {
-        for ok in [
-            "0000:00:07.1",
-            "0001:2e:00.0",
-            "10000:e0:1d.0",
-            "ffffffff:00:00.7",
-        ] {
-            assert!(is_pci_address(ok), "{ok}");
-        }
-        for bad in [
-            "pci0000:00",
-            "0000:00:07.1:pcie004",
-            "usb3",
-            "0000:00:07",
-            "000:00:07.1",
-            "0000:0:07.1",
-            "0000:00:07.10",
-            "domain0",
-        ] {
-            assert!(!is_pci_address(bad), "{bad}");
-        }
     }
 
     #[test]

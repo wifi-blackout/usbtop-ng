@@ -29,6 +29,7 @@ mod findings;
 mod fixture_corpus;
 mod fixture_replay;
 mod headless;
+mod pci;
 mod snapshot;
 mod stats;
 #[cfg(test)]
