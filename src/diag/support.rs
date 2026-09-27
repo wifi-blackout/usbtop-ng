@@ -691,7 +691,7 @@ pub fn run_support(
                 // inventory/pci-removable.toml; a name that embeds a MAC
                 // is masked like every other MAC in the bundle.
                 let mut tunnels = crate::tunnel::read_tunnels(&roots.pci, &roots.thunderbolt);
-                crate::tunnel::mask_mac_interfaces(&mut tunnels);
+                writer.redactor().mask_interface_names(&mut tunnels);
                 replayed.tunnels = tunnels;
                 let run = RunRecord {
                     record: "run",
@@ -1999,7 +1999,13 @@ mod tests {
             "[INFO] starting usbtop-ng\n",
         )
         .unwrap();
-        let env = environment(1000, Ok(status(false)));
+        let env = Environment {
+            dmesg: Ok(
+                "[   12.345678] atlantic 0000:2d:00.1 enx001122334455: renamed from eth0\n"
+                    .to_string(),
+            ),
+            ..environment(1000, Ok(status(false)))
+        };
         let opts = SupportOpts {
             window: Duration::from_secs(1),
             no_capture: true,
@@ -2024,6 +2030,13 @@ mod tests {
         let inventory = std::fs::read_to_string(dir.join("inventory/pci-removable.toml")).unwrap();
         assert!(inventory.contains("0000:2d:00.1"), "{inventory}");
         assert!(!report.contains("001122334455"), "no MAC in the report");
+
+        let log = std::fs::read_to_string(dir.join("dmesg-usb.txt")).unwrap();
+        assert!(
+            log.contains("enx<redacted>: renamed from eth0"),
+            "the kernel log's own interface name is masked too: {log}"
+        );
+        assert!(!log.contains("001122334455"), "{log}");
     }
 
     /// Live, behind the `integration` feature, following the convention of

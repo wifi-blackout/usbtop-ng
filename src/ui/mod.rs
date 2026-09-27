@@ -1591,7 +1591,11 @@ fn find_selected_device(app: &UsbTopApp) -> Option<(u8, &DeviceRow)> {
 /// the selection vanished, e.g. the device was unplugged).
 fn draw_device_chart(f: &mut Frame, area: Rect, app: &UsbTopApp) {
     let Some((bus_id, row)) = find_selected_device(app) else {
-        let placeholder = Paragraph::new("Select a device with ↑/↓").block(
+        let text = match &app.selected_device {
+            Some(selected) if selected.starts_with("pcie:") => "PCIe row: its link, not traffic",
+            _ => "Select a device with ↑/↓",
+        };
+        let placeholder = Paragraph::new(text).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Device rx/tx "),
@@ -5468,7 +5472,7 @@ mod tests {
 
         let mut app = UsbTopApp::new(Duration::from_millis(100));
         app.set_tunnels(rows());
-        app.search = SearchState::Committed("enp45s1".into());
+        app.search = SearchState::Committed("ENP45S1".into());
         app.sync_from(&mgr);
         let text = list_text(&app);
         assert!(
@@ -5847,6 +5851,24 @@ mod tests {
         let screen = terminal.backend().to_string();
 
         assert!(screen.contains("Select a device with"), "{screen}");
+    }
+
+    #[test]
+    fn device_chart_shows_a_pcie_placeholder_when_a_pcie_row_is_selected() {
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.selected_device = Some("pcie:0000:2d:00.1".to_string());
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|f| draw_device_chart(f, f.area(), &app))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(
+            screen.contains("PCIe row: its link, not traffic"),
+            "{screen}"
+        );
+        assert!(!screen.contains("Select a device with"), "{screen}");
     }
 
     #[test]

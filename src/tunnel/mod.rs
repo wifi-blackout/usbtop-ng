@@ -80,7 +80,7 @@ pub struct PciFunction {
     pub awake: bool,
     /// Only when awake and both attributes parsed.
     pub link: Option<PciLink>,
-    /// `max_link_speed`, only when awake (see `pci::runtime_status`).
+    /// `max_link_speed`, only when awake (see `pci::is_awake`).
     pub max_gts: Option<f64>,
 }
 
@@ -315,8 +315,10 @@ fn read_router(thunderbolt: &Path, name: &str, domain: u32) -> Router {
 /// The root ports with a discrete Thunderbolt controller below them: for
 /// each `domainN` on the bus, the resolved directory's parent is the host
 /// interface's PCI device, and the top of its chain, when it has one, is
-/// such a port. An integrated host interface sits on the root bus and has
-/// no chain.
+/// such a port. An integrated host interface on Intel sits on the root
+/// bus and has no chain; on AMD USB4 it sits behind an internal bridge,
+/// which then enters the set harmlessly, since nothing tunneled sits
+/// three deep under that bridge.
 fn discrete_ports(thunderbolt: &Path) -> BTreeSet<String> {
     sorted_entries(thunderbolt)
         .into_iter()
@@ -434,7 +436,7 @@ fn join(routers: &[Router], names_after: &[String], tunnel_count: usize, complet
 /// in the spec's Decisions. Sorted by root port, functions by address. An
 /// unreadable `pci_root` yields nothing; an unreadable `thunderbolt` yields
 /// tunnels without routers. Nothing here resumes a sleeping device (see
-/// `pci::runtime_status`).
+/// `pci::is_awake`).
 pub fn read_tunnels(pci_root: &Path, thunderbolt: &Path) -> Vec<Tunnel> {
     let first = router_names(thunderbolt);
     let routers: Vec<Router> = first
@@ -467,30 +469,6 @@ pub fn read_tunnels(pci_root: &Path, thunderbolt: &Path) -> Vec<Tunnel> {
         tunnels[0].router = routers.into_iter().next();
     }
     tunnels
-}
-
-/// The bundle's copy of the tunnels: an `interface` of the form `enx` or
-/// `wlx` followed by twelve hex digits embeds a MAC (systemd's
-/// `NamePolicy=mac`), so it is masked as the bundle masks every other MAC,
-/// keeping the three-letter prefix.
-pub fn mask_mac_interfaces(tunnels: &mut [Tunnel]) {
-    for function in tunnels.iter_mut().flat_map(|t| t.functions.iter_mut()) {
-        if let Some(name) = &function.interface {
-            if embeds_mac(name) {
-                function.interface = Some(format!("{}<redacted>", &name[..3]));
-            }
-        }
-    }
-}
-
-fn embeds_mac(name: &str) -> bool {
-    let Some(rest) = name
-        .strip_prefix("enx")
-        .or_else(|| name.strip_prefix("wlx"))
-    else {
-        return false;
-    };
-    rest.len() == 12 && rest.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -892,6 +870,13 @@ mod tests {
         t.router("0-1", "thunderbolt_device", &[("authorized", "1")]);
         assert!(read_tunnels(&t.pci(), &t.thunderbolt())[0].router.is_none());
 
+        // Two routers, one of them unable to carry PCIe: the count is two,
+        // whatever the second one can carry.
+        let t = PciTree::new();
+        dock(&t);
+        t.router("0-1", "thunderbolt_device", &[("authorized", "0")]);
+        assert!(read_tunnels(&t.pci(), &t.thunderbolt())[0].router.is_none());
+
         // One router, two tunnels.
         let t = PciTree::new();
         dock(&t);
@@ -973,6 +958,62 @@ mod tests {
             tunnels[0].functions.len(),
             1,
             "the unreadable function is no row"
+        );
+        assert!(
+            tunnels[0].router.is_none(),
+            "and a half-read tree decides no join"
+        );
+
+        // An incomplete walk: a function whose vendor does not parse.
+        let t = PciTree::new();
+        dock(&t);
+        t.device(
+            &[
+                "0000:00:07.1",
+                "0000:2c:00.0",
+                "0000:2d:00.0",
+                "0000:2d:00.4",
+            ],
+            &[
+                ("removable", "removable"),
+                ("class", "0x020000"),
+                ("vendor", "0x"),
+                ("device", "0x5678"),
+            ],
+        );
+        let tunnels = read_tunnels(&t.pci(), &t.thunderbolt());
+        assert_eq!(
+            tunnels[0].functions.len(),
+            1,
+            "the unreadable vendor is no row"
+        );
+        assert!(
+            tunnels[0].router.is_none(),
+            "and a half-read tree decides no join"
+        );
+
+        // An incomplete walk: a function whose device is out of `u16` range.
+        let t = PciTree::new();
+        dock(&t);
+        t.device(
+            &[
+                "0000:00:07.1",
+                "0000:2c:00.0",
+                "0000:2d:00.0",
+                "0000:2d:00.5",
+            ],
+            &[
+                ("removable", "removable"),
+                ("class", "0x020000"),
+                ("vendor", "0x1234"),
+                ("device", "0x12345"),
+            ],
+        );
+        let tunnels = read_tunnels(&t.pci(), &t.thunderbolt());
+        assert_eq!(
+            tunnels[0].functions.len(),
+            1,
+            "the out-of-range device is no row"
         );
         assert!(
             tunnels[0].router.is_none(),
@@ -1091,50 +1132,6 @@ mod tests {
         let tunnels = read_tunnels(&t.pci(), Path::new("/nonexistent/thunderbolt"));
         assert_eq!(tunnels.len(), 1);
         assert!(tunnels[0].router.is_none());
-    }
-
-    #[test]
-    fn mask_mac_interfaces_masks_only_names_that_embed_a_mac() {
-        let function = |interface: Option<&str>| PciFunction {
-            address: "0000:2d:00.1".into(),
-            class: 0x020000,
-            class_name: "Ethernet".into(),
-            vendor_id: 0x1d6a,
-            device_id: 0x14c0,
-            driver: None,
-            interface: interface.map(str::to_string),
-            runtime_status: None,
-            awake: false,
-            link: None,
-            max_gts: None,
-        };
-        let mut tunnels = vec![Tunnel {
-            root_port: "0000:00:07.1".into(),
-            router: None,
-            functions: vec![
-                function(Some("enx001122334455")),
-                function(Some("wlxAABBCCDDEEFF")),
-                function(Some("enp45s0")),
-                function(Some("enx00112233445")),
-                function(None),
-            ],
-        }];
-        mask_mac_interfaces(&mut tunnels);
-        let names: Vec<Option<&str>> = tunnels[0]
-            .functions
-            .iter()
-            .map(|f| f.interface.as_deref())
-            .collect();
-        assert_eq!(
-            names,
-            [
-                Some("enx<redacted>"),
-                Some("wlx<redacted>"),
-                Some("enp45s0"),
-                Some("enx00112233445"),
-                None
-            ]
-        );
     }
 
     #[test]

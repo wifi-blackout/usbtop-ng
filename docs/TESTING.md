@@ -179,7 +179,12 @@ Coverage: nothing is `removable` before Linux 5.16, nor on any
 architecture but x86 with ACPI from 6.13, so the row is silent there; a
 USB4 dock's USB 3 runs to the host's own xHCI over a USB 3 tunnel, so its
 devices stay in the host controller's group and no heading appears for
-that link.
+that link. On kernels up to 6.12, a discrete Thunderbolt controller whose
+host interface is not visible on the Thunderbolt bus (the `thunderbolt`
+module not loaded, or a controller in BIOS-assist mode before a device is
+attached) has no domain to mark its root port, so its own xHCI shows as an
+`external PCIe port` tunnel with the host's own Type-C buses under it; a
+limit of the rule, not of the reader.
 
 ### To acquire
 

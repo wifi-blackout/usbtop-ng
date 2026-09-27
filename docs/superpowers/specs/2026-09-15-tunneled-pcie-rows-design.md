@@ -121,8 +121,8 @@ where a rule depends on it:
   it; a root port with only removable bridges below it is no tunnel and
   counts for nothing.
 - **The router is named only when nothing else fits.** Nothing pairs a
-  root port with a router except one case: exactly one depth-one router that
-  can carry a PCIe tunnel (`DEVTYPE=thunderbolt_device`, its domain's
+  root port with a router except one case: exactly one depth-one router,
+  and it can carry PCIe (`DEVTYPE=thunderbolt_device`, its domain's
   `security` one of `none`, `user`, `secure`, its `authorized` 1 or 2) and
   exactly one tunnel, the router list read before and after the PCI walk
   and identical both times, and the PCI walk complete (no function skipped
@@ -251,7 +251,7 @@ fn class_name(class: u32) -> Option<&'static str>
 pub fn read_tunnels(pci: &Path, thunderbolt: &Path) -> Vec<Tunnel>
 
 /// The join, pure: `Some(index of the one router)` only when `before` and
-/// `after` hold the same names, exactly one router that can tunnel PCIe,
+/// `after` hold the same names, exactly one router, and it can carry PCIe,
 /// exactly one tunnel, and `complete`.
 fn join(before: &[Router], after: &[Router], tunnels: &[Tunnel], complete: bool)
     -> Option<usize>

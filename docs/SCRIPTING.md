@@ -489,7 +489,7 @@ names one of them.
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `root_port` | string | the PCI root port, `0000:00:07.1` |
-| `router` | object or null | the Thunderbolt router the tunnel runs through, only when exactly one depth-one router that can carry PCIe faces exactly one tunnel; null otherwise, never a guess |
+| `router` | object or null | the Thunderbolt router the tunnel runs through, only when exactly one depth-one router, and it can carry PCIe, faces exactly one tunnel; null otherwise, never a guess |
 | `controllers` | array | the addresses among `functions` that are USB controllers |
 | `functions` | array | the tunneled functions, sorted by address |
 

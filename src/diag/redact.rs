@@ -143,10 +143,23 @@ impl Redactor {
     }
 
     /// Masks each stand-alone `hh:hh:hh:hh:hh:hh` token as
-    /// `xx:xx:xx:xx:xx:xx`. Applied to kernel log lines, where a USB
-    /// network adapter's line names the host's own MAC; never to the device
-    /// inventory, whose serial strings are device identity and stay.
+    /// `xx:xx:xx:xx:xx:xx`, then every whitespace-delimited token that
+    /// [`embeds_mac`] accepts -- trailing punctuation such as `:` or `,`
+    /// stripped for the check and kept in the output -- as its
+    /// three-letter prefix plus `<redacted>`. Applied to kernel log lines,
+    /// where a USB network adapter's line names the host's own MAC either
+    /// as a bare address or, once systemd's `NamePolicy=mac` has renamed
+    /// the interface, inside the interface name itself; never to the
+    /// device inventory, whose serial strings are device identity and
+    /// stay. Both forms are counted under `mac_address`.
     pub fn mac_addresses(&mut self, text: &str) -> String {
+        let colon_masked = self.mask_colon_macs(text);
+        self.mask_interface_tokens(&colon_masked)
+    }
+
+    /// Every stand-alone `hh:hh:hh:hh:hh:hh` token becomes
+    /// `xx:xx:xx:xx:xx:xx`.
+    fn mask_colon_macs(&mut self, text: &str) -> String {
         const LEN: usize = 17;
         let mut bytes = text.as_bytes().to_vec();
         let mut i = 0;
@@ -165,6 +178,61 @@ impl Redactor {
         // Only ASCII bytes were replaced by ASCII bytes, so the text is
         // still valid UTF-8.
         String::from_utf8(bytes).expect("ASCII-for-ASCII substitution keeps UTF-8 valid")
+    }
+
+    /// Every whitespace-delimited token of `text` that [`embeds_mac`]
+    /// accepts, once trailing punctuation is set aside, is masked; every
+    /// other token, and the text's own whitespace, is kept exactly (the
+    /// same walk `cmdline` uses).
+    fn mask_interface_tokens(&mut self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut token_start = None;
+        for (i, c) in text.char_indices() {
+            if c.is_whitespace() {
+                if let Some(start) = token_start.take() {
+                    out.push_str(&self.interface_token(&text[start..i]));
+                }
+                out.push(c);
+            } else if token_start.is_none() {
+                token_start = Some(i);
+            }
+        }
+        if let Some(start) = token_start {
+            out.push_str(&self.interface_token(&text[start..]));
+        }
+        out
+    }
+
+    /// One whitespace-free token of `mask_interface_tokens`: trailing
+    /// punctuation (anything not ASCII alphanumeric) is set aside before
+    /// the [`embeds_mac`] check and put back after masking.
+    fn interface_token(&mut self, token: &str) -> String {
+        let name_len = token
+            .trim_end_matches(|c: char| !c.is_ascii_alphanumeric())
+            .len();
+        let (name, trailing) = token.split_at(name_len);
+        if embeds_mac(name) {
+            self.bump("mac_address");
+            format!("{}<redacted>{}", &name[..3], trailing)
+        } else {
+            token.to_string()
+        }
+    }
+
+    /// Masks every tunneled function's `interface` the way
+    /// [`Redactor::mac_addresses`] masks an embedded-MAC name in free
+    /// text: an `enx`, `wlx` or `wwx` name that embeds a MAC (systemd's
+    /// `NamePolicy=mac`) becomes its three-letter prefix plus
+    /// `<redacted>`, counted under the same `mac_address` key.
+    pub fn mask_interface_names(&mut self, tunnels: &mut [crate::tunnel::Tunnel]) {
+        for function in tunnels.iter_mut().flat_map(|t| t.functions.iter_mut()) {
+            if let Some(name) = &function.interface {
+                if embeds_mac(name) {
+                    self.bump("mac_address");
+                    function.interface = Some(format!("{}<redacted>", &name[..3]));
+                }
+            }
+        }
     }
 
     /// Masks the value after `UUID=` and `PARTUUID=` in a kernel command
@@ -338,6 +406,20 @@ fn is_mac(window: &[u8]) -> bool {
     })
 }
 
+/// True when `name` is `enx`, `wlx` or `wwx` followed by exactly twelve
+/// ASCII hex digits -- systemd's `NamePolicy=mac` forms for Ethernet, WLAN
+/// and WWAN, which put the host's own MAC directly in the interface name.
+pub fn embeds_mac(name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix("enx")
+        .or_else(|| name.strip_prefix("wlx"))
+        .or_else(|| name.strip_prefix("wwx"))
+    else {
+        return false;
+    };
+    rest.len() == 12 && rest.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,6 +576,64 @@ mod tests {
             "usb 1-3: r8152 eth0: MAC xx:xx:xx:xx:xx:xx ready; id 00:1a:2b:3c:4d:5e:ff stays"
         );
         assert_eq!(r.summary(), vec![("mac_address".to_string(), 1)]);
+    }
+
+    /// Every `enx`, `wlx` or `wwx` name that embeds a MAC (twelve hex
+    /// digits, upper or lower case) is masked and counted under the same
+    /// `mac_address` key the colon form uses; a name with the wrong digit
+    /// count, one non-hex digit, no matching prefix, or no interface at
+    /// all is left alone, and the count rises by exactly the number
+    /// masked.
+    #[test]
+    fn mask_interface_names_masks_only_names_that_embed_a_mac() {
+        let function = |interface: Option<&str>| crate::tunnel::PciFunction {
+            address: "0000:2d:00.1".into(),
+            class: 0x020000,
+            class_name: "Ethernet".into(),
+            vendor_id: 0x1d6a,
+            device_id: 0x14c0,
+            driver: None,
+            interface: interface.map(str::to_string),
+            runtime_status: None,
+            awake: false,
+            link: None,
+            max_gts: None,
+        };
+        let mut tunnels = vec![crate::tunnel::Tunnel {
+            root_port: "0000:00:07.1".into(),
+            router: None,
+            functions: vec![
+                function(Some("enx001122334455")),
+                function(Some("wlxAABBCCDDEEFF")),
+                function(Some("wwx001122334455")),
+                function(Some("enp45s0")),
+                function(Some("enx00112233445")),
+                function(Some("enx0011223344556")),
+                function(Some("enx0011223344g5")),
+                function(None),
+            ],
+        }];
+        let mut r = Redactor::new(None);
+        r.mask_interface_names(&mut tunnels);
+        let names: Vec<Option<&str>> = tunnels[0]
+            .functions
+            .iter()
+            .map(|f| f.interface.as_deref())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                Some("enx<redacted>"),
+                Some("wlx<redacted>"),
+                Some("wwx<redacted>"),
+                Some("enp45s0"),
+                Some("enx00112233445"),
+                Some("enx0011223344556"),
+                Some("enx0011223344g5"),
+                None,
+            ]
+        );
+        assert_eq!(r.summary(), vec![("mac_address".to_string(), 3)]);
     }
 
     #[test]
