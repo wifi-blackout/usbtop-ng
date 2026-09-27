@@ -191,6 +191,7 @@
   "source": "text",
   "total_rx_bps": 460543486.0,
   "total_tx_bps": 29504.0,
+  "tunnels": [],
   "version": 1,
   "window_seconds": 1.0
 }

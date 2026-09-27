@@ -1412,6 +1412,7 @@ mod tests {
                     text_active: false,
                 },
                 &crate::filter::FilterSet::default(),
+                &[],
             )
         };
         let link = report(Basis::Link);

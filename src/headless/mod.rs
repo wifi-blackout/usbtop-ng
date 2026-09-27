@@ -2,6 +2,7 @@
 //! prints every window until interrupted. Never prompts.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use crate::connector::PortIndex;
 use crate::device::manager::DeviceManager;
 use crate::filter::FilterSet;
 use crate::findings::{Cause, Finding};
+use crate::tunnel::{self, Tunnel};
 use crate::usbmon::monitor::{CaptureStream, SourceFlags};
 use crate::usbmon::parser::format_mbps;
 
@@ -57,6 +59,11 @@ pub struct Report {
     pub total_rx_bps: f64,
     pub total_tx_bps: f64,
     pub buses: Vec<BusReport>,
+    /// The PCIe side of every Thunderbolt or USB4 tunnel: one entry per
+    /// root port with tunneled functions under it (see
+    /// `tunnel::read_tunnels`). Empty when there is none; always empty in
+    /// a fixture replay, which carries no PCI tree.
+    pub tunnels: Vec<TunnelReport>,
     /// Devices linked below the speed they support, with the cause the
     /// topology proves (see `findings::analyze`); only devices the report
     /// lists. Empty when there is nothing to call out.
@@ -154,6 +161,103 @@ impl From<&Finding> for FindingReport {
             limit_mbps,
             message: finding.message(),
         }
+    }
+}
+
+/// One tunnel as the JSON report carries it (see `tunnel::Tunnel`).
+#[derive(Serialize)]
+pub struct TunnelReport {
+    pub root_port: String,
+    pub router: Option<RouterReport>,
+    /// Addresses among `functions` that are USB controllers; join with
+    /// `buses[].controller`.
+    pub controllers: Vec<String>,
+    pub functions: Vec<PciFunctionReport>,
+}
+
+/// The joined router (see `tunnel::Router`); `null` when the join named none.
+#[derive(Serialize)]
+pub struct RouterReport {
+    pub name: String,
+    pub vendor_name: Option<String>,
+    pub device_name: Option<String>,
+    pub generation: Option<u32>,
+    pub rx_gbps: Option<f64>,
+    pub tx_gbps: Option<f64>,
+    pub rx_lanes: Option<u32>,
+    pub tx_lanes: Option<u32>,
+    pub authorized: Option<u32>,
+    pub security: Option<String>,
+}
+
+/// One tunneled function (see `tunnel::PciFunction`).
+#[derive(Serialize)]
+pub struct PciFunctionReport {
+    pub address: String,
+    /// The 24-bit class code as six hex digits, `020000`, no prefix, as
+    /// the IDs.
+    pub class: String,
+    pub class_name: String,
+    pub vendor_id: String,
+    pub device_id: String,
+    pub driver: Option<String>,
+    pub interface: Option<String>,
+    pub runtime_status: Option<String>,
+    pub awake: bool,
+    pub link_gts: Option<f64>,
+    pub link_width: Option<u32>,
+    pub max_link_gts: Option<f64>,
+}
+
+impl From<&Tunnel> for TunnelReport {
+    fn from(t: &Tunnel) -> Self {
+        TunnelReport {
+            root_port: t.root_port.clone(),
+            router: t.router.as_ref().map(|r| RouterReport {
+                name: r.name.clone(),
+                vendor_name: r.vendor_name.clone(),
+                device_name: r.device_name.clone(),
+                generation: r.generation,
+                rx_gbps: r.rx_gbps,
+                tx_gbps: r.tx_gbps,
+                rx_lanes: r.rx_lanes,
+                tx_lanes: r.tx_lanes,
+                authorized: r.authorized,
+                security: r.security.clone(),
+            }),
+            controllers: t
+                .functions
+                .iter()
+                .filter(|f| f.is_usb_controller())
+                .map(|f| f.address.clone())
+                .collect(),
+            functions: t
+                .functions
+                .iter()
+                .map(|f| PciFunctionReport {
+                    address: f.address.clone(),
+                    class: format!("{:06x}", f.class),
+                    class_name: f.class_name.clone(),
+                    vendor_id: format!("{:04x}", f.vendor_id),
+                    device_id: format!("{:04x}", f.device_id),
+                    driver: f.driver.clone(),
+                    interface: f.interface.clone(),
+                    runtime_status: f.runtime_status.clone(),
+                    awake: f.awake,
+                    link_gts: f.link.as_ref().map(|l| l.gts),
+                    link_width: f.link.as_ref().map(|l| l.width),
+                    max_link_gts: f.max_gts,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The label the text report prints for a tunnel: the TUI's.
+fn tunnel_label(t: &TunnelReport) -> String {
+    match &t.router {
+        Some(r) => tunnel::router_label(&r.name, r.device_name.as_deref(), r.rx_lanes, r.rx_gbps),
+        None => tunnel::NO_ROUTER_LABEL.to_string(),
     }
 }
 
@@ -289,7 +393,8 @@ pub struct WindowFacts {
 /// Floored at 1ms so a pathological zero-elapsed window (e.g. a signal
 /// landing in the same instant as `Baseline::capture`) cannot divide by zero.
 ///
-/// The choke points are computed at `basis`.
+/// The choke points are computed at `basis`. The tunnels are the caller's
+/// read of the PCI side (see `tunnel::read_tunnels`); a replay passes none.
 pub fn build_report_at(
     basis: Basis,
     manager: &DeviceManager,
@@ -297,6 +402,7 @@ pub fn build_report_at(
     elapsed: Duration,
     facts: WindowFacts,
     filter: &FilterSet,
+    tunnels: &[Tunnel],
 ) -> Report {
     // Read, not threaded as a parameter: `manager` is already an argument,
     // and another argument alongside it would just duplicate state the
@@ -452,6 +558,7 @@ pub fn build_report_at(
         total_rx_bps,
         total_tx_bps,
         buses: bus_reports,
+        tunnels: tunnels.iter().map(TunnelReport::from).collect(),
         findings,
         demand_basis: basis.as_str(),
         choke_floor: CHOKE_FLOOR,
@@ -484,6 +591,7 @@ pub fn build_report(
             text_active,
         },
         filter,
+        &[],
     )
 }
 
@@ -515,10 +623,12 @@ fn device_id_cell(report: &Report, bus: u8, address: u8) -> String {
 }
 
 /// Render a report as plain text: a `ts=` line, one header per bus, one
-/// indented row per device, a `findings:` section — `none`, or a count and
-/// one indented line per call-out (see [`Report::findings`]) — and a
-/// closing `chokepoints:` section, `none` or a count and one indented line
-/// per choked hub link (see [`Report::chokepoints`]).
+/// indented row per device, then `tunnels: none` or `tunnels: N` with one
+/// line per tunnel (root port, label, its USB controllers) and one
+/// indented line per function, then the `findings:` section — `none`, or a
+/// count and one indented line per call-out (see [`Report::findings`]) —
+/// and a closing `chokepoints:` section, `none` or a count and one
+/// indented line per choked hub link (see [`Report::chokepoints`]).
 /// `~rx`/`~tx` marks a device whose rate is `estimated` (see
 /// [`DeviceReport::estimated`]).
 pub fn render_text(report: &Report) -> String {
@@ -570,6 +680,36 @@ pub fn render_text(report: &Report) -> String {
                 to_mbps(device.tx_bps),
                 name,
             ));
+        }
+    }
+    if report.tunnels.is_empty() {
+        out.push_str("tunnels: none\n");
+    } else {
+        out.push_str(&format!("tunnels: {}\n", report.tunnels.len()));
+        for tunnel in &report.tunnels {
+            let controllers = if tunnel.controllers.is_empty() {
+                "none".to_string()
+            } else {
+                tunnel.controllers.join(", ")
+            };
+            out.push_str(&format!(
+                "  {}  {}  controllers {}\n",
+                tunnel.root_port,
+                tunnel_label(tunnel),
+                controllers
+            ));
+            for f in &tunnel.functions {
+                out.push_str(&format!(
+                    "    {}  {}  {}  {}  {}  {}:{}\n",
+                    f.address,
+                    f.class_name,
+                    tunnel::link_text(f.link_gts, f.link_width, f.runtime_status.as_deref()),
+                    f.driver.as_deref().unwrap_or("no driver"),
+                    f.interface.as_deref().unwrap_or("-"),
+                    f.vendor_id,
+                    f.device_id
+                ));
+            }
         }
     }
     if report.findings.is_empty() {
@@ -717,6 +857,12 @@ pub fn run(
             flags.text_active.load(Ordering::Relaxed),
             flags.mmap_active.load(Ordering::Relaxed),
         );
+        // The PCI side of every tunnel, read fresh per window: the report
+        // is a sample of the host, and a dock can come and go between two.
+        let tunnels = tunnel::read_tunnels(
+            Path::new(tunnel::PCI_DEVICES),
+            Path::new(tunnel::THUNDERBOLT_DEVICES),
+        );
         let mut report = build_report_at(
             opts.demand,
             &manager,
@@ -728,6 +874,7 @@ pub fn run(
                 text_active: flags.text_active.load(Ordering::Relaxed),
             },
             &filter,
+            &tunnels,
         );
         // Not a `build_report` parameter (see the field's doc comment): the
         // kernel-drop count is read straight from the live counter here,
@@ -763,6 +910,7 @@ fn is_expected_write_failure(err: &std::io::Error) -> bool {
 mod tests {
     use super::*;
     use crate::device::manager::DeviceManager;
+    use crate::tunnel::{PciFunction, PciLink, Router};
     use crate::usbmon::parser::parse_usbmon_text_line;
     use std::sync::mpsc::sync_channel;
 
@@ -1416,6 +1564,7 @@ mod tests {
                 text_active: false,
             },
             &FilterSet::default(),
+            &[],
         );
         let v = serde_json::to_value(&report).unwrap();
         assert_eq!(v["demand_basis"], "capability");
@@ -1538,6 +1687,142 @@ mod tests {
             text.contains("\nfindings: none\nchokepoints:"),
             "the findings section precedes the choke section: {text}"
         );
+    }
+
+    fn sample_tunnel() -> Tunnel {
+        Tunnel {
+            root_port: "0000:00:07.1".into(),
+            router: Some(Router {
+                name: "0-3".into(),
+                vendor_name: Some("CalDigit, Inc.".into()),
+                device_name: Some("Element Hub".into()),
+                generation: Some(4),
+                rx_gbps: Some(20.0),
+                tx_gbps: Some(20.0),
+                rx_lanes: Some(2),
+                tx_lanes: Some(2),
+                authorized: Some(1),
+                security: Some("none".into()),
+            }),
+            functions: vec![
+                PciFunction {
+                    address: "0000:2d:00.1".into(),
+                    class: 0x020000,
+                    class_name: "Ethernet".into(),
+                    vendor_id: 0x1d6a,
+                    device_id: 0x14c0,
+                    driver: Some("atlantic".into()),
+                    interface: Some("enp45s0".into()),
+                    runtime_status: Some("active".into()),
+                    awake: true,
+                    link: Some(PciLink { gts: 8.0, width: 1 }),
+                    max_gts: Some(16.0),
+                },
+                PciFunction {
+                    address: "0000:2e:00.0".into(),
+                    class: 0x0c0330,
+                    class_name: "USB controller".into(),
+                    vendor_id: 0x8086,
+                    device_id: 0x0b27,
+                    driver: Some("xhci_hcd".into()),
+                    interface: None,
+                    runtime_status: Some("suspended".into()),
+                    awake: false,
+                    link: None,
+                    max_gts: None,
+                },
+            ],
+        }
+    }
+
+    fn report_with(tunnels: &[Tunnel], filter: &FilterSet) -> Report {
+        let temp = tempfile::tempdir().unwrap();
+        let mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let baseline = Baseline::capture(&mgr);
+        build_report_at(
+            Basis::Link,
+            &mgr,
+            &baseline,
+            Duration::from_secs(1),
+            WindowFacts {
+                source: "none",
+                dropped: 0,
+                text_active: false,
+            },
+            filter,
+            tunnels,
+        )
+    }
+
+    #[test]
+    fn json_report_carries_a_tunnel_with_its_router_and_functions() {
+        let report = report_with(&[sample_tunnel()], &FilterSet::default());
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["version"], 1, "additive fields do not bump the schema");
+        let tunnels = v["tunnels"].as_array().unwrap();
+        assert_eq!(tunnels.len(), 1);
+        let t = &tunnels[0];
+        assert_eq!(t["root_port"], "0000:00:07.1");
+        assert_eq!(t["router"]["name"], "0-3");
+        assert_eq!(t["router"]["device_name"], "Element Hub");
+        assert_eq!(t["router"]["rx_gbps"], 20.0);
+        assert_eq!(t["router"]["rx_lanes"], 2);
+        assert_eq!(t["router"]["authorized"], 1);
+        assert_eq!(t["router"]["security"], "none");
+        assert_eq!(t["controllers"], serde_json::json!(["0000:2e:00.0"]));
+        let nic = &t["functions"][0];
+        assert_eq!(nic["address"], "0000:2d:00.1");
+        assert_eq!(nic["class"], "020000");
+        assert_eq!(nic["class_name"], "Ethernet");
+        assert_eq!(nic["vendor_id"], "1d6a");
+        assert_eq!(nic["device_id"], "14c0");
+        assert_eq!(nic["driver"], "atlantic");
+        assert_eq!(nic["interface"], "enp45s0");
+        assert_eq!(nic["runtime_status"], "active");
+        assert_eq!(nic["awake"], true);
+        assert_eq!(nic["link_gts"], 8.0);
+        assert_eq!(nic["link_width"], 1);
+        assert_eq!(nic["max_link_gts"], 16.0);
+        let xhci = &t["functions"][1];
+        assert_eq!(xhci["awake"], false);
+        assert!(xhci["link_gts"].is_null());
+        assert!(xhci["interface"].is_null());
+    }
+
+    #[test]
+    fn tunnels_ignore_the_filter() {
+        let filter = FilterSet::parse(&["bus=9".into()]).unwrap();
+        let report = report_with(&[sample_tunnel()], &filter);
+        assert_eq!(
+            report.tunnels.len(),
+            1,
+            "a USB filter narrows buses, never the tunnels"
+        );
+    }
+
+    #[test]
+    fn render_text_prints_the_tunnels_section_after_the_buses_and_before_findings() {
+        let text = render_text(&report_with(&[sample_tunnel()], &FilterSet::default()));
+        assert!(
+            text.contains(
+                "tunnels: 1\n  0000:00:07.1  Thunderbolt 0-3 Element Hub · 2×20 Gb/s  controllers 0000:2e:00.0\n    0000:2d:00.1  Ethernet  8 GT/s ×1  atlantic  enp45s0  1d6a:14c0\n    0000:2e:00.0  USB controller  asleep  xhci_hcd  -  8086:0b27\nfindings: none\n"
+            ),
+            "{text}"
+        );
+        let mut bare = sample_tunnel();
+        bare.router = None;
+        bare.functions.truncate(1);
+        let text = render_text(&report_with(&[bare], &FilterSet::default()));
+        assert!(
+            text.contains("tunnels: 1\n  0000:00:07.1  external PCIe port  controllers none\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_text_says_tunnels_none_when_there_are_none() {
+        let text = render_text(&report_with(&[], &FilterSet::default()));
+        assert!(text.contains("\ntunnels: none\nfindings: none\n"), "{text}");
     }
 
     #[test]

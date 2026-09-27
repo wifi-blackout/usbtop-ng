@@ -38,6 +38,15 @@ pub fn chain(real: &Path) -> Vec<String> {
     chain
 }
 
+/// `power/runtime_status` of `real`, trimmed; `None` when absent or
+/// unreadable. The value [`is_awake`] gates the link reads on; the
+/// citation is there.
+pub fn runtime_status(real: &Path) -> Option<String> {
+    std::fs::read_to_string(real.join("power/runtime_status"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
 /// The wake gate over a `power/runtime_status` value: only `active` is
 /// awake; `suspended`, `unsupported`, anything else and an absent file are
 /// not. Callers trim the value first.
@@ -86,6 +95,19 @@ mod tests {
         assert!(!is_awake(Some("unsupported")));
         assert!(!is_awake(Some("active\n")), "callers trim before asking");
         assert!(!is_awake(None));
+    }
+
+    #[test]
+    fn runtime_status_is_read_trimmed() {
+        let temp = tempfile::tempdir().unwrap();
+        let dev = temp.path().join("dev");
+        std::fs::create_dir_all(dev.join("power")).unwrap();
+        assert_eq!(runtime_status(&dev), None);
+        std::fs::write(dev.join("power/runtime_status"), "suspended\n").unwrap();
+        assert_eq!(runtime_status(&dev).as_deref(), Some("suspended"));
+        assert!(!is_awake(runtime_status(&dev).as_deref()));
+        std::fs::write(dev.join("power/runtime_status"), "active\n").unwrap();
+        assert!(is_awake(runtime_status(&dev).as_deref()));
     }
 
     #[test]

@@ -242,6 +242,7 @@ impl Replayed {
                 text_active: self.source == Some(FixtureSource::Text),
             },
             &FilterSet::default(),
+            &[],
         )
     }
 }
@@ -364,6 +365,7 @@ mod tests {
             total_rx_bps: 0.0,
             total_tx_bps: 0.0,
             buses: Vec::new(),
+            tunnels: Vec::new(),
             findings: Vec::new(),
             demand_basis: "link",
             choke_floor: 1.25,

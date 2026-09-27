@@ -35,6 +35,7 @@ mod stats;
 #[cfg(test)]
 mod test_tree;
 mod tui;
+mod tunnel;
 mod ui;
 mod usbids;
 mod usbmon;

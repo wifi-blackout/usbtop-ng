@@ -144,3 +144,94 @@ impl Tree {
         )
     }
 }
+
+/// A fake `/sys/bus/pci/devices` and `/sys/bus/thunderbolt/devices` for the
+/// tunnel tests: device directories nested under `sys/devices/pci0000:00`
+/// in their parent chain and symlinked from the flat `pci/` directory, so
+/// `canonicalize` and `pci::chain` read them like real sysfs; routers and
+/// domains as directories under `thunderbolt/`.
+pub(crate) struct PciTree {
+    root: tempfile::TempDir,
+}
+
+impl PciTree {
+    pub(crate) fn new() -> PciTree {
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["pci", "thunderbolt", "sys/devices/pci0000:00"] {
+            std::fs::create_dir_all(root.path().join(dir)).unwrap();
+        }
+        PciTree { root }
+    }
+
+    /// The flat devices directory the reader lists.
+    pub(crate) fn pci(&self) -> PathBuf {
+        self.root.path().join("pci")
+    }
+
+    /// The Thunderbolt bus directory the reader lists.
+    pub(crate) fn thunderbolt(&self) -> PathBuf {
+        self.root.path().join("thunderbolt")
+    }
+
+    /// A PCI device: `chain` is root-first and ends with the device's own
+    /// address. Its real directory nests under the addresses above it, the
+    /// flat `pci/` directory gets a symlink to it, and each of `attrs` is
+    /// written as a file with a trailing newline (a name with a `/` makes
+    /// its directory, so `power/runtime_status` works). Returns the real
+    /// directory.
+    pub(crate) fn device(&self, chain: &[&str], attrs: &[(&str, &str)]) -> PathBuf {
+        let mut real = self.root.path().join("sys/devices/pci0000:00");
+        for address in chain {
+            real = real.join(address);
+        }
+        std::fs::create_dir_all(&real).unwrap();
+        let own = chain.last().expect("a chain ends with the device");
+        let link = self.pci().join(own);
+        if std::fs::symlink_metadata(&link).is_err() {
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+        }
+        for (name, value) in attrs {
+            let path = real.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, format!("{value}\n")).unwrap();
+        }
+        real
+    }
+
+    /// The device's `net/<name>` directory: its network interface.
+    pub(crate) fn net(&self, real: &Path, name: &str) {
+        std::fs::create_dir_all(real.join("net").join(name)).unwrap();
+    }
+
+    /// A `driver` symlink in `real` to a directory named `name`.
+    pub(crate) fn driver(&self, real: &Path, name: &str) {
+        let target = self.root.path().join("drivers").join(name);
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, real.join("driver")).unwrap();
+    }
+
+    /// An entry `name` on the Thunderbolt bus whose `uevent` names
+    /// `devtype` (`thunderbolt_device` for a router, `thunderbolt_xdomain`
+    /// for a host-to-host peer), plus attrs. Returns the directory.
+    pub(crate) fn router(&self, name: &str, devtype: &str, attrs: &[(&str, &str)]) -> PathBuf {
+        let dir = self.thunderbolt().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("uevent"), format!("DEVTYPE={devtype}\n")).unwrap();
+        for (name, value) in attrs {
+            std::fs::write(dir.join(name), format!("{value}\n")).unwrap();
+        }
+        dir
+    }
+
+    /// `domain<n>` on the Thunderbolt bus: a symlink to `<nhi>/domain<n>`,
+    /// the way the kernel hangs a domain off its host interface's PCI
+    /// device directory, holding `security`.
+    pub(crate) fn domain(&self, n: u32, nhi: &Path, security: &str) {
+        let real = nhi.join(format!("domain{n}"));
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("security"), format!("{security}\n")).unwrap();
+        std::os::unix::fs::symlink(&real, self.thunderbolt().join(format!("domain{n}"))).unwrap();
+    }
+}
