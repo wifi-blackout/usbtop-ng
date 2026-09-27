@@ -90,6 +90,34 @@ impl PciFunction {
     pub fn is_usb_controller(&self) -> bool {
         self.class >> 8 == 0x0c03 && !matches!(self.class & 0xff, 0x40 | 0xfe)
     }
+
+    /// The link as the row prints it (see [`link_text`]).
+    pub fn link_text(&self) -> String {
+        link_text(
+            self.link.as_ref().map(|l| l.gts),
+            self.link.as_ref().map(|l| l.width),
+            self.runtime_status.as_deref(),
+        )
+    }
+
+    /// The TUI row: `PCIe {address} · {class} · {link} · {driver|no
+    /// driver} · {interface}? · {vvvv}:{dddd}`. The link comes before the
+    /// identity so the 80-column floor clips the IDs, never the link.
+    pub fn row_text(&self) -> String {
+        let mut parts = vec![
+            format!("PCIe {}", self.address),
+            self.class_name.clone(),
+            self.link_text(),
+            self.driver
+                .clone()
+                .unwrap_or_else(|| "no driver".to_string()),
+        ];
+        if let Some(interface) = &self.interface {
+            parts.push(interface.clone());
+        }
+        parts.push(format!("{:04x}:{:04x}", self.vendor_id, self.device_id));
+        parts.join(" · ")
+    }
 }
 
 /// One tunnel: a root port with tunneled functions under it, and its
@@ -102,6 +130,17 @@ pub struct Tunnel {
     /// a discrete controller's own, USB controllers included, by address.
     /// Never empty.
     pub functions: Vec<PciFunction>,
+}
+
+impl Tunnel {
+    /// The heading's label: the joined router (see [`router_label`]) or
+    /// [`NO_ROUTER_LABEL`].
+    pub fn label(&self) -> String {
+        match &self.router {
+            Some(r) => router_label(&r.name, r.device_name.as_deref(), r.rx_lanes, r.rx_gbps),
+            None => NO_ROUTER_LABEL.to_string(),
+        }
+    }
 }
 
 /// A rate without decimals when it is integral and with one otherwise:
@@ -1096,6 +1135,72 @@ mod tests {
                 None
             ]
         );
+    }
+
+    #[test]
+    fn a_tunnel_labels_itself_and_a_function_prints_its_row() {
+        let nic = PciFunction {
+            address: "0000:2d:00.1".into(),
+            class: 0x020000,
+            class_name: "Ethernet".into(),
+            vendor_id: 0x1d6a,
+            device_id: 0x14c0,
+            driver: Some("atlantic".into()),
+            interface: Some("enp45s0".into()),
+            runtime_status: Some("active".into()),
+            awake: true,
+            link: Some(PciLink { gts: 8.0, width: 1 }),
+            max_gts: Some(16.0),
+        };
+        assert_eq!(nic.link_text(), "8 GT/s ×1");
+        assert_eq!(
+            nic.row_text(),
+            "PCIe 0000:2d:00.1 · Ethernet · 8 GT/s ×1 · atlantic · enp45s0 · 1d6a:14c0"
+        );
+        let asleep = PciFunction {
+            runtime_status: Some("suspended".into()),
+            awake: false,
+            link: None,
+            max_gts: None,
+            ..nic.clone()
+        };
+        assert_eq!(
+            asleep.row_text(),
+            "PCIe 0000:2d:00.1 · Ethernet · asleep · atlantic · enp45s0 · 1d6a:14c0"
+        );
+        let bare_xhci = PciFunction {
+            address: "0000:2e:00.0".into(),
+            class: 0x0c0330,
+            class_name: "USB controller".into(),
+            vendor_id: 0x8086,
+            device_id: 0x15ec,
+            driver: None,
+            interface: None,
+            ..asleep.clone()
+        };
+        assert_eq!(
+            bare_xhci.row_text(),
+            "PCIe 0000:2e:00.0 · USB controller · asleep · no driver · 8086:15ec"
+        );
+        let mut tunnel = Tunnel {
+            root_port: "0000:00:07.1".into(),
+            router: Some(Router {
+                name: "0-3".into(),
+                vendor_name: Some("CalDigit, Inc.".into()),
+                device_name: Some("Element Hub".into()),
+                generation: Some(4),
+                rx_gbps: Some(20.0),
+                tx_gbps: Some(20.0),
+                rx_lanes: Some(2),
+                tx_lanes: Some(2),
+                authorized: Some(1),
+                security: Some("none".into()),
+            }),
+            functions: vec![nic],
+        };
+        assert_eq!(tunnel.label(), "Thunderbolt 0-3 Element Hub · 2×20 Gb/s");
+        tunnel.router = None;
+        assert_eq!(tunnel.label(), "external PCIe port");
     }
 
     #[test]

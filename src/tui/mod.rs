@@ -7,11 +7,13 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
     env, io, iter,
+    path::Path,
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     time::{Duration, Instant},
 };
 
 use crate::device::manager::DeviceManager;
+use crate::tunnel;
 use crate::ui::{self, KeyOutcome, UsbTopApp};
 use crate::usbmon::monitor::CaptureStream;
 
@@ -253,6 +255,12 @@ fn run_app(
         .unwrap_or(start);
     let mut next_tick = start;
     let mut packet_backlog = false;
+    // The PCI side of every tunnel, read at most once a second whatever
+    // `--refresh` says: the reader walks every PCI device and opens the
+    // link attributes of the awake tunneled ones.
+    let pci_devices = Path::new(tunnel::PCI_DEVICES);
+    let thunderbolt_devices = Path::new(tunnel::THUNDERBOLT_DEVICES);
+    let mut last_tunnel_read: Option<Instant> = None;
 
     loop {
         let now = Instant::now();
@@ -317,6 +325,10 @@ fn run_app(
             // dropped by this refresh needs no separate handling.
             manager.enumerate_present_devices();
             let _ = manager.refresh();
+            if last_tunnel_read.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1)) {
+                app.set_tunnels(tunnel::read_tunnels(pci_devices, thunderbolt_devices));
+                last_tunnel_read = Some(now);
+            }
             app.sync_from(manager);
             app.update_bandwidth_history();
             // Measured from now, not from the missed deadline: a slow pass

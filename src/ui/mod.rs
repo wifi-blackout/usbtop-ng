@@ -19,6 +19,7 @@ use std::{
 
 use crate::capacity::{analyze as analyze_capacity, Basis, Chokepoint};
 use crate::connector::PortIndex;
+use crate::tunnel::Tunnel;
 
 mod connectors;
 use crate::device::manager::{DeviceManager, TrafficDelta, UsbBus};
@@ -113,12 +114,31 @@ pub struct ConnectorView {
     sort_key: (Vec<u32>, u8),
 }
 
-/// One host controller: its bus lines in bus order, then its connectors in
-/// chain order.
+/// One host controller, or one tunnel's root port: its bus lines in bus
+/// order, then its connectors in chain order, then the tunneled PCIe
+/// functions no bus represents.
 pub struct ControllerView {
     pub id: String,
     pub buses: Vec<BusView>,
     pub connectors: Vec<ConnectorView>,
+    /// Set when `id` is a tunnel's root port: the heading's label.
+    pub tunnel: Option<TunnelView>,
+    /// The tunnel's functions that no bus names as its controller, in
+    /// address order (see `tunnel::PciFunction::row_text`).
+    pub pcie: Vec<PcieRow>,
+}
+
+/// The heading of a tunnel group (see `tunnel::Tunnel::label`).
+pub struct TunnelView {
+    pub label: String,
+}
+
+/// One tunneled PCIe function as a row: selectable by `pcie:{address}`,
+/// rendered as `▶ {text}`, hidden by the idle filter when suspended.
+pub struct PcieRow {
+    pub address: String,
+    pub text: String,
+    pub suspended: bool,
 }
 
 impl ControllerView {
@@ -224,6 +244,9 @@ pub struct UsbTopApp {
     /// The hubs whose links are asked more than they can carry, worst first,
     /// recomputed from the manager every tick (see `capacity::analyze`).
     pub chokepoints: Vec<Chokepoint>,
+    /// The PCI side of every tunnel, set by the loop before each tick's
+    /// `sync_from` (see [`Self::set_tunnels`]); tests set it directly.
+    pub tunnels: Vec<Tunnel>,
 }
 
 /// State of the `/` search box (see `UsbTopApp::search`). `/` opens
@@ -297,6 +320,7 @@ impl UsbTopApp {
             connector_names: BTreeMap::new(),
             demand_basis: Basis::default(),
             chokepoints: Vec::new(),
+            tunnels: Vec::new(),
         }
     }
 
@@ -345,6 +369,11 @@ impl UsbTopApp {
     pub fn with_filter(mut self, filter: FilterSet) -> Self {
         self.filter = filter;
         self
+    }
+
+    /// The tunnels the next `sync_from` groups by.
+    pub fn set_tunnels(&mut self, tunnels: Vec<Tunnel>) {
+        self.tunnels = tunnels;
     }
 
     /// Attach the monitor's text-source-active flag (see
@@ -437,6 +466,18 @@ impl UsbTopApp {
         self.chokepoints = analyze_capacity(manager, &index, self.demand_basis);
         let bus_speed = |bus_id: u8| manager.buses.get(&bus_id).map(|bus| bus.speed.clone());
 
+        // A bus whose controller is a tunneled function belongs to the
+        // tunnel's root port, not to its own controller id.
+        let root_port_of: HashMap<&str, &str> = self
+            .tunnels
+            .iter()
+            .flat_map(|t| {
+                t.functions
+                    .iter()
+                    .map(move |f| (f.address.as_str(), t.root_port.as_str()))
+            })
+            .collect();
+
         let mut buses: Vec<&UsbBus> = manager.buses.values().collect();
         buses.sort_by_key(|bus| bus.bus_id);
 
@@ -444,7 +485,8 @@ impl UsbTopApp {
         for bus in buses {
             let controller = bus
                 .controller
-                .clone()
+                .as_deref()
+                .map(|c| root_port_of.get(c).copied().unwrap_or(c).to_string())
                 .unwrap_or_else(|| UNKNOWN_CONTROLLER.to_string());
             let view = grouped
                 .entry(controller.clone())
@@ -452,6 +494,8 @@ impl UsbTopApp {
                     id: controller,
                     buses: Vec::new(),
                     connectors: Vec::new(),
+                    tunnel: None,
+                    pcie: Vec::new(),
                 });
             let mut bus_line = bus_view(bus);
             for device in bus.devices.values() {
@@ -509,6 +553,38 @@ impl UsbTopApp {
                     )
                 });
             }
+        }
+
+        // Every tunnel gets a group even when no bus lands in it; its rows
+        // are the functions no bus names as its controller.
+        for tunnel in &self.tunnels {
+            let view = grouped
+                .entry(tunnel.root_port.clone())
+                .or_insert_with(|| ControllerView {
+                    id: tunnel.root_port.clone(),
+                    buses: Vec::new(),
+                    connectors: Vec::new(),
+                    tunnel: None,
+                    pcie: Vec::new(),
+                });
+            view.tunnel = Some(TunnelView {
+                label: tunnel.label(),
+            });
+            view.pcie = tunnel
+                .functions
+                .iter()
+                .filter(|f| {
+                    !manager
+                        .buses
+                        .values()
+                        .any(|bus| bus.controller.as_deref() == Some(f.address.as_str()))
+                })
+                .map(|f| PcieRow {
+                    address: f.address.clone(),
+                    text: f.row_text(),
+                    suspended: f.runtime_status.as_deref() == Some("suspended"),
+                })
+                .collect();
         }
 
         // Named controllers first (alphabetically), the catch-all group last.
@@ -615,12 +691,23 @@ impl UsbTopApp {
         }
     }
 
-    /// Device keys ("bus:dev") flattened in render order.
+    /// Device keys (`bus:dev`) and PCIe row keys (`pcie:{address}`)
+    /// flattened in render order: each group's device rows, then its
+    /// PCIe rows.
     fn device_keys(&self) -> Vec<String> {
         self.controllers
             .iter()
-            .flat_map(ControllerView::rows)
-            .map(|row| format!("{}:{}", row.device.bus_id, row.device.device_id))
+            .flat_map(|controller| {
+                controller
+                    .rows()
+                    .map(|row| format!("{}:{}", row.device.bus_id, row.device.device_id))
+                    .chain(
+                        controller
+                            .pcie
+                            .iter()
+                            .map(|row| format!("pcie:{}", row.address)),
+                    )
+            })
             .collect()
     }
 
@@ -637,15 +724,26 @@ impl UsbTopApp {
         }
     }
 
-    /// Drop rows with no current traffic.
-    fn retain_active_devices(&mut self) {
-        self.retain_rows(|row| row.device.bandwidth_stats.current_bps > 0.0);
+    /// Keep only the PCIe rows `keep` accepts, in every group.
+    fn retain_pcie(&mut self, keep: impl Fn(&PcieRow) -> bool) {
+        for controller in &mut self.controllers {
+            controller.pcie.retain(|row| keep(row));
+        }
     }
 
-    /// Drop rows the active `--filter` set does not match.
+    /// Drop rows with no current traffic. A suspended PCIe function is idle
+    /// by the kernel's own measure.
+    fn retain_active_devices(&mut self) {
+        self.retain_rows(|row| row.device.bandwidth_stats.current_bps > 0.0);
+        self.retain_pcie(|row| !row.suspended);
+    }
+
+    /// Drop rows the active `--filter` set does not match. A USB filter
+    /// hides every PCIe row.
     fn retain_filtered_devices(&mut self) {
         let filter = self.filter.clone();
         self.retain_rows(|row| filter.matches_device(&row.device));
+        self.retain_pcie(|_| false);
     }
 
     /// Drop rows the active search query does not match. A no-op while
@@ -659,6 +757,7 @@ impl UsbTopApp {
         // Lowered once per retention pass (one tick), not once per device.
         let query = query.to_lowercase();
         self.retain_rows(|row| device_matches_search(row.device.bus_id, row, &query));
+        self.retain_pcie(|row| row.text.to_lowercase().contains(&query));
     }
 
     /// Drop every group no visible row justifies: a connector with no rows,
@@ -683,8 +782,9 @@ impl UsbTopApp {
         // its own: a connector row's bus line is always in the same
         // controller, and the `buses.retain` above keeps that line, so a
         // controller with a surviving connector has a surviving bus too.
+        // A tunnel group with a surviving PCIe row stays too.
         self.controllers
-            .retain(|c| !c.buses.is_empty() || !c.connectors.is_empty());
+            .retain(|c| !c.buses.is_empty() || !c.connectors.is_empty() || !c.pcie.is_empty());
     }
 
     /// Recompute every connector's and bus line's rx/tx totals from the rows
@@ -1819,9 +1919,10 @@ fn draw_device_list(f: &mut Frame, area: Rect, app: &mut UsbTopApp) {
 
 /// The device list as rendered: a column header, then per controller a
 /// heading, per bus a summary line with the rows nothing places on a
-/// connector, then per connector a heading and its device rows. Also
-/// returns the line index of the selected device's row (headings count
-/// toward it), so the caller can keep it inside the visible scroll window.
+/// connector, then per connector a heading and its device rows, then the
+/// group's PCIe rows. Also returns the line index of the selected device's
+/// or PCIe row's line (headings count toward it), so the caller can keep it
+/// inside the visible scroll window.
 fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Option<usize>) {
     let heading_style = Style::default()
         .fg(ACCENT_COLOR)
@@ -1837,10 +1938,11 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
     let mut selected_line = None;
 
     for controller in &app.controllers {
-        lines.push(Line::styled(
-            format!("═ {} ═", controller.id),
-            heading_style,
-        ));
+        let heading = match &controller.tunnel {
+            Some(tunnel) => format!("═ {} · {} ═", controller.id, tunnel.label),
+            None => format!("═ {} ═", controller.id),
+        };
+        lines.push(Line::styled(heading, heading_style));
 
         for bus in &controller.buses {
             lines.push(bus_line(bus));
@@ -1854,6 +1956,20 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
             for row in &connector.devices {
                 push_device_row(&mut lines, app, row, &mut selected_line);
             }
+        }
+
+        for row in &controller.pcie {
+            let key = format!("pcie:{}", row.address);
+            let is_selected = app.selected_device.as_ref() == Some(&key);
+            if is_selected {
+                selected_line = Some(lines.len());
+            }
+            let line = Line::from(format!("▶ {}", row.text));
+            lines.push(if is_selected {
+                line.style(Style::default().bg(ACCENT_COLOR).fg(Color::Black))
+            } else {
+                line
+            });
         }
     }
 
@@ -2162,6 +2278,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  • Per-device and per-bus %busy"),
         Line::from("  • ⚡ high-utilization indicator (>80% of practical bandwidth)"),
         Line::from("  • 🔺 linked below the speed it supports; the line beneath says why"),
+        Line::from("  • PCIe rows: tunneled devices usbmon never sees; their link, not traffic"),
         Line::from("  • Header shows 'choke: N.NNx' when a hub's link is asked at least"),
         Line::from("    1.25x its capacity (the breathing room) by the devices below it;"),
         Line::from("    '(cap)' marks the capability basis, where a SuperSpeed hub with room"),
@@ -5147,6 +5264,242 @@ mod tests {
             .filter(|cell| ["-", "1.4.1", "2", "?"].contains(cell))
             .collect();
         assert_eq!(ports, vec!["-", "?", "1.4.1", "2"], "{screen}");
+    }
+
+    fn sample_router() -> crate::tunnel::Router {
+        crate::tunnel::Router {
+            name: "0-3".into(),
+            vendor_name: Some("CalDigit, Inc.".into()),
+            device_name: Some("Element Hub".into()),
+            generation: Some(4),
+            rx_gbps: Some(20.0),
+            tx_gbps: Some(20.0),
+            rx_lanes: Some(2),
+            tx_lanes: Some(2),
+            authorized: Some(1),
+            security: Some("none".into()),
+        }
+    }
+
+    /// A NIC at `address` with `interface`, awake with an 8 GT/s x1 link
+    /// or suspended with none.
+    fn nic(address: &str, interface: &str, awake: bool) -> crate::tunnel::PciFunction {
+        crate::tunnel::PciFunction {
+            address: address.into(),
+            class: 0x020000,
+            class_name: "Ethernet".into(),
+            vendor_id: 0x1d6a,
+            device_id: 0x14c0,
+            driver: Some("atlantic".into()),
+            interface: Some(interface.into()),
+            runtime_status: Some(if awake { "active" } else { "suspended" }.into()),
+            awake,
+            link: awake.then_some(crate::tunnel::PciLink { gts: 8.0, width: 1 }),
+            max_gts: awake.then_some(16.0),
+        }
+    }
+
+    /// The dock's xHCI as a function: awake at 2.5 GT/s x4, or asleep with
+    /// no driver when `driver` is false.
+    fn xhci_function(driver: bool) -> crate::tunnel::PciFunction {
+        crate::tunnel::PciFunction {
+            address: "0000:2e:00.0".into(),
+            class: 0x0c0330,
+            class_name: "USB controller".into(),
+            vendor_id: 0x8086,
+            device_id: 0x15ec,
+            driver: driver.then(|| "xhci_hcd".to_string()),
+            interface: None,
+            runtime_status: Some(if driver { "active" } else { "suspended" }.into()),
+            awake: driver,
+            link: driver.then_some(crate::tunnel::PciLink { gts: 2.5, width: 4 }),
+            max_gts: driver.then_some(2.5),
+        }
+    }
+
+    fn tunnel(router: bool, functions: Vec<crate::tunnel::PciFunction>) -> crate::tunnel::Tunnel {
+        crate::tunnel::Tunnel {
+            root_port: "0000:00:07.1".into(),
+            router: router.then(sample_router),
+            functions,
+        }
+    }
+
+    #[test]
+    fn a_tunneled_controllers_buses_land_under_the_root_port_heading_with_the_router_label() {
+        let (_t, mut mgr) = topology_fixture_named("0000:2e:00.0");
+        mgr.enumerate_present_devices();
+        mgr.update_bus_speeds();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.set_tunnels(vec![tunnel(true, vec![xhci_function(true)])]);
+        app.sync_from(&mgr);
+        assert_eq!(app.controllers.len(), 1);
+        assert_eq!(app.controllers[0].id, "0000:00:07.1");
+        assert_eq!(
+            app.controllers[0].tunnel.as_ref().map(|t| t.label.as_str()),
+            Some("Thunderbolt 0-3 Element Hub · 2×20 Gb/s")
+        );
+        let text = list_text(&app);
+        assert!(
+            text.contains("═ 0000:00:07.1 · Thunderbolt 0-3 Element Hub · 2×20 Gb/s ═"),
+            "{text}"
+        );
+        assert!(
+            text.contains("▶ Bus 03"),
+            "the buses moved with their controller: {text}"
+        );
+        assert!(
+            !text.contains("▶ PCIe"),
+            "the xHCI has buses, so it is no row: {text}"
+        );
+    }
+
+    #[test]
+    fn a_bare_tunnel_renders_its_pcie_rows_and_survives_pruning() {
+        let temp = tempfile::tempdir().unwrap();
+        let mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.set_tunnels(vec![tunnel(
+            false,
+            vec![nic("0000:2d:00.1", "enp45s0", true)],
+        )]);
+        app.sync_from(&mgr);
+        assert_eq!(app.controllers.len(), 1);
+        let text = list_text(&app);
+        assert!(
+            text.contains("═ 0000:00:07.1 · external PCIe port ═"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "▶ PCIe 0000:2d:00.1 · Ethernet · 8 GT/s ×1 · atlantic · enp45s0 · 1d6a:14c0"
+            ),
+            "{text}"
+        );
+        assert_eq!(app.device_keys(), ["pcie:0000:2d:00.1"].map(String::from));
+    }
+
+    #[test]
+    fn pcie_rows_fit_the_eighty_column_floor_with_the_link_intact() {
+        let temp = tempfile::tempdir().unwrap();
+        let mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.set_tunnels(vec![tunnel(
+            true,
+            vec![
+                nic("0000:2d:00.1", "enp45s0", true),
+                nic("0000:2d:00.2", "enp45s1", false),
+                xhci_function(false),
+            ],
+        )]);
+        app.sync_from(&mgr);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                draw_device_list(f, area, &mut app);
+            })
+            .unwrap();
+        let screen = terminal.backend().to_string();
+        for row in [
+            "▶ PCIe 0000:2d:00.1 · Ethernet · 8 GT/s ×1 · atlantic · enp45s0 · 1d6a:14c0",
+            "▶ PCIe 0000:2d:00.2 · Ethernet · asleep · atlantic · enp45s1 · 1d6a:14c0",
+            "▶ PCIe 0000:2e:00.0 · USB controller · asleep · no driver · 8086:15ec",
+        ] {
+            assert!(screen.contains(row), "{row}\n{screen}");
+        }
+    }
+
+    #[test]
+    fn down_from_the_last_device_row_selects_the_pcie_row_and_scrolls_to_it() {
+        let (_t, mut mgr) = topology_fixture_named("0000:2e:00.0");
+        mgr.enumerate_present_devices();
+        mgr.update_bus_speeds();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.set_tunnels(vec![tunnel(
+            true,
+            vec![xhci_function(true), nic("0000:2d:00.1", "enp45s0", true)],
+        )]);
+        app.sync_from(&mgr);
+        let keys = app.device_keys();
+        assert_eq!(keys.last().map(String::as_str), Some("pcie:0000:2d:00.1"));
+        for _ in 0..keys.len() {
+            app.select_next_device();
+        }
+        assert_eq!(app.selected_device.as_deref(), Some("pcie:0000:2d:00.1"));
+        assert_eq!(app.selected_row_trailing_lines(), 0);
+        // A window too short for the list: the scroll follows the selection.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 6)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                draw_device_list(f, area, &mut app);
+            })
+            .unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("▶ PCIe 0000:2d:00.1"), "{screen}");
+        assert!(app.list_scroll > 0, "the list scrolled down to the row");
+        // Wrapping past the last row lands on the first device again.
+        app.select_next_device();
+        assert_eq!(
+            app.selected_device.as_deref(),
+            keys.first().map(String::as_str)
+        );
+        // The row went away with its tunnel: the selection is cleared.
+        app.selected_device = Some("pcie:0000:2d:00.1".into());
+        app.set_tunnels(Vec::new());
+        app.sync_from(&mgr);
+        assert_eq!(app.selected_device, None);
+    }
+
+    #[test]
+    fn search_idle_and_filter_apply_to_pcie_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let rows = || {
+            vec![tunnel(
+                false,
+                vec![
+                    nic("0000:2d:00.1", "enp45s0", true),
+                    nic("0000:2d:00.2", "enp45s1", false),
+                ],
+            )]
+        };
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.set_tunnels(rows());
+        app.search = SearchState::Committed("enp45s1".into());
+        app.sync_from(&mgr);
+        let text = list_text(&app);
+        assert!(
+            text.contains("0000:2d:00.2") && !text.contains("0000:2d:00.1"),
+            "{text}"
+        );
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.set_tunnels(rows());
+        app.hide_idle_devices = true;
+        app.sync_from(&mgr);
+        let text = list_text(&app);
+        assert!(
+            text.contains("0000:2d:00.1") && !text.contains("0000:2d:00.2"),
+            "a suspended function is idle: {text}"
+        );
+
+        let mut app = UsbTopApp::new(Duration::from_millis(100))
+            .with_filter(FilterSet::parse(&["bus=1".into()]).unwrap());
+        app.set_tunnels(rows());
+        app.sync_from(&mgr);
+        assert!(
+            app.controllers.is_empty(),
+            "a USB filter hides every PCIe row, and the bare group with them"
+        );
+    }
+
+    #[test]
+    fn the_help_explains_pcie_rows_within_the_floor() {
+        let line = "PCIe rows: tunneled devices usbmon never sees; their link, not traffic";
+        assert!(help_lines().iter().any(|l| l.to_string().contains(line)));
     }
 
     /// A single bus with `count` devices (no sysfs, so every port chain is
