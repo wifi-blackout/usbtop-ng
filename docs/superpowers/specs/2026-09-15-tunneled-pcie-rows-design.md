@@ -170,9 +170,11 @@ where a rule depends on it:
 - **Privacy.** PCI addresses, class codes, IDs, driver names and DROM names
   are device topology and stay. The interface name is the kernel's device
   name; the bundle already carries it in the kernel log's driver lines. A
-  name that embeds a MAC (`enx`/`wlx` + twelve hex digits) is masked in the
-  bundle's copy, where the redactor masks every other MAC. A peer
-  computer's hostname never enters: XDomains are not routers.
+  name that embeds a MAC (`enx`, `wlx` or `wwx` + twelve hex digits,
+  systemd's MAC naming policy) is masked by the redactor wherever the
+  bundle prints it, the kernel log and the bundle's tunnels alike, and
+  counted with the colon-form MACs it already masks. A peer computer's
+  hostname never enters: XDomains are not routers.
 
 ## 1. The reader and the shared helpers
 
@@ -256,10 +258,13 @@ pub fn read_tunnels(pci: &Path, thunderbolt: &Path) -> Vec<Tunnel>
 fn join(before: &[Router], after: &[Router], tunnels: &[Tunnel], complete: bool)
     -> Option<usize>
 
-/// The `interface` of every function masked when it embeds a MAC
-/// (`enx`/`wlx` + twelve hex digits): the bundle's copy.
-pub fn mask_mac_interfaces(tunnels: &mut [Tunnel])
 ```
+
+The bundle's masking lives with the redactor, not here (`diag::redact`):
+`pub fn embeds_mac(name: &str) -> bool` (`enx`, `wlx` or `wwx` + twelve
+hex digits), `Redactor::mac_addresses` masking such tokens in text beside
+the colon form, and `Redactor::mask_interface_names(&self, &mut [Tunnel])`
+for the bundle's tunnels, all counted under `mac_address`.
 
 Reading rules, in the order `read_tunnels` runs them:
 
@@ -418,8 +423,8 @@ The files: `src/headless/mod.rs`, `src/headless/export.rs`,
   window over the two live paths and passes it. `fixture_replay::Replayed`
   gains a `tunnels: Vec<Tunnel>` field that `Replayed::report` passes;
   fixture replay leaves it empty, and `run_support` fills it with
-  `read_tunnels(&roots.pci, &roots.thunderbolt)` run through
-  `mask_mac_interfaces`, so `report.json` and `report.capability.json`
+  `read_tunnels(&roots.pci, &roots.thunderbolt)` run through the
+  redactor's `mask_interface_names`, so `report.json` and `report.capability.json`
   agree with `inventory/pci-removable.toml` from the same run. The test in
   support.rs that calls `build_report_at` directly and the in-crate
   `build_report` helper pass `&[]`.
@@ -512,8 +517,12 @@ stay deferred with their text; the per-domain refinement noted).
   (`0-301`) ignored, `D-0` ignored, a retimer `0-0:1.1` and a service
   `0-1.1` ignored; a root port with only bridges below it counts for
   nothing; parse failures (`Unknown` speed, empty `device_name`); a
-  `removable` that exists but cannot be read; an unreadable root;
-  `mask_mac_interfaces` on `enx001122334455` and `wlx…` beside `enp45s0`.
+  `removable` that exists but cannot be read; an unreadable root.
+- `diag::redact`: `embeds_mac` and `mask_interface_names` on `enx`, `wlx`
+  and `wwx` names beside `enp45s0`, eleven- and thirteen-digit names and a
+  non-hex character, with the count; the kernel-log line
+  `atlantic 0000:2d:00.1 enx001122334455: renamed from eth0` reaching
+  `dmesg-usb.txt` as `enx<redacted>: renamed from eth0`.
 - `ui`: a tunneled controller's buses land under the root-port heading
   with the router label; a bare tunnel (no bus) renders its PCIe rows and
   survives `prune_empty_groups`; the row text for awake, asleep and
