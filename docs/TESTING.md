@@ -35,7 +35,7 @@ the development host that contributes the ground-truth isochronous bundle
 | `pi-zero` | Raspberry Pi Zero W (BCM2835) | **armv6l** | 6.12.96+rpt-rpi-v6 | Raspbian 12 | module | single core, one `dwc_otg` OTG port at 480M; the 32-bit `gnueabihf` build target |
 | `rock5c` | Radxa ROCK 5C (Rockchip RK3588S2) | aarch64 | 6.1.84-8-rk2410 (vendor) | Debian 12 | built-in | usbmon built in, `/dev/usbmon0..8` live; eight buses (xhci + ehci/ohci-platform); the binary-only vendor-kernel path |
 | `bm1684x` | SOPHGO BM1684x | aarch64 | 5.4.217-bm1684 (vendor, dirty) | Ubuntu 20.04 | **absent** | no usbmon module in this kernel and no BTF -- not capturable as-is; Imaging Source 37UX273-ML camera attached; oldest kernel |
-| `tgl-tb4` | Intel Tiger Lake-LP, i5-1135G7 | x86_64 | 7.0.0-31-generic | Linux Mint 22.3 | module | Thunderbolt 4 (NHI + xHCI) plus a 10 Gbps USB bus; two IDS `1409:3270` USB3 cameras on a 10 Gbps hub (`usbfs`); a CalDigit Element Hub on Thunderbolt (added 2026-09-12) adds a tunneled xHCI `0000:2e:00.0` with buses 5 (480M) and 6 (10G); eBPF-ready (BTF present) |
+| `tgl-tb4` | Intel Tiger Lake-LP, i5-1135G7 | x86_64 | 7.0.0-31-generic | Linux Mint 22.3 | module | Thunderbolt 4 (NHI + xHCI) plus a 10 Gbps USB bus; two IDS `1409:3270` USB3 cameras on a 10 Gbps hub (`usbfs`); a CalDigit Element Hub on Thunderbolt (added 2026-09-12) adds a tunneled xHCI `0000:2e:00.0` with buses 5 (480M) and 6 (10G); eBPF-ready (BTF present); a second chain on its other Thunderbolt port since 2026-09-26: a Dell WD22TB4 dock (router 0-1, its xHCI 0000:03:00.0 as buses 7 and 8, a Realtek USB NIC), an XYJ-LINK Thunderbolt 3 to PCIe bridge (router 0-301, Alpine Ridge switch, a corrupt DROM so the kernel names no device) and an ASMedia ASM2464PD NVMe enclosure (a Samsung NVMe at 0000:13:00.0, the live non-USB PCIe row); the chain dropped seventy seconds after plug-in on its first attachment, so survey before use |
 | `cezanne` | AMD Ryzen 9 5900HX (Cezanne) | x86_64 | 7.0.0-30-generic | Linux Mint 22.3 | module | AMD Renoir/Cezanne USB 3.1, two 10 Gbps + two 480M buses; eBPF-ready (BTF present); AMD, not Thunderbolt/USB4 |
 | `tgl-x360` | HP Pavilion x360 14-dw1xxx, Intel Tiger Lake-LP i5-1135G7 | x86_64 | 7.0.12+kali-amd64 | Kali GNU/Linux Rolling | module? | Tiger Lake TB4 USB controller (0000:00:0d.0) plus a 500-series 10 Gbps xHCI; Type-C/PD port free (no partner) but no Thunderbolt domain exposed; BTF present; **no passwordless sudo**, so it is the fleet's non-root test case; zsh login shell; HP webcam, Elan touch, AX201 BT internal |
 | `devhost` | Development host, AMD Ryzen 9 5900HX (Cezanne), xHCI 0000:06:00.3 and .4 | x86_64 | 7.0.0-30-generic | Linux Mint 22.3 | module | Chicony webcam on bus 1 (the ground-truth iso bundle); BTF present, eBPF runs |
@@ -167,6 +167,19 @@ Verified working in captures on the reference laptop.
 | Bus Pirate 5 | 1209:7331 | 12 | full-speed CDC plus mass storage on one device |
 | Cynthion USB analyzer | 1d50:615b | 480 | vendor-class device, idle unless driven |
 | Keyboard behind its own hub | 0430:100e, 00a2 | 12 | full-speed HID two hubs deep |
+| Dell WD22TB4 Thunderbolt 4 dock | Intel 8086:0b27 xHCI, Realtek 0bda:8153 NIC, Dell 413c:b06e | tunneled xHCI, 480 + 10000 | a second tunnel (the join goes silent, by design), a tunneled USB NIC |
+| XYJ-LINK Thunderbolt 3 to PCIe bridge | Intel 8086:15da switch | tunneled, PCIe slot | a depth-two router, a corrupt DROM (no `device_name`), a tunnel of bridges only |
+| ASMedia ASM2464PD NVMe enclosure | 1b21:2463 switch, Samsung 144d:a802 NVMe | tunneled, 2.5 GT/s x1 uplink | the live non-USB PCIe row, NVMe class 010802 |
+
+The tunneled PCIe row is proven by synthetic trees (`tunnel::tests`); the
+corpus carries no PCI tree, so every bundle replays to `tunnels: []`. On
+the dock laptop the CalDigit hub gives the heading over buses 5 and 6 and,
+when the second chain is up, the NVMe enclosure gives a real `PCIe` row.
+Coverage: nothing is `removable` before Linux 5.16, nor on any
+architecture but x86 with ACPI from 6.13, so the row is silent there; a
+USB4 dock's USB 3 runs to the host's own xHCI over a USB 3 tunnel, so its
+devices stay in the host controller's group and no heading appears for
+that link.
 
 ### To acquire
 

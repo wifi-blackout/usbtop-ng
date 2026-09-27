@@ -18,6 +18,7 @@ anything, so both are safe inside a script or a cron job.
      1:1     1d6b:0002  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  Linux 7.0.0-29-generic xhci-hcd xHCI Host Controller
      1:3     05e3:0610  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  GenesysLogic USB2.1 Hub
      1:4  i  04f2:b71a  480 Mbps  rx 0.00 MB/s  tx 0.00 MB/s  SunplusIT Inc HD Webcam
+   tunnels: none
    findings: none
    chokepoints: none
    ```
@@ -28,9 +29,13 @@ anything, so both are safe inside a script or a cron job.
    1-wide origin cell (`i` when the device matches an internal-device
    snapshot, blank otherwise — see
    [The `internal` field](#the-internal-field)), `vendor_id:product_id`, link
-   speed, rx and tx rate, and the vendor/product string. Two sections close
-   the report: `findings:`, `none` or a count and one indented line per
-   device linked below the speed it supports (see
+   speed, rx and tx rate, and the vendor/product string. After the last
+   bus, `tunnels:` prints `none` or a count with one line per tunnel (root
+   port, label, `controllers a, b` or `controllers none`) and one indented
+   line per function (address, class name, link, driver, interface or
+   `-`, IDs) (see [The tunnels list](#the-tunnels-list)). Two more
+   sections close the report: `findings:`, `none` or a count and one
+   indented line per device linked below the speed it supports (see
    [The findings list](#the-findings-list)), then `chokepoints:`, `none` or
    a count and one indented line per hub whose link is asked for more than
    it can carry (see [The chokepoints list](#the-chokepoints-list)). This
@@ -100,6 +105,7 @@ Report, the top-level document:
 | `total_rx_bps` | f64 | sum of every bus's `rx_bps` |
 | `total_tx_bps` | f64 | sum of every bus's `tx_bps` |
 | `buses` | array | one entry per bus, sorted by bus number |
+| `tunnels` | array | the PCIe side of every Thunderbolt or USB4 tunnel, one entry per root port with tunneled functions under it, sorted by root port; empty when there is none, and always empty in a fixture replay. See [The tunnels list](#the-tunnels-list) |
 | `findings` | array | devices linked below the speed they support, sorted by (bus, address); empty when there is nothing to call out. See [The findings list](#the-findings-list) |
 | `demand_basis` | string | `"link"` or `"capability"`, the rate the choke-point model assumed every device pushes; follows `--demand`. See [The chokepoints list](#the-chokepoints-list) |
 | `choke_floor` | f64 | the breathing room applied, `1.25`: a hub is listed only when the devices below it ask at least this many times its link's capacity |
@@ -282,6 +288,7 @@ report as a single compact line:
       ]
     }
   ],
+  "tunnels": [],
   "findings": [
     {
       "bus": 3,
@@ -463,6 +470,62 @@ device filtered out of `buses[].devices` is filtered out of `findings` too.
 
 ```bash
 sudo usbtop-ng --once --json | jq -c '.findings[] | {path, cause, message}'
+```
+
+## The tunnels list
+
+`tunnels` is the top-level list of Thunderbolt or USB4 tunnels seen from
+the PCI side: every PCI function the kernel marks `removable` (behind a
+port the firmware flags as externally facing; Linux 5.16 and later, and
+from 6.13 only behind a tunnel proper) that is not a bridge and not a
+discrete Thunderbolt controller's own, grouped under the root port it
+hangs from. The dock's own USB controller is one such function, which is
+how a bus joins its tunnel: `tunnels[].controllers` holds the addresses
+among the functions that are USB controllers, and `buses[].controller`
+names one of them.
+
+`tunnels[]`, one entry per root port:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `root_port` | string | the PCI root port, `0000:00:07.1` |
+| `router` | object or null | the Thunderbolt router the tunnel runs through, only when exactly one depth-one router that can carry PCIe faces exactly one tunnel; null otherwise, never a guess |
+| `controllers` | array | the addresses among `functions` that are USB controllers |
+| `functions` | array | the tunneled functions, sorted by address |
+
+`tunnels[].router`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `name` | string | the bus name, `0-3` (domain, then the route) |
+| `vendor_name`, `device_name` | string or null | from the device's DROM |
+| `generation` | u32 or null | 3 for Thunderbolt 3, 4 for USB4 |
+| `rx_gbps`, `tx_gbps` | f64 or null | the rate per lane, 20 for a 40 Gb/s link |
+| `rx_lanes`, `tx_lanes` | u32 or null | 1, 2 or 3 (the wider side of an asymmetric link) |
+| `authorized` | u32 or null | the router's `authorized`; 0 means no PCIe devices reach the host |
+| `security` | string or null | the domain's security level: `none`, `user`, `secure`, `dponly`, `usbonly`, `nopcie` |
+
+`tunnels[].functions[]`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `address` | string | `0000:2d:00.1` |
+| `class` | string | the 24-bit class code, six hex digits, `020000` |
+| `class_name` | string | a short name for the class, `Ethernet`, `NVMe`, `USB controller`, or `class 0x......` when the table has none |
+| `vendor_id`, `device_id` | string | four hex digits |
+| `driver` | string or null | the bound driver |
+| `interface` | string or null | the network interface when the function has exactly one |
+| `runtime_status` | string or null | the kernel's `power/runtime_status`, `active` or `suspended` |
+| `awake` | bool | `runtime_status` was `active`, so the link was read |
+| `link_gts`, `link_width` | f64, u32 or null | the negotiated link, `8` and `1` for 8 GT/s x1; null when the function was not awake or the link was down |
+| `max_link_gts` | f64 or null | the fastest rate the function supports, read only when awake |
+
+usbtop-ng never wakes a function to read its link: a device in runtime
+suspend reports `awake: false` and null link fields. `--filter` does not
+narrow `tunnels`; it is topology, not a device the filter names.
+
+```bash
+sudo usbtop-ng --once --json | jq -c '.tunnels[] | [.root_port, .router.name, (.functions | map(.address))]'
 ```
 
 ## The chokepoints list

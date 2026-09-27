@@ -156,6 +156,22 @@ key press and quits through the same teardown as `q`.
   every hub level. A port with no companion (a USB2-only bus) is a
   connector on its own. When the two sides use different port numbers the
   label says so: `Port 1 (USB3 side: 2)`.
+- A Thunderbolt or USB4 tunnel gets a group of its own, headed by the PCI
+  root port it lands on and, when exactly one router faces exactly one
+  tunnel, the router's name and link:
+  `═ 0000:00:07.1 · Thunderbolt 0-3 Element Hub · 2×20 Gb/s ═`. The dock's
+  own USB controller is tunneled too, so its buses sit under that heading
+  rather than under their controller's address. With two docks attached,
+  or a router that cannot carry PCIe, the heading says `external PCIe
+  port` and names no router: usbtop-ng never guesses the pairing.
+- A tunneled PCIe device that is not a USB controller, a NIC or an NVMe
+  drive behind a USB4 adapter, is a row under that heading:
+  `▶ PCIe 0000:2d:00.1 · Ethernet · 8 GT/s ×1 · atlantic · enp45s0 · 1d6a:14c0`,
+  its address, class, negotiated link (`asleep` for a function in runtime
+  suspend, whose link usbtop-ng does not wake it to read), driver,
+  network interface and IDs. usbmon never sees such a device, so the row
+  carries its link, not traffic. `↑`/`↓` select it like any row; the idle
+  filter hides a suspended one; a `--filter` hides them all.
 - Name a connector in your own words with a `[connector_names]` table in
   the preferences file (see [Preferences file](#preferences-file)); the
   heading then leads with the name and keeps the position:
@@ -350,7 +366,9 @@ says, and the snapshot is the one list you control.
   exits. `--batch` prints one report per window, repeated until `Ctrl-C`.
   Neither mode opens the TUI or prompts for anything.
 - Add `--json` to either mode for one JSON document per report (NDJSON in
-  `--batch`). `--window SECONDS` sets the sample length.
+  `--batch`). `--window SECONDS` sets the sample length. The document also
+  carries a top-level `tunnels` list, the PCIe side of every Thunderbolt or
+  USB4 tunnel, and the text report a `tunnels:` section.
 - `--output PATH` writes the reports to a file instead of stdout, led by a
   run record that names the version, backend, window, filters, and command.
 - See [docs/SCRIPTING.md](docs/SCRIPTING.md) for the full flag reference, the

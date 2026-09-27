@@ -199,6 +199,26 @@ treats them alike.
   shorter heading suffix from the same numbers. The rules are in
   `docs/superpowers/specs/2026-09-13-chokepoints-design.md`.
 
+#### 4d. Tunnels (`tunnel/`, `pci/`)
+
+- `tunnel/mod.rs`: `read_tunnels(pci, thunderbolt) -> Vec<Tunnel>`, the
+  PCIe side of every Thunderbolt or USB4 tunnel: the removable, non-bridge
+  PCI functions grouped under their root port (class from a built-in table,
+  driver, IDs, `net/` interface, and the link read only while the function
+  is awake), the depth-one routers on the Thunderbolt bus, and the join
+  that names a router only when exactly one that can carry PCIe faces
+  exactly one tunnel, the router list is unchanged across the PCI walk and
+  the walk is complete. A discrete Thunderbolt controller's own host
+  interface and xHCI are excluded by the shape v6.13's
+  `arch_pci_dev_is_removable` excludes them by, so kernels that mark
+  everything below an external-facing port read the same. The TUI reads
+  it once a second, `--once`/`--batch` once a window, `--support` once a
+  run. The rules and citations are in
+  `docs/superpowers/specs/2026-09-15-tunneled-pcie-rows-design.md`.
+- `pci/mod.rs`: what that reader and `diag/inventory.rs` share, the PCI
+  address shape, the parent chain and the wake gate with its runtime-PM
+  citation.
+
 #### 5. TUI chassis (`tui/`)
 
 Everything between the app state and the terminal device: when to draw, how the
@@ -270,7 +290,9 @@ See [TUI chassis](#tui-chassis) for how these fit together.
   the drivers seen in front of one, so a tunneled device's own driver is
   heard whatever it is called and even where it names no device
   (`atlantic: Boot code hanged`). The backend probe answers which usbmon source
-  `start_monitoring` would select with the same probes it uses.
+  `start_monitoring` would select with the same probes it uses. The PCI
+  walk shares its address check, parent chain and wake gate with the
+  tunneled-device reader through `pci/`.
 - `diag/bundle.rs`: the bundle directory, the manifest (format version, UTC
   time, file list with sizes, redaction counts, notes), and the `tar`
   archive.
@@ -490,6 +512,7 @@ pub struct BandwidthStats {
 ```rust
 pub struct UsbTopApp {
     pub controllers: Vec<ControllerView>, // rebuilt from DeviceManager each interval
+    pub tunnels: Vec<Tunnel>,            // the PCI side of every tunnel, read once a second
     pub bandwidth_history: Vec<(f64, f64)>, // (session seconds, bytes/s), last 60s
     pub selected_device: Option<String>, // "bus:devnum"
     pub list_scroll: u16,                // follows the selection

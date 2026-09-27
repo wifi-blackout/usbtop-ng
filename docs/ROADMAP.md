@@ -129,15 +129,12 @@ The second step, once the stages above the root hub can be priced:
   fill the gap.
 - A tunneled PCIe device that is not a USB controller, a 10G NIC behind a
   USB4 adapter say, as a sibling consumer of that Thunderbolt link in the
-  controller grouping. usbmon never sees such a device, so today the TUI
-  has no place for it; the kernel marks it `removable` and puts it under
-  the same root port as the tunneled xHCI, which is the join the grouping
-  would use. The support bundle's `inventory/pci-removable.toml` already
-  collects exactly those devices with their link and power state, as the
-  groundwork for this row. Designed 2026-09-15; the spec lands with its
-  build: a tunnel group headed by its root port and the router's link, one
-  row per tunneled function no bus represents, a `tunnels` list in the
-  reports.
+  controller grouping. Shipped: a tunnel group headed by its root port and
+  the router's link, one row per tunneled function no bus represents, a
+  `tunnels` list in the reports. Left for a later step: a per-domain join
+  through the `usb4-host-interface` device links, which would pair a dock
+  and an eGPU on two USB4 domains (AMD) where the host-wide rule stays
+  silent by design.
 - A DisplayPort stream as a consumer, priced from what the display asks.
   Two places see it. On a Type-C connector the alt mode's pin assignment
   decides what USB keeps: C and E give all four lanes to DisplayPort and
