@@ -20,6 +20,7 @@ use crate::device::manager::DeviceManager;
 use crate::filter::FilterSet;
 use crate::headless::{build_report_at, Baseline, Report, WindowFacts};
 use crate::snapshot::Snapshot;
+use crate::tunnel::Tunnel;
 use crate::usbmon::binary::BinaryReader;
 use crate::usbmon::reader::UsbmonReader;
 
@@ -225,6 +226,9 @@ pub struct Replayed {
     baseline: Baseline,
     elapsed: Duration,
     source: Option<FixtureSource>,
+    /// The PCI side of the tunnels the report carries: what `--support`
+    /// read live, nothing in a fixture replay.
+    pub tunnels: Vec<Tunnel>,
 }
 
 impl Replayed {
@@ -242,7 +246,7 @@ impl Replayed {
                 text_active: self.source == Some(FixtureSource::Text),
             },
             &FilterSet::default(),
-            &[],
+            &self.tunnels,
         )
     }
 }
@@ -295,6 +299,7 @@ pub fn replay_fixture_prepared(
         baseline,
         elapsed,
         source,
+        tunnels: Vec::new(),
     })
 }
 
@@ -494,6 +499,40 @@ mod tests {
             .unwrap();
         assert_eq!(dev.total_rx_bytes, 1000);
         assert_eq!(dev.rx_bps, 500.0, "1000 bytes over 2 s");
+    }
+
+    #[test]
+    fn a_replayed_state_reports_the_tunnels_it_holds() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        let baseline = Baseline::capture(&manager);
+        let replayed = Replayed {
+            manager,
+            baseline,
+            elapsed: Duration::from_secs(1),
+            source: None,
+            tunnels: vec![crate::tunnel::Tunnel {
+                root_port: "0000:00:07.1".into(),
+                router: None,
+                functions: vec![crate::tunnel::PciFunction {
+                    address: "0000:2d:00.1".into(),
+                    class: 0x020000,
+                    class_name: "Ethernet".into(),
+                    vendor_id: 0x1d6a,
+                    device_id: 0x14c0,
+                    driver: None,
+                    interface: None,
+                    runtime_status: None,
+                    awake: false,
+                    link: None,
+                    max_gts: None,
+                }],
+            }],
+        };
+        let report = replayed.report(Basis::Link);
+        assert_eq!(report.tunnels.len(), 1, "the seam, not a constant");
+        assert_eq!(report.tunnels[0].root_port, "0000:00:07.1");
+        assert_eq!(report.tunnels[0].functions[0].class, "020000");
     }
 
     #[test]

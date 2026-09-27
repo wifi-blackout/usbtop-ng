@@ -186,8 +186,8 @@ impl Roots {
             dmi: PathBuf::from("/sys/devices/virtual/dmi/id"),
             device_tree: PathBuf::from("/proc/device-tree"),
             btf: PathBuf::from("/sys/kernel/btf/vmlinux"),
-            thunderbolt: PathBuf::from("/sys/bus/thunderbolt/devices"),
-            pci: PathBuf::from("/sys/bus/pci/devices"),
+            thunderbolt: PathBuf::from(crate::tunnel::THUNDERBOLT_DEVICES),
+            pci: PathBuf::from(crate::tunnel::PCI_DEVICES),
             typec: PathBuf::from("/sys/class/typec"),
             power_delivery: PathBuf::from("/sys/class/usb_power_delivery"),
             home,
@@ -685,7 +685,14 @@ pub fn run_support(
             _ => None,
         };
         match replay_fixture_prepared(&fixture_base, source, opts.window) {
-            Ok(replayed) => {
+            Ok(mut replayed) => {
+                // The bundle runs live, so its report carries the PCI side
+                // of every tunnel, read from the same roots as
+                // inventory/pci-removable.toml; a name that embeds a MAC
+                // is masked like every other MAC in the bundle.
+                let mut tunnels = crate::tunnel::read_tunnels(&roots.pci, &roots.thunderbolt);
+                crate::tunnel::mask_mac_interfaces(&mut tunnels);
+                replayed.tunnels = tunnels;
                 let run = RunRecord {
                     record: "run",
                     usbtop_ng: build.version.clone(),
@@ -1955,6 +1962,68 @@ mod tests {
             ArchiveState::Missing(reason) => assert!(reason.contains("tar"), "{reason}"),
             ArchiveState::Pending => panic!("run_support must settle the archive state"),
         }
+    }
+
+    /// The bundle runs live: its `report.json` carries the tunnels read
+    /// from the same PCI tree `inventory/pci-removable.toml` lists, with an
+    /// interface name that embeds a MAC masked the way every other MAC in
+    /// the bundle is.
+    #[test]
+    fn the_bundle_report_carries_the_live_tunnels_with_mac_names_masked() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut roots = fake_roots(temp.path());
+        let tree = crate::test_tree::PciTree::new();
+        let nic = tree.device(
+            &[
+                "0000:00:07.1",
+                "0000:2c:00.0",
+                "0000:2d:00.0",
+                "0000:2d:00.1",
+            ],
+            &[
+                ("removable", "removable"),
+                ("class", "0x020000"),
+                ("vendor", "0x1d6a"),
+                ("device", "0x14c0"),
+                ("power/runtime_status", "suspended"),
+            ],
+        );
+        tree.net(&nic, "enx001122334455");
+        roots.pci = tree.pci();
+        roots.thunderbolt = tree.thunderbolt();
+        let target = temp.path().join("out");
+        private_target(&target);
+        let prepared = prepare_dir(&target, 1_788_000_000).unwrap();
+        std::fs::write(
+            prepared.dir.join("usbtop-ng.log"),
+            "[INFO] starting usbtop-ng\n",
+        )
+        .unwrap();
+        let env = environment(1000, Ok(status(false)));
+        let opts = SupportOpts {
+            window: Duration::from_secs(1),
+            no_capture: true,
+            command: vec![
+                "usbtop-ng".into(),
+                "--support".into(),
+                "--no-capture".into(),
+            ],
+        };
+        run_support(&opts, &roots, &env, &prepared, 1_788_000_000).unwrap();
+        let dir = &prepared.dir;
+
+        let report = std::fs::read_to_string(dir.join("report.json")).unwrap();
+        let lines: Vec<&str> = report.lines().collect();
+        let doc: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        let tunnels = doc["tunnels"].as_array().unwrap();
+        assert_eq!(tunnels.len(), 1);
+        assert_eq!(tunnels[0]["root_port"], "0000:00:07.1");
+        assert_eq!(tunnels[0]["functions"][0]["address"], "0000:2d:00.1");
+        assert_eq!(tunnels[0]["functions"][0]["interface"], "enx<redacted>");
+        assert_eq!(tunnels[0]["functions"][0]["awake"], false);
+        let inventory = std::fs::read_to_string(dir.join("inventory/pci-removable.toml")).unwrap();
+        assert!(inventory.contains("0000:2d:00.1"), "{inventory}");
+        assert!(!report.contains("001122334455"), "no MAC in the report");
     }
 
     /// Live, behind the `integration` feature, following the convention of

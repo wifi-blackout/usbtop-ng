@@ -430,6 +430,30 @@ pub fn read_tunnels(pci_root: &Path, thunderbolt: &Path) -> Vec<Tunnel> {
     tunnels
 }
 
+/// The bundle's copy of the tunnels: an `interface` of the form `enx` or
+/// `wlx` followed by twelve hex digits embeds a MAC (systemd's
+/// `NamePolicy=mac`), so it is masked as the bundle masks every other MAC,
+/// keeping the three-letter prefix.
+pub fn mask_mac_interfaces(tunnels: &mut [Tunnel]) {
+    for function in tunnels.iter_mut().flat_map(|t| t.functions.iter_mut()) {
+        if let Some(name) = &function.interface {
+            if embeds_mac(name) {
+                function.interface = Some(format!("{}<redacted>", &name[..3]));
+            }
+        }
+    }
+}
+
+fn embeds_mac(name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix("enx")
+        .or_else(|| name.strip_prefix("wlx"))
+    else {
+        return false;
+    };
+    rest.len() == 12 && rest.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1028,6 +1052,50 @@ mod tests {
         let tunnels = read_tunnels(&t.pci(), Path::new("/nonexistent/thunderbolt"));
         assert_eq!(tunnels.len(), 1);
         assert!(tunnels[0].router.is_none());
+    }
+
+    #[test]
+    fn mask_mac_interfaces_masks_only_names_that_embed_a_mac() {
+        let function = |interface: Option<&str>| PciFunction {
+            address: "0000:2d:00.1".into(),
+            class: 0x020000,
+            class_name: "Ethernet".into(),
+            vendor_id: 0x1d6a,
+            device_id: 0x14c0,
+            driver: None,
+            interface: interface.map(str::to_string),
+            runtime_status: None,
+            awake: false,
+            link: None,
+            max_gts: None,
+        };
+        let mut tunnels = vec![Tunnel {
+            root_port: "0000:00:07.1".into(),
+            router: None,
+            functions: vec![
+                function(Some("enx001122334455")),
+                function(Some("wlxAABBCCDDEEFF")),
+                function(Some("enp45s0")),
+                function(Some("enx00112233445")),
+                function(None),
+            ],
+        }];
+        mask_mac_interfaces(&mut tunnels);
+        let names: Vec<Option<&str>> = tunnels[0]
+            .functions
+            .iter()
+            .map(|f| f.interface.as_deref())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                Some("enx<redacted>"),
+                Some("wlx<redacted>"),
+                Some("enp45s0"),
+                Some("enx00112233445"),
+                None
+            ]
+        );
     }
 
     #[test]
