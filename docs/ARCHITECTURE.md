@@ -512,13 +512,13 @@ pub struct BandwidthStats {
 ```rust
 pub struct UsbTopApp {
     pub controllers: Vec<ControllerView>, // rebuilt from DeviceManager each interval
-    pub tunnels: Vec<Tunnel>,            // the PCI side of every tunnel, read once a second
     pub bandwidth_history: Vec<(f64, f64)>, // (session seconds, bytes/s), last 60s
     pub selected_device: Option<String>, // "bus:devnum"
     pub list_scroll: u16,                // follows the selection
     pub dropped_counter: Option<Arc<AtomicU64>>, // shared with the reader threads
     pub shed_counter: Option<Arc<AtomicU64>>,    // shared with the output stage
     // ... UI state
+    pub tunnels: Vec<Tunnel>,            // the PCI side of every tunnel, read once a second
 }
 ```
 

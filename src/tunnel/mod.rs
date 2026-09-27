@@ -257,6 +257,23 @@ fn sorted_entries(dir: &Path) -> Vec<String> {
     names
 }
 
+/// The one entry of `real/net/`, the function's network interface. `None`
+/// when there is no such directory, when it holds two or more entries, or
+/// when any entry fails to read: a listing that lost an entry must not
+/// report the survivor as the interface. Sysfs cannot produce that
+/// failure, so this only fails closed.
+fn net_interface(real: &Path) -> Option<String> {
+    let entries = std::fs::read_dir(real.join("net")).ok()?;
+    let mut names = Vec::new();
+    for entry in entries {
+        names.push(entry.ok()?.file_name().to_string_lossy().into_owned());
+    }
+    match names.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
+}
+
 /// `0-3` -> the domain when the route (hex) is a depth-one route, 1..=255
 /// (`tb_route_length` in drivers/thunderbolt/tb.h: bits above each 8-bit
 /// hop); `0-0` is the host router and `0-301` is depth two.
@@ -331,9 +348,13 @@ fn discrete_ports(thunderbolt: &Path) -> BTreeSet<String> {
 
 /// Every removable, non-bridge function under `pci` with its root port,
 /// in address order, and whether the walk was complete (no function
-/// skipped for an unparsable identity). Under a discrete controller's
-/// root port, a function whose chain is exactly root port, upstream port,
-/// downstream port is the controller's own and is skipped.
+/// skipped for an unparsable identity). An entry that cannot be resolved
+/// or whose `removable` cannot be read is a skip, not incompleteness:
+/// completeness is about identity, and a tunnel that vanished mid-walk
+/// (its router with it) is what the second router listing catches. Under
+/// a discrete controller's root port, a function whose chain is exactly
+/// root port, upstream port, downstream port is the controller's own and
+/// is skipped.
 fn read_functions(
     pci_root: &Path,
     discrete: &BTreeSet<String>,
@@ -391,8 +412,7 @@ fn read_functions(
         } else {
             (None, None)
         };
-        let mut net = sorted_entries(&real.join("net"));
-        let interface = if net.len() == 1 { net.pop() } else { None };
+        let interface = net_interface(&real);
         functions.push((
             root_port,
             PciFunction {
@@ -438,14 +458,26 @@ fn join(routers: &[Router], names_after: &[String], tunnel_count: usize, complet
 /// tunnels without routers. Nothing here resumes a sleeping device (see
 /// `pci::is_awake`).
 pub fn read_tunnels(pci_root: &Path, thunderbolt: &Path) -> Vec<Tunnel> {
-    let first = router_names(thunderbolt);
+    read_tunnels_with(pci_root, thunderbolt, router_names)
+}
+
+/// [`read_tunnels`] with the Thunderbolt listing supplied by `list_routers`,
+/// called once before the PCI walk (the routers are read from that listing)
+/// and once after it (the names the join compares against). The seam lets
+/// a test change the bus between the two calls.
+fn read_tunnels_with(
+    pci_root: &Path,
+    thunderbolt: &Path,
+    mut list_routers: impl FnMut(&Path) -> Vec<(String, u32)>,
+) -> Vec<Tunnel> {
+    let first = list_routers(thunderbolt);
     let routers: Vec<Router> = first
         .iter()
         .map(|(name, domain)| read_router(thunderbolt, name, *domain))
         .collect();
     let discrete = discrete_ports(thunderbolt);
     let (functions, complete) = read_functions(pci_root, &discrete);
-    let second: Vec<String> = router_names(thunderbolt)
+    let second: Vec<String> = list_routers(thunderbolt)
         .into_iter()
         .map(|(name, _)| name)
         .collect();
@@ -1097,6 +1129,9 @@ mod tests {
         assert_eq!(router.rx_gbps, Some(20.0));
     }
 
+    /// A skip, not incompleteness: an entry whose `removable` cannot be
+    /// read is left out and the join still fires (compare the unparsable
+    /// `class` case, which refuses it).
     #[test]
     fn an_unreadable_removable_is_skipped() {
         let t = PciTree::new();
@@ -1198,6 +1233,71 @@ mod tests {
         assert_eq!(tunnel.label(), "Thunderbolt 0-3 Element Hub · 2×20 Gb/s");
         tunnel.router = None;
         assert_eq!(tunnel.label(), "external PCIe port");
+    }
+
+    /// The join compares the listing taken after the PCI walk, not the one
+    /// the routers were read from: a router that appears between the two
+    /// (here, on the second call only) silences it.
+    #[test]
+    fn the_join_uses_the_listing_taken_after_the_pci_walk() {
+        let t = PciTree::new();
+        dock(&t);
+        let mut calls = 0;
+        let list = |dir: &Path| {
+            calls += 1;
+            let mut names = router_names(dir);
+            if calls == 2 {
+                names.push(("0-1".to_string(), 0));
+            }
+            names
+        };
+        let tunnels = read_tunnels_with(&t.pci(), &t.thunderbolt(), list);
+        assert_eq!(tunnels.len(), 1);
+        assert!(tunnels[0].router.is_none(), "the second listing differed");
+        assert_eq!(calls, 2, "listed before and after the walk");
+        let steady = read_tunnels_with(&t.pci(), &t.thunderbolt(), router_names);
+        assert_eq!(
+            steady[0].router.as_ref().map(|r| r.name.as_str()),
+            Some("0-3")
+        );
+    }
+
+    /// The walk sits between the two listings: a function the first
+    /// listing's call creates is walked (the walk came after it), and one
+    /// the second listing's call removes is still reported (the walk came
+    /// before it).
+    #[test]
+    fn the_pci_walk_sits_between_the_two_listings() {
+        let t = PciTree::new();
+        dock(&t);
+        let mut calls = 0;
+        let list = |dir: &Path| {
+            calls += 1;
+            match calls {
+                1 => {
+                    let _ = nic(&t, "active");
+                }
+                2 => std::fs::remove_file(t.pci().join("0000:2d:00.1")).unwrap(),
+                _ => {}
+            }
+            router_names(dir)
+        };
+        let tunnels = read_tunnels_with(&t.pci(), &t.thunderbolt(), list);
+        assert_eq!(calls, 2);
+        let addresses: Vec<&str> = tunnels[0]
+            .functions
+            .iter()
+            .map(|f| f.address.as_str())
+            .collect();
+        assert_eq!(
+            addresses,
+            ["0000:2d:00.1", "0000:2e:00.0"],
+            "created before the walk, removed only after it"
+        );
+        assert!(
+            tunnels[0].router.is_some(),
+            "the listings agree, so the join holds"
+        );
     }
 
     #[test]

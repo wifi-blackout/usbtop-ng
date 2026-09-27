@@ -40,6 +40,17 @@ pub fn effective_refresh_ms(requested: u64) -> u64 {
     requested.max(REFRESH_FLOOR_MS)
 }
 
+/// How often the loop reads the PCI side of the tunnels, whatever
+/// `--refresh` says: the reader walks every PCI device and opens the link
+/// attributes of the awake tunneled ones.
+const TUNNEL_READ_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Whether a tick at `now` reads the tunnels: always when they were never
+/// read, else once [`TUNNEL_READ_INTERVAL`] has passed since `last`.
+fn tunnels_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|at| now.duration_since(at) >= TUNNEL_READ_INTERVAL)
+}
+
 /// Why the event loop stopped. [`lifecycle::unload_policy`] turns this into
 /// what the exit path is still allowed to ask the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,9 +266,8 @@ fn run_app(
         .unwrap_or(start);
     let mut next_tick = start;
     let mut packet_backlog = false;
-    // The PCI side of every tunnel, read at most once a second whatever
-    // `--refresh` says: the reader walks every PCI device and opens the
-    // link attributes of the awake tunneled ones.
+    // The PCI side of every tunnel, read at most once a second (see
+    // `tunnels_due`).
     let pci_devices = Path::new(tunnel::PCI_DEVICES);
     let thunderbolt_devices = Path::new(tunnel::THUNDERBOLT_DEVICES);
     let mut last_tunnel_read: Option<Instant> = None;
@@ -325,7 +335,7 @@ fn run_app(
             // dropped by this refresh needs no separate handling.
             manager.enumerate_present_devices();
             let _ = manager.refresh();
-            if last_tunnel_read.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1)) {
+            if tunnels_due(last_tunnel_read, now) {
                 app.set_tunnels(tunnel::read_tunnels(pci_devices, thunderbolt_devices));
                 last_tunnel_read = Some(now);
             }
@@ -458,6 +468,24 @@ mod tests {
 
     fn test_app() -> UsbTopApp {
         UsbTopApp::new(Duration::from_millis(100))
+    }
+
+    #[test]
+    fn tunnels_are_read_on_the_first_tick_and_then_once_a_second() {
+        let now = Instant::now();
+        assert!(tunnels_due(None, now), "never read yet");
+        let half = now.checked_sub(Duration::from_millis(500)).unwrap();
+        assert!(!tunnels_due(Some(half), now), "half a second is too soon");
+        let second = now.checked_sub(Duration::from_secs(1)).unwrap();
+        assert!(tunnels_due(Some(second), now), "a full second is due");
+        assert!(tunnels_due(
+            Some(now.checked_sub(Duration::from_secs(5)).unwrap()),
+            now
+        ));
+        // A `last` in the future is not due (defensive: `Instant` is
+        // monotonic): `duration_since` saturates to zero and the gate
+        // recovers on its own.
+        assert!(!tunnels_due(Some(now + Duration::from_secs(1)), now));
     }
 
     /// A bare manager for tests that don't care about its contents -- only

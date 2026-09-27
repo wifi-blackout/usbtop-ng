@@ -290,7 +290,11 @@ Reading rules, in the order `read_tunnels` runs them:
   chain.
 - Parsing: `vendor`, `device` and `class` are `0x`-prefixed hex; a value
   that does not parse skips the function and marks the walk incomplete
-  (identity is the row; a half-read tree must not decide the join).
+  (identity is the row; a half-read tree must not decide the join). The
+  earlier skips, an entry that does not resolve or a `removable` that is
+  absent or unreadable, are skips only: completeness is about identity,
+  and a tunnel that vanished mid-walk, its router with it, is what the
+  second router listing catches.
   `class_name` is the table's name for `class`, or `class 0x{class:06x}`
   when the table has none. `max_link_speed` and `current_link_speed` are
   `pci_speed_string` text (`"8.0 GT/s PCIe"`, see above): the leading
@@ -373,8 +377,8 @@ base class, so it takes the `0x02` row.
   alphabetically, as ids do today.
 - `PcieRow { address: String, text: String }`, one per function of the
   tunnel that no bus of the manager names as its controller, in address
-  order, rendered after the connectors as `▶ {text}` in the connector
-  heading style. `text` is:
+  order, rendered after the connectors as `▶ {text}` in the list's text
+  colour, the selected style when selected. `text` is:
 
   ```
   PCIe 0000:2d:00.1 · Ethernet · 8 GT/s ×1 · atlantic · enp45s0 · 1d6a:14c0

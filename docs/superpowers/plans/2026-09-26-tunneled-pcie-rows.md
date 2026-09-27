@@ -1,5 +1,13 @@
 # Tunneled PCIe Rows Implementation Plan
 
+> **Outcome (2026-09-27):** executed and merged to main as 9f96faf..e7ba978.
+> The deploy review's fix wave moved the MAC-name masking that Task 3
+> describes here (`tunnel::mask_mac_interfaces`) into the redactor
+> (`diag::redact::embeds_mac`, `Redactor::mask_interface_names`, and
+> `Redactor::mac_addresses` masking such tokens in the kernel log). The
+> task text below is the plan as executed; the spec is the authority for
+> what shipped.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Show the PCIe devices tunneled over Thunderbolt or USB4 as rows

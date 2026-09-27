@@ -1969,11 +1969,11 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
                 selected_line = Some(lines.len());
             }
             let line = Line::from(format!("▶ {}", row.text));
-            lines.push(if is_selected {
-                line.style(Style::default().bg(ACCENT_COLOR).fg(Color::Black))
+            lines.push(line.style(if is_selected {
+                Style::default().bg(ACCENT_COLOR).fg(Color::Black)
             } else {
-                line
-            });
+                Style::default().fg(TEXT_COLOR)
+            }));
         }
     }
 
@@ -5381,6 +5381,52 @@ mod tests {
             "{text}"
         );
         assert_eq!(app.device_keys(), ["pcie:0000:2d:00.1"].map(String::from));
+        // Unselected, the row takes the list's text colour like a device row.
+        let (lines, _) = device_list_lines_with_selection(&app);
+        let row = lines
+            .iter()
+            .find(|l| l.to_string().starts_with("▶ PCIe"))
+            .expect("the PCIe row");
+        assert_eq!(row.style.fg, Some(TEXT_COLOR));
+    }
+
+    /// Two controllers, one of them a tunneled xHCI: its bus moves under
+    /// the root port, the host controller's two buses stay where they are.
+    #[test]
+    fn a_non_tunneled_controllers_buses_stay_in_their_own_group() {
+        let (temp, mut mgr) = topology_fixture_named("0000:00:14.0");
+        // A second controller, the tunneled xHCI, with one root hub.
+        let real = temp.path().join("0000:2e:00.0").join("usb5");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("busnum"), "5\n").unwrap();
+        std::fs::write(real.join("devnum"), "1\n").unwrap();
+        std::fs::write(real.join("speed"), "480\n").unwrap();
+        std::os::unix::fs::symlink(&real, temp.path().join("devices").join("usb5")).unwrap();
+        mgr.enumerate_present_devices();
+        mgr.update_bus_speeds();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.set_tunnels(vec![tunnel(
+            false,
+            vec![xhci_function(true), nic("0000:2d:00.1", "enp45s0", true)],
+        )]);
+        app.sync_from(&mgr);
+        let ids: Vec<&str> = app.controllers.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["0000:00:07.1", "0000:00:14.0"]);
+        let tunnel_buses: Vec<u8> = app.controllers[0].buses.iter().map(|b| b.bus_id).collect();
+        assert_eq!(
+            tunnel_buses,
+            [5],
+            "the tunneled xHCI's bus moved under the root port"
+        );
+        assert_eq!(
+            app.controllers[0].pcie.len(),
+            1,
+            "the NIC is the one row; the xHCI has a bus"
+        );
+        let host_buses: Vec<u8> = app.controllers[1].buses.iter().map(|b| b.bus_id).collect();
+        assert_eq!(host_buses, [3, 4], "the host controller's buses stayed");
+        assert!(app.controllers[1].pcie.is_empty());
+        assert!(app.controllers[1].tunnel.is_none());
     }
 
     #[test]
