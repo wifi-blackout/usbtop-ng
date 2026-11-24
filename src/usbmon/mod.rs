@@ -6,6 +6,8 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+#[cfg(test)]
+mod bench;
 pub mod binary;
 #[cfg(feature = "ebpf")]
 mod ebpf;
@@ -14,19 +16,25 @@ pub mod monitor;
 pub mod parser;
 pub mod reader;
 pub mod ring;
+mod tick;
 
-/// How long a reader parks between polls when the interface has nothing to
-/// give (EAGAIN or EOF). Also the worst-case latency of a shutdown request.
+/// How long a ring reader parks between polls when the interface has nothing
+/// to give (EAGAIN or EOF), and how often the text reader's wait in `read` is
+/// interrupted (see [`tick`]). Either way it is the worst-case latency of a
+/// shutdown request.
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Open a usbmon interface non-blocking, so an idle bus cannot pin the reader
-/// thread inside `read`: without `O_NONBLOCK` a thread parked on a silent `Nu`
-/// file or `/dev/usbmonN` device keeps it (and therefore the usbmon module)
-/// open indefinitely. Regular files never report `WouldBlock`, so
-/// fixture-backed tests behave exactly as they would with a plain open.
+/// thread inside `read`: without `O_NONBLOCK` a thread parked on a silent
+/// `/dev/usbmonN` device keeps it (and therefore the usbmon module) open
+/// indefinitely. Regular files never report `WouldBlock`, so fixture-backed
+/// tests behave exactly as they would with a plain open.
 ///
-/// Shared by the text ([`reader`]) and binary ([`binary`]) readers, and used by
+/// Shared by the binary ([`binary`]) and text ([`reader`]) readers, and used by
 /// [`monitor::start_monitoring`] to probe whether the binary interface exists.
+/// The text reader opens this way too, and clears the flag only around the one
+/// read in which it waits for an event, with a tick running to bound that
+/// wait; see [`reader::UsbmonReader`].
 pub(crate) fn open_nonblocking(path: &Path) -> std::io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     fs::OpenOptions::new()

@@ -62,6 +62,9 @@ To install by hand instead, build and copy the binary yourself:
 cargo build --release
 sudo install -m 0755 target/release/usbtop-ng /usr/local/bin/usbtop-ng
 sudo ln -sf usbtop-ng /usr/local/bin/usbtop
+sudo install -d /usr/local/share/man/man1
+target/release/usbtop-ng --print-man | sudo tee /usr/local/share/man/man1/usbtop-ng.1 >/dev/null
+sudo ln -sf usbtop-ng.1 /usr/local/share/man/man1/usbtop.1
 ```
 
 ## Building the eBPF backend

@@ -407,14 +407,15 @@ Open, recorded 2026-09-07 so they do not get lost:
     of departed devices from the poller (`MapCore::delete`), and read the
     map with `lookup_batch` (Linux 5.6+, with the per-key fallback) instead
     of one syscall per key.
-  - The `read(2)` fallback reader discards captured payload in 512-byte
-    chunks (`DRAIN_CHUNK`); a larger chunk would cut syscalls on a
-    SuperSpeed bulk stream. Measure on the fallback path before changing
-    it: the mmap ring, the default, never drains this way.
-  - The debugfs text reader has no line-length cap. The kernel formats
-    each event into a fixed buffer (`drivers/usb/mon/mon_text.c`), so a
-    cap only guards a synthetic file handed to `--capture`/replay; add one
-    if that ever matters.
+  - (Done 2026-11-23: the `read(2)` fallback reader used to discard
+    captured payload in 512-byte chunks, `DRAIN_CHUNK`. It was measured on
+    the fallback path first, as this item asked, and it now takes an event,
+    header and payload, in one read of up to 128 KiB. See
+    [BENCHMARK.md](BENCHMARK.md#2026-11-23-the-read-reader-after-the-fix).)
+  - (Done 2026-11-23: the debugfs text reader gives up a run of more than
+    64 KiB with no newline, `LINE_LIMIT` in `src/usbmon/reader.rs`. The
+    kernel formats each event into a fixed buffer, so the cap only guards
+    a synthetic file.)
 - Connector rows leftovers: a dock fixture for the corpus when a dock is
   available. (Done 2026-09-07: the `/proc/self/fd/<n>/fixture` scrub is
   a pure function pinned by a hermetic test with a synthetic failing

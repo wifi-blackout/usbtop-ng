@@ -58,12 +58,12 @@ pub struct MonitorHandle {
     pub dropped: Arc<AtomicU64>,
     /// Kernel-side drops — traffic the kernel discarded before this process
     /// ever saw it, distinct from [`Self::dropped`] (a full channel, after
-    /// delivery). Fed by the mmap ring readers' `MON_IOCG_STATS` count and,
-    /// under the `ebpf` backend, by its full-aggregation-map drop counter
-    /// (see `usbmon::ebpf::EbpfSource`). Readers on the text or read()-based
-    /// binary interface never touch it, so it stays at zero unless the mmap
-    /// interface is in use or the eBPF map fills. Clone the `Arc` before
-    /// `stop()` to keep reading it, same as [`Self::dropped`].
+    /// delivery). Fed by the mmap ring and read() readers' `MON_IOCG_STATS`
+    /// count and, under the `ebpf` backend, by its full-aggregation-map drop
+    /// counter (see `usbmon::ebpf::EbpfSource`). A reader on the text
+    /// interface never touches it, since that interface has no such count.
+    /// Clone the `Arc` before `stop()` to keep reading it, same as
+    /// [`Self::dropped`].
     pub kernel_dropped: Arc<AtomicU64>,
     /// The live-interface flags a report reads to pick its `source` label and
     /// mark text-interface estimates (see [`SourceFlags`]). Clone before
@@ -125,10 +125,100 @@ impl PacketSource {
 /// mmap -> binary -> text chain `run_source_with_fallback`'s pre-probe
 /// already prefers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceKind {
+pub(super) enum SourceKind {
     Mmap,
     Binary,
     Text,
+}
+
+/// Where a log line about a fallback sends the reader for the causes and the
+/// fix: the man page section `manpage::CAPTURE_INTERFACES` and the README's
+/// "Reading usbmon" section, which say the same thing.
+const SEE_DOCS: &str = concat!(
+    "see CAPTURE INTERFACES in 'man usbtop-ng' or 'Reading usbmon' in the README (",
+    env!("CARGO_PKG_REPOSITORY"),
+    ")"
+);
+
+impl SourceKind {
+    /// The name the startup log line gives this interface.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            SourceKind::Mmap => "mmap-ring",
+            SourceKind::Binary => "binary",
+            SourceKind::Text => "text",
+        }
+    }
+
+    /// What a session that did not get the mmap ring is told at startup:
+    /// which fallback is in use, on which node and (when the node did not
+    /// open) why, what the fallback changes, and where the causes and the
+    /// fix are written down. `None` on the mmap ring, where there is nothing
+    /// to fix.
+    ///
+    /// What each fallback changes is stated as the work it does and the data
+    /// it loses, never as a CPU figure or a ranking of the two fallbacks:
+    /// nothing in this tree measures either.
+    fn fallback_notice(self, node: &Path, open_error: Option<&std::io::Error>) -> Option<String> {
+        let node = node.display();
+        match self {
+            SourceKind::Mmap => None,
+            SourceKind::Binary => Some(format!(
+                "could not use the mmap ring on {node}, so usbtop-ng had to fall back to read() \
+                 on it: the figures are the same, but every event takes a system call of its \
+                 own and its captured payload has to be read and discarded; {SEE_DOCS} for \
+                 the causes and the fix"
+            )),
+            SourceKind::Text => {
+                let cause = match open_error {
+                    Some(error) => format!("could not open {node}: {error}"),
+                    None => format!("could not open {node}"),
+                };
+                Some(format!(
+                    "{cause}, so usbtop-ng had to fall back to the debugfs text interface: \
+                     isochronous rates (webcams, audio) are estimates marked ~ and the \
+                     kernel's drop count is not available; {SEE_DOCS} for the causes and the fix"
+                ))
+            }
+        }
+    }
+}
+
+/// Which interface `node` (a `/dev/usbmonN`) supports, best first, and when it
+/// did not even open, the error that says why. Both probe handles are dropped
+/// before this returns, so a probe never pins usbmon.
+fn probe_node(node: &Path) -> (SourceKind, Option<std::io::Error>) {
+    if MmapReader::probe(node) {
+        return (SourceKind::Mmap, None);
+    }
+    match open_nonblocking(node) {
+        Ok(_) => (SourceKind::Binary, None),
+        Err(error) => (SourceKind::Text, Some(error)),
+    }
+}
+
+/// The per-bus warnings a reader thread logs when its own bus drops down the
+/// chain. Built here rather than inline so each one's pointer to the docs is
+/// under test.
+fn ring_unusable_message(node: &Path, bus: u8) -> String {
+    format!(
+        "cannot use the mmap ring at {} for bus {bus}; falling back to the usbmon binary interface ({SEE_DOCS})",
+        node.display()
+    )
+}
+
+fn node_unopenable_message(node: &Path, bus: u8, error: &std::io::Error) -> String {
+    format!(
+        "cannot open {} for bus {bus}: {error}; falling back to the usbmon text interface ({SEE_DOCS})",
+        node.display()
+    )
+}
+
+fn retry_message(bus: u8, next: SourceKind) -> String {
+    format!(
+        "retrying bus {bus} on the usbmon {} interface after a capture failure ({SEE_DOCS})",
+        next.label()
+    )
 }
 
 /// Given the source kind whose `read_packets` just returned `Err` and
@@ -177,36 +267,21 @@ pub fn start_monitoring(buses: &[u8]) -> (Receiver<UsbPacket>, MonitorHandle) {
     }
 
     // Probing the first target is enough: the binary devices are created by the
-    // same module for the same set of buses. The probe handles are dropped
-    // right away so they cannot pin usbmon.
-    let use_mmap = targets
-        .first()
-        .is_some_and(|bus| MmapReader::probe(Path::new(&format!("/dev/usbmon{bus}"))));
-    let use_binary = !use_mmap
-        && targets
-            .first()
-            .is_some_and(|bus| open_nonblocking(Path::new(&format!("/dev/usbmon{bus}"))).is_ok());
-    info!(
-        "using usbmon {} interface",
-        if use_mmap {
-            "mmap-ring"
-        } else if use_binary {
-            "binary"
-        } else {
-            "text"
-        }
-    );
+    // same module for the same set of buses. The one answer drives both the
+    // log lines and the readers that are built, so the two cannot disagree.
+    let node = format!("/dev/usbmon{}", targets[0]);
+    let (chosen, open_error) = probe_node(Path::new(&node));
+    info!("using usbmon {} interface", chosen.label());
+    if let Some(notice) = chosen.fallback_notice(Path::new(&node), open_error.as_ref()) {
+        warn!("{notice}");
+    }
 
     let sources = targets
         .iter()
-        .map(|&bus| {
-            if use_mmap {
-                PacketSource::Mmap(MmapReader::new(bus))
-            } else if use_binary {
-                PacketSource::Binary(BinaryReader::new(bus))
-            } else {
-                PacketSource::Text(UsbmonReader::new(bus))
-            }
+        .map(|&bus| match chosen {
+            SourceKind::Mmap => PacketSource::Mmap(MmapReader::new(bus)),
+            SourceKind::Binary => PacketSource::Binary(BinaryReader::new(bus)),
+            SourceKind::Text => PacketSource::Text(UsbmonReader::new(bus)),
         })
         .collect();
     start_sources(sources)
@@ -449,28 +524,26 @@ fn run_source_with_fallback(
     // running.
     let (source, fallback) = match source {
         PacketSource::Mmap(reader) if !MmapReader::probe(&reader.path) => {
-            warn!(
-                "cannot use the mmap ring at {} for bus {bus}; falling back to the usbmon binary interface",
-                reader.path.display()
-            );
+            warn!("{}", ring_unusable_message(&reader.path, bus));
             let binary = BinaryReader::new(bus);
-            if open_nonblocking(&binary.path).is_err() {
-                warn!(
-                    "cannot open {} for bus {bus}; falling back to the usbmon text interface",
-                    binary.path.display()
-                );
-                (PacketSource::Text(fallback), None)
-            } else {
-                (PacketSource::Binary(binary), Some(fallback))
+            match open_nonblocking(&binary.path) {
+                Err(error) => {
+                    warn!("{}", node_unopenable_message(&binary.path, bus, &error));
+                    (PacketSource::Text(fallback), None)
+                }
+                Ok(_) => (PacketSource::Binary(binary), Some(fallback)),
             }
         }
-        PacketSource::Binary(reader) if open_nonblocking(&reader.path).is_err() => {
-            warn!(
-                "cannot open {} for bus {bus}; falling back to the usbmon text interface",
-                reader.path.display()
-            );
-            (PacketSource::Text(fallback), None)
-        }
+        // The error is kept, not just tested for: it is what tells a missing
+        // node from a closed one, and the docs the warning points to branch
+        // on it.
+        PacketSource::Binary(reader) => match open_nonblocking(&reader.path) {
+            Err(error) => {
+                warn!("{}", node_unopenable_message(&reader.path, bus, &error));
+                (PacketSource::Text(fallback), None)
+            }
+            Ok(_) => (PacketSource::Binary(reader), Some(fallback)),
+        },
         source => (source, Some(fallback)),
     };
     run_source_chain(
@@ -543,11 +616,11 @@ fn run_source_chain(
         let shutdown_requested = shutdown.load(Ordering::Relaxed);
         match next_fallback(kind, shutdown_requested) {
             Some(SourceKind::Binary) => {
-                warn!("retrying bus {bus} on the usbmon binary interface after a capture failure");
+                warn!("{}", retry_message(bus, SourceKind::Binary));
                 source = PacketSource::Binary(BinaryReader::new(bus));
             }
             Some(SourceKind::Text) => {
-                warn!("retrying bus {bus} on the usbmon text interface after a capture failure");
+                warn!("{}", retry_message(bus, SourceKind::Text));
                 source = PacketSource::Text(fallback.take().expect(
                     "fallback is only None when the chain already started at Text, which \
                      next_fallback never routes back to",
@@ -779,6 +852,157 @@ mod tests {
             kernel_dropped.load(Ordering::Relaxed),
             0,
             "a source that fell back before ever reading the ring reports no kernel drops"
+        );
+    }
+
+    /// A node that is not there cannot be opened, so the probe lands on text
+    /// and hands back the error that says why.
+    #[test]
+    fn probing_a_missing_node_lands_on_text_with_the_open_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let (kind, error) = probe_node(&temp.path().join("usbmon7"));
+        assert_eq!(kind, SourceKind::Text);
+        assert_eq!(
+            error.map(|e| e.kind()),
+            Some(std::io::ErrorKind::NotFound),
+            "the reason the node did not open comes back with the choice"
+        );
+    }
+
+    /// A node that opens but has no ring (a regular file answers the ring
+    /// ioctl with ENOTTY, as a kernel without the ring would) lands on
+    /// read(), with no open error to report.
+    #[test]
+    fn probing_a_node_without_a_ring_lands_on_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = temp.path().join("usbmon7");
+        std::fs::File::create(&node).unwrap();
+        let (kind, error) = probe_node(&node);
+        assert_eq!(kind, SourceKind::Binary);
+        assert!(error.is_none(), "{error:?}");
+    }
+
+    #[test]
+    fn the_startup_line_keeps_the_three_interface_names() {
+        assert_eq!(SourceKind::Mmap.label(), "mmap-ring");
+        assert_eq!(SourceKind::Binary.label(), "binary");
+        assert_eq!(SourceKind::Text.label(), "text");
+    }
+
+    /// The pointer names the man page section by its real heading, and a
+    /// README section that exists under the name it gives.
+    #[test]
+    fn the_docs_pointer_names_sections_that_exist() {
+        assert!(
+            SEE_DOCS.contains(&format!(
+                "see {} in 'man usbtop-ng'",
+                crate::manpage::CAPTURE_INTERFACES_HEADING
+            )),
+            "{SEE_DOCS}"
+        );
+        assert!(
+            SEE_DOCS.contains("'Reading usbmon' in the README (https://"),
+            "{SEE_DOCS}"
+        );
+        let readme = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
+        assert!(
+            readme.contains("\n### Reading usbmon\n"),
+            "the README section the warnings name is gone or renamed"
+        );
+    }
+
+    #[test]
+    fn the_mmap_ring_needs_no_fallback_notice() {
+        let node = Path::new("/dev/usbmon0");
+        assert_eq!(SourceKind::Mmap.fallback_notice(node, None), None);
+    }
+
+    #[test]
+    fn the_read_fallback_notice_says_what_it_is_and_where_to_look() {
+        let notice = SourceKind::Binary
+            .fallback_notice(Path::new("/dev/usbmon3"), None)
+            .unwrap();
+        assert_eq!(
+            notice,
+            format!(
+                "could not use the mmap ring on /dev/usbmon3, so usbtop-ng had to fall back \
+                 to read() on it: the figures are the same, but every event takes a system call \
+                 of its own and its captured payload has to be read and discarded; \
+                 {SEE_DOCS} for the causes and the fix"
+            )
+        );
+        // read() loses no data: no estimates, and the kernel's drop count is
+        // still read. The notice must not claim otherwise, and it states no
+        // CPU figure, which nothing here measures.
+        assert!(!notice.contains("estimates"), "{notice}");
+        assert!(!notice.contains("drop"), "{notice}");
+        assert!(!notice.contains("debugfs"), "{notice}");
+        assert!(!notice.contains("CPU"), "{notice}");
+        assert!(
+            notice.ends_with(&format!("; {SEE_DOCS} for the causes and the fix")),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn the_debugfs_fallback_notice_names_the_node_the_error_and_where_to_look() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let notice = SourceKind::Text
+            .fallback_notice(Path::new("/dev/usbmon0"), Some(&denied))
+            .unwrap();
+        assert_eq!(
+            notice,
+            format!(
+                "could not open /dev/usbmon0: {denied}, so usbtop-ng had to fall back to \
+                 the debugfs text interface: isochronous rates (webcams, audio) are \
+                 estimates marked ~ and the kernel's drop count is not available; \
+                 {SEE_DOCS} for the causes and the fix"
+            )
+        );
+        assert!(notice.contains("estimates marked ~"), "{notice}");
+        assert!(
+            notice.contains("the kernel's drop count is not available"),
+            "{notice}"
+        );
+        assert!(!notice.contains("CPU"), "{notice}");
+        assert!(
+            notice.ends_with(&format!("; {SEE_DOCS} for the causes and the fix")),
+            "{notice}"
+        );
+    }
+
+    /// Every per-bus warning names its bus and the interface it drops to,
+    /// and carries the same pointer the startup notice does.
+    #[test]
+    fn the_per_bus_fallback_warnings_carry_the_docs_pointer() {
+        let node = Path::new("/dev/usbmon4");
+        assert_eq!(
+            ring_unusable_message(node, 4),
+            format!(
+                "cannot use the mmap ring at /dev/usbmon4 for bus 4; falling back to the \
+                 usbmon binary interface ({SEE_DOCS})"
+            )
+        );
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            node_unopenable_message(node, 4, &missing),
+            format!(
+                "cannot open /dev/usbmon4 for bus 4: {missing}; falling back to the usbmon \
+                 text interface ({SEE_DOCS})"
+            )
+        );
+        assert_eq!(
+            retry_message(4, SourceKind::Binary),
+            format!(
+                "retrying bus 4 on the usbmon binary interface after a capture failure \
+                 ({SEE_DOCS})"
+            )
+        );
+        assert_eq!(
+            retry_message(4, SourceKind::Text),
+            format!(
+                "retrying bus 4 on the usbmon text interface after a capture failure ({SEE_DOCS})"
+            )
         );
     }
 

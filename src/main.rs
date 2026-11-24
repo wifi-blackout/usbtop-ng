@@ -29,6 +29,7 @@ mod findings;
 mod fixture_corpus;
 mod fixture_replay;
 mod headless;
+mod manpage;
 mod pci;
 mod snapshot;
 mod stats;
@@ -310,10 +311,7 @@ fn main() -> Result<()> {
     // Print the man page if requested
     if cli.print_man {
         use clap::CommandFactory;
-        let man = clap_mangen::Man::new(Cli::command());
-        let mut rendered = Vec::new();
-        man.render(&mut rendered)?;
-        io::stdout().write_all(&rendered)?;
+        io::stdout().write_all(&manpage::render(Cli::command())?)?;
         return Ok(());
     }
 
@@ -1074,6 +1072,32 @@ fn open_rc_file(config_file: &str) -> io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The page `--print-man` prints, rendered from the real command line:
+    /// the hand-written section lands once, after the last option and before
+    /// VERSION, and every section clap_mangen renders is still there.
+    #[test]
+    fn the_printed_man_page_carries_the_capture_section_among_the_real_options() {
+        use clap::CommandFactory;
+        let page = String::from_utf8(manpage::render(Cli::command()).unwrap()).unwrap();
+        let position = |needle: &str| {
+            page.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} is missing from the page"))
+        };
+        let options = position("\n.SH OPTIONS\n");
+        // The synopsis names the option too; the last mention is its entry
+        // under OPTIONS.
+        let print_man = page
+            .rfind("print\\-man")
+            .expect("--print-man has an entry on the page");
+        let capture = position("\n.SH \"CAPTURE INTERFACES\"\n");
+        let version = position("\n.SH VERSION\n");
+        assert!(options < print_man && print_man < capture && capture < version);
+        assert_eq!(page.matches(".SH \"CAPTURE INTERFACES\"").count(), 1);
+        for section in [".TH usbtop-ng 1", ".SH NAME", ".SH SYNOPSIS", ".SH AUTHORS"] {
+            assert!(page.contains(section), "{section} is missing");
+        }
+    }
 
     #[test]
     fn cli_parses_print_completions_shell() {

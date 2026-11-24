@@ -248,9 +248,21 @@ drops on an idle bus.
    without a mmap-capable `/dev/usbmon0`, each of the five extra tests
    prints its own skip message and passes.
 
-The live test is gated on the feature, so it compiles to nothing on default
-builds. CI does not run this feature. It exists for manual checks on a real
-machine with real USB traffic.
+The live tests are gated on the feature, so they compile to nothing on
+default builds. CI runs the feature on an unprivileged runner, where each of
+the five skips; they exist for manual checks on a real machine with real USB
+traffic.
+
+The feature also builds the capture interface benchmark
+(`src/usbmon/bench.rs`). That adds six more tests to the run above, which
+need no privilege and no device, so they run for real in CI too: they
+exercise the benchmark's own system calls and `/proc` readers (`getrusage`, `sysconf`, `/proc/stat`, and a
+thread's `schedstat` read from another thread). It also adds
+`capture_interface_benchmark` itself, which the run lists as ignored and
+does not execute: it streams video from a USB camera while each usbmon
+reader in turn watches the bus, and reports the elapsed time and the CPU
+used. It is run by name, as root, on a host with a camera;
+[BENCHMARK.md](BENCHMARK.md) has the procedure and the results.
 
 ### Live system tests (the `ebpf` feature)
 

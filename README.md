@@ -57,14 +57,19 @@ The install creates `/usr/local/bin/usbtop` as a symlink to `usbtop-ng`, so
 `sudo`.
 
 `install.sh` also installs a man page, so `man usbtop-ng` works right after
-install.
+install. Beyond the options, its CAPTURE INTERFACES section covers the three
+ways usbtop-ng reads usbmon and how to get off a fallback.
 
-To install by hand instead, build and copy the binary yourself:
+To install by hand instead, build and copy the binary yourself, then write
+the man page the binary prints:
 
 ```bash
 cargo build --release
 sudo install -m 0755 target/release/usbtop-ng /usr/local/bin/usbtop-ng
 sudo ln -sf usbtop-ng /usr/local/bin/usbtop
+sudo install -d /usr/local/share/man/man1
+target/release/usbtop-ng --print-man | sudo tee /usr/local/share/man/man1/usbtop-ng.1 >/dev/null
+sudo ln -sf usbtop-ng.1 /usr/local/share/man/man1/usbtop.1
 ```
 
 [docs/INSTALL.md](docs/INSTALL.md) covers the usbmon setup, shell completions,
@@ -183,6 +188,13 @@ key press and quits through the same teardown as `q`.
   the device's own chain: `1.4.2` for a hub chain, `-` for a root hub, `?`
   when sysfs did not resolve the device.
 - Columns: Port, Device, Speed, Vendor, Product, Bw↓, Bw↑, %busy, `!`.
+- Vendor and Product widen with the terminal. They start at 14 and 18 cells
+  and take only the cells the row leaves unused, up to 36 and 35, so both are
+  at full width from 137 columns up and a narrower terminal loses no other
+  column to them. A string that still does not fit ends in `…`.
+- The product string is black on light blue, to stand out as the device's
+  name. The selected row, a disconnected row, and the `Unknown` placeholder
+  stay plain.
 - Speed comes from sysfs, matched by busnum and devnum. Vendor and product
   come from sysfs too, unless a usb.ids database resolves a name for them;
   see [Device names](#device-names).
@@ -485,12 +497,16 @@ says, and the snapshot is the one list you control.
   copying only each event's 48 byte header and never its captured payload.
 - A bus whose mmap ring is unusable (older kernel, mmap denied) falls back to
   the read()-based binary interface, which reads the same 48 byte
-  native-endian event header but then drains each event's captured payload
-  rather than keeping it. A bus whose binary node will not open at all falls
+  native-endian event header and, with it, the event's captured payload,
+  which it has no use for and does not keep. A bus whose binary node will not open at all falls
   back further, to the text interface, debugfs `Nu`.
 - One probe at startup checks the first target bus for mmap capability, then
   for a binary node that opens. That choice applies to every target bus. One
-  `info!` line records it.
+  `info!` line records it: `using usbmon mmap-ring interface`, `binary`, or
+  `text`. When the choice is not the mmap ring, a warning follows that says
+  which fallback had to be used and what it gives up, and points to this section
+  and to CAPTURE INTERFACES in `man usbtop-ng`. See
+  [When a fallback is in use](#when-a-fallback-is-in-use).
 - Each reader thread re-checks its own bus before it starts reading, and
   degrades to the next interface down the chain on failure, so one bus's
   unreadable or non-mmap-capable node costs one bus rather than the session.
@@ -502,15 +518,70 @@ says, and the snapshot is the one list you control.
 - The readers hand packets to the UI thread over a channel bounded at 16384
   packets. A reader never parks on a full channel. A packet that does not fit
   raises the drop counter, and the header then shows `dropped: N`.
-- The mmap readers also read the kernel's own drop count (`MON_IOCG_STATS`)
-  periodically while running (bounded to once per 50ms poll interval, plus a
-  final read at exit), and add it to a separate counter the read() and text
-  readers never touch. The header shows `kdropped: N` once it rises above
-  zero, apart from the channel's `dropped: N`.
+- The mmap and read() readers also read the kernel's own drop count
+  (`MON_IOCG_STATS`) periodically while running (bounded to once per 50ms
+  poll interval, plus a final read at exit), and add it to a separate counter
+  the text reader never touches. The header shows `kdropped: N` once it rises
+  above zero, apart from the channel's `dropped: N`.
 - The event loop applies at most 8192 packets per pass. A pass that fills its
   batch comes straight back for the rest.
 - usbtop-ng closes the usbmon files before any unload, because an open file
   pins the module and makes `modprobe -r usbmon` fail with `EBUSY`.
+
+#### When a fallback is in use
+
+The mmap ring is the interface to aim for. The other two exist so a host
+where it does not work still gets a reading, and each gives something up:
+
+| Startup line | Read through | Figures | What it does per event |
+| --- | --- | --- | --- |
+| `mmap-ring` | the mapped ring of `/dev/usbmonN` | exact | events are fetched in batches and only each 48 byte header is copied |
+| `binary` | read() on `/dev/usbmonN` | exact | the same headers, but every event takes a system call of its own, which also copies its captured payload out of the kernel to be thrown away, the only way past it to the next header; a busy bus can outrun the reader, and the kernel's ring then drops events (`kdropped: N`) |
+| `text` | debugfs, `/sys/kernel/debug/usb/usbmon/Nu` | isochronous rates (webcams, audio) are estimates, marked `~` | the kernel prints every event as a line of text and usbtop-ng parses it back; the kernel's drop count is not available, so `kdropped` says nothing about this interface |
+
+The order is the one the code prefers, and it is an order of what is lost,
+not of CPU cost: read() delivers everything the mmap ring does, and text is
+last because it is the only one that loses data. Measured against a webcam
+on two hosts, the mmap ring cost about 0.5% and 0.9% of one core, read()
+about 0.9% and 1.3%, and text about 1.0% and 1.7%. Those
+figures add the reader thread's CPU to the kernel's own work on each event,
+which was timed separately, and they are two hosts' figures for one kind of
+traffic at one rate. [docs/BENCHMARK.md](docs/BENCHMARK.md) has the method,
+the tables and what they do not show.
+
+Why each fallback happens, and how to get back to the mmap ring:
+
+- **`text`: `/dev/usbmonN` did not open.** The warning names the node and the
+  error. "No such file or directory": usbmon is loaded (`lsmod | grep
+  usbmon`) but nothing is creating device nodes in `/dev`, the usual case in
+  a container. Pass the node in from the host with the container runtime's
+  device option, for example `docker run --device /dev/usbmon0 ...`;
+  `usbmon0` is enough, because it is the all-buses node and usbtop-ng reads
+  it alone when it is there. "Permission denied" or "Operation not
+  permitted": the node is there but closed to this process, by its mode
+  (`ls -l /dev/usbmon*`; root-only unless a udev rule grants more) or by the
+  container's device rules. Run as root, `sudo usbtop-ng`, or allow the
+  device. On an ordinary host a non-root run never gets this far: with
+  neither interface readable, usbtop-ng stops and says to use sudo.
+- **`binary`: the node opened but the kernel refused the ring.** Either a
+  sandbox, a seccomp filter, or a security module denies the ioctl or the
+  mmap on the device, or the kernel is too old to have the ring. Run
+  usbtop-ng outside the sandbox, or let it map `/dev/usbmonN`.
+- **A warning that names one bus** means that bus alone fell back, after its
+  own node failed the same checks or failed while it was being read. The
+  other buses stay on the interface chosen at startup. Bus 0 is the
+  exception: it is the aggregate reader that covers every bus, so a warning
+  that names bus 0 means the whole session fell back.
+
+Debugfs is needed for the text interface and nothing else: a host on the mmap
+ring or on read() does not need it mounted. A script reads the interface from
+each report's `source` field (`mmap`, `binary`, `text`, or `ebpf`). It is the
+state of the readers when the report is built, `text` as soon as any bus is on
+it, so it follows a later fallback; it does not say which interface each
+counted packet came from. The run record
+`--output` writes also has a `backend` field, but it is a snapshot taken as
+the readers start: it can say `binary` before the mmap reader has reported
+in, and it never changes afterwards. See [docs/SCRIPTING.md](docs/SCRIPTING.md).
 
 ### The eBPF capture backend
 
@@ -630,6 +701,10 @@ says, and the snapshot is the one list you control.
 - The `integration` cargo feature adds 5 tests that need real root, a real
   usbmon interface, or a real mmap-capable `/dev/usbmon0`, each skipping
   gracefully without one. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
+  It also builds the capture interface benchmark: six tests of the system
+  calls it relies on, which need no privilege, and the benchmark itself, an
+  ignored test that is run by hand against a USB camera; see
+  [docs/BENCHMARK.md](docs/BENCHMARK.md).
 - The `ebpf` cargo feature adds tests covering the eBPF backend's pure
   delta math and transfer-type mapping, plus a live kprobe load/attach test
   gated on root and a BTF-enabled kernel that skips gracefully without
@@ -774,6 +849,8 @@ them safe in a script or a cron job. See
   chassis, known limitations.
 - [docs/SCRIPTING.md](docs/SCRIPTING.md): `--once`/`--batch` reports, the
   `--json` field list, and exit behavior.
+- [docs/BENCHMARK.md](docs/BENCHMARK.md): the capture interface benchmark,
+  how to run it, and the CPU each usbmon interface measured.
 - [docs/ROADMAP.md](docs/ROADMAP.md): feature ideas and follow-up work.
 - [CHANGELOG.md](CHANGELOG.md): what changed per release.
 

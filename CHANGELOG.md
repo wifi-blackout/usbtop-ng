@@ -5,6 +5,25 @@ All notable changes to usbtop-ng are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- A warning at startup when usbmon is not being read through the mmap ring: it names the node, says whether read() on it or the debugfs text interface had to be used (with the open error when the node did not open) and what that gives up, and points to CAPTURE INTERFACES in `man usbtop-ng` and to "Reading usbmon" in the README. The per-bus fallback warnings carry the same pointer and the open error
+- The man page has a CAPTURE INTERFACES section, and the README a "When a fallback is in use" section: the three interfaces best first, why each fallback happens, what it gives up, and how to get back to the mmap ring
+
+- A benchmark of the three usbmon interfaces, run by hand against a USB camera (`capture_interface_benchmark`, an ignored test under the `integration` feature): each run streams a fixed number of video frames while one interface reads the camera's bus, and reports the elapsed time, the frames and events seen, what the kernel dropped, the reader thread's CPU over the capture and the whole machine's. [docs/BENCHMARK.md](docs/BENCHMARK.md) has the procedure and the first results, from two hosts: with the kernel's own per-event work timed separately and added in, and with the two fallback readers as fixed below, the mmap ring cost about 0.5% and 0.9% of one core, read() about 0.9% and 1.3%, and text about 1.0% and 1.7%. The README and the man page now state those figures where they used to say nothing measured the difference
+
+### Fixed
+
+- The read() fallback on `/dev/usbmonN` costs about an eighth of the CPU it did at a webcam's rate. The reader used to take each event's 48-byte header in one read() and then read the captured payload behind it 512 bytes at a time, to reach the next header; a webcam's isochronous transfer is captured whole, up to 96 KiB of it, so one completed transfer cost about 190 system calls, and a ten-second run of the camera counted 492,345 of them. The kernel hands one read() one whole event when the buffer has room for it, so the reader now asks for 128 KiB at every read and takes an event, header and payload, in one call; a longer payload takes one more call for each further 128 KiB. On the two benchmark hosts the reader thread went from 3.9% and 4.4% of one core to 0.5% and 0.6%, with the same events counted and nothing dropped. About two thirds of what is left, by a profile, is the copy of the payload out of the kernel, which the mmap ring never makes
+- The debugfs text interface no longer loses events to the reader's own waiting. The reader used to sleep 50 ms whenever it found nothing queued, and the kernel holds few events for a text reader (93 on a 64-bit kernel with 4 KiB pages) and drops what arrives when that queue is full: a burst of more than that inside one sleep was lost, and so was most of the traffic of any bus busier than about 1,860 events a second. The benchmark found it as nine events lost every time a webcam started; on a USB SSD read in 4 KiB commands, about 59,000 events a second, the old reader reported a twentieth of the traffic. The reader now waits for the next event inside read(), where the kernel wakes it, with a per-thread timer interrupting that read every 50 ms so that it still stops promptly on a silent bus, and it pauses between batches only while events flow steadily, for at most 10 ms. It loses nothing on the webcam now, and on the SSD it lost nothing in three runs out of four and at most 0.3% of the events in the rest, which is about where the text interface stops keeping up on that board. It costs about twice the CPU it did at a webcam's rate (0.8% and 1.4% of one core on the two benchmark hosts, against 0.4% and 0.6%). Where the timer cannot be set up (a sandbox that filters `timer_create`), the reader polls every 10 ms and says so in the log
+
+### Changed
+
+- The device table's Vendor and Product columns widen with the terminal, from 14 and 18 cells up to 36 and 35, taking only the cells the row leaves unused: both are at full width from 137 columns up, and a narrower terminal keeps every column it had
+- The product string in a device row is black on light blue; the selected row, a disconnected row, and the `Unknown` placeholder stay plain
+
 ## [1.8.0] - 2026-09-29
 
 ### Added

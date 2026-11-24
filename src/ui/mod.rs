@@ -247,6 +247,10 @@ pub struct UsbTopApp {
     /// The PCI side of every tunnel, set by the loop before each tick's
     /// `sync_from` (see [`Self::set_tunnels`]); tests set it directly.
     pub tunnels: Vec<Tunnel>,
+    /// The device rows' column widths, refitted to the list's width on every
+    /// draw (see `device_column_widths`). The base widths until the first
+    /// draw, which is also what a test building lines without drawing gets.
+    device_columns: [usize; 9],
 }
 
 /// State of the `/` search box (see `UsbTopApp::search`). `/` opens
@@ -321,6 +325,7 @@ impl UsbTopApp {
             demand_basis: Basis::default(),
             chokepoints: Vec::new(),
             tunnels: Vec::new(),
+            device_columns: DEVICE_COLUMNS,
         }
     }
 
@@ -1447,7 +1452,7 @@ fn header_lines(app: &UsbTopApp) -> Vec<Line<'static>> {
         ));
     }
 
-    // Kernel-side drops the mmap ring reported through `MON_IOCG_STATS` --
+    // Kernel-side drops the mmap or read() reader reported through `MON_IOCG_STATS` --
     // traffic the kernel itself discarded before this process ever saw it,
     // which is a different loss from `dropped` above (a full channel, after
     // delivery). Kept as its own counter so the two loss sources never blur
@@ -1661,11 +1666,43 @@ fn draw_device_chart(f: &mut Frame, area: Rect, app: &UsbTopApp) {
     f.render_widget(chart, area);
 }
 
-/// Column widths, in terminal cells, for the device rows: Port, Device, Speed,
-/// Vendor, Product, Bw↓, Bw↑, %busy, !. Controller and bus headings span the
-/// whole line, which a `Table` cannot do, so the list is laid out as lines of
-/// pre-padded per-cell spans instead.
+/// Base column widths, in terminal cells, for the device rows: Port, Device,
+/// Speed, Vendor, Product, Bw↓, Bw↑, %busy, !. Controller and bus headings
+/// span the whole line, which a `Table` cannot do, so the list is laid out as
+/// lines of pre-padded per-cell spans instead. These are the widths a
+/// terminal with no room to spare gets; `device_column_widths` grows Vendor
+/// and Product from here.
 const DEVICE_COLUMNS: [usize; 9] = [8, 8, 10, 14, 18, 10, 10, 7, 3];
+
+/// Vendor and Product, by index into `DEVICE_COLUMNS`: the two cells that
+/// hold a device's string descriptors, and so the two that truncate.
+const VENDOR_COLUMN: usize = 3;
+const PRODUCT_COLUMN: usize = 4;
+
+/// How wide Vendor and Product grow when the terminal has the room.
+const VENDOR_MAX_WIDTH: usize = 36;
+const PRODUCT_MAX_WIDTH: usize = 35;
+
+/// The device rows' column widths for a list `inner_width` cells wide (the
+/// block's area less its borders). Only cells the base row leaves unused are
+/// handed out, so growing Vendor and Product never pushes a rate column off
+/// a screen it fitted on: a terminal with nothing to spare keeps the base
+/// widths. Short of both caps the two share the spare cells in proportion to
+/// what each can take, Product getting the odd one.
+fn device_column_widths(inner_width: usize) -> [usize; 9] {
+    let base_row = DEVICE_COLUMNS.iter().sum::<usize>() + DEVICE_COLUMNS.len() - 1;
+    let vendor_room = VENDOR_MAX_WIDTH - DEVICE_COLUMNS[VENDOR_COLUMN];
+    let product_room = PRODUCT_MAX_WIDTH - DEVICE_COLUMNS[PRODUCT_COLUMN];
+    let room = vendor_room + product_room;
+
+    let spare = inner_width.saturating_sub(base_row).min(room);
+    let to_vendor = spare * vendor_room / room;
+
+    let mut widths = DEVICE_COLUMNS;
+    widths[VENDOR_COLUMN] += to_vendor;
+    widths[PRODUCT_COLUMN] += spare - to_vendor;
+    widths
+}
 
 /// Where a finding's reason line starts: the Device column's own offset
 /// (Port's width plus the one-space separator after it), so the reason
@@ -1682,9 +1719,13 @@ const FINDING_INDENT: usize = DEVICE_COLUMNS[0] + 1;
 /// `port_style`, when given, styles the Port cell (column 0) -- e.g. the
 /// internal-device blue (see `INTERNAL_COLOR`). Heading/header callers pass
 /// `None`.
-fn device_columns(cells: [&str; 9], port_style: Option<Style>) -> Vec<Span<'static>> {
-    let mut spans = Vec::with_capacity(DEVICE_COLUMNS.len() * 2 - 1);
-    for (index, (cell, width)) in cells.iter().zip(DEVICE_COLUMNS).enumerate() {
+fn device_columns(
+    cells: [&str; 9],
+    widths: &[usize; 9],
+    port_style: Option<Style>,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::with_capacity(widths.len() * 2 - 1);
+    for (index, (cell, &width)) in cells.iter().zip(widths).enumerate() {
         if index > 0 {
             spans.push(Span::raw(" "));
         }
@@ -1740,7 +1781,29 @@ fn fit_to_display_width(text: &str, width: usize) -> String {
 /// column after the first, so a cell at column index `i` lands at span index
 /// `2 * i` in its output.
 const SPEED_SPAN_INDEX: usize = 2 * 2;
+const PRODUCT_SPAN_INDEX: usize = 2 * PRODUCT_COLUMN;
 const INDICATOR_SPAN_INDEX: usize = 2 * 8;
+
+/// Give the Product text of a row built by `device_columns` its highlight:
+/// black on `PRODUCT_HIGHLIGHT_COLOR`. Only the text is painted. The cell's
+/// padding moves into the separator span after it, which keeps the row's
+/// width and every cell's `2 * i` span index as they were, and keeps the
+/// highlight from running down the table as a solid band.
+fn highlight_product_text(spans: &mut [Span<'static>]) {
+    let cell = spans[PRODUCT_SPAN_INDEX].content.to_string();
+    let text = cell.trim_end();
+    if text.is_empty() {
+        return;
+    }
+    let padding = &cell[text.len()..];
+    spans[PRODUCT_SPAN_INDEX + 1] = Span::raw(format!("{padding} "));
+    spans[PRODUCT_SPAN_INDEX] = Span::styled(
+        text.to_string(),
+        Style::default()
+            .bg(PRODUCT_HIGHLIGHT_COLOR)
+            .fg(Color::Black),
+    );
+}
 
 /// Style that paints text in a speed's reference color (see
 /// `UsbSpeed::color_code`), used for both the bus header's Mbps figure and
@@ -1793,7 +1856,7 @@ fn endpoint_row_style() -> Style {
 /// each endpoint carries its own transfer type, so the per-row check needs
 /// no such indirection: the `~` marker applies exactly when a text source is
 /// active and this endpoint is isochronous.
-fn endpoint_lines(row: &DeviceRow, text_active: bool) -> Vec<Line<'static>> {
+fn endpoint_lines(row: &DeviceRow, text_active: bool, widths: &[usize; 9]) -> Vec<Line<'static>> {
     row.device
         .endpoints
         .iter()
@@ -1818,6 +1881,7 @@ fn endpoint_lines(row: &DeviceRow, text_active: bool) -> Vec<Line<'static>> {
                     "",
                     "",
                 ],
+                widths,
                 None,
             );
             Line::from(spans).style(endpoint_row_style())
@@ -1906,6 +1970,7 @@ fn inner_height(area: Rect) -> u16 {
 }
 
 fn draw_device_list(f: &mut Frame, area: Rect, app: &mut UsbTopApp) {
+    app.device_columns = device_column_widths(usize::from(area.width.saturating_sub(2)));
     let (lines, selected_line) = device_list_lines_with_selection(app);
     let trailing = app.selected_row_trailing_lines();
     app.follow_selection_in_list(lines.len(), selected_line, trailing, inner_height(area));
@@ -1936,6 +2001,7 @@ fn device_list_lines_with_selection(app: &UsbTopApp) -> (Vec<Line<'static>>, Opt
         [
             "Port", "Device", "Speed", "Vendor", "Product", "Bw↓", "Bw↑", "%busy", "!",
         ],
+        &app.device_columns,
         None,
     ))
     .style(heading_style)];
@@ -2071,7 +2137,7 @@ fn push_device_row(
     let estimated = app.text_source_active() && device.has_iso_traffic();
     // Selected/disconnected rows stay uniformly styled for readability;
     // only a plain, connected row gets its Port, Speed, and indicator cells
-    // tinted by their reference colors.
+    // tinted by their reference colors, and its Product text highlighted.
     let plain_row = !is_selected && !device.is_disconnected;
     let port_style = (plain_row && device.is_internal).then(|| Style::default().fg(INTERNAL_COLOR));
     let mut spans = device_columns(
@@ -2086,6 +2152,7 @@ fn push_device_row(
             &busy_cell(device),
             indicator.get_symbol(),
         ],
+        &app.device_columns,
         port_style,
     );
 
@@ -2097,6 +2164,11 @@ fn push_device_row(
         spans[INDICATOR_SPAN_INDEX] = spans[INDICATOR_SPAN_INDEX]
             .clone()
             .style(Style::default().fg(Color::Rgb(r, g, b)));
+        // A product string the device or usb.ids actually gave; the
+        // "Unknown" placeholder is not one, so it stays plain.
+        if device.product.is_some() {
+            highlight_product_text(&mut spans);
+        }
     }
 
     lines.push(Line::from(spans).style(status_style));
@@ -2115,7 +2187,11 @@ fn push_device_row(
         );
     }
     if is_selected {
-        lines.extend(endpoint_lines(row, app.text_source_active()));
+        lines.extend(endpoint_lines(
+            row,
+            app.text_source_active(),
+            &app.device_columns,
+        ));
     }
 }
 
@@ -4570,6 +4646,7 @@ mod tests {
                 " 91.6",
                 "⚡",
             ],
+            &DEVICE_COLUMNS,
             None,
         ));
         assert_eq!(wide.width(), device_row_width());
@@ -4588,6 +4665,7 @@ mod tests {
                 "100.0",
                 "🔺",
             ],
+            &DEVICE_COLUMNS,
             None,
         ));
         assert_eq!(clipped.width(), device_row_width());
@@ -5224,6 +5302,230 @@ mod tests {
             Some(INTERNAL_COLOR),
             "a disconnected row keeps its uniform grey styling"
         );
+    }
+
+    #[test]
+    fn column_widths_stay_at_the_base_until_the_row_has_room_to_spare() {
+        assert_eq!(device_column_widths(0), DEVICE_COLUMNS);
+        // The 80-column floor, less the block's two borders.
+        assert_eq!(
+            device_column_widths(usize::from(MIN_COLS) - 2),
+            DEVICE_COLUMNS
+        );
+        assert_eq!(device_column_widths(device_row_width()), DEVICE_COLUMNS);
+    }
+
+    #[test]
+    fn spare_width_goes_to_vendor_and_product_up_to_their_caps() {
+        let base = device_row_width();
+
+        // 39 spare cells is exactly what both caps take: 22 for Vendor
+        // (14 to 36) and 17 for Product (18 to 35).
+        let full = device_column_widths(base + 39);
+        assert_eq!(full, [8, 8, 10, 36, 35, 10, 10, 7, 3]);
+        // Past the caps the columns stop growing.
+        assert_eq!(device_column_widths(base + 40), full);
+        assert_eq!(device_column_widths(400), full);
+
+        // Part of the way there, the two share the spare cells in
+        // proportion to what each can take, and the row fills the list.
+        assert_eq!(
+            device_column_widths(base + 13),
+            [8, 8, 10, 21, 24, 10, 10, 7, 3]
+        );
+        assert_eq!(
+            device_column_widths(base + 1),
+            [8, 8, 10, 14, 19, 10, 10, 7, 3]
+        );
+        for spare in 0..=39 {
+            let widths = device_column_widths(base + spare);
+            assert_eq!(
+                widths.iter().sum::<usize>() + widths.len() - 1,
+                base + spare,
+                "{spare} spare cells: the row is exactly as wide as the list"
+            );
+            assert!(
+                (14..=36).contains(&widths[VENDOR_COLUMN])
+                    && (18..=35).contains(&widths[PRODUCT_COLUMN]),
+                "{spare} spare cells: {widths:?} leaves a column outside its base and cap"
+            );
+        }
+    }
+
+    /// One device whose strings overflow the base Vendor and Product columns
+    /// but fit the grown ones exactly: 36 and 35 cells.
+    fn long_named_fixture() -> (tempfile::TempDir, DeviceManager) {
+        let (temp, mut mgr) = manager_with_rates(&[(1, 3, 0.0)]);
+        let device = mgr.get_or_create_bus(1).devices.get_mut(&3).unwrap();
+        device.vendor = Some("IDS Imaging Development Systems GmbH".to_string());
+        device.product = Some("8BitDo Ultimate 2C Wired Controller".to_string());
+        (temp, mgr)
+    }
+
+    fn drawn_device_list(app: &mut UsbTopApp, width: u16) -> String {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, 8)).unwrap();
+        terminal
+            .draw(|f| draw_device_list(f, f.area(), app))
+            .unwrap();
+        terminal.backend().to_string()
+    }
+
+    #[test]
+    fn a_wide_terminal_shows_long_vendor_and_product_strings_whole() {
+        let (_t, mgr) = long_named_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        // 135 cells of row plus the two borders.
+        let screen = drawn_device_list(&mut app, 137);
+        assert!(
+            screen.contains("IDS Imaging Development Systems GmbH "),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("8BitDo Ultimate 2C Wired Controller "),
+            "{screen}"
+        );
+        // The row still ends on screen: the last columns were not pushed off.
+        assert!(screen.contains("%busy   !  │"), "{screen}");
+    }
+
+    #[test]
+    fn a_terminal_with_no_room_to_spare_keeps_the_base_columns() {
+        let (_t, mgr) = long_named_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        // 96 cells of base row plus the two borders.
+        let screen = drawn_device_list(&mut app, 98);
+        assert!(screen.contains("IDS Imaging D… "), "{screen}");
+        assert!(screen.contains("8BitDo Ultimate 2… "), "{screen}");
+        assert!(screen.contains("%busy   !  │"), "{screen}");
+    }
+
+    /// The columns follow the terminal both ways: a list drawn wide and then
+    /// narrow goes back to the base widths instead of keeping the grown ones.
+    #[test]
+    fn the_columns_shrink_again_when_the_terminal_does() {
+        let (_t, mgr) = long_named_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        drawn_device_list(&mut app, 137);
+        let screen = drawn_device_list(&mut app, 98);
+        assert!(screen.contains("8BitDo Ultimate 2… "), "{screen}");
+        assert!(screen.contains("%busy   !  │"), "{screen}");
+    }
+
+    /// Endpoint rows and the header are laid out on the same widths as the
+    /// device row above them, so the grown columns do not shear the table.
+    #[test]
+    fn grown_columns_keep_header_device_and_endpoint_rows_the_same_width() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mgr = DeviceManager::with_sysfs_base(temp.path().to_path_buf());
+        mgr.get_or_create_bus(1)
+            .devices
+            .insert(3, device_with_two_endpoints(1, 3));
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:3".to_string());
+
+        drawn_device_list(&mut app, 137);
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        // [0] column header, [3] the device, [4] and [5] its endpoints.
+        for index in [0, 3, 4, 5] {
+            assert_eq!(lines[index].width(), 135, "line {index}");
+        }
+    }
+
+    fn product_highlight() -> Style {
+        Style::default()
+            .bg(PRODUCT_HIGHLIGHT_COLOR)
+            .fg(Color::Black)
+    }
+
+    #[test]
+    fn product_text_is_highlighted_unless_the_row_is_selected() {
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0), (1, 4, 0.0)]);
+        {
+            let bus = mgr.get_or_create_bus(1);
+            bus.devices.get_mut(&3).unwrap().product = Some("USB3.2 Hub".to_string());
+            bus.devices.get_mut(&4).unwrap().product = Some("USB3.2 Hub".to_string());
+        }
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+        app.selected_device = Some("1:4".to_string());
+
+        let (lines, selected_line) = device_list_lines_with_selection(&app);
+        assert_eq!(selected_line, Some(4), "selected row's line index");
+
+        // The highlight covers the text and nothing else: the cell's padding
+        // is not part of the span, so no pale band runs down the column.
+        let unselected = &lines[3].spans[PRODUCT_SPAN_INDEX];
+        assert_eq!(unselected.content, "USB3.2 Hub");
+        assert_eq!(unselected.style, product_highlight());
+        assert_eq!(
+            lines[3].spans[PRODUCT_SPAN_INDEX + 1].style,
+            Style::default(),
+            "the padding after the text carries no highlight"
+        );
+        // Moving the padding out of the cell leaves the row as wide as before
+        // and every later cell where its span index says it is.
+        assert_eq!(lines[3].width(), device_row_width());
+        assert_eq!(lines[3].spans.len(), 2 * DEVICE_COLUMNS.len() - 1);
+        assert_eq!(lines[3].spans[2 * 5].content, "0.0 KB/s  ", "Bw down");
+
+        let selected = &lines[4].spans[PRODUCT_SPAN_INDEX];
+        assert_eq!(
+            selected.style,
+            Style::default(),
+            "selected row keeps the uniform highlight instead of the product one"
+        );
+    }
+
+    #[test]
+    fn a_truncated_product_is_highlighted_through_its_ellipsis() {
+        let (_t, mgr) = long_named_fixture();
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        let product = &lines[3].spans[PRODUCT_SPAN_INDEX];
+        assert_eq!(product.content, "8BitDo Ultimate 2…");
+        assert_eq!(product.style, product_highlight());
+        assert_eq!(lines[3].width(), device_row_width());
+    }
+
+    /// "Unknown" stands in for a product string the device never gave; it is
+    /// a placeholder, not a descriptor, so it is not dressed up as one.
+    #[test]
+    fn the_unknown_placeholder_is_not_highlighted() {
+        let (_t, mgr) = manager_with_rates(&[(1, 3, 0.0)]);
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        let product = &lines[3].spans[PRODUCT_SPAN_INDEX];
+        assert_eq!(product.content, "Unknown           ");
+        assert_eq!(product.style, Style::default());
+    }
+
+    /// Disconnected rows stay uniformly grey, like the Port and Speed tints.
+    #[test]
+    fn a_disconnected_rows_product_is_not_highlighted() {
+        let (_t, mut mgr) = manager_with_rates(&[(1, 3, 0.0)]);
+        {
+            let device = mgr.get_or_create_bus(1).devices.get_mut(&3).unwrap();
+            device.product = Some("USB3.2 Hub".to_string());
+            device.is_disconnected = true;
+        }
+        let mut app = UsbTopApp::new(Duration::from_millis(100));
+        app.sync_from(&mgr);
+
+        let (lines, _selected_line) = device_list_lines_with_selection(&app);
+        let product = &lines[3].spans[PRODUCT_SPAN_INDEX];
+        assert_eq!(product.content, "USB3.2 Hub        ");
+        assert_eq!(product.style, Style::default());
     }
 
     #[test]

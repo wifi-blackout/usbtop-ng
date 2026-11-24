@@ -15,3 +15,8 @@ pub const WARNING_COLOR: Color = Color::Rgb(255, 82, 82);
 /// `PRIMARY_COLOR`'s brighter cyan-blue so the two never read as the same
 /// signal.
 pub const INTERNAL_COLOR: Color = Color::Rgb(80, 140, 255); // Mid blue
+/// Background of a device row's Product text, under black: the product
+/// string is what names a device, so it is the cell the eye should land on.
+/// A pale blue no other palette entry comes near, so it reads as a
+/// highlight and not as `PRIMARY_COLOR` or `INTERNAL_COLOR`.
+pub const PRODUCT_HIGHLIGHT_COLOR: Color = Color::Rgb(173, 216, 230); // Light blue

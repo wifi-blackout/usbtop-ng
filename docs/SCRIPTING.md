@@ -24,8 +24,8 @@ anything, so both are safe inside a script or a cron job.
    ```
    The first line carries the window's timestamp, length, packet source, the
    channel drop count, and the kernel-side ring drop count (`kdropped`,
-   nonzero only when the mmap ring reader dropped packets). One bus header
-   follows per bus, then one indented row per device: `bus:address`, a
+   what the kernel lost before a reader saw it; the text interface has no
+   such count and adds nothing to it). One bus header follows per bus, then one indented row per device: `bus:address`, a
    1-wide origin cell (`i` when the device matches an internal-device
    snapshot, blank otherwise — see
    [The `internal` field](#the-internal-field)), `vendor_id:product_id`, link
@@ -99,9 +99,9 @@ Report, the top-level document:
 | `version` | u32 | report schema version, currently 1; fields are only added, never renamed or removed, and an added field does not bump it |
 | `timestamp` | f64 | Unix time the report was built, seconds |
 | `window_seconds` | f64 | the sample window's length, seconds |
-| `source` | string | `"binary"` or `"text"`, the usbmon interface read |
+| `source` | string | the state of the readers when the report is built: `"mmap"`, `"binary"` or `"text"` for the usbmon interface (`"text"` as soon as any bus is on it), or `"ebpf"`; a status label, not a record of which interface each counted packet came from |
 | `dropped_packets` | u64 | packets lost to a full channel this session |
-| `kernel_dropped_packets` | u64 | packets the kernel's usbmon ring dropped before a reader saw them, from `MON_IOCG_STATS`; always 0 unless the mmap ring reader is in use |
+| `kernel_dropped_packets` | u64 | packets the kernel's usbmon ring dropped before a reader saw them, from `MON_IOCG_STATS`; a session total from the mmap and read() readers (a text reader adds nothing to it, so it can be nonzero in a report whose `source` is `"text"`); under the eBPF backend it counts that backend's own lost updates instead |
 | `total_rx_bps` | f64 | sum of every bus's `rx_bps` |
 | `total_tx_bps` | f64 | sum of every bus's `tx_bps` |
 | `buses` | array | one entry per bus, sorted by bus number |
